@@ -1,7 +1,5 @@
 require('../config').loadEnv();
-const { readGptRegisterSources, toSafeSources } = require('../adapters/gptRegisterFs');
-const { Sub2ApiAdminClient } = require('../adapters/sub2apiAdmin');
-const { buildDiff, toSafeDiff } = require('../diff');
+const { buildSnapshot } = require('../sync');
 
 function hasFlag(name) {
   return process.argv.includes(name);
@@ -12,35 +10,9 @@ function printJson(value) {
 }
 
 async function main() {
-  const sources = readGptRegisterSources();
-  let accounts = [];
-  let diff = null;
-  let apiError = null;
-
-  if (hasFlag('--with-sub2api')) {
-    try {
-      const client = new Sub2ApiAdminClient();
-      accounts = await client.listAccounts({
-        platform: 'openai',
-        type: 'oauth',
-        pageSize: 200,
-      });
-      diff = buildDiff(sources.tokens, accounts);
-    } catch (error) {
-      apiError = error.message;
-    }
-  }
-
-  const output = {
-    generatedAt: sources.generatedAt,
-    sources: toSafeSources(sources),
-    sub2api: {
-      accountCount: accounts.length,
-      accounts,
-      apiError,
-    },
-    diff: diff ? toSafeDiff(diff) : null,
-  };
+  const output = await buildSnapshot(new URLSearchParams(hasFlag('--with-sub2api') ? 'withSub2api=1' : ''), {
+    readSub2Api: hasFlag('--with-sub2api'),
+  });
 
   if (hasFlag('--summary')) {
     process.stdout.write(JSON.stringify({

@@ -52,6 +52,9 @@ input:focus, select:focus, button:focus-visible { outline: 3px solid #b7dcf7; ou
 .button:disabled { cursor: wait; opacity: .65; }
 .selection-count, .loading-label { color: var(--muted); font-size: 12px; }
 .table-section { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.plan-panel { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.plan-wrap { overflow-x: auto; }
+.plan-wrap table { min-width: 760px; }
 .section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 18px 18px 14px; border-bottom: 1px solid var(--line); }
 .section-heading p { margin-bottom: 0; color: var(--muted); font-size: 12px; }
 .table-wrap { overflow-x: auto; }
@@ -82,4 +85,3 @@ code { color: #35546d; font-size: 11px; }
 @media (max-width: 480px) {
   .metrics { grid-template-columns: 1fr; }
 }
-

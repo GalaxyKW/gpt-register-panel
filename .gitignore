@@ -7,6 +7,7 @@ browser-profile/
 logs/
 backups/
 data/
+runtime/
 *.sql
 *.sql.gz
 *.sqlite

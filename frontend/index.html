@@ -53,7 +53,21 @@
       <div class="toolbar-actions">
         <span id="selectionCount" class="selection-count">已选 0</span>
         <button id="clearSelectionButton" class="button button-secondary" type="button">清除选择</button>
+        <button id="previewButton" class="button button-secondary" type="button">检查差异</button>
+        <button id="importButton" class="button button-primary" type="button" disabled>确认导入</button>
+        <button id="phase3Button" class="button button-secondary" type="button" disabled>Phase 3</button>
       </div>
+    </section>
+
+    <section id="planPanel" class="plan-panel" hidden>
+      <div class="section-heading">
+        <div>
+          <h2>导入预览</h2>
+          <p id="planSummary">-</p>
+        </div>
+        <span id="planVersion" class="loading-label"></span>
+      </div>
+      <div class="plan-wrap"><table><thead><tr><th>动作</th><th>账号</th><th>邮箱</th><th>来源</th><th>指纹</th><th>原因</th></tr></thead><tbody id="planRows"></tbody></table></div>
     </section>
 
     <section class="table-section">
@@ -89,4 +103,3 @@
   <script src="/app.js" defer></script>
 </body>
 </html>
-

@@ -93,6 +93,38 @@ function safeAccount(account) {
   };
 }
 
+function numberOrZero(value) {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+}
+
+function normalizeUsageStats(stats) {
+  if (!stats || typeof stats !== 'object') return null;
+  return {
+    requests: numberOrZero(stats.requests || stats.total_requests),
+    totalTokens: numberOrZero(
+      stats.tokens || stats.total_tokens || stats.input_tokens + stats.output_tokens,
+    ),
+    inputTokens: numberOrZero(stats.input_tokens),
+    outputTokens: numberOrZero(stats.output_tokens),
+    cost: numberOrZero(stats.cost || stats.actual_cost),
+    standardCost: numberOrZero(stats.standard_cost),
+    userCost: numberOrZero(stats.user_cost),
+  };
+}
+
+function normalizeTableUsageStats(value) {
+  if (!value || typeof value !== 'object') return null;
+  const historical = normalizeUsageStats(value.historical || value.history);
+  const current = normalizeUsageStats(value.current || value.today);
+  return {
+    historical,
+    current,
+    currentWindowStart: parseDateValue(value.current_window_start),
+    currentWindowEnd: parseDateValue(value.current_window_end),
+  };
+}
+
 class Sub2ApiAdminClient {
   constructor(options = {}) {
     this.baseUrl = String(
@@ -204,9 +236,43 @@ class Sub2ApiAdminClient {
       account_ids: ids.map((id) => Number(id)).filter(Number.isFinite),
     });
   }
+
+  async getBatchTableUsageStats(ids) {
+    const value = await this.request('POST', '/api/v1/admin/accounts/table-usage-stats/batch', {
+      account_ids: ids.map((id) => Number(id)).filter(Number.isFinite),
+    });
+    const stats = value?.stats && typeof value.stats === 'object' ? value.stats : value;
+    const normalized = {};
+    for (const [id, item] of Object.entries(stats || {})) {
+      normalized[String(id)] = normalizeTableUsageStats(item);
+    }
+    return {
+      stats: normalized,
+      errors: value?.errors && typeof value.errors === 'object' ? value.errors : {},
+    };
+  }
+
+  async exportAccounts(ids = []) {
+    const query = ids.length > 0 ? '?ids=' + encodeURIComponent(ids.join(',')) : '';
+    return this.request('GET', '/api/v1/admin/accounts/data' + query);
+  }
+
+  async importCodexSession(payload) {
+    return this.request('POST', '/api/v1/admin/accounts/import/codex-session', payload);
+  }
+
+  async applyOAuthCredentials(id, payload) {
+    return this.request(
+      'POST',
+      '/api/v1/admin/accounts/' + encodeURIComponent(String(id)) + '/apply-oauth-credentials',
+      payload,
+    );
+  }
 }
 
 module.exports = {
   Sub2ApiAdminClient,
+  normalizeUsageStats,
+  normalizeTableUsageStats,
   safeAccount,
 };

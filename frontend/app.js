@@ -2,6 +2,7 @@ const state = {
   snapshot: null,
   rows: [],
   selected: new Set(),
+  plan: null,
 };
 
 const elements = {
@@ -26,6 +27,13 @@ const elements = {
   emptyState: document.querySelector('#emptyState'),
   tableSummary: document.querySelector('#tableSummary'),
   loadingLabel: document.querySelector('#loadingLabel'),
+  previewButton: document.querySelector('#previewButton'),
+  importButton: document.querySelector('#importButton'),
+  phase3Button: document.querySelector('#phase3Button'),
+  planPanel: document.querySelector('#planPanel'),
+  planSummary: document.querySelector('#planSummary'),
+  planVersion: document.querySelector('#planVersion'),
+  planRows: document.querySelector('#planRows'),
 };
 
 function escapeHtml(value) {
@@ -52,10 +60,19 @@ function formatFingerprint(value) {
 
 function formatUsage(usage) {
   if (!usage) return '-';
+  if (usage.historical || usage.current) {
+    return formatUsage(usage.historical || null);
+  }
   const total = Number(usage.totalTokens || 0);
   const requests = Number(usage.requests || 0);
   if (!total && !requests) return '0';
   return total.toLocaleString('en-US') + ' / ' + requests.toLocaleString('en-US') + ' 次';
+}
+
+function formatPeriodUsage(usage) {
+  if (!usage) return '-';
+  if (usage.historical || usage.current) return formatUsage(usage.current || null);
+  return formatUsage(usage);
 }
 
 function badgeClass(kind) {
@@ -84,6 +101,32 @@ function kindLabel(kind) {
     mapping_conflict: '身份冲突',
     missing_refresh_token: '缺少续期',
   }[kind] || kind || '-';
+}
+
+function actionLabel(action) {
+  return { create: '新增', update: '更新', skip: '跳过', conflict: '冲突' }[action] || action || '-';
+}
+
+function apiHeaders(options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set('accept', 'application/json');
+  if (options.body !== undefined && !headers.has('content-type')) headers.set('content-type', 'application/json');
+  const token = sessionStorage.getItem('panelToken');
+  if (token) headers.set('x-panel-token', token);
+  return headers;
+}
+
+async function apiFetch(url, options = {}) {
+  const response = await fetch(url, { ...options, headers: apiHeaders(options), cache: 'no-store' });
+  if (response.status === 401) {
+    const token = window.prompt('请输入面板管理员令牌');
+    if (token) {
+      sessionStorage.setItem('panelToken', token);
+      const retry = await fetch(url, { ...options, headers: apiHeaders(options), cache: 'no-store' });
+      return retry;
+    }
+  }
+  return response;
 }
 
 function renderSelectOptions(select, values, labelMap, emptyLabel) {
@@ -127,7 +170,7 @@ function renderRows() {
       '<td>' + escapeHtml(formatDate(row.expiresAt)) + '</td>' +
       '<td><code>' + escapeHtml(formatFingerprint(row.fingerprints?.access)) + '</code></td>' +
       '<td>' + escapeHtml(formatUsage(row.usage)) + '</td>' +
-      '<td>' + escapeHtml(formatUsage(row.usage?.today || null)) + '</td>' +
+      '<td>' + escapeHtml(formatPeriodUsage(row.usage)) + '</td>' +
       '</tr>';
   }).join('');
   elements.emptyState.hidden = rows.length !== 0;
@@ -142,6 +185,31 @@ function renderRows() {
       renderRows();
     });
   });
+}
+
+function renderPlan(plan) {
+  state.plan = plan;
+  const items = plan?.items || [];
+  elements.planPanel.hidden = !plan;
+  if (!plan) {
+    elements.planSummary.textContent = '-';
+    elements.planVersion.textContent = '';
+    elements.planRows.innerHTML = '';
+    elements.importButton.disabled = true;
+    return;
+  }
+  const counts = plan.counts || {};
+  elements.planSummary.textContent = '新增 ' + (counts.create || 0) + ' · 更新 ' + (counts.update || 0)
+    + ' · 跳过 ' + (counts.skip || 0) + ' · 冲突 ' + (counts.conflict || 0);
+  elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12);
+  elements.planRows.innerHTML = items.map((item) => '<tr>'
+    + '<td><span class="badge ' + (item.action === 'conflict' ? 'badge-danger' : item.action === 'skip' ? 'badge-neutral' : item.action === 'update' ? 'badge-warning' : 'badge-success') + '">' + escapeHtml(actionLabel(item.action)) + '</span></td>'
+    + '<td>' + escapeHtml(item.accountName || '-') + '</td>'
+    + '<td>' + escapeHtml(item.email || '-') + '</td>'
+    + '<td>' + escapeHtml(item.source || '-') + '</td>'
+    + '<td><code>' + escapeHtml(formatFingerprint(item.fingerprints?.access)) + '</code></td>'
+    + '<td>' + escapeHtml(item.reason || '-') + '</td></tr>').join('');
+  elements.importButton.disabled = !items.some((item) => item.action === 'create' || item.action === 'update');
 }
 
 function applyFilters() {
@@ -169,10 +237,11 @@ async function loadSnapshot() {
   elements.loadingLabel.hidden = false;
   elements.refreshButton.disabled = true;
   try {
-    const response = await fetch('/api/snapshot?withSub2api=1', { cache: 'no-store' });
+    const response = await apiFetch('/api/snapshot?withSub2api=1');
     const snapshot = await response.json();
     if (!response.ok) throw new Error(snapshot.message || snapshot.error || '读取失败');
     state.snapshot = snapshot;
+    renderPlan(null);
     renderMetrics(snapshot);
     renderSelectOptions(elements.statusFilter, snapshot.filters.statuses, {}, '全部状态');
     renderSelectOptions(elements.diffFilter, snapshot.filters.diffKinds, {
@@ -188,6 +257,8 @@ async function loadSnapshot() {
     }, '全部差异');
     if (snapshot.sub2api.apiError) {
       showNotice('Sub2API 管理 API 暂未连接：' + snapshot.sub2api.apiError + '。当前仍显示 gpt_register 文件来源。', 'notice-warning');
+    } else if (snapshot.sub2api.statsError) {
+      showNotice('账号已读取，但统计接口暂不可用：' + snapshot.sub2api.statsError, 'notice-warning');
     } else {
       showNotice('', '');
     }
@@ -201,6 +272,62 @@ async function loadSnapshot() {
 }
 
 elements.refreshButton.addEventListener('click', loadSnapshot);
+elements.previewButton.addEventListener('click', async () => {
+  elements.previewButton.disabled = true;
+  try {
+    const response = await apiFetch('/api/sync/preview', {
+      method: 'POST',
+      body: JSON.stringify({ selectedKeys: [...state.selected] }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || body.error || '差异检查失败');
+    renderPlan(body);
+    showNotice('差异预览已生成，确认前仍会重新检查来源版本。', 'notice-info');
+  } catch (error) {
+    showNotice(error.message, 'notice-danger');
+  } finally {
+    elements.previewButton.disabled = false;
+  }
+});
+
+elements.importButton.addEventListener('click', async () => {
+  if (!state.plan || !window.confirm('确认将预览中的新增/更新写入 Sub2API？')) return;
+  elements.importButton.disabled = true;
+  try {
+    const response = await apiFetch('/api/sync/import', {
+      method: 'POST',
+      body: JSON.stringify({ snapshotVersion: state.plan.version, selectedKeys: [...state.selected] }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || body.error || '导入任务创建失败');
+    showNotice('导入任务已排队：' + body.jobId, 'notice-info');
+    renderPlan(null);
+    setTimeout(loadSnapshot, 1000);
+  } catch (error) {
+    showNotice(error.message, 'notice-danger');
+    elements.importButton.disabled = false;
+  }
+});
+
+elements.phase3Button.addEventListener('click', async () => {
+  const selectedRows = state.rows.filter((row) => state.selected.has(row.key));
+  if (selectedRows.length !== 1 || !selectedRows[0].email) {
+    showNotice('Phase 3 需要选择一个有邮箱的账号。', 'notice-warning');
+    return;
+  }
+  if (!window.confirm('确认排队更新 ' + selectedRows[0].email + ' 的 token？')) return;
+  try {
+    const response = await apiFetch('/api/phase3', {
+      method: 'POST',
+      body: JSON.stringify({ email: selectedRows[0].email }),
+    });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || body.error || 'Phase 3 任务创建失败');
+    showNotice('Phase 3 任务已排队：' + body.jobId, 'notice-info');
+  } catch (error) {
+    showNotice(error.message, 'notice-danger');
+  }
+});
 elements.clearSelectionButton.addEventListener('click', () => {
   state.selected.clear();
   renderRows();
@@ -213,5 +340,14 @@ elements.selectAll.addEventListener('change', () => {
 [elements.searchInput, elements.statusFilter, elements.sourceFilter, elements.diffFilter]
   .forEach((element) => element.addEventListener('input', applyFilters));
 
-loadSnapshot();
+function updateActionState() {
+  elements.phase3Button.disabled = state.selected.size !== 1;
+}
 
+const originalRenderRows = renderRows;
+renderRows = function patchedRenderRows() {
+  originalRenderRows();
+  updateActionState();
+};
+
+loadSnapshot();

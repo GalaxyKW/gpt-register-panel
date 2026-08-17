@@ -4,10 +4,9 @@ const path = require('node:path');
 const { URL } = require('node:url');
 
 require('./config').loadEnv();
-const { readGptRegisterSources, toSafeSources } = require('./adapters/gptRegisterFs');
-const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
-const { buildDiff, toSafeDiff } = require('./diff');
-const { buildRows, filterRows, statusOptions, diffOptions } = require('./view');
+const { buildSnapshot, buildImportPlan, importPlanSummary, executeImport, configuredForSub2Api, safeErrorMessage } = require('./sync');
+const { PanelDb } = require('./db');
+const { runPhase3Job } = require('./phase3Worker');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -23,60 +22,66 @@ function jsonResponse(response, statusCode, body) {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
     'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'self'; style-src 'self'; script-src 'self'; frame-ancestors 'none'",
   });
   response.end(payload);
 }
 
-function configuredForSub2Api() {
-  return Boolean(
-    process.env.SUB2API_BASE_URL
-      && (process.env.SUB2API_ADMIN_API_KEY || process.env.SUB2API_JWT),
-  );
+function configuredPanelToken() {
+  return String(process.env.PANEL_ADMIN_TOKEN || '');
 }
 
-async function buildSnapshot(query) {
-  const sources = readGptRegisterSources();
-  let accounts = [];
-  let apiError = null;
-  const shouldReadSub2Api = query.get('withSub2api') === '1' || configuredForSub2Api();
+function headerToken(request) {
+  const authorization = String(request.headers.authorization || '');
+  if (authorization.toLowerCase().startsWith('bearer ')) return authorization.slice(7).trim();
+  return String(request.headers['x-panel-token'] || '');
+}
 
-  if (shouldReadSub2Api) {
-    try {
-      const client = new Sub2ApiAdminClient();
-      accounts = await client.listAccounts({
-        platform: 'openai',
-        type: 'oauth',
-        pageSize: 200,
-      });
-    } catch (error) {
-      apiError = error.message;
+function authorizationError(request, write = false) {
+  const configuredToken = configuredPanelToken();
+  const shouldProtectRead = process.env.PANEL_REQUIRE_AUTH === '1' || configuredToken;
+  if (shouldProtectRead && (!configuredToken || headerToken(request) !== configuredToken)) {
+    return { status: 401, error: 'panel_auth_required', message: '需要有效的面板管理员令牌' };
+  }
+  if (write) {
+    if (process.env.PANEL_WRITE_ENABLED !== '1') {
+      return { status: 403, error: 'write_disabled', message: '写操作未启用，请设置 PANEL_WRITE_ENABLED=1' };
+    }
+    if (!configuredToken && process.env.PANEL_ALLOW_INSECURE_WRITE !== '1') {
+      return { status: 503, error: 'write_auth_required', message: '写操作必须配置 PANEL_ADMIN_TOKEN' };
     }
   }
+  return null;
+}
 
-  const diff = buildDiff(sources.tokens, accounts);
-  const allRows = buildRows(diff);
-  const rows = filterRows(allRows, {
-    search: query.get('search'),
-    status: query.get('status'),
-    source: query.get('source'),
-    diffKind: query.get('diff'),
+function requestActor(request) {
+  const value = String(request.headers['x-panel-actor'] || 'local').trim();
+  return value.replace(/[^A-Za-z0-9_.:@-]/g, '').slice(0, 80) || 'local';
+}
+
+function readJsonBody(request, limit = 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    request.setEncoding('utf8');
+    request.on('data', (chunk) => {
+      body += chunk;
+      if (Buffer.byteLength(body) > limit) {
+        reject(new Error('request body too large'));
+        request.destroy();
+      }
+    });
+    request.on('end', () => {
+      if (!body.trim()) return resolve({});
+      try { resolve(JSON.parse(body)); } catch { reject(new Error('invalid JSON body')); }
+    });
+    request.on('error', reject);
   });
-  return {
-    readOnly: true,
-    generatedAt: sources.generatedAt,
-    sources: toSafeSources(sources),
-    sub2api: {
-      accountCount: accounts.length,
-      apiError,
-    },
-    diff: toSafeDiff(diff),
-    rows,
-    filters: {
-      statuses: statusOptions(allRows),
-      sources: ['tokens', 'use_token', 'sub2api'],
-      diffKinds: diffOptions(allRows),
-    },
-  };
+}
+
+function pathParam(pathname, prefix) {
+  if (!pathname.startsWith(prefix)) return null;
+  const value = pathname.slice(prefix.length);
+  return value && !value.includes('/') ? decodeURIComponent(value) : null;
 }
 
 function safeStaticPath(urlPath) {
@@ -102,9 +107,20 @@ function serveStatic(request, response) {
 }
 
 function createServer(options = {}) {
+  const db = options.db || new PanelDb(options.dbPath);
   return http.createServer(async (request, response) => {
     const requestUrl = new URL(request.url || '/', 'http://localhost');
-    if (request.method !== 'GET') {
+    const isReadOnlyGet = request.method === 'GET';
+    const requiresWrite = request.method === 'POST'
+      && ['/api/sync/import', '/api/phase3'].includes(requestUrl.pathname);
+    const authError = requestUrl.pathname.startsWith('/api/')
+      ? authorizationError(request, requiresWrite)
+      : null;
+    if (authError) {
+      jsonResponse(response, authError.status, authError);
+      return;
+    }
+    if (!isReadOnlyGet && request.method !== 'POST') {
       response.setHeader('allow', 'GET');
       jsonResponse(response, 405, { error: 'read_only_endpoint' });
       return;
@@ -113,22 +129,124 @@ function createServer(options = {}) {
     if (requestUrl.pathname === '/api/health') {
       jsonResponse(response, 200, {
         ok: true,
-        readOnly: true,
+        readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
         sub2apiConfigured: configuredForSub2Api(),
+        authConfigured: Boolean(configuredPanelToken()),
         time: new Date().toISOString(),
       });
       return;
     }
 
     if (requestUrl.pathname === '/api/snapshot') {
+      if (request.method !== 'GET') {
+        response.setHeader('allow', 'GET');
+        jsonResponse(response, 405, { error: 'read_only_endpoint' });
+        return;
+      }
       try {
         jsonResponse(response, 200, await buildSnapshot(requestUrl.searchParams));
       } catch (error) {
         jsonResponse(response, 500, {
           error: 'snapshot_failed',
-          message: error.message,
+          message: safeErrorMessage(error),
         });
       }
+      return;
+    }
+
+    if (request.method === 'POST' && requestUrl.pathname === '/api/sync/preview') {
+      try {
+        const body = await readJsonBody(request);
+        const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+          includeRaw: true,
+          includeInternal: true,
+        });
+        const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, body.selectedKeys);
+        const snapshotId = await db.saveSnapshot(snapshot);
+        jsonResponse(response, 200, {
+          readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
+          snapshotId,
+          version: snapshot.version,
+          generatedAt: snapshot.generatedAt,
+          ...importPlanSummary(plan),
+        });
+      } catch (error) {
+        jsonResponse(response, 400, { error: 'preview_failed', message: safeErrorMessage(error) });
+      }
+      return;
+    }
+
+    if (request.method === 'POST' && requestUrl.pathname === '/api/sync/import') {
+      try {
+        const body = await readJsonBody(request);
+        const actor = requestActor(request);
+        const job = await db.createJob('token_import', {
+          snapshotVersion: body.snapshotVersion || null,
+          selectedKeys: Array.isArray(body.selectedKeys) ? body.selectedKeys : [],
+        }, actor);
+        await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
+        executeImport({
+          snapshotVersion: body.snapshotVersion,
+          selectedKeys: body.selectedKeys,
+          actor,
+          db,
+          jobId: job.id,
+        }).then(async (result) => {
+          await db.updateJob(job.id, {
+            status: result.failed > 0 ? 'partial' : 'succeeded',
+            result,
+            finishedAt: new Date().toISOString(),
+          });
+        }).catch(async (error) => {
+          await db.audit({ jobId: job.id, actor, action: 'token_import', result: 'failed', details: { error: safeErrorMessage(error) } });
+          await db.updateJob(job.id, {
+            status: 'failed',
+            error: safeErrorMessage(error),
+            finishedAt: new Date().toISOString(),
+          });
+        });
+        jsonResponse(response, 202, { jobId: job.id, status: 'running' });
+      } catch (error) {
+        jsonResponse(response, 400, { error: 'import_failed', message: safeErrorMessage(error) });
+      }
+      return;
+    }
+
+    if (request.method === 'POST' && requestUrl.pathname === '/api/phase3') {
+      try {
+        const body = await readJsonBody(request);
+        if (!body.email && !body.phone) throw new Error('email 或 phone 必须提供一个');
+        const actor = requestActor(request);
+        const job = await db.createJob('phase3', { email: body.email || null, phone: body.phone || null }, actor);
+        await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
+        runPhase3Job({ email: body.email, phone: body.phone, actor, db, jobId: job.id })
+          .then((result) => db.updateJob(job.id, { status: 'succeeded', result, finishedAt: new Date().toISOString() }))
+          .catch((error) => Promise.all([
+            db.audit({ jobId: job.id, actor, action: 'phase3', result: 'failed', details: { error: safeErrorMessage(error) } }),
+            db.updateJob(job.id, { status: 'failed', error: safeErrorMessage(error), finishedAt: new Date().toISOString() }),
+          ]));
+        jsonResponse(response, 202, { jobId: job.id, status: 'running' });
+      } catch (error) {
+        jsonResponse(response, 400, { error: 'phase3_failed', message: safeErrorMessage(error) });
+      }
+      return;
+    }
+
+    if (request.method === 'GET' && requestUrl.pathname === '/api/jobs') {
+      jsonResponse(response, 200, { jobs: await db.listJobs(requestUrl.searchParams.get('limit')) });
+      return;
+    }
+
+    const jobId = pathParam(requestUrl.pathname, '/api/jobs/');
+    if (request.method === 'GET' && jobId) {
+      const job = await db.getJob(jobId);
+      if (!job) jsonResponse(response, 404, { error: 'job_not_found' });
+      else jsonResponse(response, 200, job);
+      return;
+    }
+
+    if (request.method === 'GET' && requestUrl.pathname === '/api/audit') {
+      jsonResponse(response, 200, { events: await db.listAudit(requestUrl.searchParams.get('limit')) });
       return;
     }
 
