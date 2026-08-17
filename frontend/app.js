@@ -169,8 +169,8 @@ function renderRows() {
       '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span></td>' +
       '<td>' + escapeHtml(formatDate(row.expiresAt)) + '</td>' +
       '<td><code>' + escapeHtml(formatFingerprint(row.fingerprints?.access)) + '</code></td>' +
-      '<td>' + escapeHtml(formatUsage(row.usage)) + '</td>' +
-      '<td>' + escapeHtml(formatPeriodUsage(row.usage)) + '</td>' +
+      '<td class="col-historical">' + escapeHtml(formatUsage(row.usage)) + '</td>' +
+      '<td class="col-current">' + escapeHtml(formatPeriodUsage(row.usage)) + '</td>' +
       '</tr>';
   }).join('');
   elements.emptyState.hidden = rows.length !== 0;
@@ -344,6 +344,19 @@ function updateActionState() {
   elements.phase3Button.disabled = state.selected.size !== 1;
 }
 
+function applyColumnVisibility() {
+  document.querySelectorAll('[data-column-toggle]').forEach((input) => {
+    const column = input.dataset.columnToggle;
+    document.querySelectorAll('.col-' + column).forEach((cell) => {
+      cell.classList.toggle('col-hidden', !input.checked);
+    });
+  });
+}
+
+document.querySelectorAll('[data-column-toggle]').forEach((input) => {
+  input.addEventListener('change', applyColumnVisibility);
+});
+
 const originalRenderRows = renderRows;
 renderRows = function patchedRenderRows() {
   originalRenderRows();
@@ -351,3 +364,4 @@ renderRows = function patchedRenderRows() {
 };
 
 loadSnapshot();
+applyColumnVisibility();

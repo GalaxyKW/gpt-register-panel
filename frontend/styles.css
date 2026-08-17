@@ -51,6 +51,17 @@ input:focus, select:focus, button:focus-visible { outline: 3px solid #b7dcf7; ou
 .button-secondary { background: white; border-color: #cbd3dc; color: var(--ink); }
 .button:disabled { cursor: wait; opacity: .65; }
 .selection-count, .loading-label { color: var(--muted); font-size: 12px; }
+.column-picker { position: relative; color: var(--muted); font-size: 12px; }
+.column-picker summary { min-height: 37px; padding: 9px 10px; border: 1px solid #cbd3dc; border-radius: 4px; background: white; color: var(--ink); cursor: pointer; list-style: none; }
+.column-picker summary::-webkit-details-marker { display: none; }
+.column-picker[open] summary { border-color: #2585c2; }
+.column-picker label { display: flex; align-items: center; gap: 6px; min-width: 116px; padding: 7px 10px; background: white; }
+.column-picker label:first-of-type { padding-top: 10px; }
+.column-picker label:last-of-type { padding-bottom: 10px; }
+.column-picker[open] label { position: absolute; right: 0; z-index: 2; border-left: 1px solid var(--line); border-right: 1px solid var(--line); }
+.column-picker[open] label:first-of-type { top: 39px; border-top: 1px solid var(--line); }
+.column-picker[open] label:last-of-type { top: 72px; border-bottom: 1px solid var(--line); }
+.col-hidden { display: none; }
 .table-section { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .plan-panel { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
 .plan-wrap { overflow-x: auto; }

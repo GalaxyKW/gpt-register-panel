@@ -52,6 +52,11 @@
       </label>
       <div class="toolbar-actions">
         <span id="selectionCount" class="selection-count">已选 0</span>
+        <details class="column-picker">
+          <summary>列</summary>
+          <label><input type="checkbox" data-column-toggle="historical" checked> 历史累计</label>
+          <label><input type="checkbox" data-column-toggle="current" checked> 本周期</label>
+        </details>
         <button id="clearSelectionButton" class="button button-secondary" type="button">清除选择</button>
         <button id="previewButton" class="button button-secondary" type="button">检查差异</button>
         <button id="importButton" class="button button-primary" type="button" disabled>确认导入</button>
@@ -90,8 +95,8 @@
               <th>差异</th>
               <th>过期时间</th>
               <th>Token 指纹</th>
-              <th>历史累计</th>
-              <th>本周期</th>
+              <th class="col-historical">历史累计</th>
+              <th class="col-current">本周期</th>
             </tr>
           </thead>
           <tbody id="accountRows"></tbody>
