@@ -28,8 +28,14 @@ function accountCredentials(account) {
     : {};
 }
 
+function storedFingerprint(value) {
+  const text = asString(value).toLowerCase();
+  return /^[a-f0-9]{16,64}$/.test(text) ? text.slice(0, 16) : null;
+}
+
 function safeAccount(account) {
   const credentials = accountCredentials(account);
+  const extra = account?.extra && typeof account.extra === 'object' ? account.extra : {};
   const email = normalizeEmail(credentials.email || account.email);
   const accountId = asString(
     credentials.chatgpt_account_id
@@ -44,6 +50,9 @@ function safeAccount(account) {
   const accessToken = asString(credentials.access_token || credentials.accessToken);
   const refreshToken = asString(credentials.refresh_token || credentials.refreshToken);
   const idToken = asString(credentials.id_token || credentials.idToken);
+  const storedAccessFingerprint = storedFingerprint(
+    extra.access_token_sha256 || credentials.access_token_sha256,
+  );
   const expiresAt = parseDateValue(
     credentials.expired
       || credentials.expires_at
@@ -67,7 +76,7 @@ function safeAccount(account) {
     identityKeys: buildIdentityKeys({ accountId, userId, email }),
     expiresAt,
     tokenFingerprints: {
-      access: tokenFingerprint(accessToken),
+      access: storedAccessFingerprint || tokenFingerprint(accessToken),
       refresh: tokenFingerprint(refreshToken),
       id: tokenFingerprint(idToken),
     },

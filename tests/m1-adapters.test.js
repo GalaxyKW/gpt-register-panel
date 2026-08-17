@@ -6,6 +6,7 @@ const test = require('node:test');
 
 const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
 const { buildIdentityKeys, tokenFingerprint } = require('../backend/lib/token');
+const { safeAccount } = require('../backend/adapters/sub2apiAdmin');
 const { buildDiff } = require('../backend/diff');
 
 function makeJwt(payload) {
@@ -76,6 +77,7 @@ test('matches a Sub2API account by stable identity and detects changed tokens', 
     userId: token.userId,
     identityKeys: buildIdentityKeys(token),
     tokenFingerprints: { ...token.fingerprints },
+    extra: { access_token_sha256: token.fingerprints.access + '0000000000000000' },
     groupIds: [3],
   };
   let diff = buildDiff(sources.tokens, [account], { nowMs: Date.parse('2026-01-01T00:00:00.000Z') });
@@ -115,3 +117,21 @@ test('flags duplicate identities and Sub2API-only accounts', () => {
   assert.equal(diff.counts.sub2api_only, 1);
 });
 
+test('uses Sub2API stored access token fingerprint without reading raw credentials', () => {
+  const safe = safeAccount({
+    id: 19,
+    name: 'free00003',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    credentials: {
+      email: 'fingerprint@example.test',
+      chatgpt_account_id: 'account-3',
+    },
+    extra: {
+      access_token_sha256: '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+    },
+  });
+  assert.equal(safe.tokenFingerprints.access, '1234567890abcdef');
+  assert.equal(Object.prototype.hasOwnProperty.call(safe, 'credentials'), false);
+});
