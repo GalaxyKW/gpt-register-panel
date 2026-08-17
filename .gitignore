@@ -1,0 +1,17 @@
+.env
+.env.*
+!.env.example
+tokens/
+use_token/
+browser-profile/
+logs/
+backups/
+data/
+*.sql
+*.sql.gz
+*.sqlite
+*.sqlite3
+node_modules/
+dist/
+coverage/
+*.log
