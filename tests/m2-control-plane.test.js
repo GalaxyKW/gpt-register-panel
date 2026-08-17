@@ -5,7 +5,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { PanelDb } = require('../backend/db');
-const { buildImportPlan, importPlanSummary } = require('../backend/sync');
+const { buildImportPlan, importPlanSummary, buildSnapshot } = require('../backend/sync');
 const { findUsernameEntry, sanitizeLog } = require('../backend/phase3Worker');
 
 function fixture() {
@@ -69,4 +69,36 @@ test('phase3 worker matches only records with a password and redacts logs', () =
     if (previous === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous;
   }
+});
+
+test('snapshot maps Sub2API historical and current-window stats to rows', async () => {
+  const { root } = fixture();
+  const fakeClient = {
+    async listAccounts() {
+      return [{
+        id: 42,
+        name: 'free00042',
+        platform: 'openai',
+        type: 'oauth',
+        status: 'active',
+        email: 'one@example.test',
+        identityKeys: ['email:one@example.test'],
+        tokenFingerprints: {},
+      }];
+    },
+    async getBatchTableUsageStats() {
+      return { stats: { '42': {
+        historical: { totalTokens: 1234, requests: 12 },
+        current: { totalTokens: 55, requests: 2 },
+      } }, errors: {} };
+    },
+  };
+  const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+    rootDirectory: root,
+    readSub2Api: true,
+    client: fakeClient,
+  });
+  const row = snapshot.rows.find((item) => item.accountId === 42);
+  assert.equal(row.usage.historical.totalTokens, 1234);
+  assert.equal(row.usage.current.totalTokens, 55);
 });
