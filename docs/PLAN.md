@@ -256,9 +256,9 @@ tokens 和 use_token 同一身份出现多个版本时，默认只把修改时�
 
 已完成计划书、字段清单和风险确认；已确认 Sub2API 管理 API、GitHub 公开仓库方向、非交互 Phase 3 参数、最大编号加一、SQLite 和备份方案。
 
-### M1：只读适配器
+### M1：只读适配器（基础层已完成）
 
-建立独立项目和 .gitignore，完成 token、use_token、username.json 和 Sub2API 只读解析，生成身份归一化和差异快照。
+已建立独立项目和 .gitignore，完成 token、use_token、username.json 的脱敏读取、JWT 身份归一化、token 指纹和差异引擎；已实现 Sub2API 管理 API 的只读账号/分组/统计客户端。当前还需在 M2 前用管理员凭据做一次线上 API 契约 smoke test。
 
 ### M2：账号管理界面
 
