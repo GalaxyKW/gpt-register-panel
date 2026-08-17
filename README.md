@@ -24,5 +24,10 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 也可以使用 SUB2API_JWT 代替管理员 API key。输出只包含邮箱、编号、状态、过期时间和 token 指纹，不包含 token 原文、密码或验证码。
 
-生产环境的 API 凭据应放在未提交的 .env 中。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。
+## 只读 WebUI
 
+    npm start
+
+默认只监听 127.0.0.1:4170，打开 http://127.0.0.1:4170/ 即可查看账号表格。当前页面支持筛选、搜索、勾选和差异查看，但所有接口都是 GET，只读模式不会修改任何生产数据。
+
+生产环境的 API 凭据应放在未提交的 .env 中。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。

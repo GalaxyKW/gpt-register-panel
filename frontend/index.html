@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>gpt_register 账号管理</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">GPT REGISTER / SUB2API</p>
+      <h1>账号管理</h1>
+    </div>
+    <div class="topbar-actions">
+      <span id="modeBadge" class="badge badge-neutral">只读模式</span>
+      <button id="refreshButton" class="button button-primary" type="button"><span aria-hidden="true">↻</span> 刷新</button>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="notice" class="notice" hidden></section>
+
+    <section class="metrics" aria-label="概览">
+      <div class="metric"><span>来源 token</span><strong id="tokenCount">-</strong><small id="tokenDetail">-</small></div>
+      <div class="metric"><span>Sub2API 账号</span><strong id="accountCount">-</strong><small id="accountDetail">-</small></div>
+      <div class="metric"><span>差异项目</span><strong id="diffCount">-</strong><small id="diffDetail">-</small></div>
+      <div class="metric"><span>最近读取</span><strong id="lastRead">-</strong><small>服务器时间</small></div>
+    </section>
+
+    <section class="toolbar" aria-label="筛选">
+      <label class="search-field">
+        <span>搜索账号、邮箱或身份</span>
+        <input id="searchInput" type="search" placeholder="例如 free00001 或邮箱">
+      </label>
+      <label>
+        <span>状态</span>
+        <select id="statusFilter"><option value="">全部状态</option></select>
+      </label>
+      <label>
+        <span>来源</span>
+        <select id="sourceFilter">
+          <option value="">全部来源</option>
+          <option value="tokens">tokens</option>
+          <option value="use_token">use_token</option>
+          <option value="sub2api">Sub2API</option>
+        </select>
+      </label>
+      <label>
+        <span>差异</span>
+        <select id="diffFilter"><option value="">全部差异</option></select>
+      </label>
+      <div class="toolbar-actions">
+        <span id="selectionCount" class="selection-count">已选 0</span>
+        <button id="clearSelectionButton" class="button button-secondary" type="button">清除选择</button>
+      </div>
+    </section>
+
+    <section class="table-section">
+      <div class="section-heading">
+        <div>
+          <h2>上游账号</h2>
+          <p id="tableSummary">正在读取...</p>
+        </div>
+        <span id="loadingLabel" class="loading-label" hidden>读取中</span>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th class="check-col"><input id="selectAll" type="checkbox" aria-label="选择当前列表"></th>
+              <th>账号</th>
+              <th>邮箱</th>
+              <th>状态</th>
+              <th>来源</th>
+              <th>差异</th>
+              <th>过期时间</th>
+              <th>Token 指纹</th>
+              <th>历史累计</th>
+              <th>本周期</th>
+            </tr>
+          </thead>
+          <tbody id="accountRows"></tbody>
+        </table>
+      </div>
+      <div id="emptyState" class="empty-state" hidden>没有符合筛选条件的账号</div>
+    </section>
+  </main>
+  <script src="/app.js" defer></script>
+</body>
+</html>
+
