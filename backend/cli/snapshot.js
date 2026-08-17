@@ -1,3 +1,4 @@
+require('../config').loadEnv();
 const { readGptRegisterSources, toSafeSources } = require('../adapters/gptRegisterFs');
 const { Sub2ApiAdminClient } = require('../adapters/sub2apiAdmin');
 const { buildDiff, toSafeDiff } = require('../diff');
@@ -60,4 +61,3 @@ main().catch((error) => {
   process.stderr.write(error.stack + '\n');
   process.exitCode = 1;
 });
-

@@ -26,6 +26,8 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 ## 只读 WebUI
 
+    cp .env.example .env
+    # 在 .env 中填写有效的 Sub2API 管理 API key 或 JWT
     npm start
 
 默认只监听 127.0.0.1:4170，打开 http://127.0.0.1:4170/ 即可查看账号表格。当前页面支持筛选、搜索、勾选和差异查看，但所有接口都是 GET，只读模式不会修改任何生产数据。

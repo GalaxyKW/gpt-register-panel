@@ -3,6 +3,7 @@ const http = require('node:http');
 const path = require('node:path');
 const { URL } = require('node:url');
 
+require('./config').loadEnv();
 const { readGptRegisterSources, toSafeSources } = require('./adapters/gptRegisterFs');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { buildDiff, toSafeDiff } = require('./diff');
@@ -161,4 +162,3 @@ module.exports = {
   createServer,
   startServer,
 };
-
