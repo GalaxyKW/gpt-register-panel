@@ -11,6 +11,7 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 - 账号表格显示 Sub2API 的历史累计统计和当前账号窗口统计（接口可用时）。
 - 独立 SQLite 保存快照、任务状态和审计记录；不会保存 token 原文。
 - 差异预览、导入任务和 Phase 3 入口已接好，但默认关闭所有写操作。
+- 导入预览只允许把 token 更新到 Sub2API 不可用（状态非 active、不可调度或临时不可调度）的账号；可用账号即使本地 token 指纹不同也会跳过。来源 token 已过期时也会跳过，需先运行 Phase 3。
 
 ## 本地只读快照
 
@@ -34,6 +35,23 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 默认只监听 127.0.0.1:4170，打开 http://127.0.0.1:4170/ 即可查看账号表格。页面支持筛选、搜索、勾选、差异预览和任务查询。
 
+## 全程结构化日志
+
+面板会把服务启动、每个 HTTP 请求、快照、差异预览、导入、备份、逐账号处理、Phase 3 子进程以及成功/失败和耗时写入 JSON Lines 日志。默认路径为 `runtime/panel.log`，也可用以下变量调整：
+
+    PANEL_LOG_PATH=/mnt/nvme/item/gpt-register-panel/runtime/panel.log
+    PANEL_LOG_LEVEL=info       # debug / info / warn / error
+    PANEL_LOG_MAX_BYTES=10485760
+    PANEL_LOG_ROTATIONS=5
+    PANEL_LOG_CONSOLE=1        # 同时输出到面板进程终端
+
+日志文件权限为 0600，目录权限为 0700；达到大小上限后保留 `.1` 至 `.5` 轮转文件。查看最近 200 条记录：
+
+    tail -n 50 runtime/panel.log
+    curl 'http://127.0.0.1:4170/api/logs?limit=200'
+
+配置了 `PANEL_ADMIN_TOKEN` 或启用 `PANEL_REQUIRE_AUTH=1` 后，`/api/logs` 需要通过 `x-panel-token` 或 `Authorization: Bearer ...` 访问。日志会自动脱敏 access/refresh/id token、JWT、Bearer、API key、密码和 Phase 3 输出，不记录请求体或 token 原文。
+
 ## 写入开关
 
 写入必须由服务端显式开启，并同时配置面板令牌：
@@ -45,7 +63,9 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 导入流程会重新读取并比较快照版本，先通过 Sub2API 管理 API 导出备份，再逐项调用 `import/codex-session`，失败项写入独立审计表。未配置备份或来源版本变化时不会写入。浏览器不会接触 Sub2API API key、JWT 或 token 原文。
 
-Phase 3 由固定的 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 启动，禁止 shell 拼接和任意路径；`gpt_register` 的非交互邮箱参数向后兼容原有交互选择。
+同一 Sub2API 账号如果同时出现在 `tokens` 和 `use_token`，导入计划只会选择一份未过期且最新的候选；其他来源会标记为跳过，避免旧 token 在后续请求中覆盖新 token。
+
+Phase 3 由固定的 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 启动，禁止 shell 拼接和任意路径；`gpt_register` 的非交互邮箱参数向后兼容原有交互选择。面板会把 Phase 3 串行排队（共享浏览器 profile 不能并发），界面和 API 都只接受单账号选择，批量选择会直接拒绝；同一邮箱已有任务时返回 409，避免重复提交。
 
 独立 SQLite 默认位置由 `PANEL_DB_PATH` 指定，建议使用项目 `runtime/panel.sqlite3` 并保持 0600 权限；备份默认写入 `PANEL_BACKUP_DIR`，这些运行态路径已加入 `.gitignore`。
 

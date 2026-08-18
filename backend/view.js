@@ -1,7 +1,10 @@
+const { getAccountAvailability } = require('./accountAvailability');
+
 function rowFromDiffItem(item) {
   const token = item.token;
   const account = item.account;
   const source = token ? token.source : 'sub2api';
+  const availability = getAccountAvailability(account);
   const key = account
     ? 'account:' + String(account.id)
     : 'token:' + source + ':' + String(token?.relativePath || token?.fileName || Math.random());
@@ -16,6 +19,9 @@ function rowFromDiffItem(item) {
     platform: account?.platform || '',
     type: account?.type || token?.type || '',
     status: account?.status || (item.kind === 'token_only' ? '未导入' : '未知'),
+    availability: availability.key,
+    availabilityReason: availability.reason,
+    schedulable: account?.schedulable !== false,
     source,
     diffKind: item.kind,
     issues: Array.isArray(item.issues) ? item.issues : [],
@@ -42,10 +48,12 @@ function filterRows(rows, filters = {}) {
   const status = String(filters.status || '').trim();
   const source = String(filters.source || '').trim();
   const diffKind = String(filters.diffKind || '').trim();
+  const availability = String(filters.availability || '').trim();
   return rows.filter((row) => {
     if (status && row.status !== status) return false;
     if (source && row.source !== source) return false;
     if (diffKind && row.diffKind !== diffKind) return false;
+    if (availability && row.availability !== availability) return false;
     if (!search) return true;
     return [
       row.accountName,
@@ -66,11 +74,15 @@ function diffOptions(rows) {
   return [...new Set(rows.map((row) => row.diffKind).filter(Boolean))].sort();
 }
 
+function availabilityOptions(rows) {
+  return [...new Set(rows.map((row) => row.availability).filter(Boolean))].sort();
+}
+
 module.exports = {
   rowFromDiffItem,
   buildRows,
   filterRows,
   statusOptions,
   diffOptions,
+  availabilityOptions,
 };
-

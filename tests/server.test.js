@@ -6,10 +6,13 @@ const path = require('node:path');
 const test = require('node:test');
 
 const { createServer } = require('../backend/server');
+const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 
 function request(baseUrl, pathname) {
   return new Promise((resolve, reject) => {
-    const requestObject = http.get(baseUrl + pathname, (response) => {
+    const requestObject = http.get(baseUrl + pathname, configuredPanelToken
+      ? { headers: { 'x-panel-token': configuredPanelToken } }
+      : {}, (response) => {
       let body = '';
       response.setEncoding('utf8');
       response.on('data', (chunk) => { body += chunk; });
@@ -23,8 +26,29 @@ function request(baseUrl, pathname) {
   });
 }
 
+function postJson(baseUrl, pathname, body) {
+  return new Promise((resolve, reject) => {
+    const requestObject = http.request(baseUrl + pathname, {
+      method: 'POST',
+      headers: {
+        ...(configuredPanelToken ? { 'x-panel-token': configuredPanelToken } : {}),
+        'content-type': 'application/json',
+      },
+    }, (response) => {
+      let responseBody = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { responseBody += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, body: responseBody }));
+    });
+    requestObject.on('error', reject);
+    requestObject.end(JSON.stringify(body));
+  });
+}
+
 test('serves a read-only health endpoint and safe source snapshot', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-server-'));
+  const previousWriteEnabled = process.env.PANEL_WRITE_ENABLED;
+  process.env.PANEL_WRITE_ENABLED = '0';
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
   fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
@@ -54,7 +78,10 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.equal(snapshot.body.includes('refresh-hidden'), false);
 
     const writeAttempt = await new Promise((resolve, reject) => {
-      const req = http.request(baseUrl + '/api/snapshot', { method: 'POST' }, (response) => {
+      const req = http.request(baseUrl + '/api/snapshot', {
+        method: 'POST',
+        headers: configuredPanelToken ? { 'x-panel-token': configuredPanelToken } : {},
+      }, (response) => {
         response.resume();
         response.on('end', () => resolve(response.statusCode));
       });
@@ -62,10 +89,31 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
       req.end();
     });
     assert.equal(writeAttempt, 405);
+
+    const previousAllowInsecureWrite = process.env.PANEL_ALLOW_INSECURE_WRITE;
+    const previousPhase3Enabled = process.env.PANEL_PHASE3_ENABLED;
+    process.env.PANEL_WRITE_ENABLED = '1';
+    process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+    process.env.PANEL_PHASE3_ENABLED = '0';
+    try {
+      const batchPhase3 = await postJson(baseUrl, '/api/phase3', {
+        email: 'server@example.test',
+        selectedKeys: ['account:one', 'account:two'],
+      });
+      assert.equal(batchPhase3.status, 400);
+      assert.match(batchPhase3.body, /phase3_single_account_required/);
+    } finally {
+      if (previousAllowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+      else process.env.PANEL_ALLOW_INSECURE_WRITE = previousAllowInsecureWrite;
+      if (previousPhase3Enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+      else process.env.PANEL_PHASE3_ENABLED = previousPhase3Enabled;
+      process.env.PANEL_WRITE_ENABLED = '0';
+    }
   } finally {
     await new Promise((resolve) => server.close(resolve));
+    if (previousWriteEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previousWriteEnabled;
     if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previousRoot;
   }
 });
-

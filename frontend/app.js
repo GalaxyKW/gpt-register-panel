@@ -3,6 +3,7 @@ const state = {
   rows: [],
   selected: new Set(),
   plan: null,
+  phase3RequestPending: false,
 };
 
 const elements = {
@@ -18,6 +19,7 @@ const elements = {
   lastRead: document.querySelector('#lastRead'),
   searchInput: document.querySelector('#searchInput'),
   statusFilter: document.querySelector('#statusFilter'),
+  availabilityFilter: document.querySelector('#availabilityFilter'),
   sourceFilter: document.querySelector('#sourceFilter'),
   diffFilter: document.querySelector('#diffFilter'),
   selectionCount: document.querySelector('#selectionCount'),
@@ -107,6 +109,33 @@ function actionLabel(action) {
   return { create: '新增', update: '更新', skip: '跳过', conflict: '冲突' }[action] || action || '-';
 }
 
+function actionReasonLabel(reason) {
+  return {
+    token_only: 'Sub2API 没有对应账号',
+    already_in_sync: '已经一致',
+    sub2api_available: 'Sub2API 当前可用，跳过',
+    source_token_expired: '来源 token 已过期，跳过',
+    superseded_by_newer_source: '已有更新来源，跳过旧文件',
+    token_changed: 'Sub2API 不可用且 token 不同',
+    multiple_sub2api_accounts: '匹配到多个 Sub2API 账号',
+    duplicate_token_versions: '来源存在多个冲突版本',
+  }[reason] || reason || '-';
+}
+
+function statusClass(value) {
+  const status = String(value || '').toLowerCase();
+  if (status === 'active' || status === 'enabled') return 'status-active';
+  if (status === 'error' || status === 'disabled') return 'status-error';
+  return 'status-unknown';
+}
+
+function sourceClass(value) {
+  const source = String(value || '').toLowerCase();
+  if (source === 'tokens') return 'source-tokens';
+  if (source === 'use_token') return 'source-use-token';
+  return 'source-sub2api';
+}
+
 function apiHeaders(options = {}) {
   const headers = new Headers(options.headers || {});
   headers.set('accept', 'application/json');
@@ -164,8 +193,8 @@ function renderRows() {
       '<td class="check-col"><input class="row-check" data-key="' + escapeHtml(row.key) + '" type="checkbox" aria-label="选择 ' + escapeHtml(displayName) + '"' + checked + '></td>' +
       '<td><strong>' + escapeHtml(displayName) + '</strong><small>' + escapeHtml(row.chatgptAccountId || row.userId || row.relativePath || '-') + '</small></td>' +
       '<td>' + escapeHtml(row.email || '-') + '</td>' +
-      '<td><span class="status-text">' + escapeHtml(row.status || '-') + '</span></td>' +
-      '<td><span class="source-text">' + escapeHtml(row.source || '-') + '</span></td>' +
+      '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(row.status || '-') + '</span></td>' +
+      '<td><span class="source-text ' + sourceClass(row.source) + '">' + escapeHtml(row.source || '-') + '</span></td>' +
       '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span></td>' +
       '<td>' + escapeHtml(formatDate(row.expiresAt)) + '</td>' +
       '<td><code>' + escapeHtml(formatFingerprint(row.fingerprints?.access)) + '</code></td>' +
@@ -208,7 +237,7 @@ function renderPlan(plan) {
     + '<td>' + escapeHtml(item.email || '-') + '</td>'
     + '<td>' + escapeHtml(item.source || '-') + '</td>'
     + '<td><code>' + escapeHtml(formatFingerprint(item.fingerprints?.access)) + '</code></td>'
-    + '<td>' + escapeHtml(item.reason || '-') + '</td></tr>').join('');
+    + '<td>' + escapeHtml(actionReasonLabel(item.reason)) + '</td></tr>').join('');
   elements.importButton.disabled = !items.some((item) => item.action === 'create' || item.action === 'update');
 }
 
@@ -218,6 +247,7 @@ function applyFilters() {
   const rows = state.snapshot.rows;
   state.rows = rows.filter((row) => {
     if (elements.statusFilter.value && row.status !== elements.statusFilter.value) return false;
+    if (elements.availabilityFilter.value && row.availability !== elements.availabilityFilter.value) return false;
     if (elements.sourceFilter.value && row.source !== elements.sourceFilter.value) return false;
     if (elements.diffFilter.value && row.diffKind !== elements.diffFilter.value) return false;
     if (!search) return true;
@@ -244,6 +274,11 @@ async function loadSnapshot() {
     renderPlan(null);
     renderMetrics(snapshot);
     renderSelectOptions(elements.statusFilter, snapshot.filters.statuses, {}, '全部状态');
+    renderSelectOptions(elements.availabilityFilter, snapshot.filters.availabilities, {
+      available: '可用',
+      unavailable: '不可用',
+      not_present: '未导入 Sub2API',
+    }, '全部');
     renderSelectOptions(elements.diffFilter, snapshot.filters.diffKinds, {
       in_sync: '一致',
       token_only: '仅文件',
@@ -310,22 +345,28 @@ elements.importButton.addEventListener('click', async () => {
 });
 
 elements.phase3Button.addEventListener('click', async () => {
+  if (state.phase3RequestPending) return;
   const selectedRows = state.rows.filter((row) => state.selected.has(row.key));
   if (selectedRows.length !== 1 || !selectedRows[0].email) {
     showNotice('Phase 3 需要选择一个有邮箱的账号。', 'notice-warning');
     return;
   }
   if (!window.confirm('确认排队更新 ' + selectedRows[0].email + ' 的 token？')) return;
+  state.phase3RequestPending = true;
+  updateActionState();
   try {
     const response = await apiFetch('/api/phase3', {
       method: 'POST',
-      body: JSON.stringify({ email: selectedRows[0].email }),
+      body: JSON.stringify({ email: selectedRows[0].email, selectedKeys: [selectedRows[0].key] }),
     });
     const body = await response.json();
     if (!response.ok) throw new Error(body.message || body.error || 'Phase 3 任务创建失败');
     showNotice('Phase 3 任务已排队：' + body.jobId, 'notice-info');
   } catch (error) {
     showNotice(error.message, 'notice-danger');
+  } finally {
+    state.phase3RequestPending = false;
+    updateActionState();
   }
 });
 elements.clearSelectionButton.addEventListener('click', () => {
@@ -337,11 +378,25 @@ elements.selectAll.addEventListener('change', () => {
   else state.rows.forEach((row) => state.selected.delete(row.key));
   renderRows();
 });
-[elements.searchInput, elements.statusFilter, elements.sourceFilter, elements.diffFilter]
+[elements.searchInput, elements.statusFilter, elements.availabilityFilter, elements.sourceFilter, elements.diffFilter]
   .forEach((element) => element.addEventListener('input', applyFilters));
 
 function updateActionState() {
-  elements.phase3Button.disabled = state.selected.size !== 1;
+  const selectedRows = state.rows.filter((row) => state.selected.has(row.key));
+  const canRunPhase3 = state.selected.size === 1
+    && selectedRows.length === 1
+    && Boolean(selectedRows[0].email);
+  elements.phase3Button.disabled = state.phase3RequestPending || !canRunPhase3;
+  elements.clearSelectionButton.disabled = state.selected.size === 0;
+  if (state.phase3RequestPending) {
+    elements.phase3Button.title = 'Phase 3 任务提交中';
+  } else if (state.selected.size > 1) {
+    elements.phase3Button.title = '批量选择不能提交 Phase 3，请只选择一个账号';
+  } else if (!canRunPhase3) {
+    elements.phase3Button.title = '请选择一个有邮箱的账号';
+  } else {
+    elements.phase3Button.title = '为当前账号运行 Phase 3';
+  }
 }
 
 function applyColumnVisibility() {

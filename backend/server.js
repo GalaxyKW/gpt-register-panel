@@ -6,7 +6,8 @@ const { URL } = require('node:url');
 require('./config').loadEnv();
 const { buildSnapshot, buildImportPlan, importPlanSummary, executeImport, configuredForSub2Api, safeErrorMessage } = require('./sync');
 const { PanelDb } = require('./db');
-const { runPhase3Job } = require('./phase3Worker');
+const { runPhase3Job, getActivePhase3Job } = require('./phase3Worker');
+const { createLogger } = require('./logger');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -59,6 +60,14 @@ function requestActor(request) {
   return value.replace(/[^A-Za-z0-9_.:@-]/g, '').slice(0, 80) || 'local';
 }
 
+function writeLog(logger, level, event, fields = {}) {
+  try {
+    if (logger && typeof logger[level] === 'function') logger[level](event, fields);
+  } catch {
+    // Request handling must continue if the log destination is unavailable.
+  }
+}
+
 function readJsonBody(request, limit = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -108,23 +117,76 @@ function serveStatic(request, response) {
 
 function createServer(options = {}) {
   const db = options.db || new PanelDb(options.dbPath);
-  return http.createServer(async (request, response) => {
-    const requestUrl = new URL(request.url || '/', 'http://localhost');
-    const isReadOnlyGet = request.method === 'GET';
-    const requiresWrite = request.method === 'POST'
-      && ['/api/sync/import', '/api/phase3'].includes(requestUrl.pathname);
-    const authError = requestUrl.pathname.startsWith('/api/')
-      ? authorizationError(request, requiresWrite)
-      : null;
-    if (authError) {
-      jsonResponse(response, authError.status, authError);
-      return;
-    }
-    if (!isReadOnlyGet && request.method !== 'POST') {
-      response.setHeader('allow', 'GET');
-      jsonResponse(response, 405, { error: 'read_only_endpoint' });
-      return;
-    }
+  const logger = options.logger || createLogger({ dbPath: options.dbPath || db.dbPath });
+  const server = http.createServer(async (request, response) => {
+    const requestId = logger.requestId(request.headers['x-request-id']);
+    const actor = requestActor(request);
+    const startedAt = Date.now();
+    let requestPath = '/';
+    let completed = false;
+    response.setHeader('x-request-id', requestId);
+    response.once('finish', () => {
+      completed = true;
+      writeLog(logger, 'info', 'http.request_completed', {
+        requestId,
+        actor,
+        method: request.method,
+        path: requestPath,
+        statusCode: response.statusCode,
+        durationMs: Date.now() - startedAt,
+      });
+    });
+    response.once('close', () => {
+      if (!completed) {
+        writeLog(logger, 'warn', 'http.request_closed', {
+          requestId,
+          actor,
+          method: request.method,
+          path: requestPath,
+          statusCode: response.statusCode,
+          durationMs: Date.now() - startedAt,
+        });
+      }
+    });
+    try { requestPath = new URL(request.url || '/', 'http://localhost').pathname; } catch {}
+    writeLog(logger, 'info', 'http.request_started', {
+      requestId,
+      actor,
+      method: request.method,
+      path: requestPath,
+    });
+    try {
+      const requestUrl = new URL(request.url || '/', 'http://localhost');
+      requestPath = requestUrl.pathname;
+      const isReadOnlyGet = request.method === 'GET';
+      const requiresWrite = request.method === 'POST'
+        && ['/api/sync/import', '/api/phase3'].includes(requestUrl.pathname);
+      const authError = requestUrl.pathname.startsWith('/api/')
+        ? authorizationError(request, requiresWrite)
+        : null;
+      if (authError) {
+        writeLog(logger, 'warn', 'http.auth_failed', {
+          requestId,
+          actor,
+          method: request.method,
+          path: requestUrl.pathname,
+          statusCode: authError.status,
+          error: authError.error,
+        });
+        jsonResponse(response, authError.status, authError);
+        return;
+      }
+      if (!isReadOnlyGet && request.method !== 'POST') {
+        writeLog(logger, 'warn', 'http.method_not_allowed', {
+          requestId,
+          actor,
+          method: request.method,
+          path: requestUrl.pathname,
+        });
+        response.setHeader('allow', 'GET');
+        jsonResponse(response, 405, { error: 'read_only_endpoint' });
+        return;
+      }
 
     if (requestUrl.pathname === '/api/health') {
       jsonResponse(response, 200, {
@@ -139,13 +201,24 @@ function createServer(options = {}) {
 
     if (requestUrl.pathname === '/api/snapshot') {
       if (request.method !== 'GET') {
+        writeLog(logger, 'warn', 'http.method_not_allowed', {
+          requestId,
+          actor,
+          method: request.method,
+          path: requestUrl.pathname,
+        });
         response.setHeader('allow', 'GET');
         jsonResponse(response, 405, { error: 'read_only_endpoint' });
         return;
       }
       try {
-        jsonResponse(response, 200, await buildSnapshot(requestUrl.searchParams));
+        jsonResponse(response, 200, await buildSnapshot(requestUrl.searchParams, { logger, requestId, actor }));
       } catch (error) {
+        writeLog(logger, 'error', 'http.snapshot_failed', {
+          requestId,
+          actor,
+          error: safeErrorMessage(error),
+        });
         jsonResponse(response, 500, {
           error: 'snapshot_failed',
           message: safeErrorMessage(error),
@@ -155,14 +228,27 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/sync/preview') {
+      const previewStartedAt = Date.now();
+      writeLog(logger, 'info', 'preview.started', { requestId, actor });
       try {
         const body = await readJsonBody(request);
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
           includeInternal: true,
+          logger,
+          requestId,
+          actor,
         });
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, body.selectedKeys);
         const snapshotId = await db.saveSnapshot(snapshot);
+        writeLog(logger, 'info', 'preview.completed', {
+          requestId,
+          actor,
+          snapshotId,
+          version: snapshot.version,
+          durationMs: Date.now() - previewStartedAt,
+          counts: importPlanSummary(plan).counts,
+        });
         jsonResponse(response, 200, {
           readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
           snapshotId,
@@ -171,62 +257,194 @@ function createServer(options = {}) {
           ...importPlanSummary(plan),
         });
       } catch (error) {
+        writeLog(logger, 'error', 'preview.failed', {
+          requestId,
+          actor,
+          durationMs: Date.now() - previewStartedAt,
+          error: safeErrorMessage(error),
+        });
         jsonResponse(response, 400, { error: 'preview_failed', message: safeErrorMessage(error) });
       }
       return;
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/sync/import') {
+      const importRequestStartedAt = Date.now();
       try {
         const body = await readJsonBody(request);
-        const actor = requestActor(request);
         const job = await db.createJob('token_import', {
           snapshotVersion: body.snapshotVersion || null,
           selectedKeys: Array.isArray(body.selectedKeys) ? body.selectedKeys : [],
         }, actor);
         await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
+        writeLog(logger, 'info', 'import.job_queued', {
+          requestId,
+          jobId: job.id,
+          actor,
+          expectedVersion: body.snapshotVersion || null,
+          selectedCount: Array.isArray(body.selectedKeys) ? body.selectedKeys.length : 0,
+          durationMs: Date.now() - importRequestStartedAt,
+        });
         executeImport({
           snapshotVersion: body.snapshotVersion,
           selectedKeys: body.selectedKeys,
           actor,
           db,
           jobId: job.id,
+          logger,
         }).then(async (result) => {
+          const status = result.failed > 0 ? 'partial' : 'succeeded';
           await db.updateJob(job.id, {
-            status: result.failed > 0 ? 'partial' : 'succeeded',
+            status,
             result,
             finishedAt: new Date().toISOString(),
           });
+          writeLog(logger, status === 'partial' ? 'warn' : 'info', 'import.job_completed', {
+            requestId,
+            jobId: job.id,
+            actor,
+            status,
+            importedCount: result.imported?.length || 0,
+            failed: result.failed || 0,
+          });
         }).catch(async (error) => {
-          await db.audit({ jobId: job.id, actor, action: 'token_import', result: 'failed', details: { error: safeErrorMessage(error) } });
-          await db.updateJob(job.id, {
-            status: 'failed',
-            error: safeErrorMessage(error),
-            finishedAt: new Date().toISOString(),
+          const message = safeErrorMessage(error);
+          try {
+            await db.audit({ jobId: job.id, actor, action: 'token_import', result: 'failed', details: { error: message } });
+          } catch (auditError) {
+            writeLog(logger, 'error', 'import.audit_failed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              error: safeErrorMessage(auditError),
+            });
+          }
+          try {
+            await db.updateJob(job.id, {
+              status: 'failed',
+              error: message,
+              finishedAt: new Date().toISOString(),
+            });
+          } catch (jobError) {
+            writeLog(logger, 'error', 'import.job_update_failed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              error: safeErrorMessage(jobError),
+            });
+          }
+          writeLog(logger, 'error', 'import.job_failed', {
+            requestId,
+            jobId: job.id,
+            actor,
+            error: message,
           });
         });
         jsonResponse(response, 202, { jobId: job.id, status: 'running' });
       } catch (error) {
+        writeLog(logger, 'error', 'import.request_failed', {
+          requestId,
+          actor,
+          durationMs: Date.now() - importRequestStartedAt,
+          error: safeErrorMessage(error),
+        });
         jsonResponse(response, 400, { error: 'import_failed', message: safeErrorMessage(error) });
       }
       return;
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/phase3') {
+      const phase3RequestStartedAt = Date.now();
       try {
         const body = await readJsonBody(request);
+        if (body.selectedKeys !== undefined
+            && (!Array.isArray(body.selectedKeys) || body.selectedKeys.length !== 1)) {
+          writeLog(logger, 'warn', 'phase3.batch_rejected', {
+            requestId,
+            actor,
+            selectedCount: Array.isArray(body.selectedKeys) ? body.selectedKeys.length : null,
+          });
+          jsonResponse(response, 400, {
+            error: 'phase3_single_account_required',
+            message: 'Phase 3 只支持单账号提交，不能批量选择',
+          });
+          return;
+        }
         if (!body.email && !body.phone) throw new Error('email 或 phone 必须提供一个');
-        const actor = requestActor(request);
+        const existingPhase3Job = getActivePhase3Job({ email: body.email, phone: body.phone });
+        if (existingPhase3Job) {
+          writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
+            requestId,
+            actor,
+            email: body.email || null,
+            phone: body.phone || null,
+            existingJobId: existingPhase3Job.jobId || null,
+          });
+          jsonResponse(response, 409, {
+            error: 'phase3_already_running',
+            message: '该账号已有 Phase 3 任务排队或运行中',
+            jobId: existingPhase3Job.jobId || null,
+          });
+          return;
+        }
         const job = await db.createJob('phase3', { email: body.email || null, phone: body.phone || null }, actor);
-        await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
-        runPhase3Job({ email: body.email, phone: body.phone, actor, db, jobId: job.id })
-          .then((result) => db.updateJob(job.id, { status: 'succeeded', result, finishedAt: new Date().toISOString() }))
-          .catch((error) => Promise.all([
-            db.audit({ jobId: job.id, actor, action: 'phase3', result: 'failed', details: { error: safeErrorMessage(error) } }),
-            db.updateJob(job.id, { status: 'failed', error: safeErrorMessage(error), finishedAt: new Date().toISOString() }),
-          ]));
+        writeLog(logger, 'info', 'phase3.job_queued', {
+          requestId,
+          jobId: job.id,
+          actor,
+          email: body.email || null,
+          phone: body.phone || null,
+          durationMs: Date.now() - phase3RequestStartedAt,
+        });
+        runPhase3Job({ email: body.email, phone: body.phone, actor, db, jobId: job.id, logger })
+          .then(async (result) => {
+            await db.updateJob(job.id, { status: 'succeeded', result, finishedAt: new Date().toISOString() });
+            writeLog(logger, 'info', 'phase3.job_completed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              email: result.email,
+              tokenFile: result.tokenFile,
+              fingerprint: result.fingerprint,
+            });
+          })
+          .catch(async (error) => {
+            const message = safeErrorMessage(error);
+            try {
+              await db.audit({ jobId: job.id, actor, action: 'phase3', result: 'failed', details: { error: message } });
+            } catch (auditError) {
+              writeLog(logger, 'error', 'phase3.audit_failed', {
+                requestId,
+                jobId: job.id,
+                actor,
+                error: safeErrorMessage(auditError),
+              });
+            }
+            try {
+              await db.updateJob(job.id, { status: 'failed', error: message, finishedAt: new Date().toISOString() });
+            } catch (jobError) {
+              writeLog(logger, 'error', 'phase3.job_update_failed', {
+                requestId,
+                jobId: job.id,
+                actor,
+                error: safeErrorMessage(jobError),
+              });
+            }
+            writeLog(logger, 'error', 'phase3.job_failed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              error: message,
+            });
+          });
         jsonResponse(response, 202, { jobId: job.id, status: 'running' });
       } catch (error) {
+        writeLog(logger, 'error', 'phase3.request_failed', {
+          requestId,
+          actor,
+          durationMs: Date.now() - phase3RequestStartedAt,
+          error: safeErrorMessage(error),
+        });
         jsonResponse(response, 400, { error: 'phase3_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -250,8 +468,38 @@ function createServer(options = {}) {
       return;
     }
 
+    if (request.method === 'GET' && requestUrl.pathname === '/api/logs') {
+      const requestedLevel = requestUrl.searchParams.get('level');
+      const requestedEvent = requestUrl.searchParams.get('event');
+      let logs = logger.tail(requestUrl.searchParams.get('limit'));
+      if (requestedLevel) logs = logs.filter((entry) => entry.level === requestedLevel);
+      if (requestedEvent) logs = logs.filter((entry) => entry.event === requestedEvent);
+      jsonResponse(response, 200, {
+        count: logs.length,
+        logs,
+      });
+      return;
+    }
+
     serveStatic(request, response);
+    } catch (error) {
+      writeLog(logger, 'error', 'http.request_failed', {
+        requestId,
+        actor,
+        method: request.method,
+        path: requestPath,
+        statusCode: 500,
+        error: safeErrorMessage(error),
+      });
+      if (!response.headersSent) {
+        jsonResponse(response, 500, { error: 'internal_error', message: safeErrorMessage(error) });
+      } else if (!response.writableEnded) {
+        response.end();
+      }
+    }
   });
+  server.panelLogger = logger;
+  return server;
 }
 
 function startServer(options = {}) {
@@ -259,11 +507,26 @@ function startServer(options = {}) {
   const port = Number(options.port || process.env.PANEL_PORT || 4170);
   const server = createServer(options);
   return new Promise((resolve, reject) => {
-    server.once('error', reject);
+    server.once('error', (error) => {
+      writeLog(server.panelLogger, 'error', 'server.start_failed', {
+        host,
+        port,
+        error: safeErrorMessage(error),
+      });
+      reject(error);
+    });
     server.listen(port, host, () => {
       const address = server.address();
+      writeLog(server.panelLogger, 'info', 'server.started', {
+        host,
+        port: address.port,
+        pid: process.pid,
+      });
       process.stdout.write('gpt-register-panel listening on http://' + host + ':' + address.port + '\n');
       resolve(server);
+    });
+    server.once('close', () => {
+      writeLog(server.panelLogger, 'info', 'server.stopped', { host, port });
     });
   });
 }

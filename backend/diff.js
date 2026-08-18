@@ -198,7 +198,7 @@ function toSafeDiff(diff) {
 
 module.exports = {
   accountKeys,
+  isExpired,
   buildDiff,
   toSafeDiff,
 };
-

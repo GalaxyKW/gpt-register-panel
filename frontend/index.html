@@ -3,18 +3,22 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17333b">
   <title>gpt_register 账号管理</title>
   <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <p class="eyebrow">GPT REGISTER / SUB2API</p>
+    <div class="brand-lockup">
+      <div class="brand-mark" aria-hidden="true">GR</div>
+      <div>
+        <p class="eyebrow"><span class="eyebrow-dot" aria-hidden="true"></span> GPT REGISTER / SUB2API</p>
       <h1>账号管理</h1>
+      </div>
     </div>
     <div class="topbar-actions">
       <span id="modeBadge" class="badge badge-neutral">只读模式</span>
-      <button id="refreshButton" class="button button-primary" type="button"><span aria-hidden="true">↻</span> 刷新</button>
+      <button id="refreshButton" class="button button-primary" type="button"><span class="button-icon" aria-hidden="true">↻</span><span>刷新</span></button>
     </div>
   </header>
 
@@ -38,6 +42,10 @@
         <select id="statusFilter"><option value="">全部状态</option></select>
       </label>
       <label>
+        <span>Sub2API 可用性</span>
+        <select id="availabilityFilter"><option value="">全部</option></select>
+      </label>
+      <label>
         <span>来源</span>
         <select id="sourceFilter">
           <option value="">全部来源</option>
@@ -53,14 +61,14 @@
       <div class="toolbar-actions">
         <span id="selectionCount" class="selection-count">已选 0</span>
         <details class="column-picker">
-          <summary>列</summary>
+          <summary><span class="button-icon" aria-hidden="true">☷</span><span>列</span></summary>
           <label><input type="checkbox" data-column-toggle="historical" checked> 历史累计</label>
           <label><input type="checkbox" data-column-toggle="current" checked> 本周期</label>
         </details>
-        <button id="clearSelectionButton" class="button button-secondary" type="button">清除选择</button>
-        <button id="previewButton" class="button button-secondary" type="button">检查差异</button>
-        <button id="importButton" class="button button-primary" type="button" disabled>确认导入</button>
-        <button id="phase3Button" class="button button-secondary" type="button" disabled>Phase 3</button>
+        <button id="clearSelectionButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">×</span><span>清除选择</span></button>
+        <button id="previewButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">⌁</span><span>检查差异</span></button>
+        <button id="importButton" class="button button-primary" type="button" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
+        <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="Phase 3 仅支持单账号"><span class="button-icon" aria-hidden="true">↗</span><span>Phase 3</span></button>
       </div>
     </section>
 

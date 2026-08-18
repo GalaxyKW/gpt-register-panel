@@ -5,6 +5,7 @@ const {
   parseDateValue,
   asString,
 } = require('../lib/token');
+const { redactText } = require('../logger');
 
 function asList(value) {
   if (Array.isArray(value)) return value;
@@ -59,6 +60,9 @@ function safeAccount(account) {
       || credentials.expiresAt
       || account.expires_at,
   );
+  const tempUnschedulableUntil = parseDateValue(
+    account.temp_unschedulable_until || account.tempUnschedulableUntil,
+  );
   const groupIds = Array.isArray(account.group_ids)
     ? account.group_ids.map((value) => Number(value)).filter(Number.isFinite)
     : [];
@@ -70,6 +74,11 @@ function safeAccount(account) {
     type: asString(account.type),
     status: asString(account.status),
     schedulable: account.schedulable !== false,
+    tempUnschedulableUntil,
+    tempUnschedulableReason: asString(
+      account.temp_unschedulable_reason || account.tempUnschedulableReason,
+    ),
+    errorMessage: asString(account.error_message || account.errorMessage),
     email,
     accountId,
     userId,
@@ -125,6 +134,14 @@ function normalizeTableUsageStats(value) {
   };
 }
 
+function writeLog(logger, level, event, fields = {}) {
+  try {
+    if (logger && typeof logger[level] === 'function') logger[level](event, fields);
+  } catch {
+    // Network logging must never change the adapter result.
+  }
+}
+
 class Sub2ApiAdminClient {
   constructor(options = {}) {
     this.baseUrl = String(
@@ -137,6 +154,10 @@ class Sub2ApiAdminClient {
       options.jwt || process.env.SUB2API_JWT || '',
     );
     this.timeoutMs = Number(options.timeoutMs || process.env.SUB2API_TIMEOUT_MS || 15000);
+    this.logger = options.logger || null;
+    this.logContext = options.logContext && typeof options.logContext === 'object'
+      ? options.logContext
+      : {};
     if (!this.baseUrl) {
       throw new Error('SUB2API_BASE_URL is required');
     }
@@ -146,6 +167,8 @@ class Sub2ApiAdminClient {
   }
 
   async request(method, pathname, body) {
+    const startedAt = Date.now();
+    writeLog(this.logger, 'info', 'sub2api.request_started', { ...this.logContext, method, path: pathname });
     const headers = { Accept: 'application/json' };
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     else headers.Authorization = 'Bearer ' + this.jwt;
@@ -164,6 +187,13 @@ class Sub2ApiAdminClient {
     try {
       response = await fetch(this.baseUrl + pathname, options);
     } catch (error) {
+      writeLog(this.logger, 'error', 'sub2api.request_failed', {
+        ...this.logContext,
+        method,
+        path: pathname,
+        durationMs: Date.now() - startedAt,
+        error: redactText(String(error?.message || error)).slice(0, 1000),
+      });
       if (error && error.name === 'AbortError') {
         throw new Error('Sub2API request timed out: ' + method + ' ' + pathname);
       }
@@ -180,8 +210,23 @@ class Sub2ApiAdminClient {
     }
     if (!response.ok || (payload && payload.code !== undefined && payload.code !== 0 && payload.code !== '0')) {
       const detail = payload?.message || payload?.code || response.statusText || 'request failed';
+      writeLog(this.logger, 'warn', 'sub2api.request_rejected', {
+        ...this.logContext,
+        method,
+        path: pathname,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        error: redactText(String(detail)).slice(0, 1000),
+      });
       throw new Error('Sub2API ' + method + ' ' + pathname + ' failed: ' + detail);
     }
+    writeLog(this.logger, 'info', 'sub2api.request_completed', {
+      ...this.logContext,
+      method,
+      path: pathname,
+      statusCode: response.status,
+      durationMs: Date.now() - startedAt,
+    });
     return unwrapData(payload);
   }
 
