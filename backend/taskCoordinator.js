@@ -4,8 +4,11 @@ const path = require('node:path');
 const { acquireBakeryLease, releaseBakeryLease } = require('./lib/bakeryLock');
 const { ensureDirectoryTree } = require('./lib/safeFs');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
+const { redactText, redactValue } = require('./logger');
 
 const CONTROL_LOCK_KIND = 'gpt-register-panel-control-lock';
+const CONTROL_LOCK_RELEASE_CODE = 'CONTROL_PLANE_LOCK_RELEASE_FAILED';
+const CRITICAL_SECTION_RESULT_MAX_BYTES = 512 * 1024;
 
 // Keep FIFO ordering inside one process, then take a filesystem lease for the
 // whole callback so independently started panel processes cannot overlap work
@@ -169,14 +172,150 @@ function releaseControlPlaneLease(lease) {
   }
 }
 
+function safeErrorCode(value, fallback) {
+  let candidate = '';
+  try { candidate = String(value || '').trim(); } catch {}
+  return /^[A-Za-z0-9_.-]{1,100}$/.test(candidate) ? candidate : fallback;
+}
+
+function errorProperty(error, key) {
+  try { return error?.[key]; } catch { return undefined; }
+}
+
+function safeErrorMessage(error, fallback) {
+  try {
+    return redactText(String(error?.message || error || fallback)).slice(0, 1000) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function safeReleaseFailure(error) {
+  return {
+    code: safeErrorCode(errorProperty(error, 'code'), CONTROL_LOCK_RELEASE_CODE),
+    message: safeErrorMessage(error, '控制面全局锁释放失败'),
+  };
+}
+
+function safeCriticalSectionResult(value) {
+  try {
+    // A cloned value can retain an enumerable `toJSON` function. Parse and
+    // redact its serialized form once more so custom serialization cannot
+    // reintroduce credentials after the first structured redaction pass.
+    const initialSerialized = JSON.stringify(redactValue(value));
+    if (initialSerialized === undefined) {
+      return { available: false, reason: 'not_json_serializable' };
+    }
+    const initialByteLength = Buffer.byteLength(initialSerialized, 'utf8');
+    if (initialByteLength > CRITICAL_SECTION_RESULT_MAX_BYTES) {
+      return { available: false, reason: 'result_too_large', byteLength: initialByteLength };
+    }
+    const serialized = JSON.stringify(redactValue(JSON.parse(initialSerialized)));
+    const byteLength = Buffer.byteLength(serialized, 'utf8');
+    if (byteLength > CRITICAL_SECTION_RESULT_MAX_BYTES) {
+      return { available: false, reason: 'result_too_large', byteLength };
+    }
+    return { available: true, value: JSON.parse(serialized) };
+  } catch {
+    return { available: false, reason: 'result_unavailable' };
+  }
+}
+
+function completedCriticalSectionReleaseError(releaseError, result) {
+  const error = new Error(
+    '控制面操作已经完成，但全局锁释放失败；执行结果需要人工对账，禁止自动重试',
+  );
+  const safeResult = safeCriticalSectionResult(result);
+  error.code = CONTROL_LOCK_RELEASE_CODE;
+  error.criticalSectionCompleted = true;
+  error.controlPlaneLeaseReleaseFailed = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.releaseFailure = safeReleaseFailure(releaseError);
+  error.criticalSectionResultAvailable = safeResult.available;
+  if (safeResult.available) error.criticalSectionResult = safeResult.value;
+  else error.criticalSectionResultOmittedReason = safeResult.reason;
+  if (safeResult.byteLength !== undefined) {
+    error.criticalSectionResultByteLength = safeResult.byteLength;
+  }
+  return error;
+}
+
+function callbackFailureSummary(error) {
+  return {
+    code: safeErrorCode(errorProperty(error, 'code'), 'CONTROL_PLANE_CALLBACK_FAILED'),
+    message: safeErrorMessage(error, '控制面操作失败'),
+  };
+}
+
+function callbackErrorWithReleaseFailure(callbackError, releaseError) {
+  const releaseFailure = safeReleaseFailure(releaseError);
+  const annotations = {
+    controlPlaneLeaseReleaseFailed: true,
+    releaseFailure,
+  };
+  if (errorProperty(callbackError, 'criticalSectionCompleted') !== true) {
+    annotations.criticalSectionCompleted = false;
+  }
+  try {
+    if (callbackError && (typeof callbackError === 'object' || typeof callbackError === 'function')) {
+      Object.assign(callbackError, annotations);
+      if (errorProperty(callbackError, 'controlPlaneLeaseReleaseFailed') === true) {
+        return callbackError;
+      }
+    }
+  } catch {
+    // Frozen or otherwise non-extensible thrown values are represented below
+    // without retaining an unsafe raw cause.
+  }
+
+  const callbackFailure = callbackFailureSummary(callbackError);
+  const error = new Error(callbackFailure.message);
+  error.code = callbackFailure.code;
+  error.callbackFailure = callbackFailure;
+  Object.assign(error, annotations);
+  if (errorProperty(callbackError, 'criticalSectionCompleted') === true) {
+    error.criticalSectionCompleted = true;
+  }
+  if (errorProperty(callbackError, 'requiresReconciliation') === true) {
+    error.requiresReconciliation = true;
+  }
+  if (errorProperty(callbackError, 'doNotRetry') === true) error.doNotRetry = true;
+  if (errorProperty(callbackError, 'retryAllowed') === false) error.retryAllowed = false;
+  return error;
+}
+
 async function runWithGlobalLease(callback, options = {}) {
   const lease = await acquireControlPlaneLease(options);
+  let callbackCompleted = false;
+  let callbackFailed = false;
+  let callbackResult;
+  let callbackError;
   try {
     throwIfJobInterrupted(options.signal);
-    return await callback();
-  } finally {
-    releaseControlPlaneLease(lease);
+    callbackResult = await callback();
+    callbackCompleted = true;
+  } catch (error) {
+    callbackFailed = true;
+    callbackError = error;
   }
+
+  let releaseError;
+  try {
+    releaseControlPlaneLease(lease);
+  } catch (error) {
+    releaseError = error;
+  }
+
+  if (releaseError) {
+    if (callbackCompleted) {
+      throw completedCriticalSectionReleaseError(releaseError, callbackResult);
+    }
+    throw callbackErrorWithReleaseFailure(callbackError, releaseError);
+  }
+  if (callbackFailed) throw callbackError;
+  return callbackResult;
 }
 
 function queueCancelableRun(predecessor, callback, options = {}) {
