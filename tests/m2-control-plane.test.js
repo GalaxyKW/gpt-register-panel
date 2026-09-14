@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -23,8 +24,10 @@ const {
   writeBackup,
 } = require('../backend/sync');
 const {
+  PHASE3_TERMINATION_MAX_TOTAL_MS,
   canonicalPhase3Keys,
   findUsernameEntry,
+  phase3TerminationBudget,
   sanitizeLog,
   runCommand,
   runPhase3Job,
@@ -33,6 +36,23 @@ const {
 const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
+
+function processIsRunning(pid) {
+  if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 1) return false;
+  try {
+    const stat = fs.readFileSync('/proc/' + String(pid) + '/stat', 'utf8');
+    const commandEnd = stat.lastIndexOf(')');
+    const state = commandEnd < 0 ? '' : stat.slice(commandEnd + 2).trim().split(/\s+/)[0];
+    return !['Z', 'X'].includes(state);
+  } catch {
+    return false;
+  }
+}
+
+function killTestProcess(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 1) return;
+  try { process.kill(pid, 'SIGKILL'); } catch {}
+}
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-m2-'));
@@ -795,6 +815,218 @@ test('phase3 refuses writable index.js and node executables before spawning', as
   }
 });
 
+test('phase3 termination budgets leave a fixed reconciliation window before server shutdown', () => {
+  const maximum = phase3TerminationBudget({
+    terminationGraceMs: Number.MAX_SAFE_INTEGER,
+    terminationHardDeadlineMs: Number.MAX_SAFE_INTEGER,
+  });
+  assert.equal(maximum.totalMs, PHASE3_TERMINATION_MAX_TOTAL_MS);
+  assert.equal(maximum.totalMs, 5000);
+  assert.equal(maximum.totalMs < 10_000, true);
+
+  const minimum = phase3TerminationBudget({
+    terminationGraceMs: 1,
+    terminationHardDeadlineMs: 1,
+  });
+  assert.deepEqual(minimum, { graceMs: 100, finalWaitMs: 100, totalMs: 200 });
+});
+
+test('phase3 cleans a same-group helper before reporting successful command completion', async () => {
+  let keeperPid = null;
+  try {
+    const result = await runCommand('/bin/sh', ['-c', [
+      "(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &",
+      'echo keeper_pid=$!',
+      'exit 0',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 5000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+    });
+    keeperPid = Number(result.stdout.match(/keeper_pid=(\d+)/)?.[1]);
+    assert.equal(Number.isSafeInteger(keeperPid) && keeperPid > 1, true);
+    assert.equal(result.code, 0);
+    assert.equal(result.observedSignal, null);
+    assert.equal(result.requestedSignal, 'SIGKILL');
+    assert.equal(result.terminationConfirmed, true);
+    assert.equal(result.remainingDescendantCount, 0);
+    assert.equal(processIsRunning(keeperPid), false);
+  } finally {
+    if (processIsRunning(keeperPid)) killTestProcess(keeperPid);
+  }
+});
+
+test('phase3 starts cleanup at leader exit when a helper keeps inherited output pipes open', async () => {
+  let keeperPid = null;
+  const startedAt = Date.now();
+  try {
+    const result = await runCommand('/bin/sh', ['-c', [
+      "(trap '' TERM; exec /bin/sleep 30) &",
+      'echo keeper_pid=$!',
+      'exit 0',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 10_000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+    });
+    keeperPid = Number(result.stdout.match(/keeper_pid=(\d+)/)?.[1]);
+    assert.equal(Number.isSafeInteger(keeperPid) && keeperPid > 1, true);
+    assert.equal(result.code, 0);
+    assert.equal(result.terminationConfirmed, true);
+    assert.equal(result.remainingDescendantCount, 0);
+    assert.equal(processIsRunning(keeperPid), false);
+    assert.equal(Date.now() - startedAt < 3000, true);
+  } finally {
+    if (processIsRunning(keeperPid)) killTestProcess(keeperPid);
+  }
+});
+
+test('phase3 cleans a same-group helper before reporting a nonzero command exit', async () => {
+  let keeperPid = null;
+  try {
+    let failure;
+    try {
+      await runCommand('/bin/sh', ['-c', [
+        "(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &",
+        'echo keeper_pid=$!',
+        'exit 7',
+      ].join('\n')], {
+        cwd: os.tmpdir(),
+        env: { PATH: process.env.PATH || '' },
+        timeoutMs: 5000,
+        terminationGraceMs: 100,
+        terminationHardDeadlineMs: 100,
+        maxOutputBytes: 4096,
+      });
+      assert.fail('runCommand should reject a nonzero exit');
+    } catch (error) {
+      failure = error;
+    }
+    keeperPid = Number(failure?.details?.stdout?.match(/keeper_pid=(\d+)/)?.[1]);
+    assert.equal(Number.isSafeInteger(keeperPid) && keeperPid > 1, true);
+    assert.equal(failure?.details?.code, 7);
+    assert.equal(failure?.details?.terminationConfirmed, true);
+    assert.equal(failure?.details?.remainingDescendantCount, 0);
+    assert.equal(processIsRunning(keeperPid), false);
+  } finally {
+    if (processIsRunning(keeperPid)) killTestProcess(keeperPid);
+  }
+});
+
+test('phase3 supervision marker catches a fast setsid helper before successful completion', async () => {
+  let keeperPid = null;
+  try {
+    const result = await runCommand('/bin/sh', ['-c', [
+      "(/usr/bin/setsid /bin/sh -c \"trap '' TERM; exec /bin/sleep 30\") </dev/null >/dev/null 2>&1 &",
+      'echo keeper_pid=$!',
+      'exit 0',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 5000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+    });
+    keeperPid = Number(result.stdout.match(/keeper_pid=(\d+)/)?.[1]);
+    assert.equal(Number.isSafeInteger(keeperPid) && keeperPid > 1, true);
+    assert.equal(result.terminationConfirmed, true);
+    assert.equal(result.remainingDescendantCount, 0);
+    assert.equal(processIsRunning(keeperPid), false);
+  } finally {
+    if (processIsRunning(keeperPid)) killTestProcess(keeperPid);
+  }
+});
+
+test('phase3 supervision marker is never exposed through captured process output', async () => {
+  const result = await runCommand('/bin/sh', ['-c', 'printf %s "$GPT_REGISTER_PANEL_SUPERVISION_ID"'], {
+    cwd: os.tmpdir(),
+    env: { PATH: process.env.PATH || '' },
+    timeoutMs: 5000,
+    maxOutputBytes: 4096,
+  });
+  assert.equal(result.stdout, '[REDACTED]');
+  assert.equal(/[a-f0-9]{48}/.test(result.stdout), false);
+});
+
+test('phase3 supervision never signals an unmarked process in the same cgroup', async () => {
+  const unrelated = spawn('/bin/sleep', ['30'], {
+    detached: true,
+    env: { PATH: process.env.PATH || '' },
+    stdio: 'ignore',
+  });
+  const unrelatedClosed = new Promise((resolve) => unrelated.once('close', resolve));
+  try {
+    assert.equal(Number.isSafeInteger(unrelated.pid) && unrelated.pid > 1, true);
+    const result = await runCommand('/bin/sh', ['-c', [
+      "(trap '' TERM; exec /bin/sleep 30) </dev/null >/dev/null 2>&1 &",
+      'echo keeper_pid=$!',
+      'exit 0',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 5000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+    });
+    assert.equal(result.terminationConfirmed, true);
+    assert.equal(processIsRunning(unrelated.pid), true);
+  } finally {
+    if (processIsRunning(unrelated.pid)) killTestProcess(unrelated.pid);
+    await Promise.race([
+      unrelatedClosed,
+      new Promise((resolve) => setTimeout(resolve, 500)),
+    ]);
+  }
+});
+
+test('phase3 abort cleans a reparented setsid helper before reporting interruption', async () => {
+  const controller = new AbortController();
+  let keeperPid = null;
+  try {
+    const running = runCommand('/bin/sh', ['-c', [
+      '(',
+      "  /usr/bin/setsid /bin/sh -c \"trap '' TERM; exec /bin/sleep 30\" </dev/null >/dev/null 2>&1 &",
+      '  echo keeper_pid=$!',
+      ')',
+      "trap '' TERM",
+      'while :; do /bin/sleep 1; done',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 5000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+      signal: controller.signal,
+    });
+    setTimeout(() => controller.abort(), 300);
+    let failure;
+    try {
+      await running;
+      assert.fail('runCommand should reject after shutdown cancellation');
+    } catch (error) {
+      failure = error;
+    }
+    keeperPid = Number(failure?.details?.stdout?.match(/keeper_pid=(\d+)/)?.[1]);
+    assert.equal(Number.isSafeInteger(keeperPid) && keeperPid > 1, true);
+    assert.equal(failure?.code, 'JOB_INTERRUPTED');
+    assert.equal(failure?.details?.terminationConfirmed, true);
+    assert.equal(failure?.details?.remainingDescendantCount, 0);
+    assert.equal(processIsRunning(keeperPid), false);
+  } finally {
+    controller.abort();
+    if (processIsRunning(keeperPid)) killTestProcess(keeperPid);
+  }
+});
+
 test('phase3 timeout waits for a SIGTERM-resistant child to be killed and closed', async () => {
   const startedAt = Date.now();
   await assert.rejects(
@@ -808,7 +1040,12 @@ test('phase3 timeout waits for a SIGTERM-resistant child to be killed and closed
       terminationGraceMs: 100,
       maxOutputBytes: 4096,
     }),
-    (error) => error.code === 'PHASE3_TIMEOUT' && error.details?.signal === 'SIGKILL',
+    (error) => error.code === 'PHASE3_TIMEOUT'
+      && error.details?.requestedSignal === 'SIGKILL'
+      && error.details?.observedSignal === 'SIGKILL'
+      && error.details?.signal === error.details?.observedSignal
+      && error.details?.terminationConfirmed === true
+      && error.details?.remainingDescendantCount === 0,
   );
   const durationMs = Date.now() - startedAt;
   assert.equal(durationMs >= 1000, true);
@@ -874,6 +1111,10 @@ test('phase3 timeout kills an escaped detached descendant before releasing the j
   assert.equal(keeperStillRunning, false);
   assert.equal(failure?.code, 'PHASE3_TIMEOUT');
   assert.equal(failure?.details?.signal, 'SIGKILL');
+  assert.equal(failure?.details?.requestedSignal, 'SIGKILL');
+  assert.equal(failure?.details?.observedSignal, 'SIGKILL');
+  assert.equal(failure?.details?.terminationConfirmed, true);
+  assert.equal(failure?.details?.remainingDescendantCount, 0);
   assert.equal(failure?.details?.forcedClose, false);
   assert.equal(Date.now() - startedAt >= 1000, true);
   assert.equal(Date.now() - startedAt < 3000, true);

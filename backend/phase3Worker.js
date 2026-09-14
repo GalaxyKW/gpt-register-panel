@@ -42,12 +42,24 @@ const PHASE3_ENV_NAMES = new Set([
 ]);
 const activePhase3Children = new Set();
 let phase3ExitHookInstalled = false;
+let phase3ProcessTreeUnsafe = false;
 // Phase3 reads credentials from this file, so callers may lower the limit but
 // cannot configure away the process-level allocation bound.
 const PHASE3_USERNAME_DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
 const PHASE3_USERNAME_HARD_MAX_BYTES = 32 * 1024 * 1024;
-const PHASE3_FINAL_KILL_WAIT_MS = 5000;
+// Keep the complete TERM -> KILL -> verification path below the server's
+// default ten-second shutdown drain so token reconciliation and terminal job
+// persistence retain their own bounded window.
+const PHASE3_TERMINATION_GRACE_DEFAULT_MS = 4000;
+const PHASE3_TERMINATION_GRACE_MAX_MS = 4000;
+const PHASE3_FINAL_KILL_WAIT_MS = 1000;
+const PHASE3_FINAL_KILL_WAIT_MAX_MS = 1000;
+const PHASE3_TERMINATION_MAX_TOTAL_MS = PHASE3_TERMINATION_GRACE_MAX_MS
+  + PHASE3_FINAL_KILL_WAIT_MAX_MS;
 const PHASE3_DESCENDANT_LIMIT = 4096;
+const PHASE3_PROC_ENV_MAX_BYTES = 64 * 1024;
+const PHASE3_PROC_ENV_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+const PHASE3_SUPERVISION_ENV_NAME = 'GPT_REGISTER_PANEL_SUPERVISION_ID';
 const PHASE3_SCRIPT_CHILD_FD = 3;
 const PHASE3_NODE_CHILD_FD = 4;
 const PHASE3_ROOT_CHILD_FD = 5;
@@ -57,6 +69,12 @@ const READ_ONLY_NOFOLLOW = fs.constants.O_RDONLY
 
 function registerRoot() {
   return path.resolve(process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register');
+}
+
+function phase3SupervisionError() {
+  const error = new Error('此前 Phase3 子进程树未能确认退出；重启并核对账号状态前禁止继续执行');
+  error.code = 'PHASE3_SUPERVISION_UNSAFE';
+  return error;
 }
 
 function linuxProcessIdentity(pid) {
@@ -81,6 +99,92 @@ function linuxProcessIdentity(pid) {
     };
   } catch {
     return null;
+  }
+}
+
+function sameLinuxProcess(left, right) {
+  return Boolean(left && right
+    && left.pid === right.pid
+    && left.startId === right.startId
+    && left.cgroup === right.cgroup);
+}
+
+function procEnvironmentContains(pid, name, value, scanBudget) {
+  let descriptor;
+  try {
+    descriptor = fs.openSync(
+      '/proc/' + String(pid) + '/environ',
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0),
+    );
+    const marker = Buffer.from(String(name) + '=' + String(value) + '\0');
+    const chunks = [];
+    let total = 0;
+    while (total < PHASE3_PROC_ENV_MAX_BYTES && scanBudget.remaining > 0) {
+      const buffer = Buffer.allocUnsafe(Math.min(
+        8 * 1024,
+        PHASE3_PROC_ENV_MAX_BYTES - total,
+        scanBudget.remaining,
+      ));
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead <= 0) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+      scanBudget.remaining -= bytesRead;
+    }
+    const environment = Buffer.concat(chunks, total);
+    let offset = environment.indexOf(marker);
+    while (offset >= 0) {
+      if (offset === 0 || environment[offset - 1] === 0) return true;
+      offset = environment.indexOf(marker, offset + 1);
+    }
+    return false;
+  } catch {
+    return false;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+  }
+}
+
+function captureLinuxSupervisedProcesses({
+  supervisionId,
+  expectedCgroup,
+  excludedPids = new Set(),
+  tracked,
+}) {
+  if (process.platform !== 'linux' || !supervisionId || !expectedCgroup) return;
+  let processIds;
+  try {
+    processIds = fs.readdirSync('/proc')
+      .filter((value) => /^\d+$/.test(value))
+      .map(Number)
+      .filter((value) => Number.isSafeInteger(value) && value > 1)
+      // Newly spawned descendants normally have the highest PIDs. Scan them
+      // first so the aggregate environ-read ceiling cannot be consumed by
+      // unrelated long-running processes in a shared development cgroup.
+      .sort((left, right) => right - left);
+  } catch {
+    return;
+  }
+  const scanBudget = { remaining: PHASE3_PROC_ENV_SCAN_MAX_BYTES };
+  for (const pid of processIds) {
+    if (scanBudget.remaining <= 0) break;
+    if (tracked.size >= PHASE3_DESCENDANT_LIMIT || excludedPids.has(pid)) continue;
+    const before = linuxProcessIdentity(pid);
+    if (!before || before.cgroup !== expectedCgroup || ['Z', 'X'].includes(before.state)) continue;
+    if (!procEnvironmentContains(
+      pid,
+      PHASE3_SUPERVISION_ENV_NAME,
+      supervisionId,
+      scanBudget,
+    )) continue;
+    // `/proc` enumeration and environ reads are not atomic. Re-read the
+    // immutable process start id before retaining or signalling this PID so a
+    // recycled PID can never turn into an unrelated kill target.
+    const after = linuxProcessIdentity(pid);
+    if (!sameLinuxProcess(before, after) || ['Z', 'X'].includes(after.state)) continue;
+    if (!tracked.has(pid)) tracked.set(pid, { ...after, depth: PHASE3_DESCENDANT_LIMIT });
   }
 }
 
@@ -136,24 +240,13 @@ function activeTrackedDescendants(tracked) {
   for (const expected of tracked.values()) {
     const current = linuxProcessIdentity(expected.pid);
     if (!current || ['Z', 'X'].includes(current.state)
-        || current.startId !== expected.startId || current.cgroup !== expected.cgroup) continue;
+        || current.startId !== expected.startId || current.cgroup !== expected.cgroup) {
+      tracked.delete(expected.pid);
+      continue;
+    }
     active.push({ ...expected, processGroupId: current.processGroupId });
   }
   return active;
-}
-
-function signalTrackedDescendants(tracked, signal, excludedProcessGroups = new Set()) {
-  const active = activeTrackedDescendants(tracked)
-    .sort((left, right) => right.depth - left.depth || right.pid - left.pid);
-  const signalledGroups = new Set(excludedProcessGroups);
-  for (const processInfo of active) {
-    const groupId = processInfo.processGroupId;
-    if (Number.isSafeInteger(groupId) && groupId > 1 && !signalledGroups.has(groupId)) {
-      signalledGroups.add(groupId);
-      try { process.kill(-groupId, signal); } catch {}
-    }
-    try { process.kill(processInfo.pid, signal); } catch {}
-  }
 }
 
 function sameFileIdentity(left, right) {
@@ -527,11 +620,19 @@ function phase3ProcessSummary(details = {}) {
   const value = details && typeof details === 'object' ? details : {};
   const stdout = typeof value.stdout === 'string' ? value.stdout : '';
   const stderr = typeof value.stderr === 'string' ? value.stderr : '';
+  const safeSignal = (signal) => typeof signal === 'string' && /^[A-Z0-9]{1,32}$/.test(signal)
+    ? signal
+    : null;
   return {
     code: Number.isSafeInteger(value.code) ? value.code : null,
-    signal: typeof value.signal === 'string' && /^[A-Z0-9]{1,32}$/.test(value.signal)
-      ? value.signal
-      : null,
+    signal: safeSignal(value.observedSignal || value.signal),
+    requestedSignal: safeSignal(value.requestedSignal),
+    observedSignal: safeSignal(value.observedSignal || value.signal),
+    terminationConfirmed: value.terminationConfirmed === true,
+    remainingDescendantCount: Number.isSafeInteger(value.remainingDescendantCount)
+      ? Math.max(0, Math.min(PHASE3_DESCENDANT_LIMIT, value.remainingDescendantCount))
+      : 0,
+    rootProcessRemaining: value.rootProcessRemaining === true,
     forcedClose: value.forcedClose === true,
     outputTruncated: value.outputTruncated === true,
     stdoutBytes: boundedByteCount(value.stdoutBytes) || Buffer.byteLength(stdout, 'utf8'),
@@ -542,8 +643,9 @@ function phase3ProcessSummary(details = {}) {
 function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
   const details = error?.details || {};
   const hasProcessDetails = details && typeof details === 'object'
-    && ['code', 'signal', 'stdout', 'stderr', 'forcedClose', 'outputTruncated',
-      'stdoutBytes', 'stderrBytes'].some((key) => Object.hasOwn(details, key));
+    && ['code', 'signal', 'requestedSignal', 'observedSignal', 'terminationConfirmed',
+      'remainingDescendantCount', 'rootProcessRemaining', 'stdout', 'stderr', 'forcedClose',
+      'outputTruncated', 'stdoutBytes', 'stderrBytes'].some((key) => Object.hasOwn(details, key));
   const combined = [details.stdout, details.stderr, error?.message]
     .filter(Boolean)
     .join('\n');
@@ -608,6 +710,18 @@ function writeLog(logger, level, event, fields = {}) {
   }
 }
 
+function phase3TerminationBudget(options = {}) {
+  const configuredGraceMs = Number(options.terminationGraceMs);
+  const graceMs = Number.isFinite(configuredGraceMs) && configuredGraceMs > 0
+    ? Math.min(Math.max(Math.floor(configuredGraceMs), 100), PHASE3_TERMINATION_GRACE_MAX_MS)
+    : PHASE3_TERMINATION_GRACE_DEFAULT_MS;
+  const configuredFinalWaitMs = Number(options.terminationHardDeadlineMs);
+  const finalWaitMs = Number.isFinite(configuredFinalWaitMs) && configuredFinalWaitMs > 0
+    ? Math.min(Math.max(Math.floor(configuredFinalWaitMs), 100), PHASE3_FINAL_KILL_WAIT_MAX_MS)
+    : PHASE3_FINAL_KILL_WAIT_MS;
+  return { graceMs, finalWaitMs, totalMs: graceMs + finalWaitMs };
+}
+
 function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const maxOutputBytes = Number.isSafeInteger(Number(options.maxOutputBytes))
@@ -620,48 +734,102 @@ function runCommand(command, args, options = {}) {
     let child;
     let settled = false;
     let timer;
-    let killTimer;
-    let forceSettleTimer;
+    let treeCleanupTimer;
     let descendantSampler;
     let terminationError = null;
     let closeResult = null;
+    let cleanupStarted = false;
+    let requestedSignal = null;
+    let rootIdentity = null;
+    let supervisionRecord = null;
     const externalSignal = options.signal;
     let stopForwardingAbort = () => {};
     const trackedDescendants = new Map();
-    let descendantCgroup = '';
-    const captureDescendants = () => {
+    const supervisionId = crypto.randomBytes(24).toString('hex');
+    let descendantCgroup = linuxProcessIdentity(process.pid)?.cgroup || '';
+    const captureProcesses = (scanSupervision = false) => {
       if (!child?.pid) return;
+      // Sequential browser helpers must not permanently consume the bounded
+      // tracking table after they have exited.
+      activeTrackedDescendants(trackedDescendants);
+      const currentRoot = linuxProcessIdentity(child.pid);
+      if (currentRoot && !rootIdentity) rootIdentity = currentRoot;
       descendantCgroup = captureLinuxDescendants(
         child.pid,
         trackedDescendants,
         descendantCgroup,
       );
-    };
-    const terminate = (signal) => {
-      if (!child?.pid) return;
-      captureDescendants();
-      if (process.platform !== 'win32') {
-        const ownGroup = linuxProcessIdentity(process.pid)?.processGroupId;
-        signalTrackedDescendants(
-          trackedDescendants,
-          signal,
-          new Set([child.pid, ownGroup].filter(Number.isSafeInteger)),
-        );
-        try { process.kill(-child.pid, signal); } catch {}
+      if (scanSupervision) {
+        captureLinuxSupervisedProcesses({
+          supervisionId,
+          expectedCgroup: descendantCgroup,
+          excludedPids: new Set([process.pid, child.pid]),
+          tracked: trackedDescendants,
+        });
       }
-      try { child.kill(signal); } catch {}
+    };
+    const currentRootProcess = () => {
+      if (!rootIdentity) return null;
+      const current = linuxProcessIdentity(rootIdentity.pid);
+      if (!sameLinuxProcess(rootIdentity, current) || ['Z', 'X'].includes(current.state)) return null;
+      return current;
+    };
+    const activeProcessState = () => {
+      captureProcesses(true);
+      return {
+        root: currentRootProcess(),
+        descendants: activeTrackedDescendants(trackedDescendants),
+      };
+    };
+    const signalProcessTree = (signal) => {
+      if (!child?.pid) return;
+      requestedSignal = signal;
+      if (process.platform !== 'linux') {
+        try { child.kill(signal); } catch {}
+        return;
+      }
+      const state = activeProcessState();
+      const processes = [state.root, ...state.descendants].filter(Boolean);
+      const ownGroup = linuxProcessIdentity(process.pid)?.processGroupId;
+      const grouped = new Map();
+      for (const processInfo of processes) {
+        const groupId = processInfo.processGroupId;
+        if (!grouped.has(groupId)) grouped.set(groupId, []);
+        grouped.get(groupId).push(processInfo);
+      }
+      for (const [groupId, members] of grouped) {
+        let groupSignalled = false;
+        if (Number.isSafeInteger(groupId) && groupId > 1 && groupId !== ownGroup) {
+          try {
+            process.kill(-groupId, signal);
+            groupSignalled = true;
+          } catch {}
+        }
+        if (groupSignalled) continue;
+        for (const expected of members) {
+          const latest = linuxProcessIdentity(expected.pid);
+          if (!sameLinuxProcess(expected, latest) || ['Z', 'X'].includes(latest.state)) continue;
+          try { process.kill(expected.pid, signal); } catch {}
+        }
+      }
+      // A successfully spawned ChildProcess handle cannot refer to a recycled
+      // PID before it has been reaped. This fallback covers the very small
+      // window in which `/proc/<pid>/stat` is not readable yet.
+      if (!state.root && child.exitCode === null && child.signalCode === null) {
+        try { child.kill(signal); } catch {}
+      }
     };
     const readOutput = (streamName) => {
-      const value = Buffer.concat(output[streamName]).toString('utf8');
+      const value = Buffer.concat(output[streamName]).toString('utf8')
+        .replaceAll(supervisionId, '[REDACTED]');
       return sanitizeLog(value) + (outputTruncated ? '\n[phase3 output truncated]' : '');
     };
     const cleanup = () => {
       if (timer) clearTimeout(timer);
-      if (killTimer) clearTimeout(killTimer);
-      if (forceSettleTimer) clearTimeout(forceSettleTimer);
+      if (treeCleanupTimer) clearTimeout(treeCleanupTimer);
       if (descendantSampler) clearInterval(descendantSampler);
       stopForwardingAbort();
-      if (child) activePhase3Children.delete(child);
+      if (supervisionRecord) activePhase3Children.delete(supervisionRecord);
     };
     const destroyOutputPipes = () => {
       for (const stream of [child?.stdout, child?.stderr]) {
@@ -670,9 +838,16 @@ function runCommand(command, args, options = {}) {
         try { stream.destroy(); } catch {}
       }
     };
-    const terminationResult = (forcedClose) => ({
+    const processResult = ({ forcedClose = false, terminationConfirmed = true, state = null } = {}) => ({
       code: closeResult?.code ?? child?.exitCode ?? null,
-      signal: closeResult?.signal || child?.signalCode || 'SIGKILL',
+      // `signal` remains as a compatibility alias, but now means an observed
+      // exit signal only. A requested SIGKILL is never reported as observed.
+      signal: closeResult?.signal || child?.signalCode || null,
+      requestedSignal,
+      observedSignal: closeResult?.signal || child?.signalCode || null,
+      terminationConfirmed,
+      remainingDescendantCount: state?.descendants?.length || 0,
+      rootProcessRemaining: Boolean(state?.root),
       stdout: readOutput('stdout'),
       stderr: readOutput('stderr'),
       forcedClose,
@@ -680,60 +855,76 @@ function runCommand(command, args, options = {}) {
       stdoutBytes: observedBytes.stdout,
       stderrBytes: observedBytes.stderr,
     });
-    const settleTerminatedCommand = (forcedClose = false) => {
-      if (settled || !terminationError) return false;
-      captureDescendants();
-      if (!forcedClose && (!closeResult || activeTrackedDescendants(trackedDescendants).length > 0)) {
-        return false;
-      }
+    const settleConfirmedCommand = () => {
+      if (settled || !closeResult) return false;
+      const state = activeProcessState();
+      if (state.root || state.descendants.length > 0) return false;
       settled = true;
-      if (forcedClose) destroyOutputPipes();
-      terminationError.details = terminationResult(forcedClose);
+      const result = processResult({ terminationConfirmed: true, state });
       cleanup();
-      reject(terminationError);
+      if (terminationError) {
+        terminationError.details = result;
+        reject(terminationError);
+      } else if (closeResult.code !== 0) {
+        const error = new Error('phase3 进程失败（退出码 ' + String(closeResult.code) + '）');
+        error.details = result;
+        reject(error);
+      } else {
+        resolve(result);
+      }
       return true;
     };
-    const forceTerminationSettlement = () => {
-      if (settled || !terminationError) return;
-      terminate('SIGKILL');
-      settleTerminatedCommand(true);
+    const forceUnconfirmedSettlement = () => {
+      if (settled) return;
+      signalProcessTree('SIGKILL');
+      const state = activeProcessState();
+      if (settleConfirmedCommand()) return;
+      settled = true;
+      phase3ProcessTreeUnsafe = true;
+      destroyOutputPipes();
+      const originalCode = terminationError?.code || null;
+      const error = new Error('Phase3 子进程树未能在安全期限内确认退出，已禁止继续执行 Phase3');
+      error.code = 'PHASE3_TERMINATION_UNCONFIRMED';
+      error.causeCode = originalCode;
+      error.details = {
+        ...processResult({ forcedClose: true, terminationConfirmed: false, state }),
+        causeCode: originalCode,
+      };
+      // Retain the verified termination callback for the process exit hook.
+      if (timer) clearTimeout(timer);
+      if (treeCleanupTimer) clearTimeout(treeCleanupTimer);
+      if (descendantSampler) clearInterval(descendantSampler);
+      stopForwardingAbort();
+      reject(error);
+    };
+    const beginTreeCleanup = () => {
+      if (settled || cleanupStarted) return;
+      cleanupStarted = true;
+      const budget = phase3TerminationBudget(options);
+      const killAt = Date.now() + budget.graceMs;
+      const hardDeadline = killAt + budget.finalWaitMs;
+      let killSent = false;
+      signalProcessTree('SIGTERM');
+      const check = () => {
+        if (settled || settleConfirmedCommand()) return;
+        const now = Date.now();
+        if (!killSent && now >= killAt) {
+          killSent = true;
+          signalProcessTree('SIGKILL');
+        }
+        if (now >= hardDeadline) {
+          forceUnconfirmedSettlement();
+          return;
+        }
+        const nextBoundary = killSent ? hardDeadline : killAt;
+        treeCleanupTimer = setTimeout(check, Math.min(50, Math.max(1, nextBoundary - now)));
+      };
+      treeCleanupTimer = setTimeout(check, Math.min(50, budget.graceMs));
     };
     const requestTermination = (error) => {
       if (settled || terminationError) return;
       terminationError = error;
-      terminate('SIGTERM');
-      const configuredGraceMs = Number(options.terminationGraceMs);
-      const graceMs = Number.isFinite(configuredGraceMs) && configuredGraceMs > 0
-        ? Math.min(Math.max(configuredGraceMs, 100), 30000)
-        : 5000;
-      killTimer = setTimeout(() => {
-        // The leader can exit on SIGTERM while a descendant keeps the process
-        // group (and stdout/stderr pipes) alive. Keep targeting the PGID until
-        // `close` confirms all inherited stdio handles are gone.
-        if (settled) return;
-        terminate('SIGKILL');
-        const configuredFinalWaitMs = Number(options.terminationHardDeadlineMs);
-        const finalWaitMs = Number.isFinite(configuredFinalWaitMs) && configuredFinalWaitMs > 0
-          ? Math.min(Math.max(configuredFinalWaitMs, 100), 30000)
-          : PHASE3_FINAL_KILL_WAIT_MS;
-        // A detached descendant can escape the original process group while
-        // retaining its stdout/stderr descriptors. Do not let those inherited
-        // pipes keep the job Promise and cross-process lock alive forever.
-        const hardDeadline = Date.now() + finalWaitMs;
-        const checkDescendants = () => {
-          if (settled || settleTerminatedCommand(false)) return;
-          if (Date.now() >= hardDeadline) {
-            forceTerminationSettlement();
-            return;
-          }
-          forceSettleTimer = setTimeout(
-            checkDescendants,
-            Math.min(50, Math.max(1, hardDeadline - Date.now())),
-          );
-        };
-        forceSettleTimer = setTimeout(checkDescendants, Math.min(50, finalWaitMs));
-      }, graceMs);
-      killTimer.unref();
+      beginTreeCleanup();
     };
     if (externalSignal?.aborted) {
       reject(interruptedJobError());
@@ -750,10 +941,14 @@ function runCommand(command, args, options = {}) {
       reject(error);
       return;
     }
+    const childEnvironment = { [PHASE3_SUPERVISION_ENV_NAME]: supervisionId };
+    for (const [name, value] of Object.entries(options.env || process.env)) {
+      if (name !== PHASE3_SUPERVISION_ENV_NAME) childEnvironment[name] = value;
+    }
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
-        env: options.env,
+        env: childEnvironment,
         shell: false,
         detached: process.platform !== 'win32',
         stdio: ['ignore', 'pipe', 'pipe', ...extraFileDescriptors],
@@ -763,14 +958,15 @@ function runCommand(command, args, options = {}) {
       reject(error);
       return;
     }
-    activePhase3Children.add(child);
+    supervisionRecord = { terminate: () => signalProcessTree('SIGKILL') };
+    activePhase3Children.add(supervisionRecord);
     if (process.platform === 'linux') {
       // A browser helper can leave the original process group before timeout
       // or shutdown. Retain only descendants proven by pid/start-id/cgroup
       // while the parent relationship still exists, then target that bounded
       // set if termination becomes necessary.
-      captureDescendants();
-      descendantSampler = setInterval(captureDescendants, 100);
+      captureProcesses();
+      descendantSampler = setInterval(() => captureProcesses(false), 100);
       descendantSampler.unref();
     }
     if (externalSignal && typeof externalSignal.addEventListener === 'function') {
@@ -806,9 +1002,7 @@ function runCommand(command, args, options = {}) {
       phase3ExitHookInstalled = true;
       process.once('exit', () => {
         for (const running of activePhase3Children) {
-          if (process.platform !== 'win32') {
-            try { process.kill(-running.pid, 'SIGTERM'); } catch {}
-          }
+          try { running.terminate(); } catch {}
         }
       });
     }
@@ -824,19 +1018,24 @@ function runCommand(command, args, options = {}) {
     }, timeoutMs);
     child.once('error', (error) => {
       if (settled) return;
+      if (terminationError) return;
+      if (child?.pid) {
+        requestTermination(error);
+        return;
+      }
       settled = true;
-      clearTimeout(timer);
-      error.details = {
-        code: null,
-        signal: null,
-        stdout: readOutput('stdout'),
-        stderr: readOutput('stderr'),
-        outputTruncated,
-        stdoutBytes: observedBytes.stdout,
-        stderrBytes: observedBytes.stderr,
-      };
+      error.details = processResult({ terminationConfirmed: true });
       cleanup();
       reject(error);
+    });
+    // `close` waits for every inherited stdio descriptor, so a daemonized
+    // helper can keep it pending after the Phase3 leader has already exited.
+    // Detect that case at `exit`, terminate only the verified supervised
+    // descendants, and still wait for `close` to drain the final output.
+    child.once('exit', () => {
+      if (settled || cleanupStarted) return;
+      const state = activeProcessState();
+      if (state.descendants.length > 0) beginTreeCleanup();
     });
     // `exit` can fire before stdout/stderr have emitted their final chunks.
     // Wait for `close` so account-deactivation markers are available to the
@@ -853,18 +1052,11 @@ function runCommand(command, args, options = {}) {
         stdoutBytes: observedBytes.stdout,
         stderrBytes: observedBytes.stderr,
       };
-      if (terminationError) {
-        closeResult = result;
-        settleTerminatedCommand(false);
-        return;
-      }
-      settled = true;
-      cleanup();
-      if (code !== 0) {
-        const error = new Error('phase3 进程失败（退出码 ' + String(code) + '）');
-        error.details = result;
-        reject(error);
-      } else resolve(result);
+      closeResult = result;
+      // A command can exit while a daemonized browser/helper remains alive
+      // with redirected stdio. Resolve/reject only after that supervised tree
+      // has also terminated.
+      if (!settleConfirmedCommand()) beginTreeCleanup();
     });
   });
 }
@@ -880,6 +1072,7 @@ async function runPhase3JobNow({
   persistSuccess = null,
 }) {
   throwIfJobInterrupted(signal);
+  if (phase3ProcessTreeUnsafe) throw phase3SupervisionError();
   const startedAt = Date.now();
   let entry = null;
   let rootHandle = null;
@@ -1231,6 +1424,7 @@ function getActivePhase3Job({ email, phone } = {}) {
 }
 
 function runPhase3Job(args = {}) {
+  if (phase3ProcessTreeUnsafe) return Promise.reject(phase3SupervisionError());
   const keys = canonicalPhase3Keys(args);
   const key = keys[0] || null;
   if (!key) return Promise.reject(new Error('email 或 phone 必须提供一个'));
@@ -1289,6 +1483,7 @@ function runPhase3Job(args = {}) {
 }
 
 module.exports = {
+  PHASE3_TERMINATION_MAX_TOTAL_MS,
   findUsernameEntry,
   canonicalPhase3Keys,
   resolvePhase3Requests,
@@ -1297,4 +1492,5 @@ module.exports = {
   runCommand,
   runPhase3Job,
   sanitizeLog,
+  phase3TerminationBudget,
 };
