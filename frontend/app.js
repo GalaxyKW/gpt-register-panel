@@ -466,6 +466,31 @@ function accountTestRows(rows) {
   });
 }
 
+function accountTestTargetsFromRows(rows) {
+  const targets = [];
+  const revisionsById = new Map();
+  for (const row of rows || []) {
+    const accountId = Number(row?.accountId);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+      return { targets: [], problem: '所选行不是有效的 Sub2API 上游账号' };
+    }
+    if (typeof row?.targetRevision !== 'string' || !row.targetRevision) {
+      return { targets: [], problem: '所选账号缺少当前快照 revision，请刷新后重新选择' };
+    }
+    if (revisionsById.has(accountId)) {
+      return {
+        targets: [],
+        problem: revisionsById.get(accountId) === row.targetRevision
+          ? '所选多行指向同一 Sub2API 账号 ID，请仅保留其中一行'
+          : '同一 Sub2API 账号 ID 对应多个不同 revision，请刷新后重新选择',
+      };
+    }
+    revisionsById.set(accountId, row.targetRevision);
+    targets.push({ accountId, targetRevision: row.targetRevision });
+  }
+  return { targets, problem: '' };
+}
+
 async function loadAccountTestModels(snapshot) {
   renderAccountTestModels(fallbackAccountTestModels);
   const candidate = accountTestRows(snapshot?.rows || [])[0];
@@ -2264,12 +2289,11 @@ if (elements.accountTestButton) {
       return;
     }
     const selectedRows = selectedRowsFromSelection();
-    const targets = accountTestRows(selectedRows);
-    const invalidSelectedRow = selectedRows.some((row) => (
-      !Number.isSafeInteger(Number(row?.accountId)) || Number(row.accountId) <= 0
-    ));
-    if (state.selected.size === 0 || selectedRows.length !== state.selected.size || invalidSelectedRow || targets.length === 0) {
-      showNotice('请只选择已导入 Sub2API 的上游账号后再测试。', 'notice-warning');
+    const targetSelection = accountTestTargetsFromRows(selectedRows);
+    const targets = targetSelection.targets;
+    if (state.selected.size === 0 || selectedRows.length !== state.selected.size
+        || targetSelection.problem || targets.length === 0) {
+      showNotice(targetSelection.problem || '请只选择已导入 Sub2API 的上游账号后再测试。', 'notice-warning');
       return;
     }
     const modelId = normalizeAccountTestModel(elements.accountTestModelSelect?.value);
@@ -2284,7 +2308,7 @@ if (elements.accountTestButton) {
       const response = await apiFetch('/api/account-tests', {
         method: 'POST',
         body: JSON.stringify({
-          accountIds: targets.map((row) => Number(row.accountId)),
+          targets,
           modelId,
         }),
       });
@@ -2372,14 +2396,12 @@ function updateActionState() {
   const selectionVisibilityProblem = hiddenSelectionProblem();
   const phase3Targets = phase3TargetsFromRows(selectedRows);
   const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
-  const testTargets = accountTestRows(selectedRows);
-  const invalidTestRow = selectedRows.some((row) => (
-    !Number.isSafeInteger(Number(row?.accountId)) || Number(row.accountId) <= 0
-  ));
+  const testSelection = accountTestTargetsFromRows(selectedRows);
+  const testTargets = testSelection.targets;
   const canRunAccountTest = state.selected.size > 0
     && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
-    && !invalidTestRow
+    && !testSelection.problem
     && testTargets.length > 0
     && !state.snapshot?.readOnly;
   const canRunPhase3 = state.selected.size > 0
@@ -2403,7 +2425,7 @@ function updateActionState() {
     } else if (selectionVisibilityProblem) {
       elements.accountTestButton.title = selectionVisibilityProblem;
     } else if (!canRunAccountTest) {
-      elements.accountTestButton.title = '请选择已导入 Sub2API 的上游账号';
+      elements.accountTestButton.title = testSelection.problem || '请选择已导入 Sub2API 的上游账号';
     } else {
       elements.accountTestButton.title = '使用所选模型测试上游账号；error 账号成功后恢复并启用';
     }

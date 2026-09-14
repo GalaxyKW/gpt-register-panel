@@ -1,4 +1,5 @@
 const { getAccountAvailability } = require('./accountAvailability');
+const { accountTestTargetRevision } = require('./accountTargetRevision');
 const { normalizeEmail } = require('./lib/token');
 
 const TERMINAL_USERNAME_STATUSES = new Set([
@@ -158,6 +159,10 @@ function rowFromDiffItem(item, options = {}) {
     sourceDetails: sourceDetails(token),
     remoteDetails: remoteDetails(account),
     accountId: account?.id ?? null,
+    // This process-bound HMAC lets a later mutation prove that the operator
+    // selected this exact remote identity and state. It intentionally expires
+    // across panel restarts and contains no reversible account identifiers.
+    targetRevision: accountTestTargetRevision(account),
     accountName: account?.name || '',
     email: account?.email || token?.email || '',
     phone: username.phone,

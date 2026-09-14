@@ -35,6 +35,7 @@ const {
 const {
   activeAccountTestJobs,
   accountTestTargetBaseline,
+  assertAccountTestTargetRevisions,
   classifyAccountTestTargets,
   normalizeAccountTestRequest,
   runAccountTestJob,
@@ -2619,6 +2620,11 @@ function createServer(options = {}) {
               signal,
             });
             throwIfJobInterrupted(signal);
+            // Validate the exact UI-reviewed account identity, credential
+            // evidence and state before consulting active jobs or creating a
+            // durable task. The opaque revisions themselves are never stored.
+            assertAccountTestTargetRevisions(accounts, requestData.targets);
+            throwIfJobInterrupted(signal);
             const jobs = await db.listJobs(200);
             throwIfJobInterrupted(signal);
             const classified = classifyAccountTestTargets(accounts, requestData.accountIds, activeAccountTestJobs(jobs));
@@ -2706,6 +2712,7 @@ function createServer(options = {}) {
         });
         const status = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
+          : error?.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE' ? 409
           : error?.code === 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS' ? 409
             : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
             : error?.message?.includes('required') ? 503 : 400;

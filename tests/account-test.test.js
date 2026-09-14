@@ -9,12 +9,17 @@ require('./test-isolation');
 
 const {
   accountTestTargetBaseline,
+  assertAccountTestTargetRevisions,
   classifyAccountTestTargets,
   normalizeAccountTestModelId,
   normalizeAccountTestRequest,
   runAccountTestJob: runAccountTestJobWithoutLogger,
   runAccountTestJobNow: runAccountTestJobNowWithoutLogger,
 } = require('../backend/accountTestWorker');
+const {
+  accountTestTargetRevision,
+  createAccountTargetRevisionIssuer,
+} = require('../backend/accountTargetRevision');
 const { parseSseEvents } = require('../backend/adapters/sub2apiAdmin');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const { PanelDb } = require('../backend/db');
@@ -176,19 +181,130 @@ async function closeHttpServer(server) {
   });
 }
 
-test('account test request validation only accepts bounded positive ids', () => {
+test('account test request validation requires one opaque revision per unique positive id', () => {
+  const revision4 = 'account-test-v1.' + 'A'.repeat(43);
+  const revision2 = 'account-test-v1.' + 'B'.repeat(43);
   assert.deepEqual(normalizeAccountTestRequest({
-    accountIds: ['4', 2, 4],
+    targets: [
+      { accountId: '4', targetRevision: revision4 },
+      { accountId: 2, targetRevision: revision2 },
+    ],
     modelId: '5.6-luna',
   }), {
+    targets: [
+      { accountId: 4, targetRevision: revision4 },
+      { accountId: 2, targetRevision: revision2 },
+    ],
     accountIds: [4, 2],
     modelId: 'gpt-5.6-luna',
     prompt: '',
   });
   assert.equal(normalizeAccountTestModelId('5.6-luna'), 'gpt-5.6-luna');
   assert.equal(normalizeAccountTestModelId('gpt-5.6-luna'), 'gpt-5.6-luna');
-  assert.throws(() => normalizeAccountTestRequest({ accountIds: [0] }), /正整数/);
-  assert.throws(() => normalizeAccountTestRequest({ accountIds: [1], modelId: 5 }), /modelId/);
+  assert.throws(
+    () => normalizeAccountTestRequest({ accountIds: [4] }),
+    (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
+  );
+  assert.throws(
+    () => normalizeAccountTestRequest({
+      targets: [{ accountId: 0, targetRevision: revision4 }],
+    }),
+    /正整数/,
+  );
+  assert.throws(
+    () => normalizeAccountTestRequest({
+      targets: [
+        { accountId: 4, targetRevision: revision4 },
+        { accountId: 4, targetRevision: revision4 },
+      ],
+    }),
+    (error) => error.code === 'ACCOUNT_TEST_TARGET_DUPLICATE',
+  );
+  assert.throws(
+    () => normalizeAccountTestRequest({
+      targets: [{ accountId: 4, targetRevision: revision4, ignored: true }],
+    }),
+    (error) => error.code === 'ACCOUNT_TEST_TARGET_INVALID',
+  );
+  assert.throws(
+    () => normalizeAccountTestRequest({
+      targets: [{ accountId: 4, targetRevision: 'forged' }],
+    }),
+    (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_INVALID',
+  );
+  assert.throws(() => normalizeAccountTestRequest({
+    targets: [{ accountId: 4, targetRevision: revision4 }],
+    modelId: 5,
+  }), /modelId/);
+});
+
+test('account test target revisions are process-scoped, opaque, and bind recovery inputs', () => {
+  const account = oauthTestAccount(41, 'active', true, {
+    schemaValid: true,
+    platform: 'OpenAI',
+    type: 'OAuth',
+    accountId: '{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}',
+    userId: 'user-41',
+    identityKeys: [
+      'user:user-41',
+      'account:{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}',
+    ],
+    tokenFingerprints: { access: '1111111111111111', refresh: '2222222222222222', id: null },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'absent' },
+    autoPauseOnExpired: true,
+    expiresAt: '2099-01-01T00:00:00.000Z',
+    expiryStatus: 'valid',
+    credentialExpiresAt: '2098-01-01T00:00:00.000Z',
+    credentialExpiryStatus: 'valid',
+    tempUnschedulableUntil: null,
+    tempUnschedulableUntilStatus: 'missing',
+    rateLimitResetAt: null,
+    rateLimitResetStatus: 'missing',
+    overloadUntil: null,
+    overloadUntilStatus: 'missing',
+  });
+  const issuerA = createAccountTargetRevisionIssuer(Buffer.alloc(32, 1));
+  const issuerB = createAccountTargetRevisionIssuer(Buffer.alloc(32, 2));
+  const revision = issuerA.issue(account);
+  assert.match(revision, /^account-test-v1\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(revision.includes('user-41'), false);
+  assert.equal(revision.includes('1111111111111111'), false);
+  assert.equal(issuerA.matches(revision, account), true);
+  assert.equal(issuerB.matches(revision, account), false);
+  assert.equal(accountTestTargetRevision(account), accountTestTargetRevision({
+    ...account,
+    platform: 'openai',
+    type: 'oauth',
+    accountId: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+    identityKeys: [
+      'account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
+      'user:user-41',
+    ],
+  }));
+
+  const changes = [
+    { status: 'error' },
+    { schedulable: false },
+    { tokenFingerprints: { ...account.tokenFingerprints, access: '3333333333333333' } },
+    { credentialPresence: { ...account.credentialPresence, refresh: 'absent' } },
+    { userId: 'replacement-user', identityKeys: ['account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'user:replacement-user'] },
+    { expiresAt: '2099-02-01T00:00:00.000Z' },
+    { tempUnschedulableUntil: '2097-01-01T00:00:00.000Z', tempUnschedulableUntilStatus: 'valid' },
+  ];
+  for (const change of changes) {
+    assert.equal(issuerA.matches(revision, { ...account, ...change }), false);
+  }
+  assert.doesNotThrow(() => assertAccountTestTargetRevisions(
+    [account],
+    [{ accountId: 41, targetRevision: accountTestTargetRevision(account) }],
+  ));
+  assert.throws(
+    () => assertAccountTestTargetRevisions(
+      [{ ...account, userId: 'replacement-user', identityKeys: ['user:replacement-user'] }],
+      [{ accountId: 41, targetRevision: accountTestTargetRevision(account) }],
+    ),
+    (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE',
+  );
 });
 
 test('account test target classification accepts non-error accounts and rejects duplicates', () => {
@@ -222,8 +338,10 @@ test('account test baseline binds normalized submission state without raw identi
     schedulableKnown: true,
   });
   assert.match(baseline.identityDigest, /^[a-f0-9]{64}$/);
+  assert.match(baseline.targetDigest, /^[a-f0-9]{64}$/);
   assert.equal(JSON.stringify(baseline).includes('test-account-21'), false);
   assert.equal(JSON.stringify(baseline).includes('test-user-21'), false);
+  assert.equal(JSON.stringify(baseline).includes('test-fingerprint-21'), false);
 });
 
 function fakeWorkerDb() {
@@ -586,6 +704,32 @@ test('account tests reject submission state changes between list and pre-test de
   assert.equal(schedulableCalls, 0);
 });
 
+test('account tests reject credential changes in the admission-to-worker queue window', async () => {
+  const submitted = oauthTestAccount(42, 'active', true, {
+    tokenFingerprints: { access: '1111111111111111', refresh: null, id: null },
+    credentialPresence: { access: 'present', refresh: 'absent', id: 'absent' },
+  });
+  const changed = {
+    ...submitted,
+    tokenFingerprints: { ...submitted.tokenFingerprints, access: '2222222222222222' },
+  };
+  let testCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [42],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-submitted-credential-changed-before-worker-list',
+    client: {
+      async listAccounts() { return [changed]; },
+      async getAccount() { return changed; },
+      async testAccount() { testCalls += 1; return { success: true }; },
+    },
+  });
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED');
+  assert.equal(testCalls, 0);
+});
+
 test('account test workers fail closed when a persisted target baseline is missing', async () => {
   const account = oauthTestAccount(20, 'active', true);
   let listCalls = 0;
@@ -604,13 +748,10 @@ test('account test workers fail closed when a persisted target baseline is missi
   assert.equal(listCalls, 0);
 });
 
-test('account test workers fail closed for legacy identity-only persisted baselines', async () => {
+test('account test workers fail closed for pre-revision persisted baselines', async () => {
   const account = oauthTestAccount(23, 'active', true);
   const legacyBaseline = accountTestTargetBaseline(account);
-  delete legacyBaseline.status;
-  delete legacyBaseline.statusKnown;
-  delete legacyBaseline.schedulable;
-  delete legacyBaseline.schedulableKnown;
+  delete legacyBaseline.targetDigest;
   let listCalls = 0;
   await assert.rejects(
     runAccountTestJobNow({
@@ -1099,20 +1240,24 @@ test('failed test with an unavailable postflight state requires reconciliation a
   assert.equal(JSON.stringify(outcome).includes('diagnostic unavailable'), false);
 });
 
-test('shutdown cancels the diagnostic read after an unsuccessful account test', async () => {
+test('shutdown after a known failed test persists reconciliation and stops the remaining batch', async () => {
   const account = oauthTestAccount(28, 'active', true);
+  const unattempted = oauthTestAccount(39, 'active', true);
   const controller = new AbortController();
   let reads = 0;
+  let testCalls = 0;
+  let persistedResult = null;
   let markDiagnosticStarted;
   const diagnosticStarted = new Promise((resolve) => { markDiagnosticStarted = resolve; });
   const running = runAccountTestJobNow({
-    accountIds: [28],
-    targetBaselines: targetBaselines(account),
+    accountIds: [28, 39],
+    targetBaselines: targetBaselines(account, unattempted),
     db: fakeWorkerDb(),
     jobId: 'test-failure-diagnostic-cancellation',
     signal: controller.signal,
+    async persistResult(result) { persistedResult = result; },
     client: {
-      async listAccounts() { return [{ ...account }]; },
+      async listAccounts() { return [{ ...account }, { ...unattempted }]; },
       async getAccount(id, options = {}) {
         assert.equal(id, 28);
         reads += 1;
@@ -1127,13 +1272,29 @@ test('shutdown cancels the diagnostic read after an unsuccessful account test', 
           }, { once: true });
         });
       },
-      async testAccount() { return { success: false, message: 'safe failure' }; },
+      async testAccount() {
+        testCalls += 1;
+        return { success: false, message: 'safe failure' };
+      },
     },
   });
   await diagnosticStarted;
   controller.abort();
-  await assert.rejects(running, (error) => error.code === 'JOB_INTERRUPTED');
+  const outcome = await running;
   assert.equal(reads, 2);
+  assert.equal(testCalls, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.reconciliationCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testSuccess, false);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_interrupted');
+  assert.equal(outcome.results[1].accountId, 39);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.equal(persistedResult, outcome);
 });
 
 test('shutdown cancels the diagnostic read after an account test exception', async () => {
@@ -1240,7 +1401,6 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
   ]);
   const testCalls = [];
   const schedulableCalls = [];
-  let replacementAfterNextList = null;
   let omitPaginationMetadataOnce = false;
   const upstream = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://upstream.test');
@@ -1266,10 +1426,6 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
         message: 'success',
         data,
       }));
-      if (rows.length > 0 && replacementAfterNextList) {
-        accounts.set(replacementAfterNextList.id, replacementAfterNextList.account);
-        replacementAfterNextList = null;
-      }
       return;
     }
     if (!idMatch) {
@@ -1380,25 +1536,70 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     });
     const baseUrl = 'http://127.0.0.1:' + server.address().port;
     const headers = { 'x-panel-token': 'panel-account-test' };
+    const snapshotTargets = async (accountIds) => {
+      const snapshot = await requestJson(baseUrl, '/api/snapshot', { headers });
+      assert.equal(snapshot.status, 200, snapshot.body);
+      return accountIds.map((accountId) => {
+        const matches = snapshot.json.rows.filter((row) => Number(row.accountId) === accountId);
+        assert.equal(matches.length, 1, 'snapshot must expose exactly one row for account ' + accountId);
+        assert.match(matches[0].targetRevision, /^account-test-v1\.[A-Za-z0-9_-]{43}$/);
+        return { accountId, targetRevision: matches[0].targetRevision };
+      });
+    };
     const models = await requestJson(baseUrl, '/api/account-tests/models?accountId=1', { headers });
     assert.equal(models.status, 200);
     assert.deepEqual(models.json.models, ['gpt-5', 'gpt-5-mini']);
+
+    const initialTargets = await snapshotTargets([1, 2, 3, 4]);
+    const targetFor = (id) => initialTargets.find((target) => target.accountId === id);
+
+    const legacyNumericOnly = await requestJson(baseUrl, '/api/account-tests', {
+      method: 'POST',
+      headers,
+      body: { accountIds: [2], modelId: 'gpt-5.6-luna' },
+    });
+    assert.equal(legacyNumericOnly.status, 400);
+    assert.equal(legacyNumericOnly.json.error, 'ACCOUNT_TEST_TARGET_REVISION_REQUIRED');
+    assert.equal(testCalls.length, 0);
 
     omitPaginationMetadataOnce = true;
     const incompleteSelection = await requestJson(baseUrl, '/api/account-tests', {
       method: 'POST',
       headers,
-      body: { accountIds: [2], modelId: 'gpt-5.6-luna' },
+      body: { targets: [targetFor(2)], modelId: 'gpt-5.6-luna' },
     });
     assert.equal(incompleteSelection.status, 400);
     assert.equal(incompleteSelection.json.error, 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED');
     assert.equal(testCalls.length, 0);
 
+    const forgedRevision = await requestJson(baseUrl, '/api/account-tests', {
+      method: 'POST',
+      headers,
+      body: {
+        targets: [{ accountId: 2, targetRevision: 'account-test-v1.' + 'Z'.repeat(43) }],
+        modelId: 'gpt-5.6-luna',
+      },
+    });
+    assert.equal(forgedRevision.status, 409);
+    assert.equal(forgedRevision.json.error, 'ACCOUNT_TEST_TARGET_REVISION_STALE');
+    assert.equal(testCalls.length, 0);
+
+    accounts.get(3).schedulable = true;
+    const staleState = await requestJson(baseUrl, '/api/account-tests', {
+      method: 'POST',
+      headers,
+      body: { targets: [targetFor(3)], modelId: 'gpt-5.6-luna' },
+    });
+    assert.equal(staleState.status, 409);
+    assert.equal(staleState.json.error, 'ACCOUNT_TEST_TARGET_REVISION_STALE');
+    assert.equal(testCalls.length, 0);
+    accounts.get(3).schedulable = false;
+
     const queued = await requestJson(baseUrl, '/api/account-tests', {
       method: 'POST',
       headers,
       body: {
-        accountIds: [1, 2],
+        targets: [targetFor(1), targetFor(2)],
         modelId: '5.6-luna',
         prompt: 'unlabelled-private-probe-text',
       },
@@ -1415,6 +1616,10 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     }
     assert.equal(job.status, 'succeeded');
     assert.equal(JSON.stringify(job.payload).includes('unlabelled-private-probe-text'), false);
+    assert.equal(JSON.stringify(job.payload).includes('account-test-v1.'), false);
+    assert.equal(job.payload.targetBaselines.every(
+      (baseline) => /^[a-f0-9]{64}$/.test(baseline.targetDigest),
+    ), true);
     assert.equal(job.payload.promptPresent, true);
     assert.equal(job.payload.promptLength, 'unlabelled-private-probe-text'.length);
     assert.equal(job.result.succeeded, 2);
@@ -1430,7 +1635,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     const failed = await requestJson(baseUrl, '/api/account-tests', {
       method: 'POST',
       headers,
-      body: { accountIds: [3], modelId: 'gpt-5.6-luna' },
+      body: { targets: [targetFor(3)], modelId: 'gpt-5.6-luna' },
     });
     assert.equal(failed.status, 202);
     for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -1444,36 +1649,18 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     assert.equal(accounts.get(3).schedulable, false);
     assert.deepEqual(testCalls.map((call) => call.id), [1, 2, 3]);
 
-    replacementAfterNextList = {
-      id: 4,
-      account: oauthTestAccount(4, 'error', false, {
-        account_id: 'replacement-account-4',
-        user_id: 'replacement-user-4',
-        identityKeys: ['account:replacement-account-4', 'user:replacement-user-4'],
-      }),
-    };
+    accounts.set(4, oauthTestAccount(4, 'error', false, {
+      account_id: 'replacement-account-4',
+      user_id: 'replacement-user-4',
+      identityKeys: ['account:replacement-account-4', 'user:replacement-user-4'],
+    }));
     const reused = await requestJson(baseUrl, '/api/account-tests', {
       method: 'POST',
       headers,
-      body: { accountIds: [4], modelId: 'gpt-5.6-luna' },
+      body: { targets: [targetFor(4)], modelId: 'gpt-5.6-luna' },
     });
-    assert.equal(reused.status, 202);
-    for (let attempt = 0; attempt < 50; attempt += 1) {
-      job = (await requestJson(baseUrl, '/api/jobs/' + encodeURIComponent(reused.json.jobId), { headers })).json;
-      if (['succeeded', 'partial', 'failed', 'interrupted'].includes(job.status)) break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
-    assert.equal(job.status, 'failed');
-    assert.equal(job.payload.targetBaselines.length, 1);
-    assert.match(job.payload.targetBaselines[0].identityDigest, /^[a-f0-9]{64}$/);
-    assert.equal(job.payload.targetBaselines[0].accountId, 4);
-    assert.equal(job.payload.targetBaselines[0].status, 'error');
-    assert.equal(job.payload.targetBaselines[0].statusKnown, true);
-    assert.equal(job.payload.targetBaselines[0].schedulable, false);
-    assert.equal(job.payload.targetBaselines[0].schedulableKnown, true);
-    assert.equal(JSON.stringify(job.payload).includes('test-account-4'), false);
-    assert.equal(JSON.stringify(job.payload).includes('test-user-4'), false);
-    assert.equal(JSON.stringify(job.payload).includes('test-fingerprint-4'), false);
+    assert.equal(reused.status, 409);
+    assert.equal(reused.json.error, 'ACCOUNT_TEST_TARGET_REVISION_STALE');
     assert.deepEqual(testCalls.map((call) => call.id), [1, 2, 3]);
     assert.equal(accounts.get(4).account_id, 'replacement-account-4');
     assert.equal(accounts.get(4).schedulable, false);

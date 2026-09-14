@@ -117,6 +117,47 @@ test('view rows fail closed for malformed decision metadata', () => {
   assert.equal(JSON.stringify(row).includes('must-not-be-forwarded'), false);
 });
 
+test('view rows expose only an opaque process-bound revision for valid remote test targets', () => {
+  const account = {
+    id: 267,
+    name: 'free00007',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    schemaValid: true,
+    accountId: 'sensitive-account-267',
+    userId: 'sensitive-user-267',
+    identityKeys: ['account:sensitive-account-267', 'user:sensitive-user-267'],
+    tokenFingerprints: { access: '1234567890abcdef', refresh: null, id: null },
+    credentialPresence: { access: 'present', refresh: 'absent', id: 'absent' },
+  };
+  const row = rowFromDiffItem({
+    kind: 'sub2api_only',
+    token: null,
+    account,
+    issues: [],
+  });
+  assert.match(row.targetRevision, /^account-test-v1\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(row.targetRevision.includes(account.accountId), false);
+  assert.equal(row.targetRevision.includes(account.userId), false);
+  assert.equal(row.targetRevision.includes(account.tokenFingerprints.access), false);
+
+  const replaced = rowFromDiffItem({
+    kind: 'sub2api_only',
+    token: null,
+    account: {
+      ...account,
+      userId: 'replacement-user-267',
+      identityKeys: ['account:sensitive-account-267', 'user:replacement-user-267'],
+    },
+    issues: [],
+  });
+  assert.notEqual(replaced.targetRevision, row.targetRevision);
+});
+
 test('view rows use null for the side that does not exist', () => {
   const sourceOnly = rowFromDiffItem({
     kind: 'token_only',

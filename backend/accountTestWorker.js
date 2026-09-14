@@ -2,6 +2,11 @@ const crypto = require('node:crypto');
 
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { getAccountAvailability } = require('./accountAvailability');
+const {
+  REVISION_PATTERN,
+  accountTestTargetDigest,
+  matchesAccountTestTargetRevision,
+} = require('./accountTargetRevision');
 const { accountKeys, hasStrongIdentity, identitiesStronglyCompatible } = require('./diff');
 const { normalizeIdentityValue } = require('./lib/token');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
@@ -99,30 +104,50 @@ function normalizeAccountTestRequest(body) {
     error.code = 'ACCOUNT_TEST_REQUEST_INVALID';
     throw error;
   }
-  const rawIds = body.accountIds ?? body.account_ids;
-  if (!Array.isArray(rawIds) || rawIds.length === 0 || rawIds.length > 100) {
-    const error = new Error('至少选择一个已导入的上游账号，单次最多测试 100 个账号');
+  if (Object.prototype.hasOwnProperty.call(body, 'accountIds')
+      || Object.prototype.hasOwnProperty.call(body, 'account_ids')) {
+    const error = new Error('账号测试请求缺少当前快照的目标 revision，请刷新页面后重新选择');
+    error.code = 'ACCOUNT_TEST_TARGET_REVISION_REQUIRED';
+    throw error;
+  }
+  const rawTargets = body.targets;
+  if (!Array.isArray(rawTargets) || rawTargets.length === 0 || rawTargets.length > 100) {
+    const error = new Error('至少选择一个带当前 revision 的上游账号，单次最多测试 100 个账号');
     error.code = 'ACCOUNT_TEST_SELECTION_INVALID';
     throw error;
   }
   const accountIds = [];
+  const targets = [];
   const seen = new Set();
-  for (const value of rawIds) {
-    const id = normalizePositiveAccountId(value);
+  for (const target of rawTargets) {
+    if (!target || typeof target !== 'object' || Array.isArray(target)
+        || Object.keys(target).length !== 2
+        || !Object.prototype.hasOwnProperty.call(target, 'accountId')
+        || !Object.prototype.hasOwnProperty.call(target, 'targetRevision')) {
+      const error = new Error('每个账号测试目标必须只包含 accountId 和 targetRevision');
+      error.code = 'ACCOUNT_TEST_TARGET_INVALID';
+      throw error;
+    }
+    const id = normalizePositiveAccountId(target.accountId);
     if (!id) {
-      const error = new Error('accountIds 必须是正整数 ID 数组');
+      const error = new Error('账号测试目标的 accountId 必须是正整数');
       error.code = 'ACCOUNT_TEST_ACCOUNT_ID_INVALID';
       throw error;
     }
-    if (!seen.has(id)) {
-      seen.add(id);
-      accountIds.push(id);
+    if (seen.has(id)) {
+      const error = new Error('同一账号 ID 不能重复提交；请刷新后重新选择唯一账号行');
+      error.code = 'ACCOUNT_TEST_TARGET_DUPLICATE';
+      throw error;
     }
-  }
-  if (accountIds.length === 0) {
-    const error = new Error('没有有效的账号 ID');
-    error.code = 'ACCOUNT_TEST_SELECTION_INVALID';
-    throw error;
+    if (typeof target.targetRevision !== 'string'
+        || !REVISION_PATTERN.test(target.targetRevision)) {
+      const error = new Error('账号测试目标 revision 缺失或格式无效，请刷新页面后重试');
+      error.code = 'ACCOUNT_TEST_TARGET_REVISION_INVALID';
+      throw error;
+    }
+    seen.add(id);
+    accountIds.push(id);
+    targets.push({ accountId: id, targetRevision: target.targetRevision });
   }
   const modelValue = body.modelId ?? body.model_id ?? '';
   if (typeof modelValue !== 'string' || modelValue.length > 256) {
@@ -137,10 +162,31 @@ function normalizeAccountTestRequest(body) {
     throw error;
   }
   return {
+    targets,
     accountIds,
     modelId: normalizeAccountTestModelId(modelValue),
     prompt: promptValue.trim(),
   };
+}
+
+function assertAccountTestTargetRevisions(accountRows, targets) {
+  const accountsById = new Map();
+  for (const account of accountRows || []) {
+    const id = normalizePositiveAccountId(account?.id);
+    if (!id) continue;
+    const bucket = accountsById.get(id) || [];
+    bucket.push(account);
+    accountsById.set(id, bucket);
+  }
+  for (const target of targets || []) {
+    const matches = accountsById.get(target.accountId) || [];
+    if (matches.length !== 1
+        || !matchesAccountTestTargetRevision(target.targetRevision, matches[0])) {
+      const error = new Error('账号身份、凭据或状态已变化，旧 revision 已失效；请刷新页面后重新选择');
+      error.code = 'ACCOUNT_TEST_TARGET_REVISION_STALE';
+      throw error;
+    }
+  }
 }
 
 function accountStatus(account) {
@@ -202,6 +248,8 @@ function accountTestTargetBaseline(account) {
   const strongIdentityKeys = canonicalStrongIdentityKeys(account);
   if (strongIdentityKeys.length === 0) return null;
   const state = accountTestState(account);
+  const targetDigest = accountTestTargetDigest(account);
+  if (!targetDigest) return null;
   return {
     accountId,
     // Persist only a one-way digest. Raw account/user IDs and credentials do
@@ -209,6 +257,10 @@ function accountTestTargetBaseline(account) {
     identityDigest: crypto.createHash('sha256')
       .update(JSON.stringify(strongIdentityKeys))
       .digest('hex'),
+    // The full reviewed target (credential fingerprints/presence and every
+    // recovery-relevant state field) is also persisted only as a one-way
+    // digest, closing the admission-to-worker queue window.
+    targetDigest,
     // Bind the decision to probe/recover to the state that was reviewed at
     // submission time. These normalized fields are safe to persist and stop a
     // queued healthy test from becoming an implicit recovery operation.
@@ -232,11 +284,15 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
     const identityDigest = typeof baseline?.identityDigest === 'string'
       ? baseline.identityDigest.trim().toLowerCase()
       : '';
+    const targetDigest = typeof baseline?.targetDigest === 'string'
+      ? baseline.targetDigest.trim().toLowerCase()
+      : '';
     const status = typeof baseline?.status === 'string'
       ? baseline.status.trim().toLowerCase()
       : '';
     if (!accountId || !expectedIds.has(accountId) || baselines.has(accountId)
         || !/^[a-f0-9]{64}$/.test(identityDigest)
+        || !/^[a-f0-9]{64}$/.test(targetDigest)
         || baseline?.statusKnown !== true
         || !['active', 'disabled', 'error'].includes(status)
         || baseline?.schedulableKnown !== true
@@ -248,6 +304,7 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
     baselines.set(accountId, {
       accountId,
       identityDigest,
+      targetDigest,
       status,
       statusKnown: true,
       schedulable: baseline.schedulable,
@@ -260,6 +317,14 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
     throw error;
   }
   return baselines;
+}
+
+function matchesAccountTestTargetDigest(baseline, account) {
+  const actualDigest = accountTestTargetDigest(account);
+  if (!baseline || !actualDigest) return false;
+  const expected = Buffer.from(baseline.targetDigest, 'hex');
+  const actual = Buffer.from(actualDigest, 'hex');
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
 function matchesAccountTestIdentityBaseline(baseline, account) {
@@ -293,6 +358,11 @@ function assertAccountTestSubmittedBaseline(baseline, account) {
   if (!matchesAccountTestStateBaseline(baseline, account)) {
     const error = new Error('账号状态或调度设置自测试任务提交后已变化，已拒绝执行');
     error.code = 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED';
+    throw error;
+  }
+  if (!matchesAccountTestTargetDigest(baseline, account)) {
+    const error = new Error('账号凭据或恢复状态自测试任务提交后已变化，已拒绝执行');
+    error.code = 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED';
     throw error;
   }
 }
@@ -555,6 +625,7 @@ async function runAccountTestJobNow({
     let recoveryAttempted = false;
     let recoveryMutation = null;
     let testSucceeded = false;
+    let testSuccessKnown = false;
     try {
       if (listedAccount) assertAccountTestSubmittedBaseline(submittedBaseline, listedAccount);
       // Re-read immediately before testing so a deleted account or concurrent
@@ -597,16 +668,17 @@ async function runAccountTestJobNow({
         timeoutMs: Math.max(1, deadline - Date.now()),
         signal,
       });
+      testSuccessKnown = typeof test?.success === 'boolean';
       testSucceeded = test?.success === true;
-      // A successful test has already allowed Sub2API to mutate runtime state.
-      // If shutdown wins before the panel can verify the result (and, for an
-      // error account, restore scheduling), persist the unfinished chain rather
-      // than silently relabelling it as an ordinary interrupted job.
-      if (signal?.aborted && testSucceeded) {
+      // Any dispatched test can change Sub2API runtime state, including a
+      // test whose terminal result is a known failure. If shutdown wins before
+      // postflight verification, persist the unfinished chain rather than
+      // silently relabelling it as an ordinary interrupted job.
+      if (signal?.aborted && testSuccessKnown) {
         throw accountTestReconciliationError(
-          new Error('账号测试成功后恢复流程因面板停机中断'),
+          new Error('账号测试后状态确认流程因面板停机中断'),
           'post_test_interrupted',
-          { testSuccess: true },
+          { testSuccess: testSucceeded },
         );
       }
       throwIfJobInterrupted(signal);
@@ -617,8 +689,11 @@ async function runAccountTestJobNow({
           afterFailure = await client.getAccount(id, { signal });
         } catch (readError) {
           if (readError?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
-            throwIfJobInterrupted(signal);
-            throw readError;
+            throw accountTestReconciliationError(
+              readError,
+              'post_test_interrupted',
+              { testSuccess: false },
+            );
           }
           afterFailureReadError = readError;
         }
@@ -953,14 +1028,14 @@ async function runAccountTestJobNow({
         ? schedulerReconciliationError(error)
         : null;
       if (!reconciliationError
-          && testSucceeded
+          && testSuccessKnown
           && !recoveryMutation) {
         reconciliationError = accountTestReconciliationError(
           error,
           error?.code === 'JOB_INTERRUPTED' || signal?.aborted
             ? 'post_test_interrupted'
             : 'post_test_state_unconfirmed',
-          { testSuccess: true },
+          { testSuccess: testSucceeded },
         );
       }
       if (recoveryMutation && !reconciliationError) {
@@ -1085,7 +1160,8 @@ async function runAccountTestJobNow({
         accountId: id,
         accountName: account?.name || null,
         status: 'failed',
-        code: error?.code === 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED'
+        code: ['ACCOUNT_TEST_SUBMITTED_STATE_CHANGED', 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED']
+          .includes(error?.code)
           ? error.code
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),
         message: safeErrorMessage(error),
@@ -1209,6 +1285,7 @@ function runAccountTestJob(args = {}) {
 module.exports = {
   accountTestTargetBaseline,
   activeAccountTestJobs,
+  assertAccountTestTargetRevisions,
   classifyAccountTestTargets,
   normalizeAccountTestModelId,
   normalizeAccountTestRequest,

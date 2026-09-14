@@ -1148,6 +1148,40 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
     /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
 });
 
+test('frontend submits one snapshot-bound revision per unambiguous account test target', () => {
+  const targetContract = sourceSection('function accountTestRows', 'async function loadAccountTestModels');
+  const handlerContract = sourceSection(
+    'if (elements.accountTestButton) {',
+    'if (elements.cleanupButton) {',
+  );
+  const context = {};
+  vm.runInNewContext(targetContract + `
+    valid = accountTestTargetsFromRows([
+      { accountId: 7, targetRevision: 'revision-seven' },
+      { accountId: 8, targetRevision: 'revision-eight' },
+    ]);
+    duplicate = accountTestTargetsFromRows([
+      { accountId: 7, targetRevision: 'revision-seven' },
+      { accountId: 7, targetRevision: 'revision-seven' },
+    ]);
+    conflicting = accountTestTargetsFromRows([
+      { accountId: 7, targetRevision: 'revision-seven' },
+      { accountId: 7, targetRevision: 'revision-replaced' },
+    ]);
+    stale = accountTestTargetsFromRows([{ accountId: 7 }]);
+  `, context);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.valid.targets)), [
+    { accountId: 7, targetRevision: 'revision-seven' },
+    { accountId: 8, targetRevision: 'revision-eight' },
+  ]);
+  assert.equal(context.valid.problem, '');
+  assert.match(context.duplicate.problem, /同一 Sub2API 账号 ID/);
+  assert.match(context.conflicting.problem, /多个不同 revision/);
+  assert.match(context.stale.problem, /刷新后重新选择/);
+  assert.match(handlerContract, /body: JSON\.stringify\(\{\s*targets,\s*modelId,/);
+  assert.doesNotMatch(handlerContract, /accountIds\s*:/);
+});
+
 test('frontend labels the remote-only source filter unambiguously', () => {
   assert.match(htmlSource, /<option value="sub2api">仅 Sub2API（无本地 token）<\/option>/);
 });
@@ -1374,7 +1408,7 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
       cleanupButton: {},
     },
     document: { querySelectorAll: () => [] },
-    accountTestRows: () => [],
+    accountTestTargetsFromRows: () => ({ targets: [], problem: '' }),
     actionsLocked: () => false,
     reconciliationWriteBlocked: () => false,
     updateImportButtonState() {},
