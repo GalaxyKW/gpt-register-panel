@@ -14,6 +14,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
+const DEFAULT_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
+const MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_ADMIN_REQUEST_PATH_BYTES = 4096;
 const MAX_BATCH_ACCOUNT_IDS = 1000;
 const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST']);
@@ -775,21 +777,6 @@ function safeModelId(value) {
   return redacted.includes('[redacted]') ? '' : redacted;
 }
 
-function hasInvalidUnicodeText(value) {
-  if (value.includes('\ufffd')) return true;
-  for (let index = 0; index < value.length; index += 1) {
-    const code = value.charCodeAt(index);
-    if (code >= 0xd800 && code <= 0xdbff) {
-      const next = value.charCodeAt(index + 1);
-      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
-      index += 1;
-    } else if (code >= 0xdc00 && code <= 0xdfff) {
-      return true;
-    }
-  }
-  return false;
-}
-
 function decodeResponseBytes(bytes, fatalUtf8) {
   if (!fatalUtf8) return Buffer.from(bytes).toString('utf8');
   try {
@@ -801,46 +788,130 @@ function decodeResponseBytes(bytes, fatalUtf8) {
   }
 }
 
-async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024, options = {}) {
+async function readResponseTextWithLimit(response, limit = DEFAULT_RESPONSE_BODY_BYTES, options = {}) {
   const fatalUtf8 = options.fatalUtf8 === true;
-  if (!response?.body || typeof response.body.getReader !== 'function') {
-    const text = await response.text();
-    if (Buffer.byteLength(text, 'utf8') > limit) {
-      const error = new Error('Sub2API response body too large');
-      error.code = 'SUB2API_RESPONSE_TOO_LARGE';
-      throw error;
+  const signal = options.signal;
+  const byteLimit = Number.isSafeInteger(limit) && limit > 0
+    ? Math.min(limit, MAX_RESPONSE_BODY_BYTES)
+    : DEFAULT_RESPONSE_BODY_BYTES;
+  let reader;
+  let releaseReader = () => {};
+  let cancelReader = () => {};
+  try {
+    if (response?.body && typeof response.body.getReader === 'function') {
+      reader = response.body.getReader();
+      releaseReader = () => reader.releaseLock();
+      cancelReader = () => reader.cancel();
+    } else if (response?.body
+        && typeof response.body[Symbol.asyncIterator] === 'function') {
+      const iterator = response.body[Symbol.asyncIterator]();
+      reader = { read: () => iterator.next() };
+      cancelReader = () => {
+        if (typeof iterator.return === 'function') return iterator.return();
+        if (typeof response.body.destroy === 'function') response.body.destroy();
+        return undefined;
+      };
     }
-    // fetch Response#text normally performs replacement decoding. Test doubles
-    // and older fetch implementations may expose only that already-decoded
-    // string, so reject replacement/lone-surrogate evidence conservatively.
-    if (fatalUtf8 && hasInvalidUnicodeText(text)) {
-      const error = new Error('Sub2API response is not valid UTF-8');
-      error.code = 'SUB2API_RESPONSE_UTF8_INVALID';
-      throw error;
-    }
-    return text;
+  } catch {
+    reader = null;
   }
-  const reader = response.body.getReader();
+  if (!reader || typeof reader.read !== 'function') {
+    // response.text()/arrayBuffer() allocate the complete response before a
+    // postflight size check. Fail closed when the fetch implementation cannot
+    // expose a stream whose bytes can be counted as they arrive.
+    const error = new Error('Sub2API response body is not a readable stream');
+    error.code = 'SUB2API_RESPONSE_STREAM_UNAVAILABLE';
+    throw error;
+  }
+
+  const readChunk = () => {
+    if (!signal || typeof signal.addEventListener !== 'function') return reader.read();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        try { signal.removeEventListener('abort', abort); } catch {}
+      };
+      const finish = (callback, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        callback(value);
+      };
+      const abort = () => {
+        const error = new Error('Sub2API response body read aborted');
+        error.name = 'AbortError';
+        finish(reject, error);
+      };
+      try { signal.addEventListener('abort', abort, { once: true }); } catch {}
+      if (signal.aborted) {
+        abort();
+        return;
+      }
+      Promise.resolve()
+        .then(() => reader.read())
+        .then(
+          (value) => finish(resolve, value),
+          (error) => finish(reject, error),
+        );
+    });
+  };
   const chunks = [];
   let total = 0;
+  let complete = false;
   try {
     while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      const chunk = Buffer.from(value);
-      total += chunk.length;
-      if (total > limit) {
-        try { await reader.cancel(); } catch {}
+      const result = await readChunk();
+      if (!result || typeof result !== 'object') {
+        const error = new Error('Sub2API response stream returned an invalid chunk');
+        error.code = 'SUB2API_RESPONSE_STREAM_UNAVAILABLE';
+        throw error;
+      }
+      const { done, value } = result;
+      if (done === true) {
+        complete = true;
+        break;
+      }
+      let byteLength;
+      if (value instanceof Uint8Array) {
+        byteLength = value.byteLength;
+      } else if (value instanceof ArrayBuffer) {
+        byteLength = value.byteLength;
+      } else {
+        const error = new Error('Sub2API response stream returned an invalid chunk');
+        error.code = 'SUB2API_RESPONSE_STREAM_UNAVAILABLE';
+        throw error;
+      }
+      total += byteLength;
+      if (total > byteLimit) {
         const error = new Error('Sub2API response body too large');
         error.code = 'SUB2API_RESPONSE_TOO_LARGE';
         throw error;
       }
-      chunks.push(chunk);
+      chunks.push(value instanceof Uint8Array
+        ? Buffer.from(value)
+        : Buffer.from(new Uint8Array(value)));
     }
   } finally {
-    try { reader.releaseLock(); } catch {}
+    if (!complete) {
+      try {
+        const cancellation = cancelReader();
+        if (cancellation && typeof cancellation.catch === 'function') cancellation.catch(() => {});
+      } catch {}
+    }
+    try { releaseReader(); } catch {}
   }
   return decodeResponseBytes(Buffer.concat(chunks), fatalUtf8);
+}
+
+function cancelUnreadResponseBody(response) {
+  try {
+    if (response?.body && typeof response.body.cancel === 'function') {
+      const cancellation = response.body.cancel();
+      if (cancellation && typeof cancellation.catch === 'function') cancellation.catch(() => {});
+    } else if (response?.body && typeof response.body.destroy === 'function') {
+      response.body.destroy();
+    }
+  } catch {}
 }
 
 function parseAccountTestSse(text) {
@@ -1115,11 +1186,11 @@ class Sub2ApiAdminClient {
       MAX_TEST_TIMEOUT_MS,
     );
     const maxResponseBytes = Number(
-      options.maxResponseBytes || process.env.SUB2API_MAX_RESPONSE_BYTES || 4 * 1024 * 1024,
+      options.maxResponseBytes || process.env.SUB2API_MAX_RESPONSE_BYTES || DEFAULT_RESPONSE_BODY_BYTES,
     );
     this.maxResponseBytes = Number.isSafeInteger(maxResponseBytes) && maxResponseBytes >= 1024
-      ? Math.min(maxResponseBytes, 32 * 1024 * 1024)
-      : 4 * 1024 * 1024;
+      ? Math.min(maxResponseBytes, MAX_RESPONSE_BODY_BYTES)
+      : DEFAULT_RESPONSE_BODY_BYTES;
     this.logger = options.logger || null;
     this.logContext = options.logContext && typeof options.logContext === 'object'
       ? options.logContext
@@ -1213,6 +1284,7 @@ class Sub2ApiAdminClient {
         redirect: 'error',
       });
       if (!isJsonResponse(response)) {
+        cancelUnreadResponseBody(response);
         throw requestFailure(
           'SUB2API_RESPONSE_CONTENT_TYPE_INVALID',
           'Sub2API 返回的响应类型不是 JSON：' + method + ' ' + pathname,
@@ -1223,7 +1295,7 @@ class Sub2ApiAdminClient {
       text = await readResponseTextWithLimit(
         response,
         requestOptions.maxResponseBytes || this.maxResponseBytes,
-        { fatalUtf8: true },
+        { fatalUtf8: true, signal: controller.signal },
       );
     } catch (error) {
       let failure;
@@ -1243,6 +1315,9 @@ class Sub2ApiAdminClient {
       } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
         failure = error;
         reason = 'invalid_utf8';
+      } else if (error?.code === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
+        failure = error;
+        reason = 'response_stream_unavailable';
       } else if (error?.code === 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID') {
         failure = error;
         reason = 'invalid_content_type';
@@ -1634,10 +1709,27 @@ class Sub2ApiAdminClient {
         // through a cross-host redirect.
         redirect: 'error',
       });
+      if (!isSuccessfulHttpResponse(response)) {
+        cancelUnreadResponseBody(response);
+        throw markAccountTestOutcomeUnknown(
+          requestFailure(
+            'SUB2API_TEST_REQUEST_REJECTED',
+            'Sub2API 账号测试请求被上游拒绝（HTTP ' + response?.status + '）',
+          ),
+          'response_rejected',
+        );
+      }
+      if (!isEventStreamResponse(response)) {
+        cancelUnreadResponseBody(response);
+        throw markAccountTestOutcomeUnknown(
+          requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应类型无效'),
+          'invalid_content_type',
+        );
+      }
       text = await readResponseTextWithLimit(
         response,
         this.maxResponseBytes,
-        { fatalUtf8: true },
+        { fatalUtf8: true, signal: controller.signal },
       );
     } catch (error) {
       let failure;
@@ -1660,17 +1752,28 @@ class Sub2ApiAdminClient {
       } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
         failure = requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应编码无效');
         reason = 'invalid_utf8';
+      } else if (error?.code === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
+        failure = requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应无法安全读取');
+        reason = 'response_stream_unavailable';
       } else if (error?.code === 'JOB_INTERRUPTED') {
         failure = error;
         reason = 'external_abort';
+      } else if (error?.code === 'SUB2API_TEST_REQUEST_REJECTED'
+          || error?.code === 'SUB2API_TEST_RESPONSE_INVALID') {
+        failure = error;
+        reason = error.reconciliationReason || 'invalid_response';
       } else {
         failure = requestFailure('SUB2API_TEST_TRANSPORT_ERROR', 'Sub2API 账号测试请求失败');
       }
       if (requestDispatched) failure = markAccountTestOutcomeUnknown(failure, reason);
-      writeLog(this.logger, 'error', 'sub2api.account_test_failed', {
+      const rejected = failure.code === 'SUB2API_TEST_REQUEST_REJECTED';
+      writeLog(this.logger, rejected ? 'warn' : 'error', rejected
+        ? 'sub2api.account_test_rejected'
+        : 'sub2api.account_test_failed', {
         ...this.logContext,
         accountId,
         model: modelId || null,
+        statusCode: Number.isSafeInteger(response?.status) ? response.status : null,
         durationMs: Date.now() - startedAt,
         error: safeRemoteText(failure.message),
         testOutcomeUnknown: failure.testOutcomeUnknown === true,
@@ -1685,29 +1788,6 @@ class Sub2ApiAdminClient {
       throw markAccountTestOutcomeUnknown(
         requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试返回空响应'),
         'empty_response',
-      );
-    }
-    if (!isSuccessfulHttpResponse(response)) {
-      const error = markAccountTestOutcomeUnknown(
-        requestFailure('SUB2API_TEST_REQUEST_REJECTED', 'Sub2API 账号测试请求被上游拒绝（HTTP ' + response.status + '）'),
-        'response_rejected',
-      );
-      writeLog(this.logger, 'warn', 'sub2api.account_test_rejected', {
-        ...this.logContext,
-        accountId,
-        model: modelId || null,
-        statusCode: response.status,
-        durationMs: Date.now() - startedAt,
-        error: error.message,
-        testOutcomeUnknown: true,
-      });
-      throw error;
-    }
-
-    if (!isEventStreamResponse(response)) {
-      throw markAccountTestOutcomeUnknown(
-        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应类型无效'),
-        'invalid_content_type',
       );
     }
     const parsedSse = parseAccountTestSse(text);

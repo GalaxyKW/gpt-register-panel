@@ -2200,18 +2200,13 @@ test('Sub2API request errors are redacted before leaving the adapter', async () 
   const opaqueRejectedDetail = 'opaque-rejected-detail-85c214';
   const opaqueTransportDetail = 'opaque-transport-detail-a619d0';
   try {
-    global.fetch = async () => ({
-      ok: false,
+    global.fetch = async () => new Response(JSON.stringify({
+      success: false,
+      message: opaqueRejectedDetail,
+    }), {
       status: 400,
       statusText: 'Bad Request',
-      headers: new Headers({ 'content-type': 'application/json' }),
-      body: null,
-      async text() {
-        return JSON.stringify({
-          success: false,
-          message: opaqueRejectedDetail,
-        });
-      },
+      headers: { 'content-type': 'application/json' },
     });
     await assert.rejects(
       client.request('GET', '/api/v1/admin/accounts/1'),
@@ -2330,26 +2325,20 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
       fetchCalls += 1;
       assert.equal(url, 'http://127.0.0.1:8080/api/v1/admin/accounts/import/codex-session');
       capturedHeaders = options.headers;
-      return {
-        ok: true,
-        status: 200,
-        statusText: 'OK',
-        headers: new Headers({ 'content-type': 'application/json; charset=utf-8' }),
-        body: null,
-        async text() {
-          return JSON.stringify({
-            success: true,
-            data: {
-              total: 1,
-              created: 1,
-              updated: 0,
-              skipped: 0,
-              failed: 0,
-              items: [{ action: 'created', account_id: 41 }],
-            },
-          });
+      return new Response(JSON.stringify({
+        success: true,
+        data: {
+          total: 1,
+          created: 1,
+          updated: 0,
+          skipped: 0,
+          failed: 0,
+          items: [{ action: 'created', account_id: 41 }],
         },
-      };
+      }), {
+        status: 200,
+        headers: { 'content-type': 'application/json; charset=utf-8' },
+      });
     };
 
     await assert.rejects(
@@ -2390,14 +2379,10 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
 test('Sub2API write requests distinguish pre-dispatch failures from unknown remote outcomes', async () => {
   const originalFetch = global.fetch;
   const idempotencyKey = 'gptreg-create-v1-' + 'b'.repeat(64);
-  const response = (text, overrides = {}) => ({
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    headers: new Headers({ 'content-type': 'application/json' }),
-    body: null,
-    async text() { return text; },
-    ...overrides,
+  const response = (text, overrides = {}) => new Response(text, {
+    status: overrides.status ?? (overrides.ok === false ? 500 : 200),
+    statusText: overrides.statusText || 'OK',
+    headers: overrides.headers || { 'content-type': 'application/json' },
   });
   try {
     const scenarios = [
@@ -2802,19 +2787,13 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
 
   const originalFetch = global.fetch;
   try {
-    global.fetch = async () => ({
-      ok: true,
+    global.fetch = async () => new Response('data: ' + JSON.stringify({
+      type: 'test_complete',
+      success: true,
+      model: 'gpt-5',
+    }) + '\n\n', {
       status: 200,
-      statusText: 'OK',
-      headers: new Headers({ 'content-type': 'text/event-stream' }),
-      body: null,
-      async text() {
-        return 'data: ' + JSON.stringify({
-          type: 'test_complete',
-          success: true,
-          model: 'gpt-5',
-        }) + '\n\n';
-      },
+      headers: { 'content-type': 'text/event-stream' },
     });
     await assert.rejects(
       client.testAccount(1, { modelId: 'gpt-5.6-luna' }),
@@ -2826,19 +2805,13 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
         && error.testSuccessKnown === true,
     );
 
-    global.fetch = async () => ({
-      ok: true,
+    global.fetch = async () => new Response('data: ' + JSON.stringify({
+      type: 'test_complete',
+      success: true,
+      model: 'credential=sse-model-value',
+    }) + '\n\n', {
       status: 200,
-      statusText: 'OK',
-      headers: new Headers({ 'content-type': 'text/event-stream' }),
-      body: null,
-      async text() {
-        return 'data: ' + JSON.stringify({
-          type: 'test_complete',
-          success: true,
-          model: 'credential=sse-model-value',
-        }) + '\n\n';
-      },
+      headers: { 'content-type': 'text/event-stream' },
     });
     const tested = await client.testAccount(1);
     assert.equal(tested.success, true);
@@ -2851,14 +2824,10 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
 
 test('Sub2API account tests distinguish pre-dispatch interruption from unknown side effects', async () => {
   const originalFetch = global.fetch;
-  const response = (body, overrides = {}) => ({
-    ok: true,
-    status: 200,
-    statusText: 'OK',
-    headers: new Headers({ 'content-type': 'text/event-stream' }),
-    body: null,
-    async text() { return body; },
-    ...overrides,
+  const response = (body, overrides = {}) => new Response(body, {
+    status: overrides.status ?? (overrides.ok === false ? 500 : 200),
+    statusText: overrides.statusText || 'OK',
+    headers: overrides.headers || { 'content-type': 'text/event-stream' },
   });
   const assertUnknown = (error, code, reason) => error.code === code
     && error.requiresReconciliation === true
