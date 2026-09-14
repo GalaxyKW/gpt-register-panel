@@ -9,6 +9,7 @@ const {
   readGptRegisterSources,
   usernameRecordLimit,
 } = require('./adapters/gptRegisterFs');
+const { isExpired, isExpiryInvalid } = require('./diff');
 const { normalizeEmail } = require('./lib/token');
 const { redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
@@ -670,10 +671,16 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
   // untrusted prose and can contain phrases such as "account disabled"
   // without proving that this account was permanently deactivated.
   if (childRecordedTerminal) {
-    error.code = 'ACCOUNT_DEACTIVATED';
+    const supervisionFailure = error?.code === 'PHASE3_TERMINATION_UNCONFIRMED';
+    // A leaked process tree is the primary safety failure even when the child
+    // also wrote a terminal account disposition. Preserve that supervision
+    // code so callers keep Phase3 poisoned, while recording the independent
+    // account disposition under its own code.
+    error.dispositionCode = 'ACCOUNT_DEACTIVATED';
+    if (!supervisionFailure) error.code = 'ACCOUNT_DEACTIVATED';
     error.retryable = false;
     error.accountDisposition = 'discard';
-    error.message = 'OpenAI 账号已删除或停用';
+    if (!supervisionFailure) error.message = 'OpenAI 账号已删除或停用';
     const screenshot = combined.match(/(?:截图|screenshot)\s*:\s*(\S+\.png)/i)?.[1] || '';
     const safeScreenshot = /^[A-Za-z0-9._/-]{1,240}$/.test(screenshot)
       ? path.basename(screenshot)
@@ -700,6 +707,48 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
 
 function sanitizeLog(value) {
   return redactText(String(value || '')).slice(-12000);
+}
+
+function phase3TokenDateMilliseconds(value) {
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function comparePhase3TokenFreshness(left, right, nowMs = Date.now()) {
+  const leftExpired = isExpired(left, nowMs);
+  const rightExpired = isExpired(right, nowMs);
+  if (leftExpired !== rightExpired) return leftExpired ? 1 : -1;
+  for (const field of ['expiresAt', 'lastRefresh']) {
+    const leftValue = phase3TokenDateMilliseconds(left?.[field]);
+    const rightValue = phase3TokenDateMilliseconds(right?.[field]);
+    if (leftValue !== rightValue) return leftValue > rightValue ? -1 : 1;
+  }
+  const leftMtime = Number(left?.mtimeMs) || 0;
+  const rightMtime = Number(right?.mtimeMs) || 0;
+  if (leftMtime !== rightMtime) return leftMtime > rightMtime ? -1 : 1;
+  for (const field of ['access', 'refresh']) {
+    const leftPresent = Boolean(left?.fingerprints?.[field]);
+    const rightPresent = Boolean(right?.fingerprints?.[field]);
+    if (leftPresent !== rightPresent) return leftPresent ? -1 : 1;
+  }
+  const leftSourcePriority = left?.source === 'tokens' ? 1 : 0;
+  const rightSourcePriority = right?.source === 'tokens' ? 1 : 0;
+  if (leftSourcePriority !== rightSourcePriority) {
+    return leftSourcePriority > rightSourcePriority ? -1 : 1;
+  }
+  return String(left?.relativePath || '').localeCompare(
+    String(right?.relativePath || ''),
+    'en',
+    { numeric: true, sensitivity: 'base' },
+  );
+}
+
+function isUsablePhase3Token(token, nowMs = Date.now()) {
+  return token?.historical !== true
+    && token?.parseStatus === 'ok'
+    && token?.disabled !== true
+    && !isExpiryInvalid(token)
+    && !isExpired(token, nowMs);
 }
 
 function writeLog(logger, level, event, fields = {}) {
@@ -1121,7 +1170,7 @@ async function runPhase3JobNow({
       script: 'index.js',
     });
     let result;
-    let interruptionError = null;
+    let processError = null;
     try {
       throwIfJobInterrupted(signal);
       const phase3Argument = phone && entry.phone
@@ -1163,16 +1212,17 @@ async function runPhase3JobNow({
         ...processSummary,
         error: redactText(String(error?.message || error)),
       });
-      if (!shutdownInterruption || error?.accountDisposition === 'discard') throw error;
+      if (error?.accountDisposition === 'discard'
+          || error?.details?.terminationConfirmed !== true) throw error;
       // The child may have atomically published a valid token immediately
-      // before SIGTERM. Preserve the interruption while checking that
-      // irreversible output below; only a confirmed changed token can turn
-      // this race into success.
-      interruptionError = error;
+      // before a non-zero exit, timeout, output-limit termination or SIGTERM.
+      // Only after the complete process tree is confirmed stopped can that
+      // irreversible output safely turn the task into success.
+      processError = error;
       result = error?.details || {};
     }
     const processSummary = phase3ProcessSummary(result);
-    if (!interruptionError) {
+    if (!processError) {
       writeLog(logger, 'info', 'phase3.process_completed', {
         jobId,
         actor,
@@ -1186,9 +1236,10 @@ async function runPhase3JobNow({
       if (processMarker.accountDisposition === 'discard') throw processMarker;
     }
     const sources = readGptRegisterSources({ rootDirectory: root, rootHandle });
+    const tokenObservedAt = Date.now();
     const beforeByPath = new Map(beforeTokens.map((item) => [item.relativePath, item]));
     const changedTokens = sources.tokens
-      .filter((item) => item.historical !== true && item.parseStatus === 'ok' && item.email === entry.email)
+      .filter((item) => isUsablePhase3Token(item, tokenObservedAt) && item.email === entry.email)
       .filter((item) => {
         const before = beforeByPath.get(item.relativePath);
         if (!before) return true;
@@ -1199,10 +1250,10 @@ async function runPhase3JobNow({
           && Number(item.mtimeMs) >= startedAt;
         return fingerprintChanged || mtimeChangedWithoutFingerprint;
       })
-      .sort((left, right) => right.mtimeMs - left.mtimeMs);
+      .sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
     const token = changedTokens[0];
     if (!token) {
-      if (interruptionError) throw interruptionError;
+      if (processError) throw processError;
       const error = new Error('phase3 已退出，但没有检测到对应的 token 变化');
       error.code = 'PHASE3_TOKEN_UNCHANGED';
       throw error;
@@ -1220,7 +1271,13 @@ async function runPhase3JobNow({
       fingerprint: token.fingerprints?.access || null,
       process: processSummary,
     };
-    if (interruptionError) output.interruptedAfterToken = true;
+    if (processError) {
+      output.processEndedWithError = true;
+      output.processErrorCode = /^[A-Z0-9_]{1,96}$/.test(String(processError.code || ''))
+        ? processError.code
+        : 'PHASE3_PROCESS_FAILED';
+      if (processError.code === 'JOB_INTERRUPTED') output.interruptedAfterToken = true;
+    }
     if (typeof persistSuccess === 'function') {
       try {
         // Token creation is the irreversible Phase3 side effect. Persist its
@@ -1248,7 +1305,11 @@ async function runPhase3JobNow({
         targetKey: 'email:' + entry.email,
         afterFingerprint: token.fingerprints?.access || null,
         result: 'ok',
-        details: { tokenFile: token.relativePath },
+        details: {
+          tokenFile: token.relativePath,
+          processEndedWithError: output.processEndedWithError === true,
+          processErrorCode: output.processErrorCode || null,
+        },
       });
     } catch (auditError) {
       // The browser flow and token write are already complete. Audit storage
@@ -1266,6 +1327,8 @@ async function runPhase3JobNow({
       email: entry.email,
       tokenFile: token.relativePath,
       fingerprint: token.fingerprints?.access || null,
+      processEndedWithError: output.processEndedWithError === true,
+      processErrorCode: output.processErrorCode || null,
       durationMs: Date.now() - startedAt,
     });
     return output;
@@ -1273,7 +1336,11 @@ async function runPhase3JobNow({
     classifyPhase3ProcessError(error, entry, rootHandle);
     if (entry && error?.accountDisposition === 'discard') {
       try {
-        persistAccountDisposition(entry, error.code, rootHandle);
+        persistAccountDisposition(
+          entry,
+          error.dispositionCode || error.code || 'ACCOUNT_DEACTIVATED',
+          rootHandle,
+        );
         writeLog(logger, 'warn', 'phase3.account_discarded', {
           jobId,
           actor,
@@ -1484,6 +1551,8 @@ function runPhase3Job(args = {}) {
 
 module.exports = {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
+  classifyPhase3ProcessError,
+  comparePhase3TokenFreshness,
   findUsernameEntry,
   canonicalPhase3Keys,
   resolvePhase3Requests,

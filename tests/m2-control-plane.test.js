@@ -26,6 +26,7 @@ const {
 const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   canonicalPhase3Keys,
+  classifyPhase3ProcessError,
   findUsernameEntry,
   phase3TerminationBudget,
   sanitizeLog,
@@ -568,6 +569,93 @@ test('Phase3 shutdown preserves success when a valid token was already published
     else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
     if (previous.grace === undefined) delete process.env.PANEL_PHASE3_KILL_GRACE_MS;
     else process.env.PANEL_PHASE3_KILL_GRACE_MS = previous.grace;
+  }
+});
+
+test('Phase3 preserves a valid freshest token after a confirmed non-zero process exit', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-nonzero-token-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'nonzero-token@example.test', password: 'hidden' },
+  ]));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const email = 'nonzero-token@example.test';",
+    'const write = (name, document, timestamp) => {',
+    "  const file = path.join(process.cwd(), 'tokens', name);",
+    '  fs.writeFileSync(file, JSON.stringify({ ...document, email }));',
+    '  fs.utimesSync(file, new Date(timestamp), new Date(timestamp));',
+    '};',
+    "write('expired.json', { access_token: 'expired', expires_at: '2020-01-01T00:00:00.000Z' }, '2099-01-01T00:00:00.000Z');",
+    "write('invalid-expiry.json', { access_token: 'invalid', expires_at: 'not-a-date' }, '2099-01-02T00:00:00.000Z');",
+    "write('disabled.json', { access_token: 'disabled', expires_at: '2099-01-01T00:00:00.000Z', disabled: true }, '2099-01-03T00:00:00.000Z');",
+    "write('shorter.json', { access_token: 'shorter', refresh_token: 'shorter-refresh', expires_at: '2098-01-01T00:00:00.000Z', last_refresh: '2090-01-01T00:00:00.000Z' }, '2099-01-04T00:00:00.000Z');",
+    "write('freshest.json', { access_token: 'freshest', refresh_token: 'freshest-refresh', expires_at: '2099-01-01T00:00:00.000Z', last_refresh: '2020-01-01T00:00:00.000Z' }, '2020-01-01T00:00:00.000Z');",
+    'process.exitCode = 7;',
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const result = await runPhase3Job({
+      email: 'nonzero-token@example.test',
+      jobId: 'nonzero-token-job',
+      db: { async audit() {}, async updateJob() {} },
+    });
+    assert.equal(result.tokenFile, 'tokens/freshest.json');
+    assert.equal(result.processEndedWithError, true);
+    assert.equal(result.processErrorCode, 'PHASE3_PROCESS_FAILED');
+    assert.equal(result.process.code, 7);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('Phase3 supervision failure remains primary when the child also records discard', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-supervision-code-'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email: 'supervision-discard@example.test',
+    password: 'hidden',
+    status: 'account_deactivated',
+    phase3Disposition: 'discard',
+    phase3LastErrorCode: 'ACCOUNT_DEACTIVATED',
+  }]));
+  const previousRoot = process.env.GPT_REGISTER_ROOT;
+  process.env.GPT_REGISTER_ROOT = root;
+  try {
+    const error = new Error('process tree remains');
+    error.code = 'PHASE3_TERMINATION_UNCONFIRMED';
+    error.details = {
+      terminationConfirmed: false,
+      remainingDescendantCount: 1,
+      stderr: 'untrusted child output',
+    };
+    classifyPhase3ProcessError(error, {
+      index: 0,
+      email: 'supervision-discard@example.test',
+      phone: '',
+    });
+    assert.equal(error.code, 'PHASE3_TERMINATION_UNCONFIRMED');
+    assert.equal(error.dispositionCode, 'ACCOUNT_DEACTIVATED');
+    assert.equal(error.accountDisposition, 'discard');
+    assert.equal(error.retryable, false);
+    assert.equal(error.details.phase3.code, 'ACCOUNT_DEACTIVATED');
+    assert.equal(Object.hasOwn(error.details, 'stderr'), false);
+  } finally {
+    if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previousRoot;
   }
 });
 
