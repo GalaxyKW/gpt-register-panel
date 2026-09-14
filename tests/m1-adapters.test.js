@@ -2596,7 +2596,7 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
           updated: 0,
           skipped: 0,
           failed: 0,
-          items: [{ action: 'created', account_id: 41 }],
+          items: [{ index: 1, action: 'created', account_id: 41 }],
         },
       }), {
         status: 200,
@@ -2637,6 +2637,78 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
   } finally {
     global.fetch = originalFetch;
   }
+});
+
+test('Sub2API Codex imports reject malformed and explicitly unsuccessful result contracts', async () => {
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+  });
+  const idempotencyKey = 'gptreg-create-v1-' + 'c'.repeat(64);
+  const valid = {
+    total: 1,
+    created: 1,
+    updated: 0,
+    skipped: 0,
+    failed: 0,
+    items: [{ index: 1, action: 'created', account_id: 41 }],
+  };
+  client.request = async () => valid;
+  assert.deepEqual(
+    await client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+    valid,
+  );
+
+  const malformed = [
+    { message: 'accepted without a result' },
+    { ...valid, success: 'true' },
+    { ...valid, ok: 1 },
+    { ...valid, success: true, ok: false },
+    { ...valid, total: 2 },
+    { ...valid, created: '1' },
+    { ...valid, items: {} },
+    { ...valid, items: [{ ...valid.items[0], index: 2 }] },
+    { ...valid, items: [{ ...valid.items[0], action: 'updated' }] },
+    { ...valid, errors: {} },
+    { ...valid, errors: [{ index: 1, message: 'contradictory error' }] },
+    { ...valid, account_id: 42 },
+  ];
+  for (const result of malformed) {
+    client.request = async () => result;
+    await assert.rejects(
+      client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+      (error) => error.code === 'SUB2API_IMPORT_SCHEMA_INVALID'
+        && error.writeOutcomeUnknown === true
+        && error.requiresReconciliation === true
+        && error.writeOutcomeReason === 'response_schema',
+    );
+  }
+
+  const remoteDetail = 'opaque-import-error-detail';
+  client.request = async () => ({
+    total: 1,
+    created: 0,
+    updated: 0,
+    skipped: 0,
+    failed: 1,
+    items: [{ index: 1, action: 'failed', message: remoteDetail }],
+    errors: [{ index: 1, message: remoteDetail }],
+  });
+  await assert.rejects(
+    client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+    (error) => error.code === 'SUB2API_IMPORT_UNSUCCESSFUL'
+      && error.writeOutcomeUnknown === true
+      && error.requiresReconciliation === true
+      && error.writeOutcomeReason === 'response_unsuccessful'
+      && !error.message.includes(remoteDetail),
+  );
+
+  client.request = async () => ({ ...valid, success: false });
+  await assert.rejects(
+    client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+    (error) => error.code === 'SUB2API_IMPORT_UNSUCCESSFUL'
+      && error.writeOutcomeUnknown === true,
+  );
 });
 
 test('Sub2API write requests distinguish pre-dispatch failures from unknown remote outcomes', async () => {
@@ -3090,6 +3162,10 @@ test('Sub2API account-test options reject invalid models before dispatch', async
       { modelId: 'Bearer ' + secretMarker },
       { modelId: 'model\nwith-control' },
       { modelId: ' gpt-5.6-luna ' },
+      { modelId: 'gpt-5.6-luna\",\"prompt\":\"override' },
+      { modelId: 'gpt 5.6 luna' },
+      { modelId: 'g\u0440t-5.6-luna' },
+      { modelId: 'x'.repeat(257) },
       { modelId: { value: secretMarker } },
       { modelId: 'gpt-5.6-luna', model_id: 'gpt-5.6-sol' },
     ]) {
@@ -3122,7 +3198,11 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
       'credential=model-credential-value',
       'model\nwith-control',
       'x'.repeat(257),
+      'gpt-5.6-luna\",\"prompt\":\"override',
+      'g\u0440t-5.6-luna',
       { id: { access_token: 'nested-model-value' } },
+      { id: 'gpt-5.6-sol', model_id: 'credential=model-alias-secret' },
+      { id: 'gpt-5.6-sol', name: 'gpt-5.6-luna' },
     ],
   });
   const models = await client.getAvailableModels(1);
@@ -3132,6 +3212,7 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
   assert.equal(JSON.stringify(models).includes('model.header.value'), false);
   assert.equal(JSON.stringify(models).includes('model-credential-value'), false);
   assert.equal(JSON.stringify(models).includes('nested-model-value'), false);
+  assert.equal(JSON.stringify(models).includes('model-alias-secret'), false);
 
   const originalFetch = global.fetch;
   try {

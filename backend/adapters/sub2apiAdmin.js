@@ -30,6 +30,9 @@ const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
 const CREDENTIAL_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
 const LONG_OPAQUE_CREDENTIAL = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
+const CANONICAL_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:+@~*\/-]{0,255}$/;
+const CODEX_IMPORT_COUNTER_KEYS = Object.freeze(['total', 'created', 'updated', 'skipped', 'failed']);
+const CODEX_IMPORT_ACTIONS = Object.freeze(['created', 'updated', 'skipped', 'failed']);
 
 function isPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -86,6 +89,95 @@ function modelListRows(value) {
   // object that also carries a collection name belonging to another endpoint.
   if (ACCOUNT_LIST_ALIASES.some((key) => hasOwn(value, key))) return null;
   return value.models;
+}
+
+function modelRowId(value) {
+  if (typeof value === 'string') return safeModelId(value);
+  if (!isPlainObject(value)) return '';
+  const aliases = ['id', 'model_id', 'name'].filter((key) => hasOwn(value, key));
+  if (aliases.length === 0) return '';
+  const normalized = aliases.map((key) => safeModelId(value[key]));
+  if (normalized.some((item) => !item) || new Set(normalized).size !== 1) return '';
+  return normalized[0];
+}
+
+function codexImportMessageIsValid(value, total) {
+  return isPlainObject(value)
+    && Number.isSafeInteger(value.index)
+    && value.index >= 1
+    && value.index <= total
+    && typeof value.message === 'string'
+    && value.message.length > 0
+    && (!hasOwn(value, 'name') || typeof value.name === 'string');
+}
+
+function codexImportResultStatus(value) {
+  if (!isPlainObject(value)) return 'invalid';
+  const flags = ['success', 'ok'].filter((key) => hasOwn(value, key));
+  if (flags.some((key) => typeof value[key] !== 'boolean')
+      || new Set(flags.map((key) => value[key])).size > 1) return 'invalid';
+  if (CODEX_IMPORT_COUNTER_KEYS.some((key) => (
+    !hasOwn(value, key)
+      || !Number.isSafeInteger(value[key])
+      || value[key] < 0
+  ))) return 'invalid';
+  if (value.total < 1
+      || value.total !== value.created + value.updated + value.skipped + value.failed
+      || !hasOwn(value, 'items')
+      || !Array.isArray(value.items)
+      || value.items.length !== value.total) return 'invalid';
+
+  const actionCounts = Object.fromEntries(CODEX_IMPORT_ACTIONS.map((action) => [action, 0]));
+  const itemIndices = new Set();
+  const failedIndices = new Set();
+  const accountIds = new Set();
+  for (const item of value.items) {
+    if (!isPlainObject(item)
+        || !Number.isSafeInteger(item.index)
+        || item.index < 1
+        || item.index > value.total
+        || itemIndices.has(item.index)
+        || !CODEX_IMPORT_ACTIONS.includes(item.action)
+        || (hasOwn(item, 'name') && typeof item.name !== 'string')
+        || (hasOwn(item, 'message') && typeof item.message !== 'string')
+        || hasOwn(item, 'accountId')) return 'invalid';
+    const requiresAccountId = item.action === 'created' || item.action === 'updated';
+    if (requiresAccountId !== hasOwn(item, 'account_id')
+        || (requiresAccountId && (
+          !Number.isSafeInteger(item.account_id) || item.account_id <= 0
+        ))) return 'invalid';
+    itemIndices.add(item.index);
+    actionCounts[item.action] += 1;
+    if (item.action === 'failed') failedIndices.add(item.index);
+    if (requiresAccountId) accountIds.add(item.account_id);
+  }
+  if (CODEX_IMPORT_ACTIONS.some((action) => actionCounts[action] !== value[action])) {
+    return 'invalid';
+  }
+
+  const errors = hasOwn(value, 'errors') ? value.errors : [];
+  const warnings = hasOwn(value, 'warnings') ? value.warnings : [];
+  if (!Array.isArray(errors)
+      || !Array.isArray(warnings)
+      || errors.length !== value.failed
+      || errors.some((item) => !codexImportMessageIsValid(item, value.total))
+      || warnings.some((item) => !codexImportMessageIsValid(item, value.total))) return 'invalid';
+  const errorIndices = new Set(errors.map((item) => item.index));
+  if (errorIndices.size !== errors.length
+      || [...errorIndices].some((index) => !failedIndices.has(index))) return 'invalid';
+
+  const directIds = ['account_id', 'accountId']
+    .filter((key) => hasOwn(value, key))
+    .map((key) => value[key]);
+  if (directIds.some((id) => !Number.isSafeInteger(id) || id <= 0)
+      || new Set(directIds).size > 1
+      || (directIds.length > 0
+        && (value.total !== 1 || accountIds.size !== 1 || !accountIds.has(directIds[0])))) {
+    return 'invalid';
+  }
+  return flags.some((key) => value[key] === false) || value.failed > 0
+    ? 'unsuccessful'
+    : 'success';
 }
 
 const ACCOUNT_LIST_ALIASES = Object.freeze(['items', 'records', 'list', 'accounts']);
@@ -829,9 +921,10 @@ function safeModelId(value) {
   if (!cleaned
       || cleaned !== value
       || cleaned.length > 256
-      || IDENTITY_CONTROL_OR_BIDI.test(cleaned)) return '';
-  const redacted = safeRemoteText(cleaned, 256);
-  return redacted.includes('[redacted]') ? '' : redacted;
+      || IDENTITY_CONTROL_OR_BIDI.test(cleaned)
+      || !CANONICAL_MODEL_ID.test(cleaned)
+      || looksLikeCredential(cleaned)) return '';
+  return cleaned;
 }
 
 function testOptionError(code, message) {
@@ -1752,10 +1845,7 @@ class Sub2ApiAdminClient {
       error.code = 'SUB2API_MODELS_SCHEMA_INVALID';
       throw error;
     }
-    return [...new Set(rows.slice(0, 2000).map((item) => {
-      if (typeof item === 'string') return safeModelId(item);
-      return safeModelId(item?.id || item?.model_id || item?.name);
-    }).filter(Boolean))].slice(0, 1000);
+    return [...new Set(rows.slice(0, 2000).map(modelRowId).filter(Boolean))].slice(0, 1000);
   }
 
   async testAccount(id, options = {}) {
@@ -2123,17 +2213,16 @@ class Sub2ApiAdminClient {
       payload,
       { idempotencyKey, signal: options.signal, writeOperation: true },
     );
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    const resultStatus = codexImportResultStatus(value);
+    if (resultStatus === 'invalid') {
       const error = new Error('Sub2API 导入响应结构无效');
       error.code = 'SUB2API_IMPORT_SCHEMA_INVALID';
       throw markWriteOutcomeUnknown(error, 'response_schema');
     }
-    const knownField = ['success', 'ok', 'account_id', 'accountId', 'created', 'updated', 'skipped', 'failed', 'total', 'message', 'errors', 'warnings']
-      .some((key) => Object.prototype.hasOwnProperty.call(value, key));
-    if (!knownField) {
-      const error = new Error('Sub2API 导入响应缺少结果字段');
-      error.code = 'SUB2API_IMPORT_SCHEMA_INVALID';
-      throw markWriteOutcomeUnknown(error, 'response_schema');
+    if (resultStatus === 'unsuccessful') {
+      const error = new Error('Sub2API 导入返回失败结果，账号状态需要重新核验');
+      error.code = 'SUB2API_IMPORT_UNSUCCESSFUL';
+      throw markWriteOutcomeUnknown(error, 'response_unsuccessful');
     }
     return value;
   }
