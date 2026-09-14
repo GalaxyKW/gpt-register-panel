@@ -70,7 +70,7 @@
         <select id="diffFilter"><option value="">全部差异</option></select>
       </label>
       <label class="test-model-field">
-        <span>账号测试模型</span>
+        <span>账号测试模型（候选）</span>
         <select id="accountTestModelSelect">
           <option value="gpt-5.6-luna">5.6-luna</option>
           <option value="gpt-5.6-terra">gpt-5.6-terra</option>
@@ -92,7 +92,10 @@
         <button id="importButton" class="button button-primary" type="button" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
         <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="按顺序提交所选账号的 Phase 3"><span class="button-icon" aria-hidden="true">↗</span><span>Phase 3 批量</span></button>
         <button id="accountTestButton" class="button button-secondary account-test-button" type="button" disabled title="测试已选的上游账号"><span class="button-icon" aria-hidden="true">✓</span><span>测试选中账号</span></button>
-        <button id="cleanupButton" class="button button-danger" type="button" disabled title="删除 tokens 和 use_token 中已过期的 JSON 文件"><span class="button-icon" aria-hidden="true">⌫</span><span>清理过期 token</span></button>
+      </div>
+      <div class="toolbar-actions maintenance-actions" aria-label="全局维护">
+        <span class="maintenance-label">全局维护 · 不受筛选和选择影响</span>
+        <button id="cleanupButton" class="button button-danger" type="button" disabled title="全局扫描 tokens 和 use_token，并将所有已过期 JSON 文件移入隔离目录；不受当前筛选和选择影响"><span class="button-icon" aria-hidden="true">⌫</span><span>全局扫描并隔离过期 token</span></button>
       </div>
     </section>
 

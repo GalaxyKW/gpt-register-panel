@@ -93,6 +93,8 @@ h2 { margin-bottom: 5px; font-size: 18px; letter-spacing: .01em; }
 .toolbar .search-field { flex: 1 1 260px; min-width: 220px; }
 .toolbar .test-model-field { min-width: 190px; }
 .toolbar-actions { flex: 1 1 100%; justify-content: flex-end; flex-wrap: wrap; padding-top: 1px; }
+.maintenance-actions { margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line); }
+.maintenance-label { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .02em; }
 .toolbar-check { display: inline-flex !important; align-items: center; gap: 7px; min-width: auto !important; min-height: 38px; color: var(--ink-soft) !important; font-size: 12px !important; font-weight: 700 !important; white-space: nowrap; }
 input, select { min-height: 38px; padding: 8px 11px; border: 1px solid var(--line-strong); border-radius: 6px; outline: none; background: #fff; color: var(--ink); transition: border-color .15s ease, box-shadow .15s ease; }
 input::placeholder { color: #9aa8ac; }
@@ -167,6 +169,8 @@ td small { max-width: 190px; margin-top: 4px; overflow: hidden; color: var(--mut
 .status-error { color: var(--danger); }
 .status-error .status-dot { background: #d15d56; box-shadow: 0 0 0 3px #fbe8e6; }
 .availability-note { color: var(--danger) !important; font-weight: 700; }
+.availability-note-success { color: var(--success) !important; }
+.availability-note-warning { color: var(--warning) !important; }
 .source-text { display: inline-flex; align-items: center; min-height: 23px; padding: 3px 8px; border-radius: 5px; font-size: 11px; font-weight: 700; }
 .source-tokens { background: #e8f1fb; color: #356487; }
 .source-use-token { background: #f5edfc; color: #74538e; }

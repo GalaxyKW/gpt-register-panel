@@ -24,6 +24,8 @@ const state = {
   jobInventoryProbeSequence: 0,
   watchGeneration: 0,
   snapshotRefreshGeneration: 0,
+  accountTestModelRequestSequence: 0,
+  accountTestModelsPending: false,
 };
 
 const elements = {
@@ -701,7 +703,6 @@ function renderAccountTestModels(models) {
   if (!elements.accountTestModelSelect) return;
   const current = elements.accountTestModelSelect.value;
   const values = [...new Set((models || []).map(normalizeAccountTestModel).filter(Boolean))];
-  if (!values.includes('gpt-5.6-luna')) values.unshift('gpt-5.6-luna');
   elements.accountTestModelSelect.innerHTML = '';
   for (const value of values) {
     const option = document.createElement('option');
@@ -752,18 +753,40 @@ function accountTestTargetsFromRows(rows) {
   return { targets, problem: '' };
 }
 
-async function loadAccountTestModels(snapshot) {
+async function loadAccountTestModels(snapshot, selectedRows = []) {
+  const requestSequence = ++state.accountTestModelRequestSequence;
+  const selectionRevision = state.selectionRevision;
   renderAccountTestModels(fallbackAccountTestModels);
-  const candidate = accountTestRows(snapshot?.rows || [])[0];
-  if (!candidate || sub2ApiReadStatus(snapshot) !== 'ok') return;
+  const candidates = accountTestRows(selectedRows);
+  const candidate = candidates.length === 1 ? candidates[0] : null;
+  state.accountTestModelsPending = Boolean(candidate && sub2ApiReadStatus(snapshot) === 'ok');
+  if (elements.accountTestModelSelect) {
+    elements.accountTestModelSelect.title = candidate
+      ? '正在读取这个账号实际报告的模型；提交时仍会重新逐项验证'
+      : '候选模型列表；多选账号会在测试时逐项验证是否支持';
+  }
+  updateActionState();
+  if (!state.accountTestModelsPending) return;
   try {
     const response = await apiFetch('/api/account-tests/models?accountId=' + encodeURIComponent(String(candidate.accountId)));
     const body = await response.json();
     if (!response.ok || !Array.isArray(body.models) || body.models.length === 0) return;
-    if (state.snapshot !== snapshot) return;
+    if (state.snapshot !== snapshot
+        || state.selectionRevision !== selectionRevision
+        || state.accountTestModelRequestSequence !== requestSequence) return;
     renderAccountTestModels(body.models);
   } catch {
     // Keep the safe fallback list when the optional model lookup is unavailable.
+  } finally {
+    if (state.snapshot === snapshot
+        && state.selectionRevision === selectionRevision
+        && state.accountTestModelRequestSequence === requestSequence) {
+      state.accountTestModelsPending = false;
+      if (elements.accountTestModelSelect) {
+        elements.accountTestModelSelect.title = '模型列表仅作为候选；提交时会重新逐项验证';
+      }
+      updateActionState();
+    }
   }
 }
 
@@ -944,6 +967,7 @@ function changeSelection(nextSelected) {
   state.selectionRevision += 1;
   invalidatePlan();
   renderRows();
+  void loadAccountTestModels(state.snapshot, selectedRowsFromSelection());
   return true;
 }
 
@@ -1142,14 +1166,20 @@ function renderRemoteState(row, sides) {
   const scheduler = schedulableKnown
     ? (row.schedulable ? '调度：开启' : '调度：关闭')
     : '调度：未知';
+  const schedulerClass = schedulableKnown
+    ? (row.schedulable ? ' availability-note-success' : '')
+    : ' availability-note-warning';
   const availability = String(row?.availability || 'unknown');
   const availabilityText = availability === 'available'
     ? '可用'
     : availability === 'unavailable'
       ? '不可用：' + availabilityReasonLabel(row?.availabilityReason)
       : '可用性未知：' + availabilityReasonLabel(row?.availabilityReason);
-  return '<small class="availability-note">' + escapeHtml(scheduler) + '</small>'
-    + '<small class="availability-note">' + escapeHtml(availabilityText) + '</small>';
+  const availabilityClass = availability === 'available'
+    ? ' availability-note-success'
+    : availability === 'unknown' ? ' availability-note-warning' : '';
+  return '<small class="availability-note' + schedulerClass + '">' + escapeHtml(scheduler) + '</small>'
+    + '<small class="availability-note' + availabilityClass + '">' + escapeHtml(availabilityText) + '</small>';
 }
 
 function renderDiffDecision(row, sides) {
@@ -2401,7 +2431,7 @@ async function loadSnapshot(options = {}) {
       showNotice('', '');
     }
     applyFilters();
-    void loadAccountTestModels(snapshot);
+    void loadAccountTestModels(snapshot, []);
     loaded = true;
   } catch (error) {
     if (requestId === state.snapshotRequestSequence && requestIsCurrent()) {
@@ -2604,15 +2634,35 @@ if (elements.cleanupButton) {
       const scanResponse = await apiFetch('/api/tokens/expired');
       const listing = await scanResponse.json();
       if (!scanResponse.ok) throw new Error(listing.message || listing.error || '过期 token 扫描失败');
-      if (!listing.count) {
+      const expiredCount = Number(listing.count);
+      if (!Number.isSafeInteger(expiredCount) || expiredCount < 0 || expiredCount > 1_000_000
+          || !Array.isArray(listing.items)) {
+        throw new Error('服务器返回的过期 token 清单无效，已停止全局清理');
+      }
+      if (listing.recoveryRequired === true) {
+        const claimCount = Number.isSafeInteger(Number(listing.claimCount))
+          ? Math.max(0, Number(listing.claimCount))
+          : 0;
+        showNotice('检测到 ' + claimCount + ' 个未完成的过期 token 隔离 claim；请先人工核对并恢复，当前不会创建新的全局清理任务。', 'notice-danger');
+        state.cleanupRequestPending = false;
+        updateActionState();
+        return;
+      }
+      if (expiredCount === 0) {
         showNotice('没有发现可安全删除的过期 token。', 'notice-info');
         state.cleanupRequestPending = false;
         updateActionState();
         return;
       }
-      const preview = (listing.items || []).slice(0, 3).map((item) => item.relativePath).join('、');
-      const suffix = listing.count > 3 ? ' 等' : '';
-      if (!window.confirm('将把 ' + listing.count + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) {
+      if (!/^[a-f0-9]{64}$/i.test(String(listing.version || ''))) {
+        throw new Error('服务器返回的过期 token 清单版本无效，已停止全局清理');
+      }
+      const preview = listing.items.slice(0, 3)
+        .map((item) => String(item?.relativePath || '').slice(0, 120))
+        .filter(Boolean)
+        .join('、');
+      const suffix = expiredCount > 3 ? ' 等' : '';
+      if (!window.confirm('这是全局操作，不受当前筛选和选择影响。将把 ' + expiredCount + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) {
         state.cleanupRequestPending = false;
         updateActionState();
         return;
@@ -2668,6 +2718,7 @@ function updateActionState() {
     && selectedRows.length === state.selected.size
     && !testSelection.problem
     && testTargets.length > 0
+    && !state.accountTestModelsPending
     && !state.snapshot?.readOnly;
   const canRunPhase3 = state.selected.size > 0
     && !selectionVisibilityProblem
@@ -2689,11 +2740,18 @@ function updateActionState() {
       elements.accountTestButton.title = '另一个任务或请求执行中';
     } else if (selectionVisibilityProblem) {
       elements.accountTestButton.title = selectionVisibilityProblem;
+    } else if (state.accountTestModelsPending) {
+      elements.accountTestButton.title = '正在读取所选账号实际报告的模型列表';
     } else if (!canRunAccountTest) {
       elements.accountTestButton.title = testSelection.problem || '请选择已导入 Sub2API 的上游账号';
     } else {
       elements.accountTestButton.title = '使用所选模型测试上游账号；error 账号成功后恢复并启用';
     }
+  }
+  if (elements.accountTestModelSelect) {
+    elements.accountTestModelSelect.disabled = mutationLocked
+      || Boolean(state.snapshot?.readOnly)
+      || state.accountTestModelsPending;
   }
   elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
   elements.selectAll.disabled = locked;
@@ -2711,7 +2769,7 @@ function updateActionState() {
       ? '存在待人工对账任务，当前全部写操作已阻止'
       : state.jobInventoryVerified !== true
         ? '正在确认后台任务和待对账项，暂不可操作'
-        : '';
+        : '全局扫描 tokens 和 use_token；不受当前筛选和选择影响';
   }
   if (elements.reconciliationAckButton) {
     const target = reconciliationHoldTarget();

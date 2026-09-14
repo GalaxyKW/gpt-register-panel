@@ -794,6 +794,51 @@ test('frontend treats expired token cleanup as a durable polled task', () => {
   assert.match(resumeContract, /state\.cleanupRequestPending = true/);
 });
 
+test('frontend blocks global cleanup when stranded quarantine claims require recovery', async () => {
+  const cleanupHandler = sourceSection(
+    "if (elements.cleanupButton) {",
+    "elements.clearSelectionButton.addEventListener",
+  );
+  let clickHandler;
+  let mutationRequests = 0;
+  let confirmations = 0;
+  const notices = [];
+  const context = {
+    elements: {
+      cleanupButton: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          clickHandler = handler;
+        },
+      },
+    },
+    state: { cleanupRequestPending: false },
+    updateActionState() {},
+    apiFetch: async () => ({
+      ok: true,
+      async json() {
+        return {
+          version: 'a'.repeat(64),
+          count: 0,
+          items: [],
+          recoveryRequired: true,
+          claimCount: 2,
+        };
+      },
+    }),
+    idempotentMutationFetch: async () => { mutationRequests += 1; },
+    showNotice: (...args) => notices.push(args),
+    watchJob: async () => {},
+    window: { confirm: () => { confirmations += 1; return true; } },
+  };
+  vm.runInNewContext(cleanupHandler, context);
+  await clickHandler();
+  assert.equal(mutationRequests, 0);
+  assert.equal(confirmations, 0);
+  assert.equal(context.state.cleanupRequestPending, false);
+  assert.match(notices.at(-1)[0], /2 个未完成的过期 token 隔离 claim/);
+});
+
 test('frontend globally locks mutating actions while any request or task is unresolved', () => {
   const lockContract = sourceSection('function actionRequestPending', 'function renderMetrics');
   const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
@@ -1269,6 +1314,8 @@ test('frontend selection mutations are blocked while actions are locked', () => 
     actionsLocked: () => locked,
     invalidatePlan: () => { invalidations += 1; },
     renderRows: () => { renders += 1; },
+    selectedRowsFromSelection: () => [],
+    loadAccountTestModels: () => {},
   };
   vm.runInNewContext(selectionContract + `
     blocked = changeSelection(new Set(['two']));
@@ -1333,6 +1380,8 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
     actionsLocked: () => false,
     invalidatePlan() {},
     renderRows() {},
+    selectedRowsFromSelection: () => [],
+    loadAccountTestModels: () => {},
     comparisonAvailable: () => true,
     apiFetch: async () => { requests += 1; throw new Error('must not request'); },
     showNotice: (...args) => notices.push(args),
@@ -1354,8 +1403,24 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
   assert.match(notices.at(-1)[0], /请先清除选择或调整筛选/);
   assert.equal((allBulkHandlers.match(/hiddenSelectionProblem/g) || []).length, 4);
   assert.doesNotMatch(cleanupHandler, /hiddenSelectionProblem/);
+  assert.match(cleanupHandler, /listing\.recoveryRequired === true/);
+  assert.match(cleanupHandler, /未完成的过期 token 隔离 claim/);
+  assert.match(cleanupHandler, /这是全局操作，不受当前筛选和选择影响/);
+  assert.match(htmlSource, /全局维护 · 不受筛选和选择影响/);
+  assert.match(htmlSource, /全局扫描并隔离过期 token/);
   assert.match(sourceSection('function updateActionState', 'function applyColumnVisibility'),
     /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
+});
+
+test('frontend distinguishes healthy availability and never force-adds an unsupported model', () => {
+  const modelContract = sourceSection('function renderAccountTestModels', 'function accountTestRows');
+  const remoteStateContract = sourceSection('function renderRemoteState', 'function renderDiffDecision');
+  assert.doesNotMatch(modelContract, /values\.unshift\('gpt-5\.6-luna'\)/);
+  assert.match(source, /candidates\.length === 1/);
+  assert.match(source, /state\.accountTestModelsPending/);
+  assert.match(remoteStateContract, /availability-note-success/);
+  assert.match(remoteStateContract, /availability-note-warning/);
+  assert.match(stylesSource, /\.availability-note-success\s*\{[^}]*var\(--success\)/s);
 });
 
 test('frontend submits one snapshot-bound revision per unambiguous account test target', () => {
