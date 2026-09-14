@@ -928,6 +928,44 @@ function validImportPlanIntentVersion(value) {
     && /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/.test(value);
 }
 
+function planItemCreatesAccount(item) {
+  return item?.action === 'create' && item?.conflictingVersions !== true;
+}
+
+function normalizedImportGroupBinding(plan) {
+  const items = Array.isArray(plan?.items) ? plan.items : [];
+  const hasCreates = items.some(planItemCreatesAccount);
+  if (!hasCreates) return { mode: 'not_applicable', groupIds: [] };
+  const binding = plan?.groupBinding;
+  if (!binding || !['explicit', 'sub2api_default'].includes(binding.mode)
+      || !Array.isArray(binding.groupIds)
+      || binding.groupIds.length === 0
+      || binding.groupIds.length > 1000) return null;
+  const groupIds = binding.groupIds;
+  if (groupIds.some((id) => typeof id !== 'number'
+      || !Number.isSafeInteger(id)
+      || id <= 0)) return null;
+  const normalized = [...new Set(groupIds)].sort((left, right) => left - right);
+  if (normalized.length !== groupIds.length
+      || normalized.some((id, index) => id !== groupIds[index])) return null;
+  return { mode: binding.mode, groupIds: normalized };
+}
+
+function importGroupBindingProblem(plan) {
+  const items = Array.isArray(plan?.items) ? plan.items : [];
+  if (!items.some(planItemCreatesAccount)) return '';
+  return normalizedImportGroupBinding(plan)
+    ? ''
+    : '新增账号缺少可核验的 Sub2API 分组绑定，请重新检查差异';
+}
+
+function importGroupBindingLabel(plan) {
+  const binding = normalizedImportGroupBinding(plan);
+  if (!binding || binding.mode === 'not_applicable') return '';
+  const prefix = binding.mode === 'sub2api_default' ? '默认分组 ID ' : '分组 ID ';
+  return '新建绑定 ' + prefix + binding.groupIds.map((id) => '#' + id).join('、');
+}
+
 function syncSelectionProblem(selectedKeys = state.selected) {
   const maximumSelection = 500;
   const keys = selectedKeys instanceof Set ? [...selectedKeys] : [...(selectedKeys || [])];
@@ -979,11 +1017,13 @@ function updateImportButtonState() {
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
   const hiddenSelection = hiddenSelectionProblem(state.plan?.selectedKeys);
   const selectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
+  const groupBindingProblem = importGroupBindingProblem(state.plan);
   elements.importButton.disabled = !state.plan
     || actionsLocked()
     || reconciliationWriteBlocked()
     || Boolean(hiddenSelection)
     || Boolean(selectionProblem)
+    || Boolean(groupBindingProblem)
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || !validImportPlanIntentVersion(state.plan?.planIntentVersion)
@@ -1420,7 +1460,8 @@ function renderPlan(plan) {
     + ' · 跳过 ' + (counts.skip || 0) + ' · 冲突 ' + (counts.conflict || 0)
     + (supersededSelectionCount ? ' · 旧副本改用最新 ' + supersededSelectionCount : '');
   elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12)
-    + ' · 选择 ' + state.plan.selectedKeys.length;
+    + ' · 选择 ' + state.plan.selectedKeys.length
+    + (importGroupBindingLabel(plan) ? ' · ' + importGroupBindingLabel(plan) : '');
   elements.planRows.innerHTML = items.map((item) => {
     const action = effectivePlanAction(item);
     const reason = effectivePlanReason(item);
@@ -2689,6 +2730,8 @@ async function previewSelection() {
     if (!validImportPlanIntentVersion(body.planIntentVersion)) {
       throw new Error('差异预览缺少有效的导入计划版本，请刷新后重试');
     }
+    const groupBindingProblem = importGroupBindingProblem(body);
+    if (groupBindingProblem) throw new Error(groupBindingProblem);
     renderPlan({ ...body, selectedKeys });
     const supersededSelectionCount = (body.items || []).filter((item) => (
       item?.selectedSourceSuperseded === true
@@ -2723,6 +2766,11 @@ elements.importButton.addEventListener('click', async () => {
   const selectionProblem = syncSelectionProblem(state.plan.selectedKeys);
   if (selectionProblem) {
     showNotice('无法确认导入：' + selectionProblem + '。', 'notice-warning');
+    return;
+  }
+  const groupBindingProblem = importGroupBindingProblem(state.plan);
+  if (groupBindingProblem) {
+    showNotice('无法确认导入：' + groupBindingProblem + '。', 'notice-warning');
     return;
   }
   if (!comparisonAvailable()) {

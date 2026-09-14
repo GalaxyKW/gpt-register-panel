@@ -50,6 +50,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
     renderPlan({
       version: 'a'.repeat(64),
       selectedKeys: ['token:one'],
+      groupBinding: { mode: 'explicit', groupIds: [7, 9] },
       items: [
         { action: 'create', reason: 'token_only', fingerprints: {} },
         {
@@ -68,6 +69,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
     result = {
       disabled: elements.importButton.disabled,
       summary: elements.planSummary.textContent,
+      version: elements.planVersion.textContent,
       rows: elements.planRows.innerHTML,
       terminal: actionReasonLabel('source_account_terminal'),
     identityReasons: [
@@ -87,6 +89,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
   assert.equal(context.result.disabled, true);
   assert.match(context.result.summary, /冲突 1/);
   assert.match(context.result.summary, /旧副本改用最新 1/);
+  assert.match(context.result.version, /新建绑定 分组 ID #7、#9/);
   assert.match(context.result.rows, /来源 token 版本冲突，禁止导入/);
   assert.match(context.result.rows, /同身份 2 个版本/);
   assert.match(context.result.rows, /已选旧副本/);
@@ -100,6 +103,48 @@ test('frontend treats every blocking plan item as a conflict and explains termin
   assert.match(source, /可用性未知/);
   assert.match(source, /所选旧副本将按有效性与新鲜度规则改用首选版本/);
   assert.match(source, /所选旧副本将改用预览所示的排序首选版本/);
+});
+
+test('frontend rejects create previews without an exact group binding', () => {
+  const actionContracts = sourceSection('function actionReasonLabel', 'function statusClass');
+  const lockingContracts = sourceSection('function actionRequestPending', 'function renderMetrics');
+  const context = {
+    state: {
+      plan: null,
+      importRequestPending: false,
+      snapshot: { readOnly: false },
+      reconciliationHolds: { total: 0 },
+      job: null,
+    },
+    elements: { importButton: {} },
+    reconciliationHoldJobs: () => [],
+    hiddenSelectionProblem: () => '',
+    syncSelectionProblem: () => '',
+    comparisonAvailable: () => true,
+  };
+  vm.runInNewContext(actionContracts + '\n' + lockingContracts + `
+    const base = {
+      planIntentVersion: 'sync-plan-v1.' + 'a'.repeat(43),
+      selectedKeys: ['token:tokens:new.json'],
+      items: [{ action: 'create' }],
+    };
+    results = [
+      importGroupBindingProblem(base),
+      importGroupBindingProblem({ ...base, groupBinding: { mode: 'explicit', groupIds: [9, 7] } }),
+      importGroupBindingProblem({ ...base, groupBinding: { mode: 'explicit', groupIds: [7, 7] } }),
+      importGroupBindingProblem({ ...base, groupBinding: { mode: 'explicit', groupIds: [7, 9] } }),
+      importGroupBindingLabel({ ...base, groupBinding: { mode: 'sub2api_default', groupIds: [11] } }),
+    ];
+    state.plan = base;
+    updateImportButtonState();
+    missingBindingDisabled = elements.importButton.disabled;
+  `, context);
+  assert.match(context.results[0], /缺少可核验/);
+  assert.match(context.results[1], /缺少可核验/);
+  assert.match(context.results[2], /缺少可核验/);
+  assert.equal(context.results[3], '');
+  assert.equal(context.results[4], '新建绑定 默认分组 ID #11');
+  assert.equal(context.missingBindingDisabled, true);
 });
 
 test('frontend gives sync decisions distinct non-misleading visual states', () => {
@@ -157,6 +202,7 @@ test('frontend import confirmation calls out selected superseded token files', a
     },
     comparisonAvailable: () => true,
     validImportPlanIntentVersion: () => true,
+    importGroupBindingProblem: () => '',
     hiddenSelectionProblem: () => '',
     syncSelectionProblem: () => '',
     showNotice() {},
@@ -207,6 +253,7 @@ test('frontend submits the exact preview intent version with the ordered selecti
     },
     comparisonAvailable: () => true,
     validImportPlanIntentVersion: () => true,
+    importGroupBindingProblem: () => '',
     hiddenSelectionProblem: () => '',
     syncSelectionProblem: () => '',
     updateActionState() {},
