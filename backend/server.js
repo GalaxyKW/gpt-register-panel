@@ -16,6 +16,7 @@ const {
   buildImportPlanIntentVersion,
   importPlanSummary,
   executeImport,
+  resolveImportGroupBinding,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,
@@ -2387,6 +2388,8 @@ function createServer(options = {}) {
   const phase3RequestResolver = options.phase3RequestResolver || resolvePhase3Requests;
   const accountTestClientFactory = options.accountTestClientFactory
     || ((clientOptions) => new Sub2ApiAdminClient(clientOptions));
+  const syncClientFactory = options.syncClientFactory
+    || ((clientOptions) => new Sub2ApiAdminClient(clientOptions));
   const expiredTokenLister = options.expiredTokenLister || listExpiredTokens;
   const admissionControlPlaneLock = options.admissionControlPlaneLock || withControlPlaneLock;
   let server;
@@ -2594,6 +2597,11 @@ function createServer(options = {}) {
           error.code = 'IMPORT_SELECTION_INVALID';
           throw error;
         }
+        let syncClient = null;
+        const getSyncClient = (clientOptions = {}) => {
+          if (!syncClient) syncClient = syncClientFactory(clientOptions);
+          return syncClient;
+        };
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
           includeInternal: true,
@@ -2601,6 +2609,7 @@ function createServer(options = {}) {
           logger,
           requestId,
           actor,
+          clientFactory: getSyncClient,
         });
         if (!confirmedSub2ApiRead(snapshot)) {
           const error = new Error('无法确认 Sub2API 当前账号列表，已停止生成导入计划');
@@ -2608,10 +2617,15 @@ function createServer(options = {}) {
           throw error;
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
+        const groupBinding = await resolveImportGroupBinding(
+          getSyncClient({ logger, logContext: { requestId, actor } }),
+          plan,
+        );
         const planIntentVersion = buildImportPlanIntentVersion(
           snapshot.version,
           selectedKeys,
           plan,
+          groupBinding,
         );
         const snapshotId = await db.saveSnapshot(snapshot);
         writeLog(logger, 'info', 'preview.completed', {
@@ -2620,6 +2634,7 @@ function createServer(options = {}) {
           snapshotId,
           version: snapshot.version,
           planIntentVersion,
+          groupBinding,
           durationMs: Date.now() - previewStartedAt,
           counts: importPlanSummary(plan).counts,
         });
@@ -2628,6 +2643,7 @@ function createServer(options = {}) {
           snapshotId,
           version: snapshot.version,
           planIntentVersion,
+          groupBinding,
           generatedAt: snapshot.generatedAt,
           selectedKeys,
           ...importPlanSummary(plan),

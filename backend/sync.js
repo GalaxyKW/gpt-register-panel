@@ -48,6 +48,7 @@ const OPENAI_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const POSTFLIGHT_READ_ATTEMPTS = 3;
 const POSTFLIGHT_RETRY_DELAY_MS = 25;
 const BACKUP_DIRECTORY_SCAN_LIMIT = 20_000;
+const MAX_IMPORT_GROUP_IDS = 1_000;
 
 function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
@@ -402,7 +403,10 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
 
     if (shouldReadSub2Api) {
       try {
-        const client = options.client || new Sub2ApiAdminClient({ logger, logContext });
+        const client = options.client
+          || (typeof options.clientFactory === 'function'
+            ? options.clientFactory({ logger, logContext })
+            : new Sub2ApiAdminClient({ logger, logContext }));
         const loaded = await readSub2ApiAccounts(client, { signal });
         accounts = loaded.accounts;
         statsError = loaded.statsError;
@@ -924,7 +928,51 @@ function importPlanIntentItem(item) {
   };
 }
 
-function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan) {
+function normalizedImportGroupIds(values, code = 'IMPORT_GROUP_BINDING_INVALID') {
+  if (!Array.isArray(values) || values.length > MAX_IMPORT_GROUP_IDS) {
+    const error = new Error('导入分组绑定结构无效');
+    error.code = code;
+    throw error;
+  }
+  const ids = values.map((value) => {
+    if (!['string', 'number'].includes(typeof value)) return null;
+    const text = String(value).trim();
+    if (!/^[1-9]\d*$/.test(text)) return null;
+    const id = Number(text);
+    return Number.isSafeInteger(id) && id > 0 ? id : null;
+  });
+  if (ids.some((id) => id === null)) {
+    const error = new Error('导入分组 ID 必须是安全正整数');
+    error.code = code;
+    throw error;
+  }
+  return [...new Set(ids)].sort((left, right) => left - right);
+}
+
+function importPlanHasCreates(plan) {
+  return Array.isArray(plan) && plan.some((item) => item?.action === 'create');
+}
+
+function normalizeImportGroupBinding(plan, binding) {
+  if (!importPlanHasCreates(plan)) {
+    return { mode: 'not_applicable', groupIds: [] };
+  }
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+    const error = new Error('导入计划缺少新建账号的分组绑定');
+    error.code = 'IMPORT_GROUP_BINDING_REQUIRED';
+    throw error;
+  }
+  const groupIds = normalizedImportGroupIds(binding.groupIds);
+  if (groupIds.length === 0
+      || !['explicit', 'sub2api_default'].includes(binding.mode)) {
+    const error = new Error('导入分组绑定模式与 ID 不一致');
+    error.code = 'IMPORT_GROUP_BINDING_INVALID';
+    throw error;
+  }
+  return { mode: binding.mode, groupIds };
+}
+
+function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan, groupBinding = null) {
   const normalizedSnapshotVersion = typeof snapshotVersionValue === 'string'
     ? snapshotVersionValue.toLowerCase()
     : '';
@@ -953,6 +1001,11 @@ function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan) 
     schema: 'sync-plan-intent-v1',
     snapshotVersion: normalizedSnapshotVersion,
     selectedKeys: [...selectedKeys],
+    // A named Sub2API group is mutable remote state. Commit the exact IDs
+    // observed during preview, or explicitly commit to Sub2API's default
+    // binding when no group is configured, so execution cannot silently
+    // redirect a reviewed create to a different group.
+    createGroupBinding: normalizeImportGroupBinding(plan, groupBinding),
     items: plan.map(importPlanIntentItem),
   };
   return 'sync-plan-v1.' + crypto.createHash('sha256')
@@ -1191,14 +1244,14 @@ function configuredGroupIds() {
   const raw = String(process.env.SUB2API_GROUP_IDS || '').trim();
   if (!raw) return [];
   const values = raw.split(',').map((value) => value.trim());
-  const ids = values.map((value) => Number(value));
-  if (values.some((value, index) => !/^[1-9]\d*$/.test(value)
-      || !Number.isSafeInteger(ids[index]) || ids[index] <= 0)) {
-    const error = new Error('SUB2API_GROUP_IDS 必须只包含安全正整数');
-    error.code = 'SUB2API_GROUP_CONFIG_INVALID';
+  try {
+    return normalizedImportGroupIds(values, 'SUB2API_GROUP_CONFIG_INVALID');
+  } catch (error) {
+    if (error?.code === 'SUB2API_GROUP_CONFIG_INVALID') {
+      error.message = 'SUB2API_GROUP_IDS 必须只包含安全正整数';
+    }
     throw error;
   }
-  return [...new Set(ids)];
 }
 
 async function resolveGroupIds(client, options = {}) {
@@ -1206,14 +1259,27 @@ async function resolveGroupIds(client, options = {}) {
   throwIfJobInterrupted(signal);
   const configured = configuredGroupIds();
   if (configured.length > 0) return configured;
-  const wanted = String(process.env.SUB2API_GROUP_NAME || 'share').trim().toLowerCase();
-  if (!wanted) return [];
+  // An omitted setting keeps the historical `share` default. An explicitly
+  // empty setting means "use Sub2API's default binding" and must not be
+  // silently converted back to `share` by a truthiness fallback.
+  const configuredName = process.env.SUB2API_GROUP_NAME;
+  const configuredWanted = String(configuredName === undefined ? 'share' : configuredName)
+    .trim()
+    .toLowerCase();
+  const useDefaultBinding = !configuredWanted;
+  // Sub2API currently implements the OpenAI default binding by looking up
+  // this active group name. Resolve it during preview and send its concrete
+  // ID later, rather than leaving a mutable server-side default unbound.
+  const wanted = useDefaultBinding ? 'openai-default' : configuredWanted;
   try {
     const groups = await client.listGroups({ signal });
     throwIfJobInterrupted(signal);
     const resolved = groups
-      .filter((group) => [group?.name, group?.slug, group?.code]
-        .some((value) => String(value || '').trim().toLowerCase() === wanted))
+      .filter((group) => String(group?.platform || '').trim().toLowerCase() === 'openai')
+      .filter((group) => (useDefaultBinding
+        ? String(group?.name || '').trim().toLowerCase() === wanted
+        : [group?.name, group?.slug, group?.code]
+          .some((value) => String(value || '').trim().toLowerCase() === wanted)))
       .map((group) => {
         const value = group?.id;
         if (!['string', 'number'].includes(typeof value)) return null;
@@ -1223,13 +1289,17 @@ async function resolveGroupIds(client, options = {}) {
       })
       .filter((id) => Number.isSafeInteger(id) && id > 0);
     if (resolved.length === 0) {
-      const error = new Error('未找到配置的 Sub2API 分组：' + wanted);
+      const error = new Error(useDefaultBinding
+        ? '未找到 Sub2API 的 OpenAI 默认分组'
+        : '未找到配置的 Sub2API 分组：' + wanted);
       error.code = 'SUB2API_GROUP_NOT_FOUND';
       throw error;
     }
-    const unique = [...new Set(resolved)];
+    const unique = [...new Set(resolved)].sort((left, right) => left - right);
     if (unique.length !== 1) {
-      const error = new Error('配置的 Sub2API 分组名称匹配到多个 ID：' + wanted);
+      const error = new Error(useDefaultBinding
+        ? 'Sub2API 的 OpenAI 默认分组匹配到多个 ID'
+        : '配置的 Sub2API 分组名称匹配到多个 ID：' + wanted);
       error.code = 'SUB2API_GROUP_AMBIGUOUS';
       throw error;
     }
@@ -1243,6 +1313,22 @@ async function resolveGroupIds(client, options = {}) {
     wrapped.code = 'SUB2API_GROUP_RESOLVE_FAILED';
     throw wrapped;
   }
+}
+
+async function resolveImportGroupBinding(client, plan, options = {}) {
+  if (!importPlanHasCreates(plan)) {
+    return { mode: 'not_applicable', groupIds: [] };
+  }
+  const configuredIds = configuredGroupIds();
+  const configuredName = process.env.SUB2API_GROUP_NAME;
+  const useDefaultBinding = configuredIds.length === 0
+    && configuredName !== undefined
+    && String(configuredName).trim() === '';
+  const groupIds = await resolveGroupIds(client, options);
+  return normalizeImportGroupBinding(plan, {
+    mode: useDefaultBinding ? 'sub2api_default' : 'explicit',
+    groupIds,
+  });
 }
 
 function safeImportResult(result) {
@@ -2510,10 +2596,13 @@ async function executeImport({
       }
       throwIfJobInterrupted(signal);
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
+      const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
+      throwIfJobInterrupted(signal);
       const currentPlanIntentVersion = buildImportPlanIntentVersion(
         current.version,
         selectedKeys,
         fullPlan,
+        groupBinding,
       );
       if (!importPlanIntentVersionsEqual(expectedPlanIntentVersion, currentPlanIntentVersion)) {
         const error = new Error('导入计划在确认前已变化，请重新检查差异');
@@ -2606,10 +2695,10 @@ async function executeImport({
         }
       }
 
-      const groups = plan.some((item) => item.action === 'create')
-        ? await resolveGroupIds(client, { signal })
-        : [];
-      throwIfJobInterrupted(signal);
+      // Reuse the exact, preview-bound IDs. Re-resolving a mutable group name
+      // after backup could otherwise redirect a write that the user never
+      // reviewed.
+      const groups = groupBinding.groupIds;
       writeLog(logger, 'info', 'import.accounts_started', {
         jobId,
         actor,
@@ -2912,6 +3001,7 @@ module.exports = {
   importPlanSummary,
   safeImportResult,
   resolveGroupIds,
+  resolveImportGroupBinding,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,

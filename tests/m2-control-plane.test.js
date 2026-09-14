@@ -23,6 +23,7 @@ const {
   snapshotVersion,
   importPlanIntentVersionsEqual,
   resolveGroupIds,
+  resolveImportGroupBinding,
   writeBackup,
   assertBackupCoversUpdateTargets,
 } = require('../backend/sync');
@@ -63,13 +64,13 @@ function executeImportPlanItem(options = {}) {
   });
 }
 
-function importPlanIntentForSnapshot(snapshot, selectedKeys) {
+function importPlanIntentForSnapshot(snapshot, selectedKeys, groupBinding = null) {
   const plan = buildImportPlan(
     snapshot._internal.sources,
     snapshot._internal.accounts,
     selectedKeys,
   );
-  return buildImportPlanIntentVersion(snapshot.version, selectedKeys, plan);
+  return buildImportPlanIntentVersion(snapshot.version, selectedKeys, plan, groupBinding);
 }
 
 function processIsRunning(pid) {
@@ -2183,8 +2184,45 @@ test('sync selection and plan intent preserve exact keys and bind every executab
 
   const snapshot = 'a'.repeat(64);
   const firstSelectionPlan = buildImportPlan(sources, [], [firstKey]);
-  const firstIntent = buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan);
+  const groupBinding = { mode: 'explicit', groupIds: [9, 7] };
+  assert.throws(
+    () => buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan),
+    (error) => error.code === 'IMPORT_GROUP_BINDING_REQUIRED',
+  );
+  const firstIntent = buildImportPlanIntentVersion(
+    snapshot,
+    [firstKey],
+    firstSelectionPlan,
+    groupBinding,
+  );
   assert.match(firstIntent, /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(
+    firstIntent,
+    buildImportPlanIntentVersion(
+      snapshot,
+      [firstKey],
+      firstSelectionPlan,
+      { mode: 'explicit', groupIds: [7, 9, 7] },
+    ),
+  );
+  assert.notEqual(
+    firstIntent,
+    buildImportPlanIntentVersion(
+      snapshot,
+      [firstKey],
+      firstSelectionPlan,
+      { mode: 'explicit', groupIds: [7, 10] },
+    ),
+  );
+  assert.notEqual(
+    firstIntent,
+    buildImportPlanIntentVersion(
+      snapshot,
+      [firstKey],
+      firstSelectionPlan,
+      { mode: 'sub2api_default', groupIds: [11] },
+    ),
+  );
   assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent), true);
   assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent.slice(0, -1) + '!'), false);
 
@@ -2192,6 +2230,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
     snapshot,
     [secondKey],
     buildImportPlan(sources, [], [secondKey]),
+    groupBinding,
   );
   assert.notEqual(changedSelectionIntent, firstIntent);
 
@@ -2224,8 +2263,8 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   );
   assert.notEqual(newerWins[0].key, olderWins[0].key);
   assert.notEqual(
-    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], newerWins),
-    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], olderWins),
+    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], newerWins, groupBinding),
+    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], olderWins, groupBinding),
   );
 
   const unavailableTarget = {
@@ -2256,7 +2295,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   );
   assert.notEqual(
     buildImportPlanIntentVersion(snapshot, [firstKey], updatePlan),
-    buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan),
+    buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan, groupBinding),
   );
 });
 
@@ -2735,27 +2774,55 @@ test('group resolution accepts only one exact safe match', async () => {
   const previousIds = process.env.SUB2API_GROUP_IDS;
   const previousName = process.env.SUB2API_GROUP_NAME;
   try {
+    const createPlan = [{ action: 'create' }];
+    let unnecessaryReads = 0;
+    delete process.env.SUB2API_GROUP_IDS;
+    process.env.SUB2API_GROUP_NAME = '';
+    assert.deepEqual(await resolveImportGroupBinding({
+      async listGroups() {
+        unnecessaryReads += 1;
+        return [{ id: 11, name: 'openai-default', platform: 'openai' }];
+      },
+    }, createPlan), {
+      mode: 'sub2api_default',
+      groupIds: [11],
+    });
+    assert.equal(unnecessaryReads, 1);
+    assert.deepEqual(await resolveImportGroupBinding({
+      async listGroups() { unnecessaryReads += 1; return []; },
+    }, [{ action: 'update' }]), {
+      mode: 'not_applicable',
+      groupIds: [],
+    });
+    assert.equal(unnecessaryReads, 1);
+
     delete process.env.SUB2API_GROUP_IDS;
     process.env.SUB2API_GROUP_NAME = 'share';
     assert.deepEqual(await resolveGroupIds({
       async listGroups() {
         return [
-          { id: 3, name: 'share' },
-          { id: 4, name: 'share-beta' },
-          { id: 5, slug: 'not-share' },
+          { id: 3, name: 'share', platform: 'openai' },
+          { id: 4, name: 'share-beta', platform: 'openai' },
+          { id: 5, slug: 'not-share', platform: 'openai' },
+          { id: 12, name: 'share', platform: 'anthropic' },
         ];
       },
     }), [3]);
     await assert.rejects(
       resolveGroupIds({
         async listGroups() {
-          return [{ id: 3, name: 'share' }, { id: 6, code: 'SHARE' }];
+          return [
+            { id: 3, name: 'share', platform: 'openai' },
+            { id: 6, code: 'SHARE', platform: 'openai' },
+          ];
         },
       }),
       (error) => error.code === 'SUB2API_GROUP_AMBIGUOUS',
     );
     await assert.rejects(
-      resolveGroupIds({ async listGroups() { return [{ id: true, name: 'share' }]; } }),
+      resolveGroupIds({
+        async listGroups() { return [{ id: true, name: 'share', platform: 'openai' }]; },
+      }),
       (error) => error.code === 'SUB2API_GROUP_NOT_FOUND',
     );
     const opaqueGroupFailure = 'opaque-group-read-failure-87c2d4';
@@ -2766,8 +2833,14 @@ test('group resolution accepts only one exact safe match', async () => {
         && !error.message.includes(opaqueGroupFailure),
     );
 
-    process.env.SUB2API_GROUP_IDS = '7, 7,9';
+    process.env.SUB2API_GROUP_IDS = '9, 7,9';
     assert.deepEqual(await resolveGroupIds({ async listGroups() { throw new Error('unused'); } }), [7, 9]);
+    assert.deepEqual(await resolveImportGroupBinding({
+      async listGroups() { throw new Error('unused'); },
+    }, createPlan), {
+      mode: 'explicit',
+      groupIds: [7, 9],
+    });
     process.env.SUB2API_GROUP_IDS = '7,unsafe';
     await assert.rejects(
       resolveGroupIds({ async listGroups() { throw new Error('unused'); } }),
@@ -2778,6 +2851,86 @@ test('group resolution accepts only one exact safe match', async () => {
     else process.env.SUB2API_GROUP_IDS = previousIds;
     if (previousName === undefined) delete process.env.SUB2API_GROUP_NAME;
     else process.env.SUB2API_GROUP_NAME = previousName;
+  }
+});
+
+test('import rejects a named-group retarget before starting the job, backup, or write', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  delete process.env.SUB2API_GROUP_IDS;
+  process.env.SUB2API_GROUP_NAME = 'share';
+  try {
+    const previewClient = {
+      async listAccounts() { return []; },
+      async listGroups() { return [{ id: 7, name: 'share', platform: 'openai' }]; },
+    };
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: previewClient,
+    });
+    const plan = buildImportPlan(preview._internal.sources, [], []);
+    assert.equal(plan.length, 1);
+    assert.equal(plan[0].action, 'create');
+    const selectedKeys = [plan[0].key];
+    const previewBinding = await resolveImportGroupBinding(previewClient, plan);
+    assert.deepEqual(previewBinding, { mode: 'explicit', groupIds: [7] });
+    const planIntentVersion = buildImportPlanIntentVersion(
+      preview.version,
+      selectedKeys,
+      buildImportPlan(preview._internal.sources, [], selectedKeys),
+      previewBinding,
+    );
+
+    let started = 0;
+    let backups = 0;
+    let writes = 0;
+    let groupReads = 0;
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        planIntentVersion,
+        selectedKeys,
+        actor: 'tester',
+        jobId: 'group-retarget-job',
+        db: {
+          async startMutationJob() { started += 1; },
+        },
+        client: {
+          async listAccounts() { return []; },
+          async listGroups() {
+            groupReads += 1;
+            return [{ id: 8, name: 'share', platform: 'openai' }];
+          },
+          async exportAccounts() { backups += 1; return { accounts: [] }; },
+          async importCodexSession() { writes += 1; },
+          async applyOAuthCredentials() { writes += 1; },
+        },
+      }),
+      (error) => error.code === 'IMPORT_PLAN_STALE',
+    );
+    assert.equal(groupReads, 1);
+    assert.equal(started, 0);
+    assert.equal(backups, 0);
+    assert.equal(writes, 0);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 
@@ -3768,7 +3921,10 @@ test('token import returns reconciliation details and never starts the next acco
     const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
       .map((item) => item.key);
     assert.equal(selectedKeys.length, 2);
-    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys);
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys, {
+      mode: 'explicit',
+      groupIds: [7],
+    });
 
     const controller = new AbortController();
     let importCalls = 0;
@@ -4868,6 +5024,7 @@ test('token import checkpoints the credential backup before creating any backup 
     ['PANEL_ALLOW_UNBACKED_WRITES', process.env.PANEL_ALLOW_UNBACKED_WRITES],
     ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
     ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
     ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
   ]);
   process.env.GPT_REGISTER_ROOT = root;
@@ -4875,6 +5032,7 @@ test('token import checkpoints the credential backup before creating any backup 
   delete process.env.PANEL_ALLOW_UNBACKED_WRITES;
   process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
   process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.SUB2API_GROUP_IDS = '7';
   process.env.PANEL_BACKUP_DIR = backupRoot;
   try {
     const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
@@ -4887,7 +5045,10 @@ test('token import checkpoints the credential backup before creating any backup 
     assert.equal(plan.length, 1);
     assert.equal(plan[0].action, 'create');
     const selectedKeys = [plan[0].key];
-    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys);
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys, {
+      mode: 'explicit',
+      groupIds: [7],
+    });
     const checkpoints = [];
     let remoteWrites = 0;
     await assert.rejects(

@@ -1704,6 +1704,95 @@ test('Phase3 claim keys include every canonical email and phone identity', () =>
   }
 });
 
+test('sync preview binds the resolved create group IDs with one consistent client', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-group-preview-'));
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+  ]);
+  let server = null;
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '0';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  delete process.env.SUB2API_GROUP_IDS;
+  process.env.SUB2API_GROUP_NAME = 'share';
+  try {
+    fs.mkdirSync(path.join(root, 'tokens'));
+    fs.mkdirSync(path.join(root, 'use_token'));
+    fs.writeFileSync(path.join(root, 'username.json'), '[]');
+    const accessToken = [
+      'header',
+      Buffer.from(JSON.stringify({
+        sub: 'preview-user',
+        'https://api.openai.com/auth': {
+          chatgpt_account_id: 'preview-account',
+          chatgpt_user_id: 'preview-user',
+        },
+      })).toString('base64url'),
+      'signature',
+    ].join('.');
+    fs.writeFileSync(path.join(root, 'tokens', 'preview.json'), JSON.stringify({
+      access_token: accessToken,
+      expires_at: '2099-01-01T00:00:00.000Z',
+    }));
+
+    let factoryCalls = 0;
+    let accountReads = 0;
+    let groupReads = 0;
+    const client = {
+      async listAccounts() { accountReads += 1; return []; },
+      async listGroups() {
+        groupReads += 1;
+        return [{ id: 17, name: 'share', platform: 'openai' }];
+      },
+    };
+    server = createServer({
+      dbPath: path.join(root, 'panel.sqlite3'),
+      syncClientFactory() {
+        factoryCalls += 1;
+        return client;
+      },
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
+        requestId() { return 'group-preview-request'; },
+        tail() { return []; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const response = await postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/sync/preview',
+      { selectedKeys: [] },
+    );
+    assert.equal(response.status, 200);
+    const body = JSON.parse(response.body);
+    assert.deepEqual(body.groupBinding, { mode: 'explicit', groupIds: [17] });
+    assert.match(body.planIntentVersion, /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/);
+    assert.equal(body.items[0].action, 'create');
+    assert.equal(factoryCalls, 1);
+    assert.equal(accountReads, 1);
+    assert.equal(groupReads, 1);
+  } finally {
+    await closeHttpServer(server);
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
 test('serves a read-only health endpoint and safe source snapshot', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-server-'));
   const previous = {
