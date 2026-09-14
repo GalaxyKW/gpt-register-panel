@@ -4,6 +4,7 @@ const net = require('node:net');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
+const { TextDecoder } = require('node:util');
 
 const {
   booleanEnvEnabled,
@@ -762,7 +763,7 @@ function writeLog(logger, level, event, fields = {}) {
 
 function readJsonBody(request, limit = 1024 * 1024) {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks = [];
     let bodyBytes = 0;
     let settled = false;
     const fail = (error) => {
@@ -770,11 +771,14 @@ function readJsonBody(request, limit = 1024 * 1024) {
       settled = true;
       reject(error);
     };
-    request.setEncoding('utf8');
     request.on('data', (chunk) => {
       if (settled) return;
-      const chunkBytes = Buffer.byteLength(chunk);
-      bodyBytes += chunkBytes;
+      // Keep the original octets until the complete body is available.
+      // IncomingMessage#setEncoding uses a replacement character for malformed
+      // UTF-8, which can silently turn damaged mutation input into a different
+      // valid JSON document and therefore a different idempotency intent.
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk), 'utf8');
+      bodyBytes += bytes.length;
       if (bodyBytes > limit) {
         const error = new Error('request body too large');
         error.code = 'REQUEST_BODY_TOO_LARGE';
@@ -782,10 +786,24 @@ function readJsonBody(request, limit = 1024 * 1024) {
         request.resume();
         return;
       }
-      body += chunk;
+      chunks.push(bytes);
     });
     request.on('end', () => {
       if (settled) return;
+      let body;
+      try {
+        body = new TextDecoder('utf-8', {
+          fatal: true,
+          // Preserve a leading BOM so JSON.parse rejects it instead of silently
+          // accepting bytes outside the JSON text grammar.
+          ignoreBOM: true,
+        }).decode(Buffer.concat(chunks, bodyBytes));
+      } catch {
+        const error = new Error('invalid UTF-8 JSON body');
+        error.code = 'INVALID_JSON_BODY';
+        fail(error);
+        return;
+      }
       if (!body.trim()) {
         settled = true;
         resolve({});

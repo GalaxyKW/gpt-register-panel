@@ -730,29 +730,43 @@ test('listen loopback exemption requires an unbracketed numeric loopback address
   }
 });
 
-test('JSON request bodies account for bytes incrementally and reject aborted streams', async () => {
+test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject aborted streams', async () => {
   const requestStream = new EventEmitter();
-  requestStream.setEncoding = () => {};
+  requestStream.setEncoding = () => { throw new Error('must retain raw request bytes'); };
   requestStream.resume = () => {};
-  const originalByteLength = Buffer.byteLength;
-  const measuredLengths = [];
-  Buffer.byteLength = function measuredByteLength(value, ...args) {
-    measuredLengths.push(String(value).length);
-    return originalByteLength.call(Buffer, value, ...args);
-  };
-  try {
-    const parsedPromise = readJsonBody(requestStream, 64);
-    requestStream.emit('data', '{"part":');
-    requestStream.emit('data', '"value"}');
-    requestStream.emit('end');
-    assert.deepEqual(await parsedPromise, { part: 'value' });
-    assert.deepEqual(measuredLengths, [8, 8]);
-  } finally {
-    Buffer.byteLength = originalByteLength;
-  }
+  const parsedPromise = readJsonBody(requestStream, 64);
+  requestStream.emit('data', Buffer.from('{"part":'));
+  requestStream.emit('data', Buffer.from('"value"}'));
+  requestStream.emit('end');
+  assert.deepEqual(await parsedPromise, { part: 'value' });
+
+  const splitUtf8Stream = new EventEmitter();
+  splitUtf8Stream.resume = () => {};
+  const splitUtf8Promise = readJsonBody(splitUtf8Stream, 64);
+  const splitUtf8Body = Buffer.from('{"part":"值"}');
+  const characterStart = splitUtf8Body.indexOf(Buffer.from('值'));
+  splitUtf8Stream.emit('data', splitUtf8Body.subarray(0, characterStart + 1));
+  splitUtf8Stream.emit('data', splitUtf8Body.subarray(characterStart + 1));
+  splitUtf8Stream.emit('end');
+  assert.deepEqual(await splitUtf8Promise, { part: '值' });
+
+  const invalidUtf8Stream = new EventEmitter();
+  invalidUtf8Stream.resume = () => {};
+  const invalidUtf8Promise = readJsonBody(invalidUtf8Stream, 64);
+  invalidUtf8Stream.emit('data', Buffer.from('{"part":"'));
+  invalidUtf8Stream.emit('data', Buffer.from([0xc3]));
+  invalidUtf8Stream.emit('data', Buffer.from('"}'));
+  invalidUtf8Stream.emit('end');
+  await assert.rejects(invalidUtf8Promise, (error) => error.code === 'INVALID_JSON_BODY');
+
+  const byteLimitStream = new EventEmitter();
+  byteLimitStream.resume = () => {};
+  const byteLimitPromise = readJsonBody(byteLimitStream, 3);
+  byteLimitStream.emit('data', Buffer.from('值'));
+  byteLimitStream.emit('data', Buffer.from('a'));
+  await assert.rejects(byteLimitPromise, (error) => error.code === 'REQUEST_BODY_TOO_LARGE');
 
   const abortedStream = new EventEmitter();
-  abortedStream.setEncoding = () => {};
   abortedStream.resume = () => {};
   const abortedPromise = readJsonBody(abortedStream, 64);
   abortedStream.emit('data', '{"partial":');
