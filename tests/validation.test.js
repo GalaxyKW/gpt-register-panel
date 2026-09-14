@@ -419,6 +419,125 @@ test('PanelDb enforces job status transitions and preserves the first terminal r
   await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
 });
 
+test('PanelDb keeps the durable queued job and claim when a terminal export exceeds the DB limit', async () => {
+  const previousMaximum = process.env.PANEL_DB_MAX_BYTES;
+  process.env.PANEL_DB_MAX_BYTES = String(1024 * 1024);
+  try {
+    const file = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-export-limit-')),
+      'panel.sqlite3',
+    );
+    const db = new PanelDb(file);
+    const claimKey = 'phase3:oversized-terminal';
+    const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+    const durableBefore = fs.readFileSync(file);
+
+    await assert.rejects(
+      db.updateJob(job.id, {
+        status: 'succeeded',
+        result: { output: 'x'.repeat(1536 * 1024) },
+        finishedAt: '2026-09-14T00:01:00.000Z',
+      }),
+      (error) => error.code === 'PANEL_DB_TOO_LARGE'
+        && error.actualBytes > error.maximumBytes,
+    );
+
+    assert.deepEqual(fs.readFileSync(file), durableBefore);
+    const persisted = await db.getJob(job.id);
+    assert.equal(persisted.status, 'queued');
+    assert.equal(persisted.result, null);
+    await assert.rejects(
+      db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] }),
+      (error) => error.code === 'JOB_ALREADY_CLAIMED'
+        && error.existingJobId === job.id,
+    );
+
+    const recovered = await db.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+    assert.equal(recovered.applied, true);
+    const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+    assert.equal(replacement.status, 'queued');
+    await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
+  } finally {
+    if (previousMaximum === undefined) delete process.env.PANEL_DB_MAX_BYTES;
+    else process.env.PANEL_DB_MAX_BYTES = previousMaximum;
+  }
+});
+
+test('PanelDb rejects oversized job and audit fields before changing SQL rows', async () => {
+  const file = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-field-limit-')),
+    'panel.sqlite3',
+  );
+  const db = new PanelDb(file);
+
+  await assert.rejects(
+    db.createJob('phase3', { output: 'p'.repeat(1024 * 1024) }, 'tester'),
+    (error) => error.code === 'PANEL_DB_FIELD_TOO_LARGE'
+      && error.field === 'sync_jobs.payload_json',
+  );
+  assert.equal((await db.listJobs(10)).length, 0);
+
+  const claimKey = 'phase3:oversized-fields';
+  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+  await assert.rejects(
+    db.updateJob(job.id, {
+      status: 'succeeded',
+      result: { output: 'r'.repeat(2 * 1024 * 1024) },
+    }),
+    (error) => error.code === 'PANEL_DB_FIELD_TOO_LARGE'
+      && error.field === 'sync_jobs.result_json',
+  );
+  await assert.rejects(
+    db.updateJob(job.id, {
+      status: 'failed',
+      error: 'e'.repeat(64 * 1024 + 1),
+    }),
+    (error) => error.code === 'PANEL_DB_FIELD_TOO_LARGE'
+      && error.field === 'sync_jobs.error',
+  );
+  assert.equal((await db.getJob(job.id)).status, 'queued');
+  await assert.rejects(
+    db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] }),
+    (error) => error.code === 'JOB_ALREADY_CLAIMED',
+  );
+
+  const oversizedAuditText = '界'.repeat(5462);
+  const auditTextFields = new Map([
+    ['jobId', 'audit_events.job_id'],
+    ['actor', 'audit_events.actor'],
+    ['action', 'audit_events.action'],
+    ['targetKey', 'audit_events.target_key'],
+    ['beforeFingerprint', 'audit_events.before_fingerprint'],
+    ['afterFingerprint', 'audit_events.after_fingerprint'],
+    ['result', 'audit_events.result'],
+  ]);
+  for (const [property, field] of auditTextFields) {
+    await assert.rejects(
+      db.audit({
+        actor: 'tester',
+        action: 'capacity_test',
+        result: 'rejected',
+        [property]: oversizedAuditText,
+      }),
+      (error) => error.code === 'PANEL_DB_FIELD_TOO_LARGE'
+        && error.field === field
+        && error.actualBytes > error.maximumBytes,
+    );
+  }
+  await assert.rejects(
+    db.audit({
+      actor: 'tester',
+      action: 'capacity_test',
+      result: 'rejected',
+      details: { output: 'd'.repeat(512 * 1024) },
+    }),
+    (error) => error.code === 'PANEL_DB_FIELD_TOO_LARGE'
+      && error.field === 'audit_events.details_json',
+  );
+  assert.equal((await db.listAudit(10)).length, 0);
+  await db.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+});
+
 test('PanelDb rejects oversized or multiply linked database files before loading them', async () => {
   const previousMaximum = process.env.PANEL_DB_MAX_BYTES;
   process.env.PANEL_DB_MAX_BYTES = String(1024 * 1024);

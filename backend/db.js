@@ -14,6 +14,11 @@ const initializationPromises = new Map();
 const DB_LOCK_KIND = 'gpt-register-panel-db-lock';
 const DEFAULT_DB_MAX_BYTES = 128 * 1024 * 1024;
 const HARD_DB_MAX_BYTES = 512 * 1024 * 1024;
+const MAX_JOB_PAYLOAD_BYTES = 1024 * 1024;
+const MAX_JOB_RESULT_BYTES = 2 * 1024 * 1024;
+const MAX_JOB_ERROR_BYTES = 64 * 1024;
+const MAX_AUDIT_TEXT_BYTES = 16 * 1024;
+const MAX_AUDIT_DETAILS_BYTES = 512 * 1024;
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
 const JOB_STATUSES = new Set([...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES]);
@@ -57,6 +62,22 @@ function storedJobOwnerIsAlive(job) {
 
 function jsonString(value) {
   return JSON.stringify(value === undefined ? null : value);
+}
+
+function assertStoredByteLength(field, value, maximumBytes) {
+  if (value === null || value === undefined) return value;
+  const actualBytes = Buffer.byteLength(String(value), 'utf8');
+  if (actualBytes <= maximumBytes) return value;
+  const error = new Error('SQLite 字段超过安全字节上限');
+  error.code = 'PANEL_DB_FIELD_TOO_LARGE';
+  error.field = field;
+  error.actualBytes = actualBytes;
+  error.maximumBytes = maximumBytes;
+  throw error;
+}
+
+function boundedJsonString(field, value, maximumBytes) {
+  return assertStoredByteLength(field, jsonString(redactValue(value)), maximumBytes);
 }
 
 function randomId(prefix) {
@@ -420,6 +441,16 @@ class PanelDb {
 
   persistUnlocked() {
     const bytes = this.database.export();
+    const maximumBytes = databaseMaximumBytes();
+    if (bytes.byteLength > maximumBytes) {
+      // Fail before opening a temporary output file. The last durable version
+      // remains intact and the next operation will reload it from disk.
+      const error = new Error('SQLite 数据库文件超过安全上限');
+      error.code = 'PANEL_DB_TOO_LARGE';
+      error.actualBytes = bytes.byteLength;
+      error.maximumBytes = maximumBytes;
+      throw error;
+    }
     const pinnedDirectory = this.openPinnedDatabaseDirectory();
     const fileName = path.basename(this.dbPath);
     const temporaryPath = path.join(
@@ -510,7 +541,12 @@ class PanelDb {
       .map((key) => String(key || '').trim())
       .filter((key) => key && key.length <= 512))];
     const owner = currentProcessOwner();
-    const safePayload = redactValue(payload);
+    let safePayloadJson;
+    try {
+      safePayloadJson = boundedJsonString('sync_jobs.payload_json', payload, MAX_JOB_PAYLOAD_BYTES);
+    } catch (error) {
+      return Promise.reject(error);
+    }
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
@@ -559,7 +595,7 @@ class PanelDb {
           id,
           type,
           requestedBy,
-          jsonString(safePayload),
+          safePayloadJson,
           now,
           jsonString(claimKeys),
           owner.pid,
@@ -593,11 +629,27 @@ class PanelDb {
       fields.push(column + ' = ?');
       values.push(value);
     };
+    let safeResultJson;
+    let safeError;
+    try {
+      safeResultJson = patch.result === undefined
+        ? undefined
+        : boundedJsonString('sync_jobs.result_json', patch.result, MAX_JOB_RESULT_BYTES);
+      safeError = patch.error === undefined
+        ? undefined
+        : patch.error === null
+          ? null
+          : assertStoredByteLength(
+            'sync_jobs.error',
+            redactText(String(patch.error)),
+            MAX_JOB_ERROR_BYTES,
+          );
+    } catch (error) {
+      return Promise.reject(error);
+    }
     add('status', patch.status);
-    add('result_json', patch.result === undefined ? undefined : jsonString(redactValue(patch.result)));
-    add('error', patch.error === undefined
-      ? undefined
-      : patch.error === null ? null : redactText(String(patch.error)));
+    add('result_json', safeResultJson);
+    add('error', safeError);
     add('started_at', patch.startedAt);
     add('finished_at', patch.finishedAt);
     if (fields.length === 0) return Promise.resolve();
@@ -786,11 +838,9 @@ class PanelDb {
 
   audit(event = {}) {
     const now = new Date().toISOString();
-    return this.write((database) => {
-      const statement = database.prepare(`INSERT INTO audit_events
-        (job_id, actor, action, target_key, before_fingerprint, after_fingerprint, result, details_json, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
-      statement.run([
+    let values;
+    try {
+      values = [
         event.jobId || null,
         event.actor || 'local',
         event.action || 'unknown',
@@ -798,9 +848,32 @@ class PanelDb {
         event.beforeFingerprint || null,
         event.afterFingerprint || null,
         event.result || 'ok',
-        jsonString(redactValue(event.details || {})),
-        now,
-      ]);
+      ];
+      const fields = [
+        'audit_events.job_id',
+        'audit_events.actor',
+        'audit_events.action',
+        'audit_events.target_key',
+        'audit_events.before_fingerprint',
+        'audit_events.after_fingerprint',
+        'audit_events.result',
+      ];
+      values = values.map((value, index) => (
+        assertStoredByteLength(fields[index], value, MAX_AUDIT_TEXT_BYTES)
+      ));
+      values.push(boundedJsonString(
+        'audit_events.details_json',
+        event.details || {},
+        MAX_AUDIT_DETAILS_BYTES,
+      ));
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.write((database) => {
+      const statement = database.prepare(`INSERT INTO audit_events
+        (job_id, actor, action, target_key, before_fingerprint, after_fingerprint, result, details_json, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      statement.run([...values, now]);
       statement.free();
     });
   }
