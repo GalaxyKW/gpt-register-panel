@@ -1136,6 +1136,26 @@ test('Sub2API account listing follows server-capped pages and rejects incomplete
   );
 });
 
+test('Sub2API account listing rejects coercible non-integer pagination totals', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  for (const total of [true, false, [], {}, ' 1', '1 ', '01', '-0', '1.0', 1.5]) {
+    client.request = async () => ({ items: [{ id: 1 }], total });
+    await assert.rejects(
+      client.listAccounts({ requireTotal: true }),
+      (error) => error.code === 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+      'unexpectedly accepted total=' + JSON.stringify(total),
+    );
+  }
+
+  for (const total of [1, '1']) {
+    client.request = async () => ({ items: [{ id: 1 }], total });
+    assert.deepEqual(
+      (await client.listAccounts({ requireTotal: true })).map((account) => account.id),
+      [1],
+    );
+  }
+});
+
 test('Sub2API account exports require a complete supported backup envelope', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
   const validPayloads = [

@@ -84,6 +84,15 @@ function positiveAccountId(value) {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
+function paginationTotal(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value >= 0 ? value : null;
+  }
+  if (typeof value !== 'string' || !/^(?:0|[1-9]\d*)$/.test(value)) return null;
+  const total = Number(value);
+  return Number.isSafeInteger(total) ? total : null;
+}
+
 function scalarAliases(values, maximumLength, options = {}) {
   const present = values.filter((value) => value !== undefined && value !== null && value !== '');
   const normalized = [];
@@ -1041,8 +1050,8 @@ class Sub2ApiAdminClient {
       }
       const rawTotal = value?.total ?? value?.pagination?.total;
       if (rawTotal !== undefined && rawTotal !== null && rawTotal !== '') {
-        const total = Number(rawTotal);
-        if (!Number.isSafeInteger(total) || total < 0
+        const total = paginationTotal(rawTotal);
+        if (total === null
             || (expectedTotal !== null && expectedTotal !== total)) {
           const error = new Error('Sub2API 账号列表分页统计无效或已变化');
           error.code = 'SUB2API_ACCOUNTS_PAGINATION_INVALID';
