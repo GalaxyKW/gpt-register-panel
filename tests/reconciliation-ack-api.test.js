@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
@@ -26,6 +27,9 @@ function requestJson(baseUrl, pathname, options = {}) {
       headers: {
         ...(options.token ? { 'x-panel-token': options.token } : {}),
         ...(options.contentType === false ? {} : body ? { 'content-type': 'application/json' } : {}),
+        ...(options.method === 'POST' && pathname === '/api/tokens/expired/delete'
+          ? { 'idempotency-key': 'test-idem-' + crypto.randomUUID() }
+          : {}),
         'content-length': Buffer.byteLength(body),
       },
     }, (response) => {

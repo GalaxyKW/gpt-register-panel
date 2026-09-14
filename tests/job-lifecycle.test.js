@@ -424,6 +424,11 @@ test('HTTP shutdown cancels a queued import admission before job creation', asyn
     await lockEntered;
     const db = {
       dbPath: path.join(os.tmpdir(), 'unused-panel-admission-shutdown.sqlite3'),
+      async getMutationReceipt() { return null; },
+      async createMutationSubmission() {
+        createdJobs += 1;
+        throw new Error('unexpected task creation');
+      },
       async createJob() {
         createdJobs += 1;
         return { id: 'must-not-exist', type: 'token_import', status: 'queued' };
@@ -451,7 +456,10 @@ test('HTTP shutdown cancels a queued import admission before job creation', asyn
         port: address.port,
         path: '/api/sync/import',
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'idempotency-key': 'test-idem-admission-shutdown-1234567890',
+        },
       }, (response) => {
         let body = '';
         response.setEncoding('utf8');

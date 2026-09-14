@@ -589,6 +589,414 @@ test('write endpoints fail closed when the audit log becomes unavailable', async
   }
 });
 
+test('all mutation routes require one strict key and replay before live validation', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const receiptCalls = [];
+  let admissions = 0;
+  let server;
+  const responseJobId = 'job_' + '1'.repeat(24);
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-idempotency-replay.sqlite3',
+        async getMutationReceipt(context) {
+          receiptCalls.push(context);
+          return {
+            statusCode: 202,
+            response: { jobId: responseJobId, status: 'queued' },
+          };
+        },
+      },
+      jobManager: {
+        shuttingDown: false,
+        activeCount: 0,
+        async withAdmission() {
+          admissions += 1;
+          throw new Error('receipt replay must not enter admission');
+        },
+        async shutdown() { return { active: 0, interrupted: [] }; },
+      },
+      logger: {
+        requestId: () => 'idempotency-route-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const key = 'idem_v1_route_replay_12345678901234567890';
+    const requests = [
+      ['/api/sync/import', {
+        snapshotVersion: 'a'.repeat(64),
+        selectedKeys: ['token:tokens:tokens/missing.json'],
+      }],
+      ['/api/phase3', {
+        accounts: [{
+          email: 'missing@example.test',
+          selectedKey: 'token:tokens:tokens/missing.json',
+          phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+        }],
+        selectedKeys: ['token:tokens:tokens/missing.json'],
+      }],
+      ['/api/account-tests', {
+        targets: [{
+          accountId: 999,
+          targetRevision: 'account-test-v1.' + 'A'.repeat(43),
+        }],
+        modelId: 'gpt-5.6-luna',
+      }],
+      ['/api/tokens/expired/delete', {
+        version: 'b'.repeat(64),
+        confirmation: 'DELETE_EXPIRED_TOKENS',
+      }],
+    ];
+    for (const [pathname, body] of requests) {
+      const replay = await postJson(baseUrl, pathname, body, { 'idempotency-key': key });
+      assert.equal(replay.status, 202, pathname);
+      assert.equal(replay.headers['idempotency-replayed'], 'true');
+      assert.deepEqual(JSON.parse(replay.body), { jobId: responseJobId, status: 'queued' });
+    }
+    assert.equal(admissions, 0);
+    assert.deepEqual(receiptCalls.map((item) => item.workflow), [
+      'token_import', 'phase3', 'account_test', 'token_cleanup',
+    ]);
+    assert.equal(receiptCalls.every((item) => /^[a-f0-9]{64}$/.test(item.requestDigest)), true);
+    assert.equal(JSON.stringify(receiptCalls).includes(key), true);
+
+    const validPhaseBody = JSON.stringify(requests[1][1]);
+    const missing = await postBody(baseUrl, '/api/phase3', validPhaseBody, 'application/json');
+    assert.equal(missing.status, 400);
+    assert.equal(JSON.parse(missing.body).error, 'IDEMPOTENCY_KEY_REQUIRED');
+    const invalid = await postBody(baseUrl, '/api/phase3', validPhaseBody, 'application/json', {
+      'idempotency-key': 'short',
+    });
+    assert.equal(invalid.status, 400);
+    assert.equal(JSON.parse(invalid.body).error, 'IDEMPOTENCY_KEY_INVALID');
+    const duplicate = await postBody(baseUrl, '/api/phase3', validPhaseBody, 'application/json', {
+      'idempotency-key': [key, key],
+    });
+    assert.equal(duplicate.status, 400);
+    assert.equal(JSON.parse(duplicate.body).error, 'IDEMPOTENCY_KEY_INVALID');
+  } finally {
+    await closeHttpServer(server);
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('the locked receipt recheck wins before every mutable live validator', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const receiptCalls = new Map();
+  const liveCalls = { phase3: 0, accountTest: 0, cleanup: 0, create: 0 };
+  let admissions = 0;
+  let server;
+  const responseJobId = 'job_' + '2'.repeat(24);
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-idempotency-locked-replay.sqlite3',
+        async getMutationReceipt(context) {
+          const calls = (receiptCalls.get(context.workflow) || 0) + 1;
+          receiptCalls.set(context.workflow, calls);
+          if (calls === 1) return null;
+          return {
+            statusCode: 202,
+            response: { jobId: responseJobId, status: 'queued' },
+          };
+        },
+        async createMutationSubmission() {
+          liveCalls.create += 1;
+          throw new Error('job creation must not follow a locked receipt replay');
+        },
+      },
+      phase3RequestResolver() {
+        liveCalls.phase3 += 1;
+        throw new Error('Phase3 live resolution must not run after a locked replay');
+      },
+      accountTestClientFactory() {
+        liveCalls.accountTest += 1;
+        throw new Error('Sub2API live read must not run after a locked replay');
+      },
+      expiredTokenLister() {
+        liveCalls.cleanup += 1;
+        throw new Error('expired-token scan must not run after a locked replay');
+      },
+      jobManager: {
+        shuttingDown: false,
+        activeCount: 0,
+        async withAdmission(callback) {
+          admissions += 1;
+          return callback(new AbortController().signal);
+        },
+        begin() { throw new Error('worker must not start after a locked receipt replay'); },
+        async shutdown() { return { active: 0, interrupted: [] }; },
+      },
+      logger: {
+        requestId: () => 'idempotency-locked-replay-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const requests = [
+      ['/api/sync/import', {
+        snapshotVersion: 'a'.repeat(64),
+        selectedKeys: ['token:tokens:tokens/not-present.json'],
+      }],
+      ['/api/phase3', {
+        accounts: [{
+          email: 'not-present@example.test',
+          selectedKey: 'token:tokens:tokens/not-present.json',
+          phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+        }],
+        selectedKeys: ['token:tokens:tokens/not-present.json'],
+      }],
+      ['/api/account-tests', {
+        targets: [{
+          accountId: 999,
+          targetRevision: 'account-test-v1.' + 'A'.repeat(43),
+        }],
+        modelId: 'gpt-5.6-luna',
+      }],
+      ['/api/tokens/expired/delete', {
+        version: 'b'.repeat(64),
+        confirmation: 'DELETE_EXPIRED_TOKENS',
+      }],
+    ];
+    for (const [index, [pathname, body]] of requests.entries()) {
+      const replay = await postJson(baseUrl, pathname, body, {
+        'idempotency-key': 'idem_v1_locked_replay_' + String(index).padStart(24, '0'),
+      });
+      assert.equal(replay.status, 202, pathname);
+      assert.equal(replay.headers['idempotency-replayed'], 'true');
+      assert.deepEqual(JSON.parse(replay.body), { jobId: responseJobId, status: 'queued' });
+    }
+    assert.equal(admissions, 4);
+    assert.deepEqual(Object.fromEntries(receiptCalls), {
+      token_import: 2,
+      phase3: 2,
+      account_test: 2,
+      token_cleanup: 2,
+    });
+    assert.deepEqual(liveCalls, { phase3: 0, accountTest: 0, cleanup: 0, create: 0 });
+  } finally {
+    await closeHttpServer(server);
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('concurrent requests that both miss initially create and dispatch only once', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const job = {
+    id: 'job_' + '3'.repeat(24),
+    type: 'token_import',
+    status: 'queued',
+    requestedBy: 'anonymous',
+    createdAt: new Date().toISOString(),
+  };
+  const receipt = { statusCode: 202, response: { jobId: job.id, status: 'queued' } };
+  let lookupCalls = 0;
+  let initialLookups = 0;
+  let releaseInitialLookups;
+  const bothInitialLookups = new Promise((resolve) => { releaseInitialLookups = resolve; });
+  let committedReceipt = null;
+  let creates = 0;
+  let begins = 0;
+  let server;
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-idempotency-concurrent-route.sqlite3',
+        async getMutationReceipt() {
+          lookupCalls += 1;
+          if (initialLookups < 2) {
+            initialLookups += 1;
+            if (initialLookups === 2) releaseInitialLookups();
+            await bothInitialLookups;
+            return null;
+          }
+          return committedReceipt;
+        },
+        async createMutationSubmission() {
+          creates += 1;
+          committedReceipt = receipt;
+          return {
+            receipt,
+            replayed: false,
+            createdJobs: [{ job }],
+            rejections: [],
+          };
+        },
+        async updateJob() { return { applied: true }; },
+        async audit() {},
+      },
+      jobManager: {
+        shuttingDown: false,
+        activeCount: 0,
+        async withAdmission(callback) { return callback(new AbortController().signal); },
+        begin() {
+          begins += 1;
+          const controller = new AbortController();
+          controller.abort();
+          return { controller };
+        },
+        track(_record, observation) {
+          Promise.resolve(observation).catch(() => {});
+          return observation;
+        },
+        async shutdown() { return { active: 0, interrupted: [] }; },
+      },
+      logger: {
+        requestId: () => 'idempotency-concurrent-route-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const body = {
+      snapshotVersion: 'a'.repeat(64),
+      selectedKeys: ['token:tokens:tokens/concurrent.json'],
+    };
+    const key = 'idem_v1_concurrent_route_123456789012345';
+    const responses = await Promise.all([
+      postJson(baseUrl, '/api/sync/import', body, { 'idempotency-key': key }),
+      postJson(baseUrl, '/api/sync/import', body, { 'idempotency-key': key }),
+    ]);
+    assert.equal(initialLookups, 2);
+    assert.equal(lookupCalls, 4);
+    assert.equal(creates, 1);
+    assert.equal(begins, 1);
+    assert.equal(responses.every((item) => item.status === 202), true);
+    assert.equal(responses[0].body, responses[1].body);
+    assert.deepEqual(
+      responses.map((item) => item.headers['idempotency-replayed']).sort(),
+      ['false', 'true'],
+    );
+  } finally {
+    releaseInitialLookups?.();
+    await closeHttpServer(server);
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('a completed cleanup replays its original 202 without rescanning or starting another worker', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-replay-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
+    access_token: 'expired-placeholder',
+    email: 'replay@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
+  let server;
+  try {
+    const listing = listExpiredTokens();
+    const requestBody = {
+      version: listing.version,
+      confirmation: 'DELETE_EXPIRED_TOKENS',
+    };
+    const key = 'idem_v1_cleanup_replay_12345678901234567';
+    server = createServer({
+      db,
+      logger: {
+        requestId: () => 'cleanup-replay-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const first = await postJson(baseUrl, '/api/tokens/expired/delete', requestBody, {
+      'idempotency-key': key,
+    });
+    assert.equal(first.status, 202);
+    assert.equal(first.headers['idempotency-replayed'], 'false');
+    const firstBody = JSON.parse(first.body);
+    const terminal = await waitForTerminalJob(baseUrl, firstBody.jobId);
+    assert.equal(terminal.status, 'succeeded');
+
+    const replay = await postJson(baseUrl, '/api/tokens/expired/delete', requestBody, {
+      'idempotency-key': key,
+    });
+    assert.equal(replay.status, 202);
+    assert.equal(replay.headers['idempotency-replayed'], 'true');
+    assert.equal(replay.body, first.body);
+    assert.equal((await db.listJobs()).filter((job) => job.type === 'token_cleanup').length, 1);
+
+    const changed = await postJson(baseUrl, '/api/tokens/expired/delete', {
+      ...requestBody,
+      version: 'c'.repeat(64),
+    }, { 'idempotency-key': key });
+    assert.equal(changed.status, 409);
+    assert.equal(JSON.parse(changed.body).error, 'IDEMPOTENCY_KEY_REUSED');
+    assert.equal((await db.listJobs()).filter((job) => job.type === 'token_cleanup').length, 1);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
 function request(baseUrl, pathname) {
   return new Promise((resolve, reject) => {
     const requestObject = http.get(baseUrl + pathname, configuredPanelToken
@@ -607,19 +1015,27 @@ function request(baseUrl, pathname) {
   });
 }
 
-function postJson(baseUrl, pathname, body) {
+function postJson(baseUrl, pathname, body, extraHeaders = {}) {
+  const mutationPath = ['/api/sync/import', '/api/phase3', '/api/account-tests',
+    '/api/tokens/expired/delete'].includes(pathname);
   return new Promise((resolve, reject) => {
     const requestObject = http.request(baseUrl + pathname, {
       method: 'POST',
       headers: {
         ...(configuredPanelToken ? { 'x-panel-token': configuredPanelToken } : {}),
         'content-type': 'application/json',
+        ...(mutationPath ? { 'idempotency-key': 'test-idem-' + crypto.randomUUID() } : {}),
+        ...extraHeaders,
       },
     }, (response) => {
       let responseBody = '';
       response.setEncoding('utf8');
       response.on('data', (chunk) => { responseBody += chunk; });
-      response.on('end', () => resolve({ status: response.statusCode, body: responseBody }));
+      response.on('end', () => resolve({
+        status: response.statusCode,
+        headers: response.headers,
+        body: responseBody,
+      }));
     });
     requestObject.on('error', reject);
     requestObject.end(JSON.stringify(body));
@@ -1317,14 +1733,15 @@ test('token cleanup never recovers a claim from a stale ordinary delete and repo
   try {
     await db.ready;
     const listing = listExpiredTokens();
-    const createJob = db.createJob.bind(db);
+    const createMutationSubmission = db.createMutationSubmission.bind(db);
     let injected = false;
     let injectedClaimPath = null;
     let cleanupJobCreates = 0;
-    db.createJob = async (...args) => {
-      if (args[0] === 'token_cleanup') cleanupJobCreates += 1;
-      const job = await createJob(...args);
-      if (!injected && args[0] === 'token_cleanup') {
+    db.createMutationSubmission = async (options) => {
+      const isCleanup = options?.jobs?.some((item) => item?.type === 'token_cleanup');
+      if (isCleanup) cleanupJobCreates += 1;
+      const submission = await createMutationSubmission(options);
+      if (!injected && isCleanup && !submission.replayed) {
         injected = true;
         const contentHash = crypto.createHash('sha256').update(sourceContent).digest('hex');
         const encodedName = Buffer.from(path.basename(sourcePath), 'utf8').toString('base64url');
@@ -1341,7 +1758,7 @@ test('token cleanup never recovers a claim from a stale ordinary delete and repo
           expired: '2020-01-01T00:00:00.000Z',
         }), { mode: 0o600 });
       }
-      return job;
+      return submission;
     };
     server = createServer({
       db,
@@ -1531,6 +1948,8 @@ test('shutdown cancels a queued expired token deletion before any audit or file 
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async getMutationReceipt() { return null; },
+        async createMutationSubmission() { throw new Error('unexpected task creation'); },
         async assertNoReconciliationHold() {},
         async audit() { auditCalls += 1; },
         async interruptOwnedActiveJobs() { return []; },

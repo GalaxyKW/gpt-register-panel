@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const http = require('node:http');
 const fs = require('node:fs');
 const os = require('node:os');
@@ -95,6 +96,9 @@ function requestJson(baseUrl, pathname, options = {}) {
       method: options.method || 'GET',
       headers: {
         ...(options.body === undefined ? {} : { 'content-type': 'application/json' }),
+        ...(options.method === 'POST' && pathname === '/api/account-tests'
+          ? { 'idempotency-key': 'test-idem-' + crypto.randomUUID() }
+          : {}),
         ...(options.headers || {}),
       },
     }, (response) => {

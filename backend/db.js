@@ -6,6 +6,7 @@ const { redactText, redactValue } = require('./logger');
 const { acquireBakeryLease, releaseBakeryLease } = require('./lib/bakeryLock');
 const { ensureDirectoryTree } = require('./lib/safeFs');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
+const { mutationKeyHash, normalizeIdempotencyKey } = require('./idempotency');
 
 // /tmp keeps an unconfigured development run writable in restricted containers.
 // Production should set PANEL_DB_PATH to a 0600 path under the project runtime directory.
@@ -22,6 +23,14 @@ const MAX_AUDIT_DETAILS_BYTES = 512 * 1024;
 const MAX_JOB_CLAIM_KEYS = 1000;
 const MAX_JOB_CLAIM_KEY_BYTES = 512;
 const MAX_RECONCILIATION_LIST_JOBS = 100;
+const MAX_MUTATION_RECEIPT_RESPONSE_BYTES = 64 * 1024;
+const MAX_MUTATION_RECEIPT_JOBS = 100;
+const MAX_MUTATION_RECEIPT_JOB_IDS_BYTES = 8 * 1024;
+const DEFAULT_MUTATION_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const MIN_MUTATION_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
+const MAX_MUTATION_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const DEFAULT_MAX_MUTATION_RECEIPTS = 2000;
+const HARD_MAX_MUTATION_RECEIPTS = 10000;
 // Public history pages need only a compact operational summary. Individual
 // results may legitimately approach MAX_JOB_RESULT_BYTES, so transferring,
 // parsing and recursively redacting hundreds of them on every poll would let
@@ -937,6 +946,343 @@ function durableReconciliationListSummary(row) {
   };
 }
 
+function mutationReceiptTtlMs() {
+  const value = Number(process.env.PANEL_IDEMPOTENCY_TTL_MS);
+  if (!Number.isFinite(value)) return DEFAULT_MUTATION_RECEIPT_TTL_MS;
+  return Math.max(
+    MIN_MUTATION_RECEIPT_TTL_MS,
+    Math.min(MAX_MUTATION_RECEIPT_TTL_MS, Math.floor(value)),
+  );
+}
+
+function maximumMutationReceipts() {
+  const value = Number(process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS);
+  if (!Number.isSafeInteger(value) || value <= 0) return DEFAULT_MAX_MUTATION_RECEIPTS;
+  return Math.min(value, HARD_MAX_MUTATION_RECEIPTS);
+}
+
+function normalizeMutationWorkflow(value) {
+  const workflow = typeof value === 'string' ? value.trim() : '';
+  if (!/^[a-z][a-z0-9_]{1,63}$/.test(workflow)) {
+    const error = new Error('幂等工作流标识无效');
+    error.code = 'IDEMPOTENCY_WORKFLOW_INVALID';
+    throw error;
+  }
+  return workflow;
+}
+
+function normalizeMutationActor(value) {
+  const actor = typeof value === 'string' ? value.trim() : '';
+  if (!/^[a-z][a-z0-9-]{0,31}$/.test(actor)) {
+    const error = new Error('幂等请求执行者无效');
+    error.code = 'IDEMPOTENCY_SCOPE_INVALID';
+    throw error;
+  }
+  return actor;
+}
+
+function normalizeRequestDigest(value) {
+  const digest = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!/^[a-f0-9]{64}$/.test(digest)) {
+    const error = new Error('幂等请求摘要无效');
+    error.code = 'IDEMPOTENCY_REQUEST_INVALID';
+    throw error;
+  }
+  return digest;
+}
+
+function normalizeMutationJobSpecs(value) {
+  if (!Array.isArray(value) || value.length === 0
+      || value.length > MAX_MUTATION_RECEIPT_JOBS) {
+    const error = new Error('幂等提交必须包含 1 至 100 个任务');
+    error.code = 'IDEMPOTENCY_JOBS_INVALID';
+    throw error;
+  }
+  return value.map((rawSpec) => {
+    if (!rawSpec || typeof rawSpec !== 'object' || Array.isArray(rawSpec)) {
+      const error = new Error('幂等任务定义无效');
+      error.code = 'IDEMPOTENCY_JOBS_INVALID';
+      throw error;
+    }
+    const type = typeof rawSpec.type === 'string' ? rawSpec.type.trim() : '';
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(type)) {
+      const error = new Error('幂等任务类型无效');
+      error.code = 'IDEMPOTENCY_JOBS_INVALID';
+      throw error;
+    }
+    return {
+      type,
+      payloadJson: boundedJsonString(
+        'sync_jobs.payload_json',
+        rawSpec.payload === undefined ? {} : rawSpec.payload,
+        MAX_JOB_PAYLOAD_BYTES,
+      ),
+      claimKeys: normalizeClaimKeys(rawSpec.claimKeys),
+      metadata: rawSpec.metadata,
+    };
+  });
+}
+
+function normalizeMaximumActiveByType(value) {
+  if (value === undefined || value === null) return new Map();
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    const error = new Error('幂等任务容量约束无效');
+    error.code = 'IDEMPOTENCY_JOBS_INVALID';
+    throw error;
+  }
+  const result = new Map();
+  for (const [rawType, rawMaximum] of Object.entries(value)) {
+    const type = typeof rawType === 'string' ? rawType.trim() : '';
+    const maximum = Number(rawMaximum);
+    if (!/^[a-z][a-z0-9_]{1,63}$/.test(type)
+        || !Number.isSafeInteger(maximum) || maximum < 1 || maximum > 10000) {
+      const error = new Error('幂等任务容量约束无效');
+      error.code = 'IDEMPOTENCY_JOBS_INVALID';
+      throw error;
+    }
+    result.set(type, maximum);
+  }
+  return result;
+}
+
+function mutationReceiptError(code, message, fields = {}) {
+  const error = new Error(message);
+  error.code = code;
+  Object.assign(error, fields);
+  return error;
+}
+
+function receiptJobIds(row) {
+  let values;
+  try { values = JSON.parse(row?.job_ids_json); } catch {}
+  if (!Array.isArray(values) || values.length === 0
+      || values.length > MAX_MUTATION_RECEIPT_JOBS
+      || values.some((id) => typeof id !== 'string' || !/^job_[a-f0-9]{24}$/.test(id))
+      || new Set(values).size !== values.length) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执关联的任务标识无效，已拒绝继续写入',
+    );
+  }
+  return values;
+}
+
+function mutationReceiptStoredBytes(row, field, measuredField) {
+  if (Object.prototype.hasOwnProperty.call(row || {}, measuredField)) {
+    return Number(row[measuredField]);
+  }
+  return Buffer.byteLength(String(row?.[field] || ''), 'utf8');
+}
+
+function validateMutationReceiptMetadata(row) {
+  const responseBytes = mutationReceiptStoredBytes(row, 'response_json', 'response_bytes');
+  const jobIdsBytes = mutationReceiptStoredBytes(row, 'job_ids_json', 'job_ids_bytes');
+  if (!/^[a-f0-9]{64}$/.test(String(row?.key_hash || ''))
+      || !/^[a-z][a-z0-9_]{1,63}$/.test(String(row?.workflow || ''))
+      || !/^[a-f0-9]{64}$/.test(String(row?.request_digest || ''))
+      || Number(row?.http_status) !== 202
+      || !Number.isSafeInteger(responseBytes)
+      || responseBytes <= 0 || responseBytes > MAX_MUTATION_RECEIPT_RESPONSE_BYTES
+      || !Number.isSafeInteger(jobIdsBytes)
+      || jobIdsBytes <= 0 || jobIdsBytes > MAX_MUTATION_RECEIPT_JOB_IDS_BYTES
+      || !isCanonicalIsoTimestamp(row?.created_at)
+      || !isCanonicalIsoTimestamp(row?.expires_at)
+      || row.expires_at <= row.created_at) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执元数据无效，已拒绝继续写入',
+    );
+  }
+}
+
+function readBoundStatementRows(statement, parameters, maximumRows) {
+  const rows = [];
+  statement.bind(parameters);
+  try {
+    while (statement.step()) {
+      rows.push(statement.getAsObject());
+      if (rows.length >= maximumRows) break;
+    }
+  } finally {
+    statement.reset();
+  }
+  return rows;
+}
+
+function mutationReceiptLinkedJobs(database, keyHash, reusableStatement) {
+  const statement = reusableStatement || database.prepare(`SELECT id, status, reconciliation_hold,
+    submission_key_hash FROM sync_jobs WHERE submission_key_hash = ?
+    ORDER BY created_at ASC, id ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
+  try {
+    return readBoundStatementRows(statement, [keyHash], MAX_MUTATION_RECEIPT_JOBS + 1);
+  } finally {
+    if (!reusableStatement) statement.free();
+  }
+}
+
+function validateMutationReceiptResponse(response, jobIds) {
+  if (!response || typeof response !== 'object' || Array.isArray(response)) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执响应无效，已拒绝继续写入',
+    );
+  }
+  const responseJobIds = Array.isArray(response.jobIds)
+    ? response.jobIds
+    : typeof response.jobId === 'string' ? [response.jobId] : [];
+  if (response.status !== 'queued'
+      || responseJobIds.length !== jobIds.length
+      || responseJobIds.some((id, index) => id !== jobIds[index])
+      || (typeof response.jobId === 'string' && response.jobId !== jobIds[0])) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执响应与关联任务不一致，已拒绝继续写入',
+    );
+  }
+}
+
+function decodeMutationReceipt(database, row, expected = {}) {
+  if (!row) return null;
+  validateMutationReceiptMetadata(row);
+  const jobIds = receiptJobIds(row);
+  if (expected.workflow && row.workflow !== expected.workflow) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执工作流不一致，已拒绝继续写入',
+    );
+  }
+  if (expected.requestDigest && row.request_digest !== expected.requestDigest) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_KEY_REUSED',
+      '该 Idempotency-Key 已用于不同请求，请为新操作生成新键',
+    );
+  }
+  let response;
+  try { response = JSON.parse(row.response_json); } catch {}
+  validateMutationReceiptResponse(response, jobIds);
+  const linkedRows = Array.isArray(expected.linkedJobs)
+    ? expected.linkedJobs
+    : mutationReceiptLinkedJobs(database, row.key_hash);
+  const linkedIds = new Set(linkedRows.map((item) => item.id));
+  if (linkedIds.size !== jobIds.length || jobIds.some((id) => !linkedIds.has(id))) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执与任务记录不一致，已拒绝继续写入',
+    );
+  }
+  return {
+    workflow: row.workflow,
+    requestDigest: row.request_digest,
+    statusCode: 202,
+    response: redactValue(response),
+    jobIds,
+    createdAt: row.created_at,
+    expiresAt: row.expires_at,
+  };
+}
+
+function pruneExpiredMutationReceipts(database, now) {
+  // An expired receipt can be removed only after every linked task has a
+  // normal terminal outcome. Active and reconciliation-held tasks retain the
+  // receipt indefinitely so expiry can never authorize duplicate work.
+  // Validate the complete receipt/job graph before changing any row. A
+  // missing or extra linked job is evidence that the earlier operation's
+  // durable boundary is corrupt; silently expiring that receipt would permit
+  // a duplicate operation with an unknown prior outcome.
+  const receiptCount = Number(resultRows(database.exec(
+    'SELECT COUNT(*) AS count FROM mutation_receipts',
+  ))[0]?.count);
+  if (!Number.isSafeInteger(receiptCount) || receiptCount < 0
+      || receiptCount > HARD_MAX_MUTATION_RECEIPTS) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执数量超过完整性校验上限，已拒绝继续写入',
+    );
+  }
+
+  const orphan = resultRows(database.exec(`SELECT jobs.id, jobs.submission_key_hash
+    FROM sync_jobs AS jobs
+    LEFT JOIN mutation_receipts AS receipts
+      ON receipts.key_hash = jobs.submission_key_hash
+    WHERE jobs.submission_key_hash IS NOT NULL AND receipts.key_hash IS NULL
+    LIMIT 1`))[0];
+  if (orphan) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '任务指向不存在或无效的幂等回执，已拒绝继续写入',
+    );
+  }
+
+  // Keep the scan bounded to one compact metadata row plus one receipt and at
+  // most 101 linked jobs. Expired candidates retain only a hash and count.
+  // No durable graph row is changed until the complete first pass succeeds.
+  const removable = [];
+  const receiptScan = database.prepare(`SELECT key_hash, workflow, request_digest,
+      http_status, created_at, expires_at,
+      length(CAST(response_json AS BLOB)) AS response_bytes,
+      length(CAST(job_ids_json AS BLOB)) AS job_ids_bytes
+    FROM mutation_receipts ORDER BY created_at ASC, key_hash ASC`);
+  const receiptByHash = database.prepare(
+    'SELECT * FROM mutation_receipts WHERE key_hash = ? LIMIT 1',
+  );
+  const jobsByHash = database.prepare(`SELECT id, status, reconciliation_hold,
+      submission_key_hash FROM sync_jobs WHERE submission_key_hash = ?
+      ORDER BY created_at ASC, id ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
+  try {
+    while (receiptScan.step()) {
+      const metadata = receiptScan.getAsObject();
+      // Reject oversized/corrupt fields before materializing them in JS.
+      validateMutationReceiptMetadata(metadata);
+      const row = readBoundStatementRows(receiptByHash, [metadata.key_hash], 1)[0];
+      const jobs = mutationReceiptLinkedJobs(database, metadata.key_hash, jobsByHash);
+      const receipt = decodeMutationReceipt(database, row, { linkedJobs: jobs });
+      for (const job of jobs) {
+        if (!JOB_STATUSES.has(job.status)
+            || ![0, 1].includes(Number(job.reconciliation_hold))) {
+          throw mutationReceiptError(
+            'IDEMPOTENCY_RECEIPT_INVALID',
+            '幂等回执关联任务状态无效，已拒绝继续写入',
+          );
+        }
+      }
+      if (receipt.expiresAt <= now && jobs.every((job) => (
+        TERMINAL_JOB_STATUSES.has(job.status) && Number(job.reconciliation_hold) === 0
+      ))) {
+        removable.push({ keyHash: metadata.key_hash, linkedCount: jobs.length });
+      }
+    }
+  } finally {
+    jobsByHash.free();
+    receiptByHash.free();
+    receiptScan.free();
+  }
+
+  const unlinkJob = database.prepare(`UPDATE sync_jobs SET submission_key_hash = NULL
+    WHERE submission_key_hash = ?`);
+  const deleteReceipt = database.prepare('DELETE FROM mutation_receipts WHERE key_hash = ?');
+  try {
+    for (const item of removable) {
+      unlinkJob.run([item.keyHash]);
+      if (database.getRowsModified() !== item.linkedCount) {
+        throw mutationReceiptError(
+          'IDEMPOTENCY_RECEIPT_INVALID',
+          '幂等回执关联任务在清理期间发生变化，已拒绝继续写入',
+        );
+      }
+      deleteReceipt.run([item.keyHash]);
+      if (database.getRowsModified() !== 1) {
+        throw mutationReceiptError(
+          'IDEMPOTENCY_RECEIPT_INVALID',
+          '幂等回执在清理期间发生变化，已拒绝继续写入',
+        );
+      }
+    }
+  } finally {
+    deleteReceipt.free();
+    unlinkJob.free();
+  }
+}
+
 class PanelDb {
   constructor(dbPath = process.env.PANEL_DB_PATH || DEFAULT_DB_PATH) {
     this.dbPath = path.resolve(dbPath);
@@ -1165,7 +1511,8 @@ class PanelDb {
         reconciliation_claim_digest TEXT,
         reconciliation_acknowledged_at TEXT,
         reconciliation_resolution TEXT,
-        reconciliation_acknowledged_by TEXT
+        reconciliation_acknowledged_by TEXT,
+        submission_key_hash TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sync_jobs_created_at ON sync_jobs(created_at DESC);
       CREATE TABLE IF NOT EXISTS job_claims (
@@ -1175,6 +1522,18 @@ class PanelDb {
         created_at TEXT NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_job_claims_job_id ON job_claims(job_id);
+      CREATE TABLE IF NOT EXISTS mutation_receipts (
+        key_hash TEXT PRIMARY KEY,
+        workflow TEXT NOT NULL,
+        request_digest TEXT NOT NULL,
+        http_status INTEGER NOT NULL,
+        response_json TEXT NOT NULL,
+        job_ids_json TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_mutation_receipts_expires_at
+        ON mutation_receipts(expires_at);
       CREATE TABLE IF NOT EXISTS audit_events (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         job_id TEXT,
@@ -1228,6 +1587,10 @@ class PanelDb {
     if (!columns.includes('reconciliation_acknowledged_by')) {
       this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_acknowledged_by TEXT');
     }
+    if (!columns.includes('submission_key_hash')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN submission_key_hash TEXT');
+    }
+    this.database.run('CREATE INDEX IF NOT EXISTS idx_sync_jobs_submission_key_hash ON sync_jobs(submission_key_hash)');
   }
 
   pruneRows() {
@@ -1237,9 +1600,11 @@ class PanelDb {
     // Never prune a queued/running job: its claim is the guard that prevents
     // duplicate remote work. Terminal history is expendable; active work is
     // not, even when a burst temporarily exceeds the retention limit.
+    pruneExpiredMutationReceipts(this.database, new Date().toISOString());
     this.database.run(`DELETE FROM sync_jobs WHERE id IN (
       SELECT id FROM sync_jobs
       WHERE status NOT IN ('queued', 'running') AND reconciliation_hold = 0
+        AND submission_key_hash IS NULL
       ORDER BY COALESCE(reconciliation_acknowledged_at, finished_at, created_at) DESC
       LIMIT -1 OFFSET ${maxJobs}
     )`);
@@ -1346,6 +1711,11 @@ class PanelDb {
       return this.withFileLock(async () => {
         this.loadDatabaseFromDisk();
         this.runSchema();
+        // Validate every durable idempotency boundary before an arbitrary DB
+        // mutation callback runs. This makes unrelated receipt corruption a
+        // fail-closed condition instead of allowing later capacity/pruning
+        // work to erase evidence of an unknown prior operation.
+        pruneExpiredMutationReceipts(this.database, new Date().toISOString());
         const result = await callback(this.database);
         this.pruneRows();
         this.persistUnlocked();
@@ -1513,6 +1883,264 @@ class PanelDb {
       }
       if (outcome?.runningBlock) throw runningMutationError(outcome.runningBlock);
       return outcome.job;
+    });
+  }
+
+  getMutationReceipt({ workflow, requestedBy = 'local', idempotencyKey, requestDigest } = {}) {
+    let normalizedWorkflow;
+    let normalizedActor;
+    let normalizedDigest;
+    let keyHash;
+    try {
+      normalizedWorkflow = normalizeMutationWorkflow(workflow);
+      normalizedActor = normalizeMutationActor(requestedBy);
+      normalizedDigest = normalizeRequestDigest(requestDigest);
+      normalizeIdempotencyKey(idempotencyKey);
+      keyHash = mutationKeyHash(normalizedWorkflow, normalizedActor, idempotencyKey);
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        const row = resultRows(database.exec(`SELECT * FROM mutation_receipts
+          WHERE key_hash = ${sqlString(keyHash)} LIMIT 1`))[0];
+        const receipt = decodeMutationReceipt(database, row, {
+          workflow: normalizedWorkflow,
+          requestDigest: normalizedDigest,
+        });
+        database.run('COMMIT');
+        return receipt;
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
+    });
+  }
+
+  createMutationSubmission(options = {}) {
+    let workflow;
+    let requestedBy;
+    let requestDigest;
+    let keyHash;
+    let jobSpecs;
+    let maximumActiveByType;
+    const allowPartial = options.allowPartial === true;
+    const responseFactory = options.responseFactory;
+    try {
+      workflow = normalizeMutationWorkflow(options.workflow);
+      requestedBy = normalizeMutationActor(options.requestedBy || 'local');
+      requestDigest = normalizeRequestDigest(options.requestDigest);
+      normalizeIdempotencyKey(options.idempotencyKey);
+      keyHash = mutationKeyHash(workflow, requestedBy, options.idempotencyKey);
+      jobSpecs = normalizeMutationJobSpecs(options.jobs);
+      maximumActiveByType = normalizeMaximumActiveByType(options.maximumActiveByType);
+      if (typeof responseFactory !== 'function') {
+        throw mutationReceiptError('IDEMPOTENCY_RESPONSE_INVALID', '幂等提交缺少响应构造器');
+      }
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const now = new Date().toISOString();
+    const expiresAt = new Date(Date.parse(now) + mutationReceiptTtlMs()).toISOString();
+    const owner = currentProcessOwner();
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        // A committed receipt is authoritative before current revisions,
+        // claims or process-local signing keys are consulted.
+        const receiptRow = resultRows(database.exec(`SELECT * FROM mutation_receipts
+          WHERE key_hash = ${sqlString(keyHash)} LIMIT 1`))[0];
+        const existingReceipt = decodeMutationReceipt(database, receiptRow, {
+          workflow,
+          requestDigest,
+        });
+        if (existingReceipt) {
+          database.run('COMMIT');
+          return { receipt: existingReceipt, replayed: true, createdJobs: [], rejections: [] };
+        }
+
+        const receiptCount = Number(resultRows(database.exec(
+          'SELECT COUNT(*) AS count FROM mutation_receipts',
+        ))[0]?.count);
+        if (!Number.isSafeInteger(receiptCount) || receiptCount < 0
+            || receiptCount >= maximumMutationReceipts()) {
+          throw mutationReceiptError(
+            'IDEMPOTENCY_CAPACITY_EXCEEDED',
+            '幂等回执容量已满；未执行任何新任务，请等待旧回执到期或由管理员扩容',
+          );
+        }
+
+        const activeJobs = validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
+        for (const activeJob of activeJobs.filter((job) => (
+          job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job)
+        ))) {
+          interruptDeadOwnerJob(database, activeJob, now);
+        }
+        const reconciliationBarrier = firstReconciliationBarrier(database);
+        if (reconciliationBarrier) {
+          database.run('COMMIT');
+          return {
+            recoveryBlock: {
+              jobId: reconciliationBarrier.id,
+              scope: reconciliationBarrier.reconciliation_scope || 'claims',
+            },
+          };
+        }
+        const runningMutation = firstRunningMutation(database);
+        if (runningMutation) {
+          database.run('COMMIT');
+          return { runningBlock: runningMutation };
+        }
+
+        const activeCounts = new Map();
+        for (const type of maximumActiveByType.keys()) {
+          const count = Number(resultRows(database.exec(`SELECT COUNT(*) AS count
+            FROM sync_jobs WHERE status IN ('queued', 'running')
+              AND type = ${sqlString(type)}`))[0]?.count);
+          if (!Number.isSafeInteger(count) || count < 0) {
+            throw mutationReceiptError(
+              'IDEMPOTENCY_RECEIPT_INVALID',
+              '无法安全确认活跃任务数量，已拒绝提交',
+            );
+          }
+          activeCounts.set(type, count);
+        }
+
+        const createdJobs = [];
+        const rejections = [];
+        const insertJob = database.prepare(`INSERT INTO sync_jobs
+          (id, type, status, requested_by, payload_json, created_at, claim_keys_json,
+            owner_pid, owner_start_id, owner_boot_id, submission_key_hash)
+          VALUES (?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)`);
+        const insertClaim = database.prepare(`INSERT INTO job_claims
+          (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+        try {
+          for (const spec of jobSpecs) {
+            const maximum = maximumActiveByType.get(spec.type);
+            if (maximum !== undefined && (activeCounts.get(spec.type) || 0) >= maximum) {
+              if (!allowPartial) {
+                throw mutationReceiptError('JOB_QUEUE_FULL', '活跃任务已达到安全上限');
+              }
+              rejections.push({ reason: 'queue_full', metadata: spec.metadata });
+              continue;
+            }
+            let claimConflict = null;
+            for (const claimKey of spec.claimKeys) {
+              claimConflict = resultRows(database.exec(`SELECT job_id FROM job_claims
+                WHERE claim_key = ${sqlString(claimKey)} LIMIT 1`))[0] || null;
+              if (claimConflict) break;
+            }
+            if (claimConflict) {
+              if (!allowPartial) {
+                throw Object.assign(new Error('该操作目标已有任务排队或运行中'), {
+                  code: 'JOB_ALREADY_CLAIMED',
+                  existingJobId: claimConflict.job_id,
+                });
+              }
+              rejections.push({
+                reason: createdJobs.some((item) => item.job.id === claimConflict.job_id)
+                  ? 'duplicate_in_submission'
+                  : 'claim_conflict',
+                existingJobId: claimConflict.job_id,
+                metadata: spec.metadata,
+              });
+              continue;
+            }
+            const id = randomId('job');
+            insertJob.run([
+              id,
+              spec.type,
+              requestedBy,
+              spec.payloadJson,
+              now,
+              jsonString(spec.claimKeys),
+              owner.pid,
+              owner.processStartId,
+              owner.processBootId,
+              keyHash,
+            ]);
+            for (const claimKey of spec.claimKeys) insertClaim.run([claimKey, id, spec.type, now]);
+            const job = { id, type: spec.type, status: 'queued', requestedBy, createdAt: now };
+            createdJobs.push({ job, metadata: spec.metadata });
+            if (maximum !== undefined) {
+              activeCounts.set(spec.type, (activeCounts.get(spec.type) || 0) + 1);
+            }
+          }
+        } finally {
+          insertClaim.free();
+          insertJob.free();
+        }
+
+        if (createdJobs.length === 0) {
+          database.run('COMMIT');
+          return { noJobs: true, createdJobs: [], rejections };
+        }
+        const rawResponse = responseFactory({ createdJobs, rejections });
+        if (!rawResponse || typeof rawResponse !== 'object' || Array.isArray(rawResponse)) {
+          throw mutationReceiptError(
+            'IDEMPOTENCY_RESPONSE_INVALID',
+            '幂等提交响应必须是 JSON 对象',
+          );
+        }
+        const responseJson = boundedJsonString(
+          'mutation_receipts.response_json',
+          rawResponse,
+          MAX_MUTATION_RECEIPT_RESPONSE_BYTES,
+        );
+        const response = JSON.parse(responseJson);
+        const jobIds = createdJobs.map((item) => item.job.id);
+        validateMutationReceiptResponse(response, jobIds);
+        const jobIdsJson = boundedJsonString(
+          'mutation_receipts.job_ids_json',
+          jobIds,
+          MAX_MUTATION_RECEIPT_JOB_IDS_BYTES,
+        );
+        const insertReceipt = database.prepare(`INSERT INTO mutation_receipts
+          (key_hash, workflow, request_digest, http_status, response_json,
+            job_ids_json, created_at, expires_at)
+          VALUES (?, ?, ?, 202, ?, ?, ?, ?)`);
+        try {
+          insertReceipt.run([
+            keyHash,
+            workflow,
+            requestDigest,
+            responseJson,
+            jobIdsJson,
+            now,
+            expiresAt,
+          ]);
+        } finally {
+          insertReceipt.free();
+        }
+        database.run('COMMIT');
+        return {
+          receipt: {
+            workflow,
+            requestDigest,
+            statusCode: 202,
+            response,
+            jobIds,
+            createdAt: now,
+            expiresAt,
+          },
+          replayed: false,
+          createdJobs,
+          rejections,
+        };
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
+    }).then((outcome) => {
+      if (outcome?.recoveryBlock) {
+        throw reconciliationHoldError({
+          id: outcome.recoveryBlock.jobId,
+          reconciliation_scope: outcome.recoveryBlock.scope || 'claims',
+        });
+      }
+      if (outcome?.runningBlock) throw runningMutationError(outcome.runningBlock);
+      return outcome;
     });
   }
 

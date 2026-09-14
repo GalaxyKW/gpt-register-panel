@@ -891,7 +891,10 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
     },
   };
   vm.runInNewContext(apiHeadersContract + '\n' + apiFetchContract + `
-    resultPromise = apiFetch('/api/health', { timeoutMs: 1000 });
+    resultPromise = apiFetch('/api/health', {
+      timeoutMs: 1000,
+      headers: { 'Idempotency-Key': 'idem_v1_401_retry_12345678901234567890' },
+    });
     blockedPromise = resultPromise.then(() => apiFetch('https://example.invalid/api/health', { timeoutMs: 1000 }));
   `, context);
   const response = await context.resultPromise;
@@ -900,11 +903,218 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
   assert.notEqual(calls[0].options.signal, calls[1].options.signal);
   assert.equal(calls[0].options.headers.get('x-panel-token'), null);
   assert.equal(calls[1].options.headers.get('x-panel-token'), 'new-admin-token');
+  assert.equal(calls[0].options.headers.get('idempotency-key'), 'idem_v1_401_retry_12345678901234567890');
+  assert.equal(calls[1].options.headers.get('idempotency-key'), 'idem_v1_401_retry_12345678901234567890');
   assert.equal(calls.every((call) => call.options.redirect === 'error'), true);
   assert.equal(input.value, '');
   assert.equal(context.elements.adminTokenOrigin.textContent, 'http://127.0.0.1:4170');
   await assert.rejects(context.blockedPromise, /拒绝向非同源地址发送面板凭证/);
   assert.equal(calls.length, 2);
+});
+
+test('frontend keeps independent unknown intent keys and clears only their confirmed 202', async () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'function renderSelectOptions');
+  const values = new Map();
+  const calls = [];
+  let attempt = 0;
+  const crypto = require('node:crypto').webcrypto;
+  const context = {
+    TextEncoder,
+    apiFetch: async (url, options) => {
+      calls.push({ url, options });
+      attempt += 1;
+      if (attempt < 3) throw new TypeError('simulated lost response');
+      return {
+        ok: true,
+        status: 202,
+        async json() { return { jobId: 'job_' + 'a'.repeat(24), status: 'queued' }; },
+      };
+    },
+    sessionStorage: {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    window: { crypto },
+  };
+  vm.runInNewContext(contract + `
+    firstPromise = idempotentMutationFetch('account_test', '/api/account-tests', {
+      targets: [{ accountId: 7, targetRevision: 'revision' }],
+      modelId: 'model-a',
+      prompt: 'prompt-marker-must-not-enter-storage',
+    });
+  `, context);
+  await assert.rejects(context.firstPromise, /simulated lost response/);
+  const firstKey = calls[0].options.headers['Idempotency-Key'];
+  assert.match(firstKey, /^[A-Za-z0-9][A-Za-z0-9._:-]{19,127}$/);
+  assert.equal([...values.values()].join('').includes('prompt-marker-must-not-enter-storage'), false);
+  const firstStored = JSON.parse([...values.values()][0]);
+  assert.equal(firstStored.entries.length, 1);
+  assert.equal(Number.isSafeInteger(firstStored.entries[0].createdAt), true);
+  assert.ok(Date.now() - firstStored.entries[0].createdAt < 10000);
+
+  vm.runInNewContext(`
+    secondPromise = idempotentMutationFetch('account_test', '/api/account-tests', {
+      targets: [{ accountId: 7, targetRevision: 'revision' }],
+      modelId: 'model-b',
+      prompt: 'prompt-marker-must-not-enter-storage',
+    });
+  `, context);
+  await assert.rejects(context.secondPromise, /simulated lost response/);
+  const secondKey = calls[1].options.headers['Idempotency-Key'];
+  assert.notEqual(secondKey, firstKey);
+  assert.equal(values.size, 1);
+  assert.equal(JSON.parse([...values.values()][0]).entries.length, 2);
+
+  vm.runInNewContext(`
+    thirdPromise = idempotentMutationFetch('account_test', '/api/account-tests', {
+      targets: [{ accountId: 7, targetRevision: 'revision' }],
+      modelId: 'model-a',
+      prompt: 'prompt-marker-must-not-enter-storage',
+    });
+  `, context);
+  const accepted = await context.thirdPromise;
+  assert.equal(accepted.response.status, 202);
+  assert.equal(calls[2].options.headers['Idempotency-Key'], firstKey);
+  assert.equal(JSON.parse([...values.values()][0]).entries.length, 1);
+
+  vm.runInNewContext(`
+    fourthPromise = idempotentMutationFetch('account_test', '/api/account-tests', {
+      targets: [{ accountId: 7, targetRevision: 'revision' }],
+      modelId: 'model-b',
+      prompt: 'prompt-marker-must-not-enter-storage',
+    });
+  `, context);
+  assert.equal((await context.fourthPromise).response.status, 202);
+  assert.equal(calls[3].options.headers['Idempotency-Key'], secondKey);
+  assert.equal(values.size, 0);
+  assert.equal(calls.every((call) => call.options.method === 'POST'), true);
+});
+
+test('frontend refuses to fetch when an idempotency key cannot be durably read back', async () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'function renderSelectOptions');
+  const crypto = require('node:crypto').webcrypto;
+  for (const failureMode of ['quota', 'silent']) {
+    let fetches = 0;
+    const values = new Map();
+    const context = {
+      TextEncoder,
+      apiFetch: async () => {
+        fetches += 1;
+        throw new Error('fetch must not run');
+      },
+      sessionStorage: {
+        getItem: (key) => values.get(key) || null,
+        setItem(key, value) {
+          if (failureMode === 'quota') throw new DOMException('quota', 'QuotaExceededError');
+          if (failureMode !== 'silent') values.set(key, value);
+        },
+        removeItem: (key) => values.delete(key),
+      },
+      window: { crypto },
+    };
+    vm.runInNewContext(contract + `
+      resultPromise = idempotentMutationFetch('token_import', '/api/sync/import', {
+        snapshotVersion: '${'a'.repeat(64)}',
+        selectedKeys: ['token:tokens:tokens/example.json'],
+      });
+    `, context);
+    await assert.rejects(context.resultPromise, /无法可靠保存.*发送前安全停止/);
+    assert.equal(fetches, 0, failureMode);
+  }
+});
+
+test('frontend fails closed instead of evicting sixteen unresolved intents', async () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'function renderSelectOptions');
+  const crypto = require('node:crypto').webcrypto;
+  const values = new Map();
+  values.set('panelMutationPending:v2:store', JSON.stringify({
+    version: 2,
+    entries: Array.from({ length: 16 }, (_, index) => ({
+      version: 2,
+      workflow: 'account_test',
+      bodyDigest: index.toString(16).padStart(64, '0'),
+      key: 'idem_v1_pending_' + String(index).padStart(24, '0'),
+      createdAt: Date.now(),
+    })),
+  }));
+  let fetches = 0;
+  const context = {
+    TextEncoder,
+    apiFetch: async () => { fetches += 1; },
+    sessionStorage: {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    window: { crypto },
+  };
+  vm.runInNewContext(contract + `
+    resultPromise = idempotentMutationFetch('token_cleanup', '/api/tokens/expired/delete', {
+      version: '${'b'.repeat(64)}',
+      confirmation: 'DELETE_EXPIRED_TOKENS',
+    });
+  `, context);
+  await assert.rejects(context.resultPromise, /待确认写操作已达到安全上限/);
+  assert.equal(fetches, 0);
+  assert.equal(JSON.parse(values.get('panelMutationPending:v2:store')).entries.length, 16);
+});
+
+test('frontend refuses expired, unknown-age and future pending keys without fetching', async () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'function renderSelectOptions');
+  const crypto = require('node:crypto').webcrypto;
+  const now = Date.now();
+  for (const [label, createdAt] of [
+    ['expired', now - 20 * 60 * 60 * 1000],
+    ['unknown', undefined],
+    ['future', now + 6 * 60 * 1000],
+  ]) {
+    const values = new Map();
+    const entry = {
+      version: 2,
+      workflow: 'account_test',
+      bodyDigest: 'a'.repeat(64),
+      key: 'idem_v1_unsafe_age_12345678901234567890',
+    };
+    if (createdAt !== undefined) entry.createdAt = createdAt;
+    values.set('panelMutationPending:v2:store', JSON.stringify({ version: 2, entries: [entry] }));
+    let fetches = 0;
+    const context = {
+      TextEncoder,
+      apiFetch: async () => { fetches += 1; },
+      sessionStorage: {
+        getItem: (key) => values.get(key) || null,
+        setItem: (key, value) => values.set(key, value),
+        removeItem: (key) => values.delete(key),
+      },
+      window: { crypto },
+    };
+    vm.runInNewContext(contract + `
+      resultPromise = idempotentMutationFetch('token_cleanup', '/api/tokens/expired/delete', {
+        version: '${'b'.repeat(64)}',
+        confirmation: 'DELETE_EXPIRED_TOKENS',
+      });
+    `, context);
+    await assert.rejects(context.resultPromise, /\u4eba工核对.*禁止自动更换幂等键/, label);
+    assert.equal(fetches, 0, label);
+    assert.equal(values.has('panelMutationPending:v2:store'), true, label);
+  }
+});
+
+test('frontend accepts only bounded unique queued job receipts', () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'async function idempotentMutationFetch');
+  const context = {};
+  vm.runInNewContext(contract + `
+    const id = 'job_' + 'a'.repeat(24);
+    accepted = [
+      acceptedMutationResponse({ status: 'queued', jobId: id }),
+      acceptedMutationResponse({ status: 'succeeded', jobId: id }),
+      acceptedMutationResponse({ status: 'queued', jobIds: [id, id] }),
+      acceptedMutationResponse({ status: 'queued', jobId: 'invalid' }),
+      acceptedMutationResponse({ status: 'queued', jobId: id, jobIds: ['job_' + 'b'.repeat(24)] }),
+    ];
+  `, context);
+  assert.deepEqual([...context.accepted], [true, false, false, false, false]);
 });
 
 test('frontend API deadline also bounds a response body that never finishes', async () => {
@@ -1178,7 +1388,7 @@ test('frontend submits one snapshot-bound revision per unambiguous account test 
   assert.match(context.duplicate.problem, /同一 Sub2API 账号 ID/);
   assert.match(context.conflicting.problem, /多个不同 revision/);
   assert.match(context.stale.problem, /刷新后重新选择/);
-  assert.match(handlerContract, /body: JSON\.stringify\(\{\s*targets,\s*modelId,/);
+  assert.match(handlerContract, /idempotentMutationFetch\(\s*'account_test',\s*'\/api\/account-tests',\s*\{\s*targets,\s*modelId,/);
   assert.doesNotMatch(handlerContract, /accountIds\s*:/);
 });
 

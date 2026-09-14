@@ -129,6 +129,8 @@ unit 使用只读文件系统视图，只开放以下已经绑定并固定的服
 
 ## 写入开关
 
+幂等请求摘要使用未持久化的原始 `Idempotency-Key` 做 HMAC-SHA-256，避免数据库单独泄露后对账号测试短 prompt 进行离线字典猜测。回执完整性校验会逐条读取有界元数据、单个回执及最多 101 条关联任务，完成全图校验后才修改到期行。WebUI 会为未知结果请求保存创建时间；达到 20 小时安全窗口或发现未知/异常时间时，会要求人工核对而不会更换键重发。
+
 写入必须由服务端显式开启，并同时配置面板令牌：
 
     PANEL_ADMIN_TOKEN=请换成随机长令牌
@@ -148,13 +150,15 @@ Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 
 
 “清理过期 token”只扫描 `GPT_REGISTER_ROOT/tokens` 和 `GPT_REGISTER_ROOT/use_token` 下的普通 JSON 文件，要求能解析且明确存在过期时间；扫描结果带版本号，确认操作时会重新校验版本，文件发生变化就拒绝处理。所谓删除实际是移动到 `GPT_REGISTER_ROOT/.panel-quarantine/expired-tokens`（或 `PANEL_TOKEN_QUARANTINE_DIR` 指定的目录），并按批次保留原相对路径，便于恢复；跨文件系统时会先完整复制并刷盘，再移除来源。删除列表、跳过项和操作者会写入结构化日志与 SQLite 审计，不会记录 token 原文；无 access token、无法解析、无过期时间或未过期文件不会处理。恢复时将隔离目录中的文件移回原来的 `tokens/` 或 `use_token/` 目录。
 
-导入和 Phase 3 任务会先记录为 `queued`，执行阶段改为 `running`，结束为 `succeeded`、`partial`、`failed` 或 `interrupted`。服务重启不会假装恢复浏览器/远程 API 操作：已确认尚未开始的死队列任务可安全释放；已运行或已标记外部结果未知的任务会保留持久 claim。在各工作流尚未共享同一资源键空间前，任一未解除的 hold 会保守阻止全部新写任务和过期 token 清理，避免跨类型操作破坏人工对账现场。旧版已删除 claim 但仍保留可信保护键的未知终态，会在启动时重建阻挡；键冲突或元数据不可验证时则拒绝启动，不会自动删除安全屏障。
+导入、Phase 3、账号测试和过期 token 清理都要求客户端提供严格的 `Idempotency-Key`。服务在同一 SQLite 事务中保存任务、claims 和 202 回执；同一键与同一规范请求在响应丢失、任务结束或服务重启后只重放原响应，不会再启动 worker，同一键改作其他请求则拒绝。认证、写开关、审计日志健康和服务停止门禁有意先于回执读取：重放不会绕过访问控制，也不会在停止阶段触发 SQLite 清理/持久化；通过这些服务级门禁并完成请求结构与摘要校验后，回执会先于文件、远端 revision、版本、claim 和队列状态校验。WebUI 会先将每个“工作流 + 请求摘要”的待确认键写入 `sessionStorage` 并回读核验；不同的未知请求不会互相覆盖，浏览器拒绝或无法确认持久写入时不会发出操作。原始幂等键和账号测试 prompt 不会写入 SQLite，prompt 也不会写入浏览器存储，只参与请求摘要。回执默认保留 7 天（可用 `PANEL_IDEMPOTENCY_TTL_MS` 在 1 至 30 天内调整），`PANEL_IDEMPOTENCY_MAX_RECEIPTS` 是不可自动逐出的硬容量，满额时新写操作会失败关闭。未过期回执关联的终态任务不会被历史清理；到期回执只有在其任务列表完整一致且全部为普通终态时才能清理，仍活跃、待对账或关联损坏则继续固定/失败关闭，避免超时变成重复执行许可。
+
+任务会先记录为 `queued`，执行阶段改为 `running`，结束为 `succeeded`、`partial`、`failed` 或 `interrupted`。服务重启不会假装恢复浏览器/远程 API 操作：已确认尚未开始的死队列任务可安全释放；已运行或已标记外部结果未知的任务会保留持久 claim。在各工作流尚未共享同一资源键空间前，任一未解除的 hold 会保守阻止全部新写任务和过期 token 清理，避免跨类型操作破坏人工对账现场。旧版已删除 claim 但仍保留可信保护键的未知终态，会在启动时重建阻挡；键冲突或元数据不可验证时则拒绝启动，不会自动删除安全屏障。
 
 WebUI 会显示持久对账阻挡。只有通过管理员令牌认证的 `panel-admin`，在 Sub2API 和源文件中按账号 ID、account/user 强身份、token 指纹及调度状态完成人工核对后，才能用快照中的 claim 摘要解除该任务对未来操作的阻挡。确认框打开前会按任务路径重新读取详情并核对任务 ID 与 claim 摘要；详情只展示按工作流允许且有界、脱敏的目标上下文，缺失、不一致或被截断时禁止确认。面板不会自动证明人工结论；解除后原任务仍为不可重试，不得把“已解除阻挡”解读为“原操作未执行”。可信的历史未知任务若完全没有保护键，会迁移为阻挡全部写操作的合成全局 hold；普通终态不会被误迁移，元数据不可验证时则拒绝启动。
 
 浏览器刷新后，WebUI 会自动接回最近的 queued/running 任务；任务状态接口短暂失败时会有限重试，避免把仍在执行的任务误显示成失败。
 
-独立 SQLite 默认位置由 `PANEL_DB_PATH` 指定，建议使用项目 `runtime/panel.sqlite3` 并保持 0600 权限；`PANEL_DB_MAX_BYTES` 只能在代码硬上限内调整加载上限。备份默认写入 `PANEL_BACKUP_DIR`，目录必须为当前用户所有且权限不宽于 0700，并由保留天数、文件数和总字节上限共同约束；这些运行态路径已加入 `.gitignore`。跨进程任务锁默认派生自数据库路径，也可通过 `PANEL_CONTROL_LOCK_PATH` 指定；等待时间和轮询间隔可分别用 `PANEL_CONTROL_LOCK_TIMEOUT_MS`、`PANEL_CONTROL_LOCK_POLL_MS` 调整。Phase 3 的输出保留量和终止宽限时间由 `PANEL_PHASE3_MAX_OUTPUT_BYTES`、`PANEL_PHASE3_KILL_GRACE_MS` 限制；TERM 宽限硬上限为 4 秒，随后最多再用 1 秒执行 KILL 和进程树核验。Phase3 启用时，`PANEL_SHUTDOWN_TIMEOUT_MS` 不得低于 6000，建议保持默认 10000，以便在进程清理后继续核对 token 并落盘任务终态。账号测试批次由 `PANEL_ACCOUNT_TEST_JOB_TIMEOUT_MS` 设置总时限。源 token 和 `username.json` 的单文件读取上限可通过 `GPT_REGISTER_TOKEN_MAX_BYTES`、`GPT_REGISTER_USERNAME_MAX_BYTES` 下调，`username.json` 的账号数还受 `GPT_REGISTER_USERNAME_MAX_RECORDS` 限制；token 扫描另受 `GPT_REGISTER_TOKEN_MAX_FILES`、`GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES`（包含非 JSON 目录项）与 `GPT_REGISTER_TOKEN_TOTAL_MAX_BYTES` 约束，代码仍会执行不可突破的硬上限。
+独立 SQLite 默认位置由 `PANEL_DB_PATH` 指定，建议使用项目 `runtime/panel.sqlite3` 并保持 0600 权限；`PANEL_DB_MAX_BYTES` 只能在代码硬上限内调整加载上限。备份默认写入 `PANEL_BACKUP_DIR`，目录必须为当前用户所有且权限不宽于 0700，并由保留天数、文件数和总字节上限共同约束；这些运行态路径已加入 `.gitignore`。跨进程任务锁默认派生自数据库路径，也可通过 `PANEL_CONTROL_LOCK_PATH` 指定；等待时间和轮询间隔可分别用 `PANEL_CONTROL_LOCK_TIMEOUT_MS`、`PANEL_CONTROL_LOCK_POLL_MS` 调整。所有共享同一 SQLite、gpt_register 根目录或 Sub2API 账号池的面板实例，必须使用完全相同的绝对 `PANEL_DB_PATH` 和 `PANEL_CONTROL_LOCK_PATH`；不同容器/进程若把同一资源映射成不同锁命名空间，系统无法从单个进程内自动识别，会破坏“实时校验后只创建一次”的保证，因此多实例部署应保留由数据库路径派生的默认锁或由编排配置统一注入并核对。Phase 3 的输出保留量和终止宽限时间由 `PANEL_PHASE3_MAX_OUTPUT_BYTES`、`PANEL_PHASE3_KILL_GRACE_MS` 限制；TERM 宽限硬上限为 4 秒，随后最多再用 1 秒执行 KILL 和进程树核验。Phase3 启用时，`PANEL_SHUTDOWN_TIMEOUT_MS` 不得低于 6000，建议保持默认 10000，以便在进程清理后继续核对 token 并落盘任务终态。账号测试批次由 `PANEL_ACCOUNT_TEST_JOB_TIMEOUT_MS` 设置总时限。源 token 和 `username.json` 的单文件读取上限可通过 `GPT_REGISTER_TOKEN_MAX_BYTES`、`GPT_REGISTER_USERNAME_MAX_BYTES` 下调，`username.json` 的账号数还受 `GPT_REGISTER_USERNAME_MAX_RECORDS` 限制；token 扫描另受 `GPT_REGISTER_TOKEN_MAX_FILES`、`GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES`（包含非 JSON 目录项）与 `GPT_REGISTER_TOKEN_TOTAL_MAX_BYTES` 约束，代码仍会执行不可突破的硬上限。
 
 Sub2API 管理地址使用明文 HTTP 时只允许回环主机；其他主机必须使用 HTTPS。仅在完全受控网络中才能显式设置 `SUB2API_ALLOW_INSECURE_HTTP=1`，该开关会让管理凭据和 OAuth 更新暴露于明文链路，因此不建议启用。
 

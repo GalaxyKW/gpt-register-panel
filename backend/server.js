@@ -28,7 +28,6 @@ const {
 const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   runPhase3Job,
-  getActivePhase3Job,
   canonicalPhase3Keys,
   resolvePhase3Requests,
 } = require('./phase3Worker');
@@ -61,6 +60,11 @@ const {
   throwIfJobInterrupted,
   updateTerminalJob,
 } = require('./jobLifecycle');
+const {
+  mutationRequestDigest,
+  promptDigest,
+  requestIdempotencyKey,
+} = require('./idempotency');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -102,6 +106,12 @@ const TOKEN_CLEANUP_JOB_TYPE = 'token_cleanup';
 const TOKEN_CLEANUP_CLAIM_KEY = 'token_cleanup:expired_tokens';
 // One additional summary target is included in reconciliation responses.
 const MAX_TOKEN_CLEANUP_REVIEW_TARGETS = 99;
+const MUTATION_WORKFLOWS = Object.freeze({
+  import: 'token_import',
+  phase3: 'phase3',
+  accountTest: 'account_test',
+  tokenCleanup: 'token_cleanup',
+});
 
 const authFailureBuckets = new Map();
 const MAX_AUTH_FAILURE_BUCKETS = 10_000;
@@ -205,6 +215,50 @@ function jsonResponse(response, statusCode, body) {
     'x-frame-options': 'DENY',
   });
   response.end(payload);
+}
+
+function mutationContext(request, workflow, normalizedIntent) {
+  const idempotencyKey = requestIdempotencyKey(request);
+  return {
+    workflow,
+    idempotencyKey,
+    requestDigest: mutationRequestDigest(workflow, normalizedIntent, idempotencyKey),
+  };
+}
+
+async function existingMutationReceipt(db, context, actor) {
+  if (!db || typeof db.getMutationReceipt !== 'function') {
+    const error = new Error('幂等回执存储不可用，已拒绝写操作');
+    error.code = 'IDEMPOTENCY_STORE_UNAVAILABLE';
+    throw error;
+  }
+  return db.getMutationReceipt({
+    ...context,
+    requestedBy: actor,
+  });
+}
+
+function sendMutationReceipt(response, receipt, replayed = false) {
+  if (!receipt || receipt.statusCode !== 202
+      || !receipt.response || typeof receipt.response !== 'object'
+      || Array.isArray(receipt.response)) {
+    const error = new Error('幂等回执响应无效');
+    error.code = 'IDEMPOTENCY_RECEIPT_INVALID';
+    throw error;
+  }
+  response.setHeader('idempotency-replayed', replayed ? 'true' : 'false');
+  jsonResponse(response, receipt.statusCode, receipt.response);
+}
+
+function mutationRequestStatus(error, fallback = 400) {
+  if (error?.code === 'IDEMPOTENCY_KEY_REUSED') return 409;
+  if (['IDEMPOTENCY_CAPACITY_EXCEEDED', 'IDEMPOTENCY_RECEIPT_INVALID',
+    'IDEMPOTENCY_STORE_UNAVAILABLE'].includes(error?.code)) return 503;
+  if (['IDEMPOTENCY_KEY_REQUIRED', 'IDEMPOTENCY_KEY_INVALID',
+    'IDEMPOTENCY_REQUEST_INVALID', 'IDEMPOTENCY_WORKFLOW_INVALID',
+    'IDEMPOTENCY_SCOPE_INVALID', 'IDEMPOTENCY_RESPONSE_INVALID',
+    'IDEMPOTENCY_JOBS_INVALID'].includes(error?.code)) return 400;
+  return fallback;
 }
 
 function configuredPanelToken() {
@@ -1955,6 +2009,13 @@ function createServer(options = {}) {
   const db = options.db || new PanelDb(options.dbPath);
   const logger = options.logger || createLogger({ dbPath: options.dbPath || db.dbPath });
   const jobManager = options.jobManager || createBackgroundJobManager({ db });
+  // Narrow injection points keep replay-order tests deterministic without
+  // weakening the production path. These callbacks are consulted only after
+  // the second durable receipt lookup inside the cross-process control lock.
+  const phase3RequestResolver = options.phase3RequestResolver || resolvePhase3Requests;
+  const accountTestClientFactory = options.accountTestClientFactory
+    || ((clientOptions) => new Sub2ApiAdminClient(clientOptions));
+  const expiredTokenLister = options.expiredTokenLister || listExpiredTokens;
   let server;
   server = http.createServer(async (request, response) => {
     const requestId = typeof logger.requestId === 'function'
@@ -2206,32 +2267,72 @@ function createServer(options = {}) {
         const requestError = importRequestError(body);
         if (requestError) throw requestError;
         const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
-        const { job, trackedImport } = await jobManager.withAdmission(async (signal) => {
+        const normalizedSnapshotVersion = String(body.snapshotVersion).toLowerCase();
+        const idempotency = mutationContext(request, MUTATION_WORKFLOWS.import, {
+          snapshotVersion: normalizedSnapshotVersion,
+          selectedKeys,
+        });
+        const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
+        if (priorReceipt) {
+          writeLog(logger, 'info', 'import.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, priorReceipt, true);
+          return;
+        }
+        const { submission, job, trackedImport } = await jobManager.withAdmission(async (signal) => {
           const created = await withControlPlaneLock(async () => {
             throwIfJobInterrupted(signal);
-            const createdJob = await db.createJob('token_import', {
-              snapshotVersion: body.snapshotVersion,
-              selectedKeys,
-              // Keep a separately validated, non-secret display path because
-              // generic text redaction intentionally masks `token:...` values.
-              selectedSourcePaths: selectedKeys
-                .map(sourcePathFromSelectionKey)
-                .filter(Boolean),
-            }, actor, { claimKeys: ['token_import'] });
+            const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
+            if (lockedReceipt) {
+              return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
+            }
+            const createdSubmission = await db.createMutationSubmission({
+              ...idempotency,
+              requestedBy: actor,
+              jobs: [{
+                type: 'token_import',
+                payload: {
+                  snapshotVersion: normalizedSnapshotVersion,
+                  selectedKeys,
+                  // Keep a separately validated, non-secret display path because
+                  // generic text redaction intentionally masks `token:...` values.
+                  selectedSourcePaths: selectedKeys
+                    .map(sourcePathFromSelectionKey)
+                    .filter(Boolean),
+                },
+                claimKeys: ['token_import'],
+              }],
+              responseFactory: ({ createdJobs }) => ({
+                jobId: createdJobs[0].job.id,
+                status: 'queued',
+              }),
+            });
             throwIfJobInterrupted(signal);
-            return createdJob;
+            return createdSubmission;
           }, { signal });
+          if (created.replayed) return { submission: created, job: null, trackedImport: null };
+          const createdJob = created.createdJobs[0]?.job;
+          if (!createdJob) {
+            const error = new Error('导入任务未能原子入队');
+            error.code = 'IDEMPOTENCY_RECEIPT_INVALID';
+            throw error;
+          }
           throwIfJobInterrupted(signal);
           return {
-            job: created,
-            trackedImport: jobManager.begin(created, 'token_import', actor),
+            submission: created,
+            job: createdJob,
+            trackedImport: jobManager.begin(createdJob, 'token_import', actor),
           };
         });
+        if (submission.replayed) {
+          writeLog(logger, 'info', 'import.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, submission.receipt, true);
+          return;
+        }
         writeLog(logger, 'info', 'import.job_queued', {
           requestId,
           jobId: job.id,
           actor,
-          expectedVersion: body.snapshotVersion || null,
+          expectedVersion: normalizedSnapshotVersion,
           selectedCount: selectedKeys.length,
           durationMs: Date.now() - importRequestStartedAt,
         });
@@ -2272,7 +2373,7 @@ function createServer(options = {}) {
         const importObservation = Promise.resolve().then(() => {
           throwIfJobInterrupted(trackedImport.controller.signal);
           return executeImport({
-            snapshotVersion: body.snapshotVersion,
+            snapshotVersion: normalizedSnapshotVersion,
             selectedKeys,
             actor,
             db,
@@ -2344,7 +2445,7 @@ function createServer(options = {}) {
           });
         });
         jobManager.track(trackedImport, importObservation);
-        jsonResponse(response, 202, { jobId: job.id, status: 'queued' });
+        sendMutationReceipt(response, submission.receipt, false);
       } catch (error) {
         writeLog(logger, 'error', 'import.request_failed', {
           requestId,
@@ -2352,9 +2453,10 @@ function createServer(options = {}) {
           durationMs: Date.now() - importRequestStartedAt,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
           : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409 : 400;
+        const status = mutationRequestStatus(error, fallbackStatus);
         jsonResponse(response, status, { error: error?.code || 'import_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -2367,149 +2469,136 @@ function createServer(options = {}) {
         const bodyError = requestBodyObjectError(body);
         if (bodyError) throw bodyError;
         const { requests, duplicateIndexes } = normalizePhase3Requests(body);
-        const resolved = resolvePhase3Requests(requests);
-        const resolvedRequests = resolved.eligible;
-        const queued = [];
-        const rejected = duplicateIndexes.map((index) => ({
-          index,
-          error: 'duplicate_in_request',
-          message: '同一请求中账号重复，已合并为一个任务',
-        })).concat(resolved.rejected);
-        let enqueueFailure = null;
-        const enqueue = async (signal) => {
-          throwIfJobInterrupted(signal);
-          const batchClaimKeys = new Set();
-          const maximumActive = boundedEnvNumber('PANEL_PHASE3_MAX_ACTIVE_JOBS', 100, 1, 100);
-          let activeCount = await db.countActiveJobs('phase3');
-          throwIfJobInterrupted(signal);
-          for (const requestItem of resolvedRequests) {
-            throwIfJobInterrupted(signal);
-            if (activeCount >= maximumActive) {
-              rejected.push({
-                index: requestItem.originalIndex,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                error: 'phase3_queue_full',
-                message: 'Phase 3 活跃任务已达到安全上限',
-              });
-              continue;
-            }
-            const claimKeys = phase3ClaimKeys(requestItem);
-            if (claimKeys.some((key) => batchClaimKeys.has(key))) {
-              rejected.push({
-                index: requestItem.originalIndex,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                error: 'duplicate_in_request',
-                message: '同一请求中账号重复，已合并为一个任务',
-              });
-              continue;
-            }
-            claimKeys.forEach((key) => batchClaimKeys.add(key));
-            const existingPhase3Job = getActivePhase3Job(requestItem);
-            if (existingPhase3Job) {
-              rejected.push({
-                index: requestItem.originalIndex,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                error: 'phase3_already_running',
-                message: '该账号已有 Phase 3 任务排队或运行中',
-                jobId: existingPhase3Job.jobId || null,
-              });
-              writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
-                requestId,
-                actor,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                existingJobId: existingPhase3Job.jobId || null,
-              });
-              continue;
-            }
-            let job;
-            try {
-              throwIfJobInterrupted(signal);
-              job = await db.createJob('phase3', {
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                canonicalKeys: requestItem.canonicalKeys,
-                selectedKey: requestItem.selectedKey || null,
-                // selectedKey itself is redacted in persisted job payloads;
-                // retain only its validated source-relative path for review.
-                sourcePath: sourcePathFromSelectionKey(requestItem.selectedKey),
-                batch: resolvedRequests.length > 1,
-              }, actor, {
-                claimKeys,
-              });
-              throwIfJobInterrupted(signal);
-            } catch (error) {
-              if (error?.code === 'JOB_RECONCILIATION_REQUIRED') {
-                enqueueFailure = error;
-                rejected.push({
-                  index: requestItem.originalIndex,
-                  email: requestItem.email || null,
-                  phone: requestItem.phone || null,
-                  error: 'phase3_reconciliation_required',
-                  message: '上一个任务结果未知，已保留持久阻挡；请先人工核对',
-                  jobId: error.existingJobId || null,
-                });
-                break;
-              }
-              if (error?.code !== 'JOB_ALREADY_CLAIMED') {
-                enqueueFailure = error;
-                rejected.push({
-                  index: requestItem.originalIndex,
-                  email: requestItem.email || null,
-                  phone: requestItem.phone || null,
-                  error: 'phase3_enqueue_failed',
-                  message: 'Phase 3 任务入队失败，已停止本批后续入队',
-                });
-                break;
-              }
-              rejected.push({
-                index: requestItem.originalIndex,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                error: 'phase3_already_running',
-                message: '该账号已有 Phase 3 任务排队或运行中',
-                jobId: error.existingJobId || null,
-              });
-              writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
-                requestId,
-                actor,
-                email: requestItem.email || null,
-                phone: requestItem.phone || null,
-                existingJobId: error.existingJobId || null,
-              });
-              continue;
-            }
-            queued.push({
-              ...requestItem,
-              executionBinding: requestItem.executionBinding,
-              job,
-            });
-            activeCount += 1;
-            writeLog(logger, 'info', 'phase3.job_queued', {
-              requestId,
-              jobId: job.id,
-              actor,
+        const normalizedSelectedKeys = body.selectedKeys.map((value) => value.trim());
+        const idempotency = mutationContext(request, MUTATION_WORKFLOWS.phase3, {
+          accounts: requests.map((item) => ({
+            originalIndex: item.originalIndex,
+            email: item.email,
+            phone: item.phone,
+            selectedKey: item.selectedKey,
+            phase3TargetRevision: item.phase3TargetRevision,
+          })),
+          duplicateIndexes,
+          selectedKeys: normalizedSelectedKeys,
+        });
+        const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
+        if (priorReceipt) {
+          writeLog(logger, 'info', 'phase3.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, priorReceipt, true);
+          return;
+        }
+        let resolvedRequests = [];
+        let initiallyRejected = [];
+        const rejectionFromDatabase = (item) => {
+          const requestItem = item.metadata || {};
+          if (item.reason === 'duplicate_in_submission') {
+            return {
+              index: requestItem.originalIndex,
               email: requestItem.email || null,
               phone: requestItem.phone || null,
+              error: 'duplicate_in_request',
+              message: '同一请求中账号重复，已合并为一个任务',
+            };
+          }
+          if (item.reason === 'queue_full') {
+            return {
+              index: requestItem.originalIndex,
+              email: requestItem.email || null,
+              phone: requestItem.phone || null,
+              error: 'phase3_queue_full',
+              message: 'Phase 3 活跃任务已达到安全上限',
+            };
+          }
+          return {
+            index: requestItem.originalIndex,
+            email: requestItem.email || null,
+            phone: requestItem.phone || null,
+            error: 'phase3_already_running',
+            message: '该账号已有 Phase 3 任务排队或运行中',
+            jobId: item.existingJobId || null,
+          };
+        };
+        const admission = await jobManager.withAdmission(async (signal) => {
+          const submission = await withControlPlaneLock(async () => {
+            throwIfJobInterrupted(signal);
+            const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
+            if (lockedReceipt) {
+              return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
+            }
+            // Resolution reads mutable gpt_register files and validates the
+            // process-local target revision. It must happen only after the
+            // authoritative receipt recheck while this cross-process lock is
+            // held; otherwise a concurrent committed submission could be
+            // rejected as stale instead of replayed.
+            const resolved = phase3RequestResolver(requests);
+            resolvedRequests = resolved.eligible;
+            initiallyRejected = duplicateIndexes.map((index) => ({
+              index,
+              error: 'duplicate_in_request',
+              message: '同一请求中账号重复，已合并为一个任务',
+            })).concat(resolved.rejected);
+            if (resolvedRequests.length === 0) {
+              return { noJobs: true, createdJobs: [], rejections: [] };
+            }
+            const created = await db.createMutationSubmission({
+              ...idempotency,
+              requestedBy: actor,
+              allowPartial: true,
+              maximumActiveByType: {
+                phase3: boundedEnvNumber('PANEL_PHASE3_MAX_ACTIVE_JOBS', 100, 1, 100),
+              },
+              jobs: resolvedRequests.map((requestItem) => ({
+                type: 'phase3',
+                payload: {
+                  email: requestItem.email || null,
+                  phone: requestItem.phone || null,
+                  canonicalKeys: requestItem.canonicalKeys,
+                  selectedKey: requestItem.selectedKey || null,
+                  // selectedKey itself is redacted in persisted job payloads;
+                  // retain only its validated source-relative path for review.
+                  sourcePath: sourcePathFromSelectionKey(requestItem.selectedKey),
+                  batch: resolvedRequests.length > 1,
+                },
+                claimKeys: phase3ClaimKeys(requestItem),
+                metadata: requestItem,
+              })),
+              responseFactory: ({ createdJobs, rejections }) => {
+                const queuedJobs = createdJobs.map((item) => ({
+                  jobId: item.job.id,
+                  email: item.metadata.email || null,
+                  phone: item.metadata.phone || null,
+                  status: 'queued',
+                }));
+                const jobIds = queuedJobs.map((item) => item.jobId);
+                return {
+                  batch: jobIds.length > 1,
+                  status: 'queued',
+                  jobId: jobIds.length === 1 ? jobIds[0] : null,
+                  jobIds,
+                  jobs: queuedJobs,
+                  rejected: initiallyRejected.concat(rejections.map(rejectionFromDatabase)),
+                };
+              },
+            });
+            throwIfJobInterrupted(signal);
+            return created;
+          }, { signal });
+          if (submission.replayed || submission.noJobs) return { submission, queued: [] };
+          const queued = submission.createdJobs.map((item) => ({
+            ...item.metadata,
+            executionBinding: item.metadata.executionBinding,
+            job: item.job,
+          }));
+          for (const item of queued) {
+            writeLog(logger, 'info', 'phase3.job_queued', {
+              requestId,
+              jobId: item.job.id,
+              actor,
+              email: item.email || null,
+              phone: item.phone || null,
               batch: resolvedRequests.length > 1,
               durationMs: Date.now() - phase3RequestStartedAt,
             });
-          }
-        };
-        await jobManager.withAdmission(async (signal) => {
-          try {
-            await withControlPlaneLock(() => enqueue(signal), { signal });
-          } catch (error) {
-            enqueueFailure = error;
-          }
-          // Jobs already persisted before a later batch failure must always be
-          // observed; otherwise they would remain queued with live claims until
-          // the whole service restarts.
-          throwIfJobInterrupted(signal);
-          for (const item of queued) {
             observePhase3Job({
               job: item.job,
               email: item.email,
@@ -2523,9 +2612,17 @@ function createServer(options = {}) {
               jobManager,
             });
           }
+          return { submission, queued };
         });
-        if (queued.length === 0) {
-          if (enqueueFailure) throw enqueueFailure;
+        if (admission.submission.replayed) {
+          writeLog(logger, 'info', 'phase3.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, admission.submission.receipt, true);
+          return;
+        }
+        if (admission.submission.noJobs) {
+          const rejected = initiallyRejected.concat(
+            admission.submission.rejections.map(rejectionFromDatabase),
+          );
           jsonResponse(response, 409, {
             error: rejected.some((item) => item.error === 'phase3_queue_full')
               ? 'phase3_queue_full'
@@ -2536,29 +2633,7 @@ function createServer(options = {}) {
           });
           return;
         }
-        if (enqueueFailure) {
-          writeLog(logger, 'error', 'phase3.batch_enqueue_partial', {
-            requestId,
-            actor,
-            queuedCount: queued.length,
-            rejectedCount: rejected.length,
-            error: safeErrorMessage(enqueueFailure),
-          });
-        }
-        const jobIds = queued.map((item) => item.job.id);
-        jsonResponse(response, 202, {
-          batch: jobIds.length > 1,
-          status: 'queued',
-          jobId: jobIds.length === 1 ? jobIds[0] : null,
-          jobIds,
-          jobs: queued.map((item) => ({
-            jobId: item.job.id,
-            email: item.email || null,
-            phone: item.phone || null,
-            status: 'queued',
-          })),
-          rejected,
-        });
+        sendMutationReceipt(response, admission.submission.receipt, false);
       } catch (error) {
         writeLog(logger, 'error', 'phase3.request_failed', {
           requestId,
@@ -2566,9 +2641,10 @@ function createServer(options = {}) {
           durationMs: Date.now() - phase3RequestStartedAt,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
             : error?.code === 'JOB_RECONCILIATION_REQUIRED' ? 409 : 400;
+        const status = mutationRequestStatus(error, fallbackStatus);
         jsonResponse(response, status, { error: error?.code || 'phase3_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -2616,59 +2692,119 @@ function createServer(options = {}) {
       try {
         const body = await readJsonBody(request);
         const requestData = normalizeAccountTestRequest(body);
-        const { submission, taskRecord } = await jobManager.withAdmission(async (signal) => {
-          const submitted = await withAccountTestSubmissionLock(async () => {
-            throwIfJobInterrupted(signal);
-            const client = new Sub2ApiAdminClient({ logger, logContext: { requestId, actor } });
-            const accounts = await client.listAccounts({
-              platform: 'openai',
-              type: 'oauth',
-              pageSize: 200,
-              requireTotal: true,
-              requirePaginationMetadata: true,
-              signal,
-            });
-            throwIfJobInterrupted(signal);
-            // Validate the exact UI-reviewed account identity, credential
-            // evidence and state before consulting active jobs or creating a
-            // durable task. The opaque revisions themselves are never stored.
-            assertAccountTestTargetRevisions(accounts, requestData.targets);
-            throwIfJobInterrupted(signal);
-            const jobs = await db.listJobs(200);
-            throwIfJobInterrupted(signal);
-            const classified = classifyAccountTestTargets(accounts, requestData.accountIds, activeAccountTestJobs(jobs));
-            if (classified.eligible.length === 0) return classified;
-            const accountIds = classified.eligible.map((item) => item.id);
-            const targetBaselines = classified.eligible.map((item) => accountTestTargetBaseline(item.account));
-            if (targetBaselines.some((baseline) => !baseline)) {
-              const error = new Error('无法建立账号测试目标的身份与状态基线');
-              error.code = 'ACCOUNT_TEST_BASELINE_INVALID';
-              throw error;
-            }
-            throwIfJobInterrupted(signal);
-            const job = await db.createJob('account_test', {
-              accountIds,
-              targetBaselines,
-              modelId: requestData.modelId,
-              // Prompts are forwarded only through the in-memory worker closure.
-              // Persisting arbitrary prompt text would make an unlabelled secret
-              // retrievable through the jobs API even after log redaction.
-              promptPresent: requestData.prompt.length > 0,
-              promptLength: requestData.prompt.length,
-            }, actor, {
-              claimKeys: accountIds.map((id) => 'account_test:' + String(id)),
-            });
-            throwIfJobInterrupted(signal);
-            return { ...classified, accountIds, targetBaselines, job };
-          });
+        const idempotency = mutationContext(request, MUTATION_WORKFLOWS.accountTest, {
+          targets: requestData.targets,
+          modelId: requestData.modelId,
+          promptDigest: promptDigest(requestData.prompt),
+        });
+        const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
+        if (priorReceipt) {
+          writeLog(logger, 'info', 'account_test.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, priorReceipt, true);
+          return;
+        }
+        const admission = await jobManager.withAdmission(async (signal) => {
+          const submitted = await withAccountTestSubmissionLock(() => (
+            withControlPlaneLock(async () => {
+              throwIfJobInterrupted(signal);
+              const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
+              if (lockedReceipt) {
+                return {
+                  mutationSubmission: {
+                    receipt: lockedReceipt,
+                    replayed: true,
+                    createdJobs: [],
+                    rejections: [],
+                  },
+                  job: null,
+                };
+              }
+              const client = accountTestClientFactory({
+                logger,
+                logContext: { requestId, actor },
+              });
+              const accounts = await client.listAccounts({
+                platform: 'openai',
+                type: 'oauth',
+                pageSize: 200,
+                requireTotal: true,
+                requirePaginationMetadata: true,
+                signal,
+              });
+              throwIfJobInterrupted(signal);
+              // Validate the exact UI-reviewed account identity, credential
+              // evidence and state before consulting active jobs or creating a
+              // durable task. The opaque revisions themselves are never stored.
+              assertAccountTestTargetRevisions(accounts, requestData.targets);
+              throwIfJobInterrupted(signal);
+              const jobs = await db.listJobs(200);
+              throwIfJobInterrupted(signal);
+              const classified = classifyAccountTestTargets(
+                accounts,
+                requestData.accountIds,
+                activeAccountTestJobs(jobs),
+              );
+              if (classified.eligible.length === 0) return classified;
+              const accountIds = classified.eligible.map((item) => item.id);
+              const targetBaselines = classified.eligible
+                .map((item) => accountTestTargetBaseline(item.account));
+              if (targetBaselines.some((baseline) => !baseline)) {
+                const error = new Error('无法建立账号测试目标的身份与状态基线');
+                error.code = 'ACCOUNT_TEST_BASELINE_INVALID';
+                throw error;
+              }
+              throwIfJobInterrupted(signal);
+              const mutationSubmission = await db.createMutationSubmission({
+                ...idempotency,
+                requestedBy: actor,
+                jobs: [{
+                  type: 'account_test',
+                  payload: {
+                    accountIds,
+                    targetBaselines,
+                    modelId: requestData.modelId,
+                    // Prompts are forwarded only through the in-memory worker closure.
+                    // Persisting arbitrary prompt text would make an unlabelled secret
+                    // retrievable through the jobs API even after log redaction.
+                    promptPresent: requestData.prompt.length > 0,
+                    promptLength: requestData.prompt.length,
+                  },
+                  claimKeys: accountIds.map((id) => 'account_test:' + String(id)),
+                }],
+                responseFactory: ({ createdJobs }) => ({
+                  jobId: createdJobs[0].job.id,
+                  status: 'queued',
+                  accountIds,
+                  rejected: classified.rejected,
+                }),
+              });
+              throwIfJobInterrupted(signal);
+              return {
+                ...classified,
+                accountIds,
+                targetBaselines,
+                mutationSubmission,
+                job: mutationSubmission.replayed
+                  ? null
+                  : mutationSubmission.createdJobs[0]?.job || null,
+              };
+            }, { signal })
+          ));
           throwIfJobInterrupted(signal);
           return {
             submission: submitted,
-            taskRecord: submitted.job
+            taskRecord: submitted.job && !submitted.mutationSubmission?.replayed
               ? jobManager.begin(submitted.job, 'account_test', actor)
               : null,
           };
         });
+        const submission = admission.submission;
+        const taskRecord = admission.taskRecord;
+        if (submission.mutationSubmission?.replayed) {
+          writeLog(logger, 'info', 'account_test.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, submission.mutationSubmission.receipt, true);
+          return;
+        }
         if (!submission.job) {
           writeLog(logger, 'warn', 'account_test.request_rejected', {
             requestId,
@@ -2705,12 +2841,7 @@ function createServer(options = {}) {
           jobManager,
           taskRecord,
         });
-        jsonResponse(response, 202, {
-          jobId: submission.job.id,
-          status: 'queued',
-          accountIds: submission.accountIds,
-          rejected: submission.rejected,
-        });
+        sendMutationReceipt(response, submission.mutationSubmission.receipt, false);
       } catch (error) {
         writeLog(logger, 'error', 'account_test.request_failed', {
           requestId,
@@ -2719,12 +2850,13 @@ function createServer(options = {}) {
           code: error?.code || null,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
           : error?.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE' ? 409
           : error?.code === 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS' ? 409
             : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
             : error?.message?.includes('required') ? 503 : 400;
+        const status = mutationRequestStatus(error, fallbackStatus);
         jsonResponse(response, status, {
           error: error?.code || 'account_test_failed',
           message: safeErrorMessage(error),
@@ -2773,15 +2905,40 @@ function createServer(options = {}) {
           throw error;
         }
         const expectedVersion = String(body.version).toLowerCase();
-        const { job, trackedCleanup } = await jobManager.withAdmission(async (signal) => {
+        const idempotency = mutationContext(request, MUTATION_WORKFLOWS.tokenCleanup, {
+          confirmation: TOKEN_CLEANUP_CONFIRMATION,
+          version: expectedVersion,
+        });
+        const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
+        if (priorReceipt) {
+          writeLog(logger, 'info', 'token_cleanup.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, priorReceipt, true);
+          return;
+        }
+        const { submission, job, trackedCleanup } = await jobManager.withAdmission(async (signal) => {
           const created = await withControlPlaneLock(async () => {
             throwIfJobInterrupted(signal);
-            if (!db || typeof db.createJob !== 'function') {
+            const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
+            if (lockedReceipt) {
+              return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
+            }
+            if (!db || typeof db.createMutationSubmission !== 'function') {
               const error = new Error('token 清理任务持久化安全检查不可用，未修改任何文件');
               error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
               throw error;
             }
-            const listing = listExpiredTokens();
+            if (typeof db.assertNoReconciliationHold !== 'function') {
+              const error = new Error('token 清理任务对账安全检查不可用，未修改任何文件');
+              error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+              throw error;
+            }
+            // Once replay has been ruled out, reject a global hold/running
+            // mutation before touching even the live cleanup scan. The final
+            // atomic create repeats this check to protect against DB-level
+            // callers and future lock-boundary changes.
+            await db.assertNoReconciliationHold();
+            throwIfJobInterrupted(signal);
+            const listing = expiredTokenLister();
             if (listing.version.toLowerCase() !== expectedVersion) {
               const error = new Error('过期 token 清单已变化，请重新扫描后再删除');
               error.code = 'TOKEN_CLEANUP_STALE';
@@ -2789,21 +2946,41 @@ function createServer(options = {}) {
               throw error;
             }
             assertTokenCleanupRecoveryNotRequired(listing);
-            const createdJob = await db.createJob(
-              TOKEN_CLEANUP_JOB_TYPE,
-              tokenCleanupJobPayload(listing),
-              actor,
-              { claimKeys: [TOKEN_CLEANUP_CLAIM_KEY] },
-            );
+            const createdSubmission = await db.createMutationSubmission({
+              ...idempotency,
+              requestedBy: actor,
+              jobs: [{
+                type: TOKEN_CLEANUP_JOB_TYPE,
+                payload: tokenCleanupJobPayload(listing),
+                claimKeys: [TOKEN_CLEANUP_CLAIM_KEY],
+              }],
+              responseFactory: ({ createdJobs }) => ({
+                jobId: createdJobs[0].job.id,
+                status: 'queued',
+              }),
+            });
             throwIfJobInterrupted(signal);
-            return createdJob;
+            return createdSubmission;
           }, { signal });
+          if (created.replayed) return { submission: created, job: null, trackedCleanup: null };
+          const createdJob = created.createdJobs[0]?.job;
+          if (!createdJob) {
+            const error = new Error('token 清理任务未能原子入队');
+            error.code = 'IDEMPOTENCY_RECEIPT_INVALID';
+            throw error;
+          }
           throwIfJobInterrupted(signal);
           return {
-            job: created,
-            trackedCleanup: jobManager.begin(created, TOKEN_CLEANUP_JOB_TYPE, actor),
+            submission: created,
+            job: createdJob,
+            trackedCleanup: jobManager.begin(createdJob, TOKEN_CLEANUP_JOB_TYPE, actor),
           };
         });
+        if (submission.replayed) {
+          writeLog(logger, 'info', 'token_cleanup.request_replayed', { requestId, actor });
+          sendMutationReceipt(response, submission.receipt, true);
+          return;
+        }
         writeLog(logger, 'info', 'token_cleanup.job_queued', {
           requestId,
           jobId: job.id,
@@ -2821,7 +2998,7 @@ function createServer(options = {}) {
           jobManager,
           taskRecord: trackedCleanup,
         });
-        jsonResponse(response, 202, { jobId: job.id, status: 'queued' });
+        sendMutationReceipt(response, submission.receipt, false);
       } catch (error) {
         writeLog(logger, 'error', 'token_cleanup.failed', {
           requestId,
@@ -2830,12 +3007,13 @@ function createServer(options = {}) {
           error: safeErrorMessage(error),
           durationMs: Date.now() - cleanupStartedAt,
         });
-        const status = ['TOKEN_CLEANUP_STALE', 'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+        const fallbackStatus = ['TOKEN_CLEANUP_STALE', 'TOKEN_CLEANUP_RECOVERY_REQUIRED',
           'JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
           : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
             'JOB_RECONCILIATION_GUARD_UNAVAILABLE'].includes(error?.code)
             ? 503
             : 400;
+        const status = mutationRequestStatus(error, fallbackStatus);
         jsonResponse(response, status, {
           error: error?.code || 'token_cleanup_failed',
           message: safeErrorMessage(error),

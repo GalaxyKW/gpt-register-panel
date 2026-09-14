@@ -407,6 +407,267 @@ async function apiFetch(url, options = {}) {
   return apiFetchAttempt(url, options);
 }
 
+const MUTATION_PENDING_PREFIX = 'panelMutationPending:v2:';
+const MUTATION_PENDING_STORE_KEY = MUTATION_PENDING_PREFIX + 'store';
+const LEGACY_MUTATION_PENDING_PREFIX = 'panelMutationPending:v1:';
+const MAX_PENDING_MUTATIONS = 16;
+// The server permits a receipt TTL as low as 24 hours. Stop automatic replay
+// comfortably before that boundary so a client-side key can never outlive the
+// receipt that makes it safe to resend.
+const MAX_PENDING_MUTATION_AGE_MS = 20 * 60 * 60 * 1000;
+const MAX_PENDING_MUTATION_FUTURE_SKEW_MS = 5 * 60 * 1000;
+
+function mutationPersistenceError() {
+  const error = new Error('浏览器无法可靠保存本次写操作的幂等键，已在发送前安全停止。');
+  error.code = 'MUTATION_IDEMPOTENCY_STORAGE_UNAVAILABLE';
+  return error;
+}
+
+function mutationRetryWindowError() {
+  const error = new Error(
+    '待确认写操作已超出安全重试时间或浏览器时钟异常；请先人工核对服务器任务记录，已禁止自动更换幂等键。',
+  );
+  error.code = 'MUTATION_IDEMPOTENCY_RETRY_UNSAFE';
+  return error;
+}
+
+function assertPendingMutationRetryWindow(value, now = Date.now()) {
+  const createdAt = value?.createdAt;
+  if (!Number.isSafeInteger(now) || !Number.isSafeInteger(createdAt) || createdAt <= 0
+      || createdAt - now > MAX_PENDING_MUTATION_FUTURE_SKEW_MS
+      || now - createdAt >= MAX_PENDING_MUTATION_AGE_MS) {
+    throw mutationRetryWindowError();
+  }
+}
+
+function canonicalMutationJson(value) {
+  if (value === null) return 'null';
+  if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('写请求包含无法规范化的数值。');
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) return '[' + value.map(canonicalMutationJson).join(',') + ']';
+  if (!value || typeof value !== 'object') throw new Error('写请求包含无法规范化的值。');
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error('写请求必须由普通对象组成。');
+  }
+  const fields = Object.keys(value).sort().map((key) => {
+    if (value[key] === undefined) throw new Error('写请求包含未定义字段。');
+    return JSON.stringify(key) + ':' + canonicalMutationJson(value[key]);
+  });
+  return '{' + fields.join(',') + '}';
+}
+
+async function mutationBodyDigest(workflow, body) {
+  if (!window.crypto?.subtle || typeof TextEncoder !== 'function') {
+    throw new Error('当前浏览器缺少安全的幂等请求支持，已阻止写操作。');
+  }
+  const bytes = new TextEncoder().encode(
+    'panel-mutation-v1\0' + workflow + '\0' + canonicalMutationJson(body),
+  );
+  const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function newMutationKey() {
+  if (typeof window.crypto?.randomUUID === 'function') {
+    return 'idem_v1_' + window.crypto.randomUUID();
+  }
+  if (typeof window.crypto?.getRandomValues !== 'function') {
+    throw new Error('当前浏览器无法生成安全的幂等键，已阻止写操作。');
+  }
+  const bytes = new Uint8Array(24);
+  window.crypto.getRandomValues(bytes);
+  return 'idem_v1_' + [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function pendingMutationIdentity(workflow, bodyDigest) {
+  return workflow + ':' + bodyDigest;
+}
+
+function validPendingMutation(value, workflow, bodyDigest, version = 2) {
+  return Boolean(value
+    && value.version === version
+    && value.workflow === workflow
+    && value.bodyDigest === bodyDigest
+    && /^[a-z][a-z0-9_]{1,63}$/.test(String(value.workflow || ''))
+    && /^[a-f0-9]{64}$/.test(String(value.bodyDigest || ''))
+    && /^[A-Za-z0-9][A-Za-z0-9._:-]{19,127}$/.test(String(value.key || '')));
+}
+
+function readPendingMutationStore() {
+  let raw;
+  try {
+    raw = sessionStorage.getItem(MUTATION_PENDING_STORE_KEY);
+  } catch {
+    throw mutationPersistenceError();
+  }
+  if (raw === null) return { version: 2, entries: [] };
+  let store;
+  try { store = JSON.parse(raw); } catch { throw mutationPersistenceError(); }
+  if (!store || store.version !== 2 || !Array.isArray(store.entries)
+      || store.entries.length > MAX_PENDING_MUTATIONS) {
+    throw mutationPersistenceError();
+  }
+  const identities = new Set();
+  for (const pending of store.entries) {
+    if (!validPendingMutation(pending, pending?.workflow, pending?.bodyDigest)) {
+      throw mutationPersistenceError();
+    }
+    assertPendingMutationRetryWindow(pending);
+    const identity = pendingMutationIdentity(pending.workflow, pending.bodyDigest);
+    if (identities.has(identity)) throw mutationPersistenceError();
+    identities.add(identity);
+  }
+  return { version: 2, entries: store.entries.map((entry) => ({ ...entry })) };
+}
+
+function persistPendingMutationStore(store) {
+  const serialized = JSON.stringify(store);
+  try {
+    if (store.entries.length === 0) {
+      sessionStorage.removeItem(MUTATION_PENDING_STORE_KEY);
+      if (sessionStorage.getItem(MUTATION_PENDING_STORE_KEY) !== null) {
+        throw mutationPersistenceError();
+      }
+      return;
+    }
+    sessionStorage.setItem(MUTATION_PENDING_STORE_KEY, serialized);
+    if (sessionStorage.getItem(MUTATION_PENDING_STORE_KEY) !== serialized) {
+      throw mutationPersistenceError();
+    }
+  } catch (error) {
+    if (error?.code === 'MUTATION_IDEMPOTENCY_STORAGE_UNAVAILABLE') throw error;
+    throw mutationPersistenceError();
+  }
+}
+
+function migrateLegacyPendingMutation(workflow, store) {
+  let raw;
+  try {
+    raw = sessionStorage.getItem(LEGACY_MUTATION_PENDING_PREFIX + workflow);
+  } catch {
+    throw mutationPersistenceError();
+  }
+  if (raw === null) return store;
+  let legacy;
+  try { legacy = JSON.parse(raw); } catch { throw mutationPersistenceError(); }
+  if (!validPendingMutation(legacy, workflow, legacy?.bodyDigest, 1)) {
+    throw mutationPersistenceError();
+  }
+  // Old entries did not necessarily record an age. Unknown age cannot prove
+  // that the server receipt still exists, so migration is fail-closed.
+  assertPendingMutationRetryWindow(legacy);
+  const identity = pendingMutationIdentity(workflow, legacy.bodyDigest);
+  const existing = store.entries.find((entry) => (
+    pendingMutationIdentity(entry.workflow, entry.bodyDigest) === identity
+  ));
+  if (existing && existing.key !== legacy.key) throw mutationPersistenceError();
+  if (!existing) {
+    if (store.entries.length >= MAX_PENDING_MUTATIONS) throw mutationPersistenceError();
+    store = {
+      version: 2,
+      entries: store.entries.concat({
+        version: 2,
+        workflow,
+        bodyDigest: legacy.bodyDigest,
+        key: legacy.key,
+        createdAt: legacy.createdAt,
+      }),
+    };
+    persistPendingMutationStore(store);
+  }
+  try {
+    sessionStorage.removeItem(LEGACY_MUTATION_PENDING_PREFIX + workflow);
+  } catch {}
+  return store;
+}
+
+function readPendingMutation(workflow, bodyDigest) {
+  const store = migrateLegacyPendingMutation(workflow, readPendingMutationStore());
+  return {
+    store,
+    pending: store.entries.find((entry) => (
+      entry.workflow === workflow && entry.bodyDigest === bodyDigest
+    )) || null,
+  };
+}
+
+function savePendingMutation(pending, store) {
+  assertPendingMutationRetryWindow(pending);
+  if (store.entries.length >= MAX_PENDING_MUTATIONS) {
+    throw new Error('待确认写操作已达到安全上限，请先重试已有操作。');
+  }
+  const nextStore = { version: 2, entries: store.entries.concat(pending) };
+  // sessionStorage.setItem is atomic for one value. Read it back before any
+  // request leaves the browser so a quota/security/silent-write failure can
+  // never degrade to an in-memory-only idempotency key.
+  persistPendingMutationStore(nextStore);
+  return nextStore;
+}
+
+function clearPendingMutation(pending) {
+  try {
+    const store = readPendingMutationStore();
+    const entries = store.entries.filter((entry) => !(
+      entry.workflow === pending.workflow
+        && entry.bodyDigest === pending.bodyDigest
+        && entry.key === pending.key
+    ));
+    if (entries.length !== store.entries.length) {
+      persistPendingMutationStore({ version: 2, entries });
+    }
+  } catch {
+    // A confirmed 202 already contains durable job IDs. Retaining the pending
+    // key is safe: a later identical submit can only replay that same receipt.
+  }
+}
+
+function acceptedMutationResponse(body) {
+  if (!body || body.status !== 'queued') return false;
+  const jobIds = Array.isArray(body?.jobIds)
+    ? body.jobIds
+    : body?.jobId ? [body.jobId] : [];
+  return jobIds.length > 0 && jobIds.length <= 100
+    && new Set(jobIds).size === jobIds.length
+    && jobIds.every((jobId) => /^job_[a-f0-9]{24}$/.test(String(jobId)))
+    && (body.jobId === undefined || body.jobId === null || body.jobId === jobIds[0]);
+}
+
+async function idempotentMutationFetch(workflow, url, body) {
+  const bodyDigest = await mutationBodyDigest(workflow, body);
+  let { pending, store } = readPendingMutation(workflow, bodyDigest);
+  if (!pending) {
+    pending = {
+      version: 2,
+      workflow,
+      bodyDigest,
+      key: newMutationKey(),
+      createdAt: Date.now(),
+    };
+    // Persist before sending. A timeout, refresh or lost response can then
+    // recover the server's durable receipt without creating another worker.
+    savePendingMutation(pending, store);
+  }
+  const response = await apiFetch(url, {
+    method: 'POST',
+    headers: { 'Idempotency-Key': pending.key },
+    body: JSON.stringify(body),
+  });
+  let responseBody;
+  try {
+    responseBody = await response.json();
+  } catch {
+    throw new Error('服务器返回了无法确认的响应；再次提交将安全复用同一幂等键。');
+  }
+  if (response.status === 202 && response.ok && acceptedMutationResponse(responseBody)) {
+    clearPendingMutation(pending);
+  }
+  return { response, body: responseBody };
+}
+
 function renderSelectOptions(select, values, labelMap, emptyLabel) {
   const current = select.value;
   select.innerHTML = '<option value="">' + emptyLabel + '</option>';
@@ -2231,11 +2492,11 @@ elements.importButton.addEventListener('click', async () => {
   state.importRequestPending = true;
   updateActionState();
   try {
-    const response = await apiFetch('/api/sync/import', {
-      method: 'POST',
-      body: JSON.stringify({ snapshotVersion: state.plan.version, selectedKeys }),
-    });
-    const body = await response.json();
+    const { response, body } = await idempotentMutationFetch(
+      'token_import',
+      '/api/sync/import',
+      { snapshotVersion: state.plan.version, selectedKeys },
+    );
     if (!response.ok) throw new Error(body.message || body.error || '导入任务创建失败');
     showNotice('导入任务已排队，正在等待执行结果。', 'notice-info');
     await watchJob(body.jobId, 'token_import');
@@ -2265,11 +2526,11 @@ elements.phase3Button.addEventListener('click', async () => {
   state.phase3RequestPending = true;
   updateActionState();
   try {
-    const response = await apiFetch('/api/phase3', {
-      method: 'POST',
-      body: JSON.stringify({ accounts: targets, selectedKeys: [...state.selected] }),
-    });
-    const body = await response.json();
+    const { response, body } = await idempotentMutationFetch(
+      'phase3',
+      '/api/phase3',
+      { accounts: targets, selectedKeys: [...state.selected] },
+    );
     if (!response.ok) throw new Error(body.message || body.error || 'Phase 3 任务创建失败');
     const jobIds = Array.isArray(body.jobIds) ? body.jobIds : (body.jobId ? [body.jobId] : []);
     if (!jobIds.length) throw new Error('Phase 3 未返回任务编号');
@@ -2309,14 +2570,14 @@ if (elements.accountTestButton) {
     state.accountTestRequestPending = true;
     updateActionState();
     try {
-      const response = await apiFetch('/api/account-tests', {
-        method: 'POST',
-        body: JSON.stringify({
+      const { response, body } = await idempotentMutationFetch(
+        'account_test',
+        '/api/account-tests',
+        {
           targets,
           modelId,
-        }),
-      });
-      const body = await response.json();
+        },
+      );
       if (!response.ok) {
         const rejected = Array.isArray(body.rejected) ? body.rejected.length : 0;
         throw new Error(body.message || body.error || (rejected ? '没有可测试的上游账号' : '账号测试任务创建失败'));
@@ -2356,11 +2617,11 @@ if (elements.cleanupButton) {
         updateActionState();
         return;
       }
-      const deleteResponse = await apiFetch('/api/tokens/expired/delete', {
-        method: 'POST',
-        body: JSON.stringify({ version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' }),
-      });
-      const result = await deleteResponse.json();
+      const { response: deleteResponse, body: result } = await idempotentMutationFetch(
+        'token_cleanup',
+        '/api/tokens/expired/delete',
+        { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+      );
       if (!deleteResponse.ok) throw new Error(result.message || result.error || '过期 token 删除失败');
       if (!/^job_[a-f0-9]{24}$/.test(String(result.jobId || ''))) {
         throw new Error('过期 token 清理未返回有效任务编号');
