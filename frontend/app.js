@@ -736,6 +736,17 @@ function accountTestRows(rows) {
 }
 
 function accountTestTargetsFromRows(rows) {
+  const maximumSelection = 100;
+  const revisionPattern = /^account-test-v1\.[A-Za-z0-9_-]{43}$/;
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return { targets: [], problem: '请至少选择一个已导入 Sub2API 的上游账号' };
+  }
+  if (rows.length > maximumSelection) {
+    return {
+      targets: [],
+      problem: '账号测试单次最多选择 ' + maximumSelection + ' 个账号',
+    };
+  }
   const targets = [];
   const revisionsById = new Map();
   for (const row of rows || []) {
@@ -743,8 +754,8 @@ function accountTestTargetsFromRows(rows) {
     if (!Number.isSafeInteger(accountId) || accountId <= 0) {
       return { targets: [], problem: '所选行不是有效的 Sub2API 上游账号' };
     }
-    if (typeof row?.targetRevision !== 'string' || !row.targetRevision) {
-      return { targets: [], problem: '所选账号缺少当前快照 revision，请刷新后重新选择' };
+    if (!revisionPattern.test(String(row?.targetRevision || ''))) {
+      return { targets: [], problem: '所选账号缺少有效的当前快照 revision，请刷新后重新选择' };
     }
     if (revisionsById.has(accountId)) {
       return {
@@ -849,8 +860,12 @@ function validImportPlanIntentVersion(value) {
 }
 
 function syncSelectionProblem(selectedKeys = state.selected) {
+  const maximumSelection = 500;
   const keys = selectedKeys instanceof Set ? [...selectedKeys] : [...(selectedKeys || [])];
   if (keys.length === 0) return '';
+  if (keys.length > maximumSelection) {
+    return '同步导入单次最多选择 ' + maximumSelection + ' 个 token 文件';
+  }
   // A pre-upgrade snapshot is allowed to reach the server for authoritative
   // validation. Current snapshots always include rows and can reject choices
   // that the import planner necessarily excludes before making a request.
@@ -988,7 +1003,11 @@ function phase3TargetsFromRows(rows) {
 }
 
 function phase3SelectionProblem(rows, selectedCount) {
+  const maximumSelection = 100;
   if (selectedCount === 0) return '请至少选择一个账号';
+  if (selectedCount > maximumSelection) {
+    return 'Phase 3 单次最多选择 ' + maximumSelection + ' 个账号';
+  }
   if (rows.length !== selectedCount) return '所选账号已不在当前快照中，请刷新后重选';
   const missingRevision = rows.find((row) => row?.phase3Eligible === true
     && !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || '')));
@@ -1241,7 +1260,13 @@ function renderDiffDecision(row, sides) {
     : null;
   if (action) {
     const reason = actionReasonLabel(row?.decisionReason);
-    return '<small class="availability-note">同步：' + escapeHtml(actionLabel(action))
+    const actionClass = {
+      create: 'decision-note-success',
+      update: 'decision-note-warning',
+      skip: 'decision-note-neutral',
+      conflict: 'decision-note-danger',
+    }[action];
+    return '<small class="decision-note ' + actionClass + '">同步：' + escapeHtml(actionLabel(action))
       + (reason === '-' ? '' : ' · ' + escapeHtml(reason)) + '</small>';
   }
   const previewable = Boolean(sides?.source)
@@ -1249,7 +1274,8 @@ function renderDiffDecision(row, sides) {
     && !['invalid_file', 'remote_unknown'].includes(row?.diffKind);
   const label = previewable ? '同步：需先预览' : '同步：不可决策';
   const reason = actionReasonLabel(row?.decisionReason);
-  return '<small class="availability-note">' + escapeHtml(label)
+  return '<small class="decision-note '
+    + (previewable ? 'decision-note-neutral' : 'decision-note-danger') + '">' + escapeHtml(label)
     + (reason === '-' ? '' : ' · ' + escapeHtml(reason)) + '</small>';
 }
 
@@ -1286,7 +1312,8 @@ function renderRows() {
   elements.tableSummary.textContent = '当前显示 ' + rows.length + ' 项 · 已选 ' + state.selected.size
     + (selectedVisible !== state.selected.size ? '（当前列表 ' + selectedVisible + '）' : '');
   elements.selectionCount.textContent = '已选 ' + state.selected.size;
-  elements.selectionCount.title = hiddenSelectionProblem();
+  elements.selectionCount.title = hiddenSelectionProblem()
+    || '选择会跨筛选条件保留；表头复选框只影响当前显示项';
   elements.selectAll.checked = rows.length > 0 && rows.every((row) => state.selected.has(row.key));
   elements.selectAll.indeterminate = selectedVisible > 0 && !elements.selectAll.checked;
   document.querySelectorAll('.row-check').forEach((input) => {
@@ -2686,7 +2713,8 @@ elements.phase3Button.addEventListener('click', async () => {
     showNotice('无法提交 Phase 3：' + (selectionProblem || '没有符合条件的账号'), 'notice-warning');
     return;
   }
-  if (!window.confirm('确认排队更新已选的 ' + targets.length + ' 个账号 token？任务会按顺序执行。')) return;
+  if (!window.confirm('确认对已选的 ' + targets.length
+      + ' 个本地 gpt_register 账号运行 Phase 3 并更新 token？任务会按顺序执行。')) return;
   state.phase3RequestPending = true;
   updateActionState();
   try {
@@ -2730,7 +2758,10 @@ if (elements.accountTestButton) {
       showNotice('请选择测试模型。', 'notice-warning');
       return;
     }
-    if (!window.confirm('确认使用 ' + accountTestModelLabel(modelId) + ' 测试已选的 ' + targets.length + ' 个上游账号？error 账号成功后会尝试恢复并启用；Sub2API 测试接口本身可能依据结果更新账号状态、限流或调度信息，其他账号面板不会额外切换调度。')) return;
+    const visibleIds = targets.slice(0, 10).map((target) => '#' + target.accountId).join('、');
+    const targetIds = visibleIds + (targets.length > 10 ? ' 等 ' + targets.length + ' 个' : '');
+    if (!window.confirm('确认使用 ' + accountTestModelLabel(modelId) + ' 测试 Sub2API 账号 '
+        + targetIds + '？error 账号成功后会尝试恢复并启用；Sub2API 测试接口本身可能依据结果更新账号状态、限流或调度信息，其他账号面板不会额外切换调度。')) return;
     state.accountTestRequestPending = true;
     updateActionState();
     try {
@@ -2881,7 +2912,7 @@ function updateActionState() {
     } else if (!canRunAccountTest) {
       elements.accountTestButton.title = testSelection.problem || '请选择已导入 Sub2API 的上游账号';
     } else {
-      elements.accountTestButton.title = '使用所选模型测试上游账号；error 账号成功后恢复并启用';
+      elements.accountTestButton.title = '使用所选模型测试 Sub2API 上游账号；error 账号成功后恢复并启用';
     }
   }
   if (elements.accountTestModelSelect) {
@@ -2927,7 +2958,7 @@ function updateActionState() {
   } else if (!canRunPhase3) {
     elements.phase3Button.title = phase3Problem || '请选择至少一个符合条件的账号';
   } else {
-    elements.phase3Button.title = '按顺序为已选账号运行 Phase 3';
+    elements.phase3Button.title = '按顺序为已选本地 gpt_register 账号运行 Phase 3';
   }
   elements.previewButton.title = state.jobInventoryVerified !== true
     ? '正在确认后台任务和待对账项，暂不可操作'

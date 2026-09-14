@@ -171,6 +171,11 @@ td small { max-width: 190px; margin-top: 4px; overflow: hidden; color: var(--mut
 .availability-note { color: var(--danger) !important; font-weight: 700; }
 .availability-note-success { color: var(--success) !important; }
 .availability-note-warning { color: var(--warning) !important; }
+.decision-note { font-weight: 700; }
+.decision-note-success { color: var(--success) !important; }
+.decision-note-warning { color: var(--warning) !important; }
+.decision-note-neutral { color: var(--muted) !important; }
+.decision-note-danger { color: var(--danger) !important; }
 .source-text { display: inline-flex; align-items: center; min-height: 23px; padding: 3px 8px; border-radius: 5px; font-size: 11px; font-weight: 700; }
 .source-tokens { background: #e8f1fb; color: #356487; }
 .source-use-token { background: #f5edfc; color: #74538e; }

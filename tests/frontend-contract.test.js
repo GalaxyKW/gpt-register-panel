@@ -102,6 +102,33 @@ test('frontend treats every blocking plan item as a conflict and explains termin
   assert.match(source, /所选旧副本将改用预览所示的排序首选版本/);
 });
 
+test('frontend gives sync decisions distinct non-misleading visual states', () => {
+  const renderContract = sourceSection('function renderDiffDecision', 'function renderRows');
+  const context = {
+    actionReasonLabel: (reason) => reason || '-',
+    actionLabel: (action) => action,
+    escapeHtml: (value) => String(value ?? ''),
+  };
+  vm.runInNewContext(renderContract + `
+    result = {
+      create: renderDiffDecision({ decisionAction: 'create', decisionReason: 'token_only' }, {}),
+      update: renderDiffDecision({ decisionAction: 'update', decisionReason: 'token_changed' }, {}),
+      skip: renderDiffDecision({ decisionAction: 'skip', decisionReason: 'already_in_sync' }, {}),
+      conflict: renderDiffDecision({ decisionAction: 'conflict', decisionReason: 'ambiguous_sub2api_identity' }, {}),
+    };
+  `, context);
+  assert.match(context.result.create, /decision-note-success/);
+  assert.match(context.result.update, /decision-note-warning/);
+  assert.match(context.result.skip, /decision-note-neutral/);
+  assert.match(context.result.conflict, /decision-note-danger/);
+  assert.doesNotMatch(context.result.create, /availability-note/);
+  assert.doesNotMatch(context.result.skip, /availability-note/);
+  assert.match(stylesSource, /\.decision-note-success\s*\{[^}]*var\(--success\)/s);
+  assert.match(stylesSource, /\.decision-note-warning\s*\{[^}]*var\(--warning\)/s);
+  assert.match(stylesSource, /\.decision-note-neutral\s*\{[^}]*var\(--muted\)/s);
+  assert.match(stylesSource, /\.decision-note-danger\s*\{[^}]*var\(--danger\)/s);
+});
+
 test('frontend import confirmation calls out selected superseded token files', async () => {
   const importHandler = sourceSection(
     "elements.importButton.addEventListener('click'",
@@ -1892,9 +1919,19 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
   assert.match(htmlSource, /全局维护 · 不受筛选和选择影响/);
   assert.match(htmlSource, /全局扫描并隔离过期 token/);
   assert.match(htmlSource, /不含 historical\/old_codex 历史备份/);
+  assert.match(htmlSource, /筛选外已选项不受影响/);
+  assert.match(source, /表头复选框只影响当前显示项/);
   assert.doesNotMatch(htmlSource, /所有已过期 JSON 文件/);
   assert.match(sourceSection('function updateActionState', 'function applyColumnVisibility'),
     /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
+});
+
+test('frontend identifies the local and Sub2API sides of mutation buttons', () => {
+  assert.match(htmlSource, /<span>本地 Phase 3<\/span>/);
+  assert.match(htmlSource, /<span>测试 Sub2API 账号<\/span>/);
+  assert.match(source, /本地 gpt_register 账号运行 Phase 3 并更新 token/);
+  assert.match(source, /测试 Sub2API 账号/);
+  assert.match(source, /targets\.slice\(0, 10\).*target\.accountId/s);
 });
 
 test('frontend distinguishes healthy availability and never force-adds an unsupported model', () => {
@@ -1916,30 +1953,60 @@ test('frontend submits one snapshot-bound revision per unambiguous account test 
   );
   const context = {};
   vm.runInNewContext(targetContract + `
+    const revisionSeven = 'account-test-v1.' + 'A'.repeat(43);
+    const revisionEight = 'account-test-v1.' + 'B'.repeat(43);
+    const revisionReplaced = 'account-test-v1.' + 'C'.repeat(43);
     valid = accountTestTargetsFromRows([
-      { accountId: 7, targetRevision: 'revision-seven' },
-      { accountId: 8, targetRevision: 'revision-eight' },
+      { accountId: 7, targetRevision: revisionSeven },
+      { accountId: 8, targetRevision: revisionEight },
     ]);
     duplicate = accountTestTargetsFromRows([
-      { accountId: 7, targetRevision: 'revision-seven' },
-      { accountId: 7, targetRevision: 'revision-seven' },
+      { accountId: 7, targetRevision: revisionSeven },
+      { accountId: 7, targetRevision: revisionSeven },
     ]);
     conflicting = accountTestTargetsFromRows([
-      { accountId: 7, targetRevision: 'revision-seven' },
-      { accountId: 7, targetRevision: 'revision-replaced' },
+      { accountId: 7, targetRevision: revisionSeven },
+      { accountId: 7, targetRevision: revisionReplaced },
     ]);
     stale = accountTestTargetsFromRows([{ accountId: 7 }]);
+    malformed = accountTestTargetsFromRows([{ accountId: 7, targetRevision: 'revision-seven' }]);
+    tooMany = accountTestTargetsFromRows(Array.from({ length: 101 }, (_, index) => ({
+      accountId: index + 1,
+      targetRevision: revisionSeven,
+    })));
   `, context);
   assert.deepEqual(JSON.parse(JSON.stringify(context.valid.targets)), [
-    { accountId: 7, targetRevision: 'revision-seven' },
-    { accountId: 8, targetRevision: 'revision-eight' },
+    { accountId: 7, targetRevision: 'account-test-v1.' + 'A'.repeat(43) },
+    { accountId: 8, targetRevision: 'account-test-v1.' + 'B'.repeat(43) },
   ]);
   assert.equal(context.valid.problem, '');
   assert.match(context.duplicate.problem, /同一 Sub2API 账号 ID/);
   assert.match(context.conflicting.problem, /多个不同 revision/);
   assert.match(context.stale.problem, /刷新后重新选择/);
+  assert.match(context.malformed.problem, /有效的当前快照 revision/);
+  assert.match(context.tooMany.problem, /单次最多选择 100 个账号/);
   assert.match(handlerContract, /idempotentMutationFetch\(\s*'account_test',\s*'\/api\/account-tests',\s*\{\s*targets,\s*modelId,/);
   assert.doesNotMatch(handlerContract, /accountIds\s*:/);
+});
+
+test('frontend enforces the same bulk selection limits as mutation endpoints', () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
+  const phase3Contract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
+  const context = {
+    state: { snapshot: { rows: [] } },
+  };
+  vm.runInNewContext(comparisonContract + '\n' + phase3Contract + `
+    state.snapshot.rows = Array.from({ length: 501 }, (_, index) => ({
+      key: 'token:tokens:tokens/' + index + '.json',
+      source: 'tokens',
+      diffKind: 'token_only',
+      historical: false,
+    }));
+    syncProblem = syncSelectionProblem(state.snapshot.rows.map((row) => row.key));
+    phase3Problem = phase3SelectionProblem(Array.from({ length: 101 }, () => ({})), 101);
+  `, context);
+  assert.match(context.syncProblem, /单次最多选择 500 个 token 文件/);
+  assert.match(context.phase3Problem, /单次最多选择 100 个账号/);
 });
 
 test('frontend labels the remote-only source filter unambiguously', () => {
