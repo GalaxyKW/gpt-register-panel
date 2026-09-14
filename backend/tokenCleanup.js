@@ -326,10 +326,16 @@ function cleanupDirectoryError(error, label, syncing = false) {
   return wrapped;
 }
 
+function cleanupProcessUid() {
+  if (typeof process.geteuid === 'function') return process.geteuid();
+  return typeof process.getuid === 'function' ? process.getuid() : null;
+}
+
 function verifyCleanupDirectory(stat, label, privateRequired) {
-  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const currentUid = cleanupProcessUid();
   if (!stat?.isDirectory() || stat.isSymbolicLink()
-      || (privateRequired && currentUid !== null && stat.uid !== currentUid)
+      || (currentUid !== null && stat.uid !== currentUid)
+      || (stat.mode & 0o022) !== 0
       || (privateRequired && (stat.mode & 0o077) !== 0)) {
     throw cleanupDirectoryError(null, label);
   }
@@ -532,6 +538,19 @@ function assertPreparedCleanupDirectories(prepared) {
   for (const pin of prepared.pins) assertCleanupDirectoryPin(pin);
 }
 
+function assertPublishedCleanupTarget(targetPath, targetDescriptor, expectedStat) {
+  const linked = fs.lstatSync(targetPath);
+  const opened = fs.fstatSync(targetDescriptor);
+  const currentUid = cleanupProcessUid();
+  if (linked.isSymbolicLink() || !linked.isFile() || !opened.isFile()
+      || !sameInode(linked, expectedStat) || !sameInode(opened, expectedStat)
+      || linked.nlink !== 1 || opened.nlink !== 1
+      || (currentUid !== null && (linked.uid !== currentUid || opened.uid !== currentUid))
+      || (linked.mode & 0o022) !== 0 || (opened.mode & 0o022) !== 0) {
+    throw new Error('隔离目标在持久化确认期间发生变化');
+  }
+}
+
 function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let targetLinked = false;
   let linkedTargetDescriptor;
@@ -562,6 +581,9 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
       throw new Error('隔离目标在权限收紧前发生变化');
     }
     fs.fchmodSync(linkedTargetDescriptor, 0o600);
+    // The target name must never become the only name of an inode whose data or
+    // tightened permissions have not reached stable storage yet.
+    fs.fsyncSync(linkedTargetDescriptor);
     syncCleanupDirectory(path.dirname(targetPath));
     const latestSource = fs.lstatSync(sourcePath);
     const latestTarget = fs.lstatSync(targetPath);
@@ -577,6 +599,10 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     fs.unlinkSync(sourcePath);
     sourceRemoved = true;
     syncCleanupDirectory(path.dirname(sourcePath));
+    fs.fsyncSync(linkedTargetDescriptor);
+    assertPublishedCleanupTarget(targetPath, linkedTargetDescriptor, targetStat);
+    if (typeof options.afterSourceUnlink === 'function') options.afterSourceUnlink();
+    assertPublishedCleanupTarget(targetPath, linkedTargetDescriptor, targetStat);
     fs.closeSync(linkedTargetDescriptor);
     linkedTargetDescriptor = undefined;
     return;
@@ -667,6 +693,10 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     fs.unlinkSync(sourcePath);
     copiedSourceRemoved = true;
     syncCleanupDirectory(path.dirname(sourcePath));
+    fs.fsyncSync(targetDescriptor);
+    assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
+    if (typeof options.afterSourceUnlink === 'function') options.afterSourceUnlink();
+    assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
   } catch (error) {
     let rollbackUnconfirmed = temporaryIdentity
       ? !rollbackOwnedPath(temporaryPath, temporaryIdentity)
@@ -943,7 +973,7 @@ function regularFileSnapshot(filePath) {
         | (fs.constants.O_NONBLOCK || 0),
     );
     const before = fs.fstatSync(descriptor);
-    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    const currentUid = cleanupProcessUid();
     if (!before.isFile() || before.nlink !== 1
         || (currentUid !== null && before.uid !== currentUid)
         || (before.mode & 0o022) !== 0) {
@@ -1298,19 +1328,28 @@ function deleteExpiredTokens(options = {}) {
     assertPreparedCleanupDirectories(preparedQuarantine);
     assertPreparedCleanupDirectories(preparedSources);
     for (const item of current._internalItems || []) {
-      const sourcePin = preparedSources.sourcePins.get(item.source);
-      const quarantineSourcePin = preparedQuarantine.quarantineSourcePins.get(item.source);
-      if (!sourcePin || !quarantineSourcePin) throw cleanupDirectoryError(null, 'token 清理目录');
-      assertPreparedCleanupDirectories(preparedSources);
-      assertPreparedCleanupDirectories(preparedQuarantine);
-      const fileName = path.basename(item.relativePath);
-      const absolutePath = cleanupFdPath(sourcePin, fileName);
-      const sourceFolder = quarantineSourcePin.displayPath;
-      const operationSourceFolder = cleanupFdPath(quarantineSourcePin);
+      let absolutePath = null;
+      let sourceFolder = null;
+      let operationSourceFolder = null;
       let claimPath = null;
       let quarantinedPath = null;
       let quarantinedDisplayPath = null;
       try {
+        const sourcePin = preparedSources.sourcePins.get(item.source);
+        const quarantineSourcePin = preparedQuarantine.quarantineSourcePins.get(item.source);
+        if (!sourcePin || !quarantineSourcePin) {
+          throw cleanupDirectoryError(null, 'token 清理目录');
+        }
+        assertPreparedCleanupDirectories(preparedSources);
+        assertPreparedCleanupDirectories(preparedQuarantine);
+        const fileName = path.basename(item.relativePath);
+        absolutePath = cleanupFdPath(sourcePin, fileName);
+        sourceFolder = quarantineSourcePin.displayPath;
+        operationSourceFolder = cleanupFdPath(quarantineSourcePin);
+        const assertAllDirectoryPins = () => {
+          assertPreparedCleanupDirectories(preparedSources);
+          assertPreparedCleanupDirectories(preparedQuarantine);
+        };
         const sourceSnapshot = regularFileSnapshot(absolutePath);
         if (sourceSnapshot.contentHash !== item.contentHash) {
           skipped.push({ ...item, reason: 'file_changed' });
@@ -1340,7 +1379,8 @@ function deleteExpiredTokens(options = {}) {
               'changed-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
             );
             moveToQuarantine(claimPath, changedPath, {
-              beforeSourceUnlink: () => assertPreparedCleanupDirectories(preparedQuarantine),
+              beforeSourceUnlink: assertAllDirectoryPins,
+              afterSourceUnlink: assertAllDirectoryPins,
             });
             assertCleanupClaimResolved(claimPath);
             claimPath = null;
@@ -1360,10 +1400,8 @@ function deleteExpiredTokens(options = {}) {
           continue;
         }
         moveToQuarantine(claimPath, quarantinedPath, {
-          beforeSourceUnlink: () => {
-            assertPreparedCleanupDirectories(preparedSources);
-            assertPreparedCleanupDirectories(preparedQuarantine);
-          },
+          beforeSourceUnlink: assertAllDirectoryPins,
+          afterSourceUnlink: assertAllDirectoryPins,
         });
         assertCleanupClaimResolved(claimPath);
         claimPath = null;
@@ -1393,8 +1431,28 @@ function deleteExpiredTokens(options = {}) {
           );
           throw failure;
         }
-        if (error?.cleanupInfrastructureInvalid === true && !claimPath) throw error;
+        if (error?.cleanupInfrastructureInvalid === true && !claimPath) {
+          if (deleted.length > 0 || skipped.length > 0) {
+            throw attachCleanupProgress(error, item, deleted.length, skipped.length);
+          }
+          throw error;
+        }
         if (claimPath) {
+          if (error?.cleanupInfrastructureInvalid === true) {
+            try {
+              // Restoring a claimed token is itself a namespace mutation. A
+              // source/root pin that has become foreign-owned or writable by
+              // other users must remain untouched for manual reconciliation.
+              assertPreparedCleanupDirectories(preparedSources);
+            } catch (sourcePinError) {
+              throw attachCleanupProgress(
+                cleanupClaimRecoveryOutcomeUnknown(sourcePinError),
+                item,
+                deleted.length,
+                skipped.length,
+              );
+            }
+          }
           let restored = false;
           try {
             restored = restoreClaimedPath(claimPath, absolutePath);
@@ -1408,7 +1466,12 @@ function deleteExpiredTokens(options = {}) {
           }
           if (restored) {
             claimPath = null;
-            if (error?.cleanupInfrastructureInvalid === true) throw error;
+            if (error?.cleanupInfrastructureInvalid === true) {
+              if (deleted.length > 0 || skipped.length > 0) {
+                throw attachCleanupProgress(error, item, deleted.length, skipped.length);
+              }
+              throw error;
+            }
           } else {
             if (error?.cleanupInfrastructureInvalid === true) {
               throw attachCleanupProgress(
@@ -1427,7 +1490,14 @@ function deleteExpiredTokens(options = {}) {
               );
               recoveryDisplayPath = path.join(sourceFolder, path.basename(recoveryPath));
               moveToQuarantine(claimPath, recoveryPath, {
-                beforeSourceUnlink: () => assertPreparedCleanupDirectories(preparedQuarantine),
+                beforeSourceUnlink: () => {
+                  assertPreparedCleanupDirectories(preparedSources);
+                  assertPreparedCleanupDirectories(preparedQuarantine);
+                },
+                afterSourceUnlink: () => {
+                  assertPreparedCleanupDirectories(preparedSources);
+                  assertPreparedCleanupDirectories(preparedQuarantine);
+                },
               });
               assertCleanupClaimResolved(claimPath);
               claimPath = null;
@@ -1453,7 +1523,12 @@ function deleteExpiredTokens(options = {}) {
             }
           }
         }
-        if (error?.cleanupInfrastructureInvalid === true) throw error;
+        if (error?.cleanupInfrastructureInvalid === true) {
+          if (deleted.length > 0 || skipped.length > 0) {
+            throw attachCleanupProgress(error, item, deleted.length, skipped.length);
+          }
+          throw error;
+        }
         skipped.push({ ...item, reason: 'file_unavailable' });
       }
     }

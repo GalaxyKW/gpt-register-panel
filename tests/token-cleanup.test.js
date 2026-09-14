@@ -1972,3 +1972,324 @@ test('expired token cleanup rejects a quarantine directory readable or writable 
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'expired.json')), true);
   assert.deepEqual(fs.readdirSync(quarantine), []);
 });
+
+test('cleanup source and root pins reject group/world writable directories', () => {
+  for (const relativeDirectory of ['', 'tokens', 'use_token']) {
+    const root = makeRoot();
+    const unsafeDirectory = path.join(root, relativeDirectory);
+    const originalMode = fs.statSync(unsafeDirectory).mode & 0o777;
+    fs.chmodSync(unsafeDirectory, 0o777);
+    try {
+      assert.throws(
+        () => listExpiredTokens({ rootDirectory: root }),
+        (error) => error.code === 'TOKEN_CLEANUP_PATH_INVALID'
+          && error.cleanupInfrastructureInvalid === true,
+        relativeDirectory || 'root',
+      );
+    } finally {
+      fs.chmodSync(unsafeDirectory, originalMode);
+    }
+  }
+});
+
+test('same-filesystem quarantine fsyncs the target inode before and after source unlink', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'durable-source.json');
+  const targetDirectory = path.join(root, 'durable-target');
+  const targetPath = path.join(targetDirectory, 'durable-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'durable-content', { mode: 0o600 });
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let targetDescriptor = null;
+  let targetFsyncs = 0;
+  let fsyncsObservedBeforeUnlink = 0;
+  fs.openSync = function trackTargetDescriptor(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (filePath === targetPath) targetDescriptor = descriptor;
+    return descriptor;
+  };
+  fs.closeSync = function forgetTargetDescriptor(descriptor) {
+    if (descriptor === targetDescriptor) targetDescriptor = null;
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function trackTargetFsync(descriptor) {
+    if (descriptor === targetDescriptor) targetFsyncs += 1;
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  fs.unlinkSync = function inspectSourceUnlink(filePath) {
+    if (filePath === sourcePath) fsyncsObservedBeforeUnlink = targetFsyncs;
+    return originalUnlinkSync.call(fs, filePath);
+  };
+  try {
+    moveToQuarantine(sourcePath, targetPath);
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+    fs.unlinkSync = originalUnlinkSync;
+  }
+  assert.equal(fsyncsObservedBeforeUnlink >= 1, true);
+  assert.equal(targetFsyncs >= 2, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'durable-content');
+});
+
+test('same-filesystem quarantine rolls back when target inode fsync fails before unlink', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'pre-unlink-fsync-source.json');
+  const targetDirectory = path.join(root, 'pre-unlink-fsync-target');
+  const targetPath = path.join(targetDirectory, 'pre-unlink-fsync-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'pre-unlink-fsync-content', { mode: 0o600 });
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  let targetDescriptor = null;
+  let injected = false;
+  fs.openSync = function trackTargetDescriptor(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (filePath === targetPath) targetDescriptor = descriptor;
+    return descriptor;
+  };
+  fs.closeSync = function forgetTargetDescriptor(descriptor) {
+    if (descriptor === targetDescriptor) targetDescriptor = null;
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function failTargetFsync(descriptor) {
+    if (!injected && descriptor === targetDescriptor) {
+      injected = true;
+      const error = new Error('simulated target inode fsync failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    assert.throws(
+      () => moveToQuarantine(sourcePath, targetPath),
+      (error) => error.code === 'EIO',
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.existsSync(targetPath), false);
+});
+
+test('same-filesystem quarantine reports unknown when target fsync fails after unlink', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'post-unlink-fsync-source.json');
+  const targetDirectory = path.join(root, 'post-unlink-fsync-target');
+  const targetPath = path.join(targetDirectory, 'post-unlink-fsync-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'post-unlink-fsync-content', { mode: 0o600 });
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  let targetDescriptor = null;
+  let targetFsyncs = 0;
+  fs.openSync = function trackTargetDescriptor(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (filePath === targetPath) targetDescriptor = descriptor;
+    return descriptor;
+  };
+  fs.closeSync = function forgetTargetDescriptor(descriptor) {
+    if (descriptor === targetDescriptor) targetDescriptor = null;
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function failSecondTargetFsync(descriptor) {
+    if (descriptor === targetDescriptor) {
+      targetFsyncs += 1;
+      if (targetFsyncs === 2) {
+        const error = new Error('simulated post-unlink target fsync failure');
+        error.code = 'EIO';
+        throw error;
+      }
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => moveToQuarantine(sourcePath, targetPath),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+          && error.causeCode === 'EIO';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(targetFsyncs, 2);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'post-unlink-fsync-content');
+});
+
+test('cleanup revalidates the published target after source unlink', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'post-unlink-source.json');
+  const targetDirectory = path.join(root, 'post-unlink-target');
+  const targetPath = path.join(targetDirectory, 'post-unlink-target.json');
+  const displacedPath = targetPath + '.displaced';
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'post-unlink-content', { mode: 0o600 });
+  let failure;
+  assert.throws(
+    () => moveToQuarantine(sourcePath, targetPath, {
+      afterSourceUnlink() {
+        fs.renameSync(targetPath, displacedPath);
+        fs.writeFileSync(targetPath, 'unrelated-replacement', { mode: 0o600 });
+      },
+    }),
+    (error) => {
+      failure = error;
+      return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+        && error.reconciliationReason === 'quarantine_move_outcome_unknown';
+    },
+  );
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(displacedPath, 'utf8'), 'post-unlink-content');
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'unrelated-replacement');
+});
+
+test('cleanup reports unknown when the quarantined inode gains another hard link', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'post-unlink-link-source.json');
+  const targetDirectory = path.join(root, 'post-unlink-link-target');
+  const targetPath = path.join(targetDirectory, 'post-unlink-link-target.json');
+  const unexpectedLink = path.join(targetDirectory, 'unexpected-alias.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'post-unlink-link-content', { mode: 0o600 });
+  let failure;
+  assert.throws(
+    () => moveToQuarantine(sourcePath, targetPath, {
+      afterSourceUnlink() {
+        fs.linkSync(targetPath, unexpectedLink);
+      },
+    }),
+    (error) => {
+      failure = error;
+      return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+        && error.reconciliationReason === 'quarantine_move_outcome_unknown';
+    },
+  );
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'post-unlink-link-content');
+  assert.equal(fs.readFileSync(unexpectedLink, 'utf8'), 'post-unlink-link-content');
+});
+
+test('cleanup leaves a claim for reconciliation when a source pin becomes unsafe', () => {
+  const root = makeRoot();
+  const tokensDirectory = path.join(root, 'tokens');
+  const sourcePath = path.join(tokensDirectory, 'source-pin-race.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: jwt('source-pin-race@example.test', { suffix: '-source-pin-race' }),
+    email: 'source-pin-race@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }), { mode: 0o600 });
+  const options = { rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') };
+  const listing = listExpiredTokens(options);
+  const originalLinkSync = fs.linkSync;
+  let permissionsChanged = false;
+  fs.linkSync = function makeSourceDirectoryUnsafe(from, to) {
+    const result = originalLinkSync.call(fs, from, to);
+    if (!permissionsChanged
+        && path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
+      permissionsChanged = true;
+      fs.chmodSync(tokensDirectory, 0o777);
+    }
+    return result;
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.linkSync = originalLinkSync;
+    fs.chmodSync(tokensDirectory, 0o755);
+  }
+  assert.equal(permissionsChanged, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.causeCode, 'TOKEN_CLEANUP_PATH_INVALID');
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readdirSync(tokensDirectory).some(
+    (name) => name.startsWith('.panel-token-cleanup-claim-'),
+  ), true);
+});
+
+test('cleanup preserves completed progress when a later per-item pin check fails', () => {
+  const root = makeRoot();
+  const tokensDirectory = path.join(root, 'tokens');
+  const firstPath = path.join(tokensDirectory, 'a-first.json');
+  const secondPath = path.join(tokensDirectory, 'b-second.json');
+  const expired = (name) => JSON.stringify({
+    access_token: jwt(name + '@example.test', { user: name, suffix: '-' + name }),
+    email: name + '@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  fs.writeFileSync(firstPath, expired('completed-first'), { mode: 0o600 });
+  fs.writeFileSync(secondPath, expired('pending-second'), { mode: 0o600 });
+  const options = { rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') };
+  const listing = listExpiredTokens(options);
+  const originalRelative = path.relative;
+  let permissionsChanged = false;
+  path.relative = function makeSourceUnsafeAfterFirstResult(from, to) {
+    const result = originalRelative.call(path, from, to);
+    if (!permissionsChanged
+        && String(from).includes(path.join('.panel-quarantine', 'expired-tokens'))
+        && path.basename(String(to)) === path.basename(firstPath)) {
+      permissionsChanged = true;
+      fs.chmodSync(tokensDirectory, 0o777);
+    }
+    return result;
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_PATH_INVALID';
+      },
+    );
+  } finally {
+    path.relative = originalRelative;
+    fs.chmodSync(tokensDirectory, 0o755);
+  }
+  assert.equal(permissionsChanged, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.completedCount, 1);
+  assert.equal(failure.skippedCount, 0);
+  assert.deepEqual(failure.currentItem, {
+    source: 'tokens',
+    relativePath: 'tokens/b-second.json',
+  });
+  assert.equal(fs.existsSync(firstPath), false);
+  assert.equal(fs.existsSync(secondPath), true);
+});
