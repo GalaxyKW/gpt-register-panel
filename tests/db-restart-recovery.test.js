@@ -1,5 +1,7 @@
 const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
 const crypto = require('node:crypto');
+const { once } = require('node:events');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -8,6 +10,7 @@ const test = require('node:test');
 require('./test-isolation');
 
 const { PanelDb, RECONCILIATION_ACK_CONFIRMATION } = require('../backend/db');
+const { currentProcessOwner } = require('../backend/taskCoordinator');
 
 function databasePath(label) {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'panel-' + label + '-')), 'panel.sqlite3');
@@ -45,6 +48,19 @@ function claimKeysDigest(claimKeys) {
   return crypto.createHash('sha256')
     .update(JSON.stringify([...claimKeys].sort()))
     .digest('hex');
+}
+
+function linuxProcessStartId(pid) {
+  if (process.platform !== 'linux') return null;
+  try {
+    const value = fs.readFileSync('/proc/' + String(pid) + '/stat', 'utf8');
+    const commandEnd = value.lastIndexOf(')');
+    if (commandEnd < 0) return null;
+    const fields = value.slice(commandEnd + 2).trim().split(/\s+/);
+    return /^(?:0|[1-9][0-9]{0,19})$/.test(fields[19] || '') ? fields[19] : null;
+  } catch {
+    return null;
+  }
 }
 
 test('restart releases clean queued work but persistently holds an unknown running outcome', async () => {
@@ -110,6 +126,98 @@ test('restart preserves a running job whose exact owner process is still alive',
     (error) => error.code === 'JOB_ALREADY_CLAIMED' && error.existingJobId === job.id,
   );
   await restarted.updateJob(job.id, { status: 'failed', error: 'cleanup' });
+});
+
+test('a live foreign owner cannot have its active jobs started, changed, or terminalized', async (context) => {
+  const localOwner = currentProcessOwner();
+  if (process.platform !== 'linux' || !localOwner.processBootId) {
+    context.skip('full Linux process identity is unavailable');
+    return;
+  }
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  await once(child, 'spawn');
+  context.after(() => {
+    try { child.kill('SIGKILL'); } catch {}
+  });
+  const childStartId = linuxProcessStartId(child.pid);
+  if (!childStartId) {
+    context.skip('child process start identity is unavailable');
+    return;
+  }
+
+  const file = databasePath('live-foreign-owner');
+  const ownerDb = new PanelDb(file);
+  const queued = await ownerDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:live-foreign-owner-queued'],
+  });
+  const running = await ownerDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:live-foreign-owner-running'],
+  });
+  await ownerDb.startMutationJob(running.id);
+  await ownerDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET owner_pid = ?, owner_start_id = ?, owner_boot_id = ? WHERE id = ?`);
+    try {
+      for (const job of [queued, running]) {
+        statement.run([child.pid, childStartId, localOwner.processBootId, job.id]);
+      }
+    } finally {
+      statement.free();
+    }
+  });
+
+  const foreignDb = new PanelDb(file);
+  await assert.rejects(
+    foreignDb.startMutationJob(queued.id),
+    (error) => error.code === 'JOB_OWNER_CONFLICT'
+      && error.existingJobId === queued.id
+      && error.currentStatus === 'queued',
+  );
+  await assert.rejects(
+    foreignDb.updateJob(queued.id, { result: { forgedProgress: true } }),
+    (error) => error.code === 'JOB_OWNER_CONFLICT'
+      && error.existingJobId === queued.id,
+  );
+  await assert.rejects(
+    foreignDb.updateJob(running.id, {
+      status: 'failed',
+      error: 'must not replace the live owner outcome',
+      finishedAt: new Date().toISOString(),
+    }),
+    (error) => error.code === 'JOB_OWNER_CONFLICT'
+      && error.existingJobId === running.id,
+  );
+
+  const preservedQueued = await foreignDb.getJob(queued.id);
+  assert.equal(preservedQueued.status, 'queued');
+  assert.equal(preservedQueued.result, null);
+  assert.equal(preservedQueued.error, null);
+  assert.equal(preservedQueued.finishedAt, null);
+  const preservedRunning = await foreignDb.getJob(running.id);
+  assert.equal(preservedRunning.status, 'running');
+  assert.equal(preservedRunning.error, null);
+  assert.equal(preservedRunning.finishedAt, null);
+  assert.equal(await scalar(foreignDb,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id IN ('${queued.id}', '${running.id}')`), 2);
+});
+
+test('PanelDb instances in one process share ownership for start and terminal updates', async () => {
+  const file = databasePath('same-process-owner');
+  const creator = new PanelDb(file);
+  const job = await creator.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:same-process-owner'],
+  });
+  const worker = new PanelDb(file);
+  await worker.startMutationJob(job.id);
+  assert.equal((await creator.getJob(job.id)).status, 'running');
+  await creator.updateJob(job.id, {
+    status: 'failed',
+    error: 'test cleanup',
+    finishedAt: new Date().toISOString(),
+  });
+  assert.equal((await worker.getJob(job.id)).status, 'failed');
 });
 
 test('an already-open database converts every provably dead running owner before admitting other work', async () => {

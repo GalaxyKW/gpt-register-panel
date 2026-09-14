@@ -214,6 +214,15 @@ function storedJobOwnedBy(job, owner) {
   return startMatches && bootMatches;
 }
 
+function assertStoredJobOwnedByCurrentProcess(job) {
+  if (storedJobOwnedBy(job, currentProcessOwner())) return;
+  const error = new Error('任务不属于当前面板进程，拒绝修改');
+  error.code = 'JOB_OWNER_CONFLICT';
+  error.existingJobId = job?.id || null;
+  error.currentStatus = job?.status || null;
+  throw error;
+}
+
 function jsonString(value) {
   return JSON.stringify(value === undefined ? null : value);
 }
@@ -3134,7 +3143,9 @@ class PanelDb {
         ))) {
           interruptDeadOwnerJob(database, activeJob, startedAt);
         }
-        const current = resultRows(database.exec(`SELECT id, status FROM sync_jobs
+        const current = resultRows(database.exec(`SELECT id, status,
+            owner_pid, owner_start_id, owner_boot_id
+          FROM sync_jobs
           WHERE id = ${sqlString(jobId)} LIMIT 1`))[0];
         if (!current) {
           const error = new Error('任务不存在');
@@ -3153,6 +3164,12 @@ class PanelDb {
           error.requestedStatus = 'running';
           throw error;
         }
+        // validateJobClaims() has already recovered every active task whose
+        // owner is dead or unverifiable. Any active row left here belongs to a
+        // proven-live process, so only that exact process identity may launch
+        // it. Multiple PanelDb objects in this process intentionally share the
+        // same owner triple and remain compatible.
+        assertStoredJobOwnedByCurrentProcess(current);
         const runningMutation = firstRunningMutation(database);
         if (runningMutation) {
           database.run('COMMIT');
@@ -3495,7 +3512,8 @@ class PanelDb {
       if (terminalStatus) {
         validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
       }
-      const row = resultRows(database.exec(`SELECT type, status, claim_keys_json, result_json,
+      const row = resultRows(database.exec(`SELECT id, type, status, claim_keys_json, result_json,
+          owner_pid, owner_start_id, owner_boot_id,
           reconciliation_hold, reconciliation_scope, reconciliation_claim_digest
         FROM sync_jobs WHERE id = ${sqlString(id)} LIMIT 1`))[0];
       if (!row) {
@@ -3528,6 +3546,11 @@ class PanelDb {
         error.requestedStatus = requestedStatus;
         throw error;
       }
+      // Only the process identity recorded at admission may alter an active
+      // task's execution evidence or terminalize it. This covers status-less
+      // result, error and timestamp patches as well as explicit transitions;
+      // dedicated recovery paths remain responsible for foreign dead owners.
+      assertStoredJobOwnedByCurrentProcess(row);
       const transitionAllowed = !hasRequestedStatus
         || (currentStatus === 'queued'
           && (requestedStatus === 'running' || terminalStatus !== null))
