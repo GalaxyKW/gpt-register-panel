@@ -4598,7 +4598,7 @@ test('import plan items pass one cancellation signal through update and create r
           updated: 0,
           skipped: 0,
           failed: 0,
-          items: [{ index: 0, action: 'created', account_id: 302 }],
+          items: [{ index: 1, action: 'created', account_id: 302 }],
         };
       },
       async getAccount(id, options) {
@@ -4647,7 +4647,7 @@ test('create cancellation after the POST starts no postflight request', async ()
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 303 }],
+            items: [{ index: 1, action: 'created', account_id: 303 }],
           };
         },
         async getAccount() {
@@ -4791,7 +4791,7 @@ test('token import returns reconciliation details and never starts the next acco
           updated: 0,
           skipped: 0,
           failed: 0,
-          items: [{ index: 0, action: 'created', account_id: 401 }],
+          items: [{ index: 1, action: 'created', account_id: 401 }],
         };
       },
       async getAccount() {
@@ -4880,7 +4880,7 @@ test('token import returns reconciliation details and never starts the next acco
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 402 }],
+            items: [{ index: 1, action: 'created', account_id: 402 }],
           };
         },
         async getAccount(id, options) {
@@ -5075,7 +5075,7 @@ test('create verification consumes the nested Codex import account ID', async ()
         updated: 0,
         skipped: 0,
         failed: 0,
-        items: [{ index: 0, action: 'created', account_id: 42 }],
+        items: [{ index: 1, action: 'created', account_id: 42 }],
       };
     },
     async getAccount(id) {
@@ -5125,7 +5125,7 @@ test('create verification consumes the nested Codex import account ID', async ()
             updated: 1,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'updated', account_id: 99 }],
+            items: [{ index: 1, action: 'updated', account_id: 99 }],
           };
         },
       },
@@ -5146,7 +5146,7 @@ test('create verification consumes the nested Codex import account ID', async ()
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 43 }],
+            items: [{ index: 1, action: 'created', account_id: 43 }],
           };
         },
       },
@@ -5177,7 +5177,7 @@ test('create verification consumes the nested Codex import account ID', async ()
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 44 }],
+            items: [{ index: 1, action: 'created', account_id: 44 }],
           };
         },
       },
@@ -5232,7 +5232,7 @@ test('create postflight requires the exact preview-bound group set', async () =>
               updated: 0,
               skipped: 0,
               failed: 0,
-              items: [{ index: 0, action: 'created', account_id: 510 }],
+              items: [{ index: 1, action: 'created', account_id: 510 }],
             };
           },
           async getAccount() {
@@ -5265,13 +5265,15 @@ test('create responses require exact numeric counters, one raw item, and consist
     updated: 0,
     skipped: 0,
     failed: 0,
-    items: [{ index: 0, action: 'created', account_id: 501 }],
+    items: [{ index: 1, action: 'created', account_id: 501 }],
   };
   const malformedResults = [
     { ...valid, total: undefined },
     { ...valid, created: '1' },
     { ...valid, failed: false },
     { ...valid, items: [null, ...valid.items] },
+    { ...valid, items: [{ ...valid.items[0], index: 0 }] },
+    { ...valid, items: [{ ...valid.items[0], index: 2 }] },
     { ...valid, items: [{ ...valid.items[0], account_id: '501' }] },
     { ...valid, account_id: 502 },
     { ...valid, accountId: '501' },
@@ -5341,7 +5343,7 @@ test('create postflight retries only bounded complete reads and never retries th
           updated: 0,
           skipped: 0,
           failed: 0,
-          items: [{ index: 0, action: 'created', account_id: 511 }],
+          items: [{ index: 1, action: 'created', account_id: 511 }],
         };
       },
       async getAccount(id, options) {
@@ -5402,7 +5404,7 @@ test('create postflight fails closed on a concurrent duplicate strong identity',
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 51 }],
+            items: [{ index: 1, action: 'created', account_id: 51 }],
           };
         },
         async getAccount() { return created; },
@@ -5466,7 +5468,7 @@ test('create postflight fails closed when the allocated free name is no longer u
             updated: 0,
             skipped: 0,
             failed: 0,
-            items: [{ index: 0, action: 'created', account_id: 61 }],
+            items: [{ index: 1, action: 'created', account_id: 61 }],
           };
         },
         async getAccount() { return created; },
@@ -5525,7 +5527,7 @@ test('create verification rejects malformed or non-OpenAI OAuth target rows', as
               updated: 0,
               skipped: 0,
               failed: 0,
-              items: [{ index: 0, action: 'created', account_id: 71 }],
+              items: [{ index: 1, action: 'created', account_id: 71 }],
             };
           },
           async getAccount() { return replacement; },

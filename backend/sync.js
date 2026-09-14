@@ -2179,6 +2179,7 @@ function assertCreatedImportResult(result, knownAccountIds = new Set()) {
       || Array.isArray(result)
       || items?.length !== 1
       || !item
+      || item.index !== 1
       || item.action !== 'created'
       || !Number.isSafeInteger(accountId)
       || accountId <= 0
