@@ -1,15 +1,20 @@
 const crypto = require('node:crypto');
+const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
+const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
 
 function asString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
 }
 
 function normalizeEmail(value) {
-  return asString(value).toLowerCase();
+  const raw = value === undefined || value === null ? '' : String(value);
+  return C0_OR_DEL.test(raw) ? '' : raw.trim().toLowerCase();
 }
 
 function normalizeIdentityValue(prefix, value) {
-  const text = asString(value);
+  const raw = value === undefined || value === null ? '' : String(value);
+  if (C0_OR_DEL.test(raw)) return '';
+  const text = raw.trim();
   if (prefix === 'email:') return text.toLowerCase();
   if (prefix === 'account:' || prefix === 'user:') {
     const match = /^\{?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\}?$/i.exec(text);
@@ -61,7 +66,7 @@ function openAiAuth(payload) {
   return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
 }
 
-function stringAliases(object, keys, maximumLength) {
+function stringAliases(object, keys, maximumLength, options = {}) {
   let value = '';
   let invalid = false;
   for (const key of keys) {
@@ -73,7 +78,9 @@ function stringAliases(object, keys, maximumLength) {
       continue;
     }
     const normalized = raw.trim();
-    if (normalized.length > maximumLength || (value && value !== normalized)) invalid = true;
+    if (normalized.length > maximumLength
+        || (options.rejectControls && options.rejectControls.test(raw))
+        || (value && value !== normalized)) invalid = true;
     else if (normalized) value = normalized;
   }
   return { value, invalid };
@@ -88,7 +95,9 @@ const TOKEN_CREDENTIAL_FIELDS = Object.freeze({
 function tokenCredentialField(document, kind) {
   const definition = TOKEN_CREDENTIAL_FIELDS[kind];
   if (!definition) return { value: '', invalid: true };
-  return stringAliases(document, definition.keys, definition.maximumLength);
+  return stringAliases(document, definition.keys, definition.maximumLength, {
+    rejectControls: CREDENTIAL_LINE_CONTROL,
+  });
 }
 
 function claimScalar(object, key, maximumLength, allowNumber = true) {
@@ -100,8 +109,9 @@ function claimScalar(object, key, maximumLength, allowNumber = true) {
   if (typeof raw !== 'string' && !(allowNumber && typeof raw === 'number' && Number.isFinite(raw))) {
     return { value: '', invalid: true };
   }
-  const value = String(raw).trim();
-  return value.length <= maximumLength
+  const rawText = String(raw);
+  const value = rawText.trim();
+  return value.length <= maximumLength && !C0_OR_DEL.test(rawText)
     ? { value, invalid: false }
     : { value: '', invalid: true };
 }
@@ -168,10 +178,16 @@ function normalizeTokenDocument({
     document,
     ['chatgpt_account_id', 'account_id', 'accountId'],
     512,
+    { rejectControls: C0_OR_DEL },
   );
-  const explicitUser = stringAliases(document, ['chatgpt_user_id', 'user_id', 'userId'], 512);
-  const explicitEmail = stringAliases(document, ['email'], 320);
-  const explicitTypeField = stringAliases(document, ['type'], 32);
+  const explicitUser = stringAliases(
+    document,
+    ['chatgpt_user_id', 'user_id', 'userId'],
+    512,
+    { rejectControls: C0_OR_DEL },
+  );
+  const explicitEmail = stringAliases(document, ['email'], 320, { rejectControls: C0_OR_DEL });
+  const explicitTypeField = stringAliases(document, ['type'], 32, { rejectControls: C0_OR_DEL });
   const accessToken = accessField.value;
   const refreshToken = refreshField.value;
   const idToken = idField.value;

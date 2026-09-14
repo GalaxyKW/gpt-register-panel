@@ -16,7 +16,7 @@ const {
 } = require('../backend/adapters/sub2apiAdmin');
 const { buildDiff } = require('../backend/diff');
 const { buildRows, filterRows, rowFromDiffItem } = require('../backend/view');
-const { buildImportPlan, buildSnapshot } = require('../backend/sync');
+const { buildImportPlan, buildSnapshot, safeErrorMessage } = require('../backend/sync');
 
 function makeJwt(payload) {
   return [
@@ -177,6 +177,15 @@ test('source JSON size limits are enforced before parsing', () => {
   const oversized = sources.tokens.find((item) => item.fileName === 'oversized.json');
   assert.equal(oversized.parseStatus, 'invalid');
   assert.match(oversized.parseError, /大小上限/);
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      tokenMaxBytes: 1024,
+      strictCompleteSnapshot: true,
+    }),
+    (error) => error.code === 'GPT_REGISTER_FILE_TOO_LARGE',
+  );
 
   fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([
     { email: 'large@example.test', password: 'x'.repeat(2048) },
@@ -217,6 +226,28 @@ test('token scans enforce aggregate file limits and reject hard-linked sources',
     assert.equal(sources.tokens.find((item) => item.fileName === name).parseStatus, 'invalid');
   }
   assert.equal(JSON.stringify(sources).includes('hardlink-secret-value'), false);
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    }),
+    (error) => error.code === 'GPT_REGISTER_PATH_INVALID',
+  );
+});
+
+test('token directory scans bound all entries independently from JSON files', () => {
+  const fixture = fixtureRoot();
+  fs.writeFileSync(path.join(fixture.root, 'tokens', 'ignored-one.txt'), 'ignored');
+  fs.writeFileSync(path.join(fixture.root, 'tokens', 'ignored-two.txt'), 'ignored');
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      tokenMaxDirectoryEntries: 3,
+    }),
+    (error) => error.code === 'GPT_REGISTER_SOURCE_LIMIT'
+      && /目录项数量/.test(error.message),
+  );
 });
 
 test('malformed token JSON reports a stable error without parser input fragments', () => {
@@ -253,6 +284,11 @@ test('complete source snapshots reject malformed username identity and terminal 
     { email: { access_token: 'nested-email-secret' }, password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', password: 'present', status: { value: 'account_deleted' } },
     { email: 'valid@example.test', password: { value: 'nested-password-secret' }, status: 'oauth_done' },
+    { email: 'del\u007f@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', phone: '138\n0000', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', name: 'display\tname', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', password: 'password-lure\r\nnext', status: 'oauth_done' },
+    { email: 'valid@example.test', password: 'present', status: 'oauth_done\n' },
   ]) {
     fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([record]));
     assert.throws(
@@ -261,8 +297,14 @@ test('complete source snapshots reject malformed username identity and terminal 
         includeRaw: true,
         strictCompleteSnapshot: true,
       }),
-      (error) => error.code === 'GPT_REGISTER_USERNAME_INVALID'
-        && !JSON.stringify(error).includes('nested-'),
+      (error) => {
+        assert.equal(error.code, 'GPT_REGISTER_USERNAME_INVALID');
+        for (const lure of ['nested-', 'password-lure']) {
+          assert.equal(String(error.message).includes(lure), false);
+          assert.equal(safeErrorMessage(error).includes(lure), false);
+        }
+        return true;
+      },
     );
   }
 });
@@ -282,10 +324,31 @@ test('complete source snapshots reject every missing required source explicitly'
         includeRaw: true,
         strictCompleteSnapshot: true,
       }),
-      (error) => error.code === 'GPT_REGISTER_SOURCE_MISSING',
+      (error) => error.code === 'GPT_REGISTER_SOURCE_MISSING'
+        && JSON.stringify(error.missingSources) === JSON.stringify([missing]),
       missing,
     );
   }
+});
+
+test('a missing root reports only the fixed required-source allowlist', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-missing-root-'));
+  const missingRoot = path.join(parent, 'credential=must-not-be-reported');
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: missingRoot,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    }),
+    (error) => {
+      assert.equal(error.code, 'GPT_REGISTER_SOURCE_MISSING');
+      assert.deepEqual(error.missingSources, ['tokens', 'use_token', 'username.json']);
+      assert.equal(JSON.stringify(error.missingSources).includes('must-not-be-reported'), false);
+      assert.equal(String(error.message).includes('must-not-be-reported'), false);
+      assert.equal(safeErrorMessage(error).includes('must-not-be-reported'), false);
+      return true;
+    },
+  );
 });
 
 test('write-plan snapshots stop before any remote read when a required source is missing', async () => {
@@ -330,7 +393,7 @@ test('complete source snapshots reject unreadable token identities instead of us
       includeRaw: true,
       strictCompleteSnapshot: true,
     }),
-    (error) => error.code === 'GPT_REGISTER_SOURCE_INCOMPLETE',
+    (error) => error.code === 'GPT_REGISTER_PATH_INVALID',
   );
   assert.equal(JSON.stringify(diagnostic).includes('must-not-appear'), false);
 });
@@ -338,19 +401,30 @@ test('complete source snapshots reject unreadable token identities instead of us
 test('complete source snapshots detect token directory changes during enumeration', () => {
   const fixture = fixtureRoot();
   const tokenDirectory = path.join(fixture.root, 'tokens');
-  const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
   let tokenReads = 0;
-  fs.readdirSync = function changingReaddir(target, ...args) {
-    const result = originalReaddirSync.call(fs, target, ...args);
+  fs.opendirSync = function changingOpendir(target, ...args) {
+    const result = originalOpendirSync.call(fs, target, ...args);
     let realTarget = '';
     try { realTarget = fs.realpathSync(String(target)); } catch {}
-    if (realTarget === tokenDirectory && ++tokenReads === 1) {
-      fs.writeFileSync(path.join(tokenDirectory, 'appeared-during-scan.json'), JSON.stringify({
-        access_token: 'late-token-must-not-appear',
-        account_id: 'late-account',
-      }));
-    }
-    return result;
+    if (realTarget !== tokenDirectory || ++tokenReads !== 1) return result;
+    let changed = false;
+    return {
+      readSync() {
+        const entry = result.readSync();
+        if (!entry && !changed) {
+          changed = true;
+          fs.writeFileSync(path.join(tokenDirectory, 'appeared-during-scan.json'), JSON.stringify({
+            access_token: 'late-token-must-not-appear',
+            account_id: 'late-account',
+          }));
+        }
+        return entry;
+      },
+      closeSync() {
+        return result.closeSync();
+      },
+    };
   };
   try {
     assert.throws(
@@ -362,7 +436,106 @@ test('complete source snapshots detect token directory changes during enumeratio
       (error) => error.code === 'GPT_REGISTER_SOURCE_CHANGED',
     );
   } finally {
+    fs.opendirSync = originalOpendirSync;
+  }
+});
+
+test('a JSON disappearing after enumeration is source-changed, not source-missing', () => {
+  const fixture = fixtureRoot();
+  const targetPath = path.join(fixture.root, 'tokens', 'a.json');
+  const originalLstatSync = fs.lstatSync;
+  let injected = false;
+  fs.lstatSync = function disappearingEnumeratedFile(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (!injected && String(target).startsWith('/proc/self/fd/') && realTarget === targetPath) {
+      injected = true;
+      const error = new Error('simulated enumerated file disappearance');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return originalLstatSync.call(fs, target, ...args);
+  };
+  try {
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_SOURCE_CHANGED'
+        && error.missingSources === undefined,
+    );
+    assert.equal(injected, true);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+});
+
+test('a verified source path disappearing while opening stays path-invalid', () => {
+  const fixture = fixtureRoot();
+  const tokenDirectory = path.join(fixture.root, 'tokens');
+  const originalOpenSync = fs.openSync;
+  let injected = false;
+  fs.openSync = function disappearingSourceOpen(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (!injected && realTarget === tokenDirectory) {
+      injected = true;
+      const error = new Error('simulated source open race');
+      error.code = 'ENOENT';
+      throw error;
+    }
+    return originalOpenSync.call(fs, target, ...args);
+  };
+  try {
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_PATH_INVALID'
+        && error.missingSources === undefined,
+    );
+    assert.equal(injected, true);
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+});
+
+test('every strict token manifest pass uses the bounded iterator', () => {
+  const fixture = fixtureRoot();
+  const tokenDirectories = new Set([
+    path.join(fixture.root, 'tokens'),
+    path.join(fixture.root, 'use_token'),
+  ]);
+  const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
+  let boundedPasses = 0;
+  fs.readdirSync = function rejectingUnboundedTokenRead(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (tokenDirectories.has(realTarget)) throw new Error('unbounded token directory read');
+    return originalReaddirSync.call(fs, target, ...args);
+  };
+  fs.opendirSync = function countingBoundedTokenRead(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (tokenDirectories.has(realTarget)) boundedPasses += 1;
+    return originalOpendirSync.call(fs, target, ...args);
+  };
+  try {
+    const sources = readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    });
+    assert.equal(sources.summary.tokenCount, 2);
+    assert.equal(boundedPasses, 8);
+  } finally {
     fs.readdirSync = originalReaddirSync;
+    fs.opendirSync = originalOpendirSync;
   }
 });
 

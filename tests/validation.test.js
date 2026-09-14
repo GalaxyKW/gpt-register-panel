@@ -16,7 +16,7 @@ const {
   validateListenConfiguration,
 } = require('../backend/server');
 const { safeImportResult, buildSnapshot } = require('../backend/sync');
-const { normalizeTokenDocument } = require('../backend/lib/token');
+const { normalizeTokenDocument, tokenCredentialField } = require('../backend/lib/token');
 const { buildDiff } = require('../backend/diff');
 const { PanelDb } = require('../backend/db');
 const { findUsernameEntry, persistAccountDisposition } = require('../backend/phase3Worker');
@@ -188,6 +188,59 @@ test('token documents reject nested, oversized, and non-Codex credential fields'
       assert.equal(JSON.stringify(token).includes(item.sensitive), false, item.relativePath);
     }
   }
+});
+
+test('token identities reject C0 and DEL while credentials reject line controls', () => {
+  const jwtWithControlledIdentity = [
+    'header',
+    Buffer.from(JSON.stringify({ sub: 'claim-lure\nsubject' })).toString('base64url'),
+    'signature',
+  ].join('.');
+  const cases = [
+    {
+      label: 'access CRLF',
+      data: { access_token: 'access-lure\r\nInjected: value', email: 'safe@example.test' },
+    },
+    {
+      label: 'refresh NUL',
+      data: { access_token: 'opaque-access', refresh_token: 'refresh-lure\0tail', email: 'safe@example.test' },
+    },
+    {
+      label: 'identity DEL',
+      data: { access_token: 'opaque-access', account_id: 'account-lure\u007fhidden' },
+    },
+    {
+      label: 'identity tab',
+      data: { access_token: 'opaque-access', email: 'safe\t@example.test' },
+    },
+    {
+      label: 'JWT claim control',
+      data: { access_token: jwtWithControlledIdentity },
+    },
+  ];
+  for (const item of cases) {
+    const token = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/control.json',
+      fileName: 'control.json',
+      mtimeMs: 1,
+      data: item.data,
+    });
+    assert.equal(token.parseStatus, 'invalid', item.label);
+    assert.equal(token.parseError, 'token 字段类型或长度无效', item.label);
+    for (const lure of ['access-lure', 'refresh-lure', 'account-lure', 'claim-lure']) {
+      assert.equal(String(token.parseError).includes(lure), false, item.label);
+    }
+  }
+
+  assert.deepEqual(
+    tokenCredentialField({ access_token: 'header\r\nvalue' }, 'access'),
+    { value: '', invalid: true },
+  );
+  assert.deepEqual(
+    tokenCredentialField({ access_token: 'opaque-access' }, 'access'),
+    { value: 'opaque-access', invalid: false },
+  );
 });
 
 test('invalid expiry fields are surfaced separately and never treated as expired', () => {
