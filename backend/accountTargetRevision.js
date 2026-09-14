@@ -68,14 +68,29 @@ function canonicalOptionalScalar(value, maximumLength = 1024) {
   return normalizedScalar(value, maximumLength);
 }
 
+function canonicalGroupIds(value) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) return null;
+  const ids = [];
+  for (const raw of value) {
+    const text = String(raw ?? '').trim();
+    if (!/^[1-9]\d*$/.test(text)) return null;
+    const id = Number(text);
+    if (!Number.isSafeInteger(id) || id <= 0) return null;
+    ids.push(id);
+  }
+  return [...new Set(ids)].sort((left, right) => left - right);
+}
+
 function canonicalAccountTestTarget(account) {
   const id = positiveAccountId(account?.id);
   const platform = normalizedScalar(account?.platform, 64)?.toLowerCase() || null;
   const type = normalizedScalar(account?.type, 64)?.toLowerCase() || null;
   const identities = canonicalStrongIdentities(account);
   const state = knownAccountState(account);
+  const groupIds = canonicalGroupIds(account?.groupIds);
   if (!id || !platform || !type || !state || account?.schemaValid === false || identities.invalid
-      || identities.account.length + identities.user.length === 0) return null;
+      || !groupIds || identities.account.length + identities.user.length === 0) return null;
 
   const fingerprints = {};
   const presence = {};
@@ -125,6 +140,7 @@ function canonicalAccountTestTarget(account) {
     type,
     identities: { account: identities.account, user: identities.user },
     credentials: { fingerprints, presence },
+    groupIds,
     state: {
       ...state,
       schemaValid: account?.schemaValid !== false,
@@ -174,6 +190,22 @@ function accountTestTargetDigest(account) {
     .digest('hex');
 }
 
+function accountTestOwnershipDigest(account) {
+  const target = canonicalAccountTestTarget(account);
+  if (!target) return null;
+  return crypto.createHash('sha256')
+    .update('gpt-register-panel/account-test-ownership/v1\0')
+    .update(JSON.stringify({
+      id: target.id,
+      platform: target.platform,
+      type: target.type,
+      identities: target.identities,
+      credentials: target.credentials,
+      groupIds: target.groupIds,
+    }))
+    .digest('hex');
+}
+
 const processIssuer = createAccountTargetRevisionIssuer();
 
 function accountTestTargetRevision(account) {
@@ -186,6 +218,7 @@ function matchesAccountTestTargetRevision(revision, account) {
 
 module.exports = {
   REVISION_PATTERN,
+  accountTestOwnershipDigest,
   accountTestTargetDigest,
   accountTestTargetRevision,
   createAccountTargetRevisionIssuer,

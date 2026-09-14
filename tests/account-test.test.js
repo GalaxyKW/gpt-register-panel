@@ -262,6 +262,7 @@ test('account test target revisions are process-scoped, opaque, and bind recover
     rateLimitResetStatus: 'missing',
     overloadUntil: null,
     overloadUntilStatus: 'missing',
+    groupIds: [9, 3, 9],
   });
   const issuerA = createAccountTargetRevisionIssuer(Buffer.alloc(32, 1));
   const issuerB = createAccountTargetRevisionIssuer(Buffer.alloc(32, 2));
@@ -280,6 +281,7 @@ test('account test target revisions are process-scoped, opaque, and bind recover
       'account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
       'user:user-41',
     ],
+    groupIds: [3, 9],
   }));
 
   const changes = [
@@ -290,6 +292,7 @@ test('account test target revisions are process-scoped, opaque, and bind recover
     { userId: 'replacement-user', identityKeys: ['account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'user:replacement-user'] },
     { expiresAt: '2099-02-01T00:00:00.000Z' },
     { tempUnschedulableUntil: '2097-01-01T00:00:00.000Z', tempUnschedulableUntilStatus: 'valid' },
+    { groupIds: [3, 10] },
   ];
   for (const change of changes) {
     assert.equal(issuerA.matches(revision, { ...account, ...change }), false);
@@ -305,6 +308,7 @@ test('account test target revisions are process-scoped, opaque, and bind recover
     ),
     (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE',
   );
+  assert.equal(issuerA.issue({ ...account, groupIds: ['invalid-group'] }), null);
 });
 
 test('account test target classification accepts non-error accounts and rejects duplicates', () => {
@@ -730,6 +734,26 @@ test('account tests reject credential changes in the admission-to-worker queue w
   assert.equal(testCalls, 0);
 });
 
+test('account tests reject group changes in the admission-to-worker queue window', async () => {
+  const submitted = oauthTestAccount(43, 'active', true, { groupIds: [8, 2] });
+  const changed = { ...submitted, groupIds: [2, 9] };
+  let testCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [43],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-submitted-group-changed-before-worker-list',
+    client: {
+      async listAccounts() { return [changed]; },
+      async getAccount() { return changed; },
+      async testAccount() { testCalls += 1; return { success: true }; },
+    },
+  });
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED');
+  assert.equal(testCalls, 0);
+});
+
 test('account test workers fail closed when a persisted target baseline is missing', async () => {
   const account = oauthTestAccount(20, 'active', true);
   let listCalls = 0;
@@ -766,6 +790,123 @@ test('account test workers fail closed for pre-revision persisted baselines', as
     (error) => error?.code === 'ACCOUNT_TEST_BASELINE_INVALID',
   );
   assert.equal(listCalls, 0);
+});
+
+test('successful tests reconcile every credential evidence change before scheduler enable', async () => {
+  const variants = [
+    ['access fingerprint', (account) => ({
+      ...account,
+      tokenFingerprints: { ...account.tokenFingerprints, access: 'aaaaaaaaaaaaaaaa' },
+    })],
+    ['refresh fingerprint', (account) => ({
+      ...account,
+      tokenFingerprints: { ...account.tokenFingerprints, refresh: 'bbbbbbbbbbbbbbbb' },
+    })],
+    ['id fingerprint', (account) => ({
+      ...account,
+      tokenFingerprints: { ...account.tokenFingerprints, id: 'cccccccccccccccc' },
+    })],
+    ['access presence', (account) => ({
+      ...account,
+      credentialPresence: { ...account.credentialPresence, access: 'absent' },
+    })],
+    ['refresh presence', (account) => ({
+      ...account,
+      credentialPresence: { ...account.credentialPresence, refresh: 'absent' },
+    })],
+    ['id presence', (account) => ({
+      ...account,
+      credentialPresence: { ...account.credentialPresence, id: 'absent' },
+    })],
+  ];
+  for (let index = 0; index < variants.length; index += 1) {
+    const [label, replaceEvidence] = variants[index];
+    let account = oauthTestAccount(44 + index, 'error', false, {
+      tokenFingerprints: {
+        access: '1111111111111111',
+        refresh: '2222222222222222',
+        id: '3333333333333333',
+      },
+      credentialPresence: { access: 'present', refresh: 'present', id: 'present' },
+      groupIds: [2, 8],
+    });
+    const submitted = { ...account };
+    let schedulerWrites = 0;
+    const outcome = await runAccountTestJobNow({
+      accountIds: [account.id],
+      targetBaselines: targetBaselines(submitted),
+      db: fakeWorkerDb(),
+      jobId: 'test-post-test-credential-change-' + index,
+      client: {
+        async listAccounts() { return [{ ...submitted }]; },
+        async getAccount() { return { ...account }; },
+        async testAccount() {
+          account = replaceEvidence({ ...account, status: 'active' });
+          return { success: true };
+        },
+        async setSchedulable() { schedulerWrites += 1; return { ...account, schedulable: true }; },
+      },
+    });
+    assert.equal(schedulerWrites, 0, label);
+    assert.equal(outcome.failed, 1, label);
+    assert.equal(outcome.results[0].code, 'account_test_reconciliation_required', label);
+    assert.equal(outcome.results[0].testSuccess, true, label);
+    assert.equal(outcome.results[0].reconciliationScope, 'test', label);
+  }
+});
+
+test('successful test reconciles a group change before scheduler enable', async () => {
+  let account = oauthTestAccount(50, 'error', false, { groupIds: [2, 8] });
+  const submitted = { ...account };
+  let schedulerWrites = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [50],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-post-test-group-change',
+    client: {
+      async listAccounts() { return [{ ...submitted }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = { ...account, status: 'active', groupIds: [2, 9] };
+        return { success: true };
+      },
+      async setSchedulable() { schedulerWrites += 1; return { ...account, schedulable: true }; },
+    },
+  });
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+});
+
+test('account ownership normalizes group order before recovery', async () => {
+  let account = oauthTestAccount(52, 'error', false, { groupIds: [8, 2] });
+  const submitted = { ...account };
+  const schedulerWrites = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [52],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-post-test-group-order',
+    client: {
+      async listAccounts() { return [{ ...submitted }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = { ...account, status: 'active', groupIds: [2, 8] };
+        return { success: true };
+      },
+      async setSchedulable(id, value) {
+        schedulerWrites.push({ id, value });
+        account = { ...account, schedulable: value };
+        return { ...account };
+      },
+    },
+  });
+  assert.deepEqual(schedulerWrites, [{ id: 52, value: true }]);
+  assert.equal(outcome.succeeded, 1);
+  assert.equal(outcome.results[0].code, 'account_recovered');
 });
 
 test('scheduler recovery rejects a write response for a replaced identity', async () => {
@@ -805,8 +946,57 @@ test('scheduler recovery rejects a write response for a replaced identity', asyn
   assert.deepEqual(schedulableCalls, [{ id: 15, value: true }]);
 });
 
+test('scheduler recovery treats changed credential evidence in the write response as unknown', async () => {
+  let account = oauthTestAccount(51, 'error', false, {
+    tokenFingerprints: {
+      access: '1111111111111111',
+      refresh: '2222222222222222',
+      id: '3333333333333333',
+    },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'present' },
+    groupIds: [4],
+  });
+  const schedulableCalls = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [51],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-credential-changed-in-enable-response',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = { ...account, status: 'active' };
+        return { success: true };
+      },
+      async setSchedulable(id, value) {
+        schedulableCalls.push({ id, value });
+        return {
+          ...account,
+          schedulable: true,
+          tokenFingerprints: { ...account.tokenFingerprints, id: 'dddddddddddddddd' },
+        };
+      },
+    },
+  });
+  assert.deepEqual(schedulableCalls, [{ id: 51, value: true }]);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].reconciliationReason, 'enable_response_mismatch');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].enabledKnown, false);
+});
+
 test('scheduler rollback does not adopt state changed after its write response', async () => {
-  let account = oauthTestAccount(18, 'error', false);
+  let account = oauthTestAccount(18, 'error', false, {
+    tokenFingerprints: {
+      access: '1111111111111111',
+      refresh: '2222222222222222',
+      id: '3333333333333333',
+    },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'present' },
+    groupIds: [5, 7],
+  });
   const schedulableCalls = [];
   let concurrentChangePending = false;
   const outcome = await runAccountTestJobNow({
@@ -821,7 +1011,12 @@ test('scheduler rollback does not adopt state changed after its write response',
           concurrentChangePending = false;
           account = {
             ...account,
-            tokenFingerprints: { access: 'concurrent-admin-fingerprint' },
+            tokenFingerprints: {
+              ...account.tokenFingerprints,
+              refresh: 'concurrent-admin-fingerprint',
+            },
+            credentialPresence: { ...account.credentialPresence, id: 'absent' },
+            groupIds: [5, 9],
           };
         }
         return { ...account, tokenFingerprints: { ...account.tokenFingerprints } };
@@ -851,7 +1046,9 @@ test('scheduler rollback does not adopt state changed after its write response',
   assert.equal(outcome.results[0].enabled, null);
   assert.deepEqual(schedulableCalls, [true]);
   assert.equal(account.schedulable, true);
-  assert.equal(account.tokenFingerprints.access, 'concurrent-admin-fingerprint');
+  assert.equal(account.tokenFingerprints.refresh, 'concurrent-admin-fingerprint');
+  assert.equal(account.credentialPresence.id, 'absent');
+  assert.deepEqual(account.groupIds, [5, 9]);
 });
 
 test('mismatched scheduler-rollback response marks the write outcome unknown', async () => {

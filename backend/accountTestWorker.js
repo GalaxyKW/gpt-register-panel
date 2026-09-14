@@ -4,6 +4,7 @@ const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { getAccountAvailability } = require('./accountAvailability');
 const {
   REVISION_PATTERN,
+  accountTestOwnershipDigest,
   accountTestTargetDigest,
   matchesAccountTestTargetRevision,
 } = require('./accountTargetRevision');
@@ -376,19 +377,29 @@ function sameAccountTarget(expected, actual) {
       === JSON.stringify(canonicalStrongIdentityKeys(actual));
 }
 
+function sameAccountOwnership(expected, actual) {
+  if (!sameAccountTarget(expected, actual)) return false;
+  const expectedDigest = accountTestOwnershipDigest(expected);
+  const actualDigest = accountTestOwnershipDigest(actual);
+  if (!expectedDigest || !actualDigest) return false;
+  const expectedBuffer = Buffer.from(expectedDigest, 'hex');
+  const actualBuffer = Buffer.from(actualDigest, 'hex');
+  return expectedBuffer.length === actualBuffer.length
+    && crypto.timingSafeEqual(expectedBuffer, actualBuffer);
+}
+
 function accountStateVersion(account) {
-  return JSON.stringify({
-    id: account?.id ?? null,
-    status: accountStatus(account),
-    schedulable: account?.schedulable,
-    identityKeys: [...accountIdentityKeys(account)].sort(),
-    accessFingerprint: account?.tokenFingerprints?.access || null,
-    tempUnschedulableUntil: account?.tempUnschedulableUntil || null,
-    rateLimitResetAt: account?.rateLimitResetAt || null,
-    overloadUntil: account?.overloadUntil || null,
-    expiresAt: account?.expiresAt || null,
-    autoPauseOnExpired: account?.autoPauseOnExpired,
-  });
+  return accountTestTargetDigest(account);
+}
+
+function sameAccountStateVersion(expected, actual) {
+  const expectedVersion = accountStateVersion(expected);
+  const actualVersion = accountStateVersion(actual);
+  if (!expectedVersion || !actualVersion) return false;
+  const expectedBuffer = Buffer.from(expectedVersion, 'hex');
+  const actualBuffer = Buffer.from(actualVersion, 'hex');
+  return expectedBuffer.length === actualBuffer.length
+    && crypto.timingSafeEqual(expectedBuffer, actualBuffer);
 }
 
 function activeAccountTestJobs(jobs = []) {
@@ -509,8 +520,8 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
     if (error?.code === 'JOB_INTERRUPTED' || options.signal?.aborted) throw error;
     return { attempted: false, succeeded: false, state: null, reason: 'rollback_state_unavailable' };
   }
-  if (!sameAccountTarget(mutation.after, current)
-      || accountStateVersion(current) !== accountStateVersion(mutation.after)
+  if (!sameAccountOwnership(mutation.after, current)
+      || !sameAccountStateVersion(current, mutation.after)
       || current.schedulable !== mutation.written) {
     return { attempted: false, succeeded: false, state: current, reason: 'rollback_state_changed' };
   }
@@ -527,7 +538,7 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
     { signal: options.signal },
   );
   if (!writeResponse
-      || !sameAccountTarget(mutation.after, writeResponse)
+      || !sameAccountOwnership(mutation.after, writeResponse)
       || writeResponse.schedulable !== mutation.original) {
     return {
       attempted: true,
@@ -538,8 +549,8 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
     };
   }
   const verified = await client.getAccount(id, { signal: options.signal });
-  const succeeded = sameAccountTarget(writeResponse, verified)
-    && accountStateVersion(verified) === accountStateVersion(writeResponse)
+  const succeeded = sameAccountOwnership(writeResponse, verified)
+    && sameAccountStateVersion(verified, writeResponse)
     && verified.schedulable === mutation.original;
   return {
     attempted: true,
@@ -712,8 +723,8 @@ async function runAccountTestJobNow({
             { testSuccess: false },
           );
         }
-        if (!sameAccountTarget(account, afterFailure)) {
-          const error = new Error('账号测试后强身份已变化');
+        if (!sameAccountOwnership(account, afterFailure)) {
+          const error = new Error('账号测试后身份、凭据或所属组已变化');
           error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
           throw accountTestReconciliationError(
             error,
@@ -753,9 +764,9 @@ async function runAccountTestJobNow({
       // healthy or intentionally disabled accounts must keep their setting.
       if (!shouldRecover) {
         const after = await client.getAccount(id, { signal });
-        const targetUnchanged = sameAccountTarget(account, after);
+        const targetUnchanged = sameAccountOwnership(account, after);
         if (!targetUnchanged) {
-          const error = new Error('账号测试后强身份已变化');
+          const error = new Error('账号测试后身份、凭据或所属组已变化');
           error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
           throw accountTestReconciliationError(
             error,
@@ -821,8 +832,8 @@ async function runAccountTestJobNow({
       }
 
       const afterTest = await client.getAccount(id, { signal });
-      if (!sameAccountTarget(account, afterTest)) {
-        const error = new Error('测试后账号身份或结构已变化，拒绝修改调度设置');
+      if (!sameAccountOwnership(account, afterTest)) {
+        const error = new Error('测试后账号身份、凭据或所属组已变化，拒绝修改调度设置');
         error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
         throw error;
       }
@@ -914,7 +925,7 @@ async function runAccountTestJobNow({
       }
       if (!writeResponse
           || typeof writeResponse !== 'object'
-          || !sameAccountTarget(afterTest, writeResponse)
+          || !sameAccountOwnership(afterTest, writeResponse)
           || writeResponse.schedulable !== true) {
         // The write may have raced a delete/recreate. Its response is not
         // an account we can safely treat as our mutation or roll back.
@@ -927,12 +938,12 @@ async function runAccountTestJobNow({
       }
       recoveryMutation.after = writeResponse;
       const after = await client.getAccount(id, { signal });
-      if (!sameAccountTarget(afterTest, after)) {
-        const error = new Error('启用调度后账号身份或结构已变化');
+      if (!sameAccountOwnership(afterTest, after)) {
+        const error = new Error('启用调度后账号身份、凭据或所属组已变化');
         error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
         throw error;
       }
-      if (accountStateVersion(after) !== accountStateVersion(writeResponse)) {
+      if (!sameAccountStateVersion(after, writeResponse)) {
         // Keep the immediate mutation response as the ownership boundary.
         // A later GET may include a concurrent administrator change; treating
         // that newer state as ours could make rollback undo their scheduler.
@@ -980,7 +991,7 @@ async function runAccountTestJobNow({
           code: 'account_recovery_not_confirmed',
           message: '测试成功，但恢复状态或启用调度未确认，未标记为成功',
           testSuccess: true,
-          enabled: sameAccountTarget(account, rollbackState) && rollbackState.schedulable === true,
+          enabled: sameAccountOwnership(account, rollbackState) && rollbackState.schedulable === true,
           statusBefore,
           statusAfter: rollbackState?.status || after?.status || null,
           durationMs: Date.now() - itemStartedAt,
@@ -1156,6 +1167,7 @@ async function runAccountTestJobNow({
           throw readError;
         }
       }
+      const afterFailureOwned = sameAccountOwnership(account, afterFailure);
       const result = {
         accountId: id,
         accountName: account?.name || null,
@@ -1166,11 +1178,11 @@ async function runAccountTestJobNow({
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),
         message: safeErrorMessage(error),
         testSuccess: testSucceeded,
-        enabled: sameAccountTarget(account, afterFailure) ? afterFailure.schedulable === true : null,
-        enabledKnown: sameAccountTarget(account, afterFailure),
+        enabled: afterFailureOwned ? afterFailure.schedulable === true : null,
+        enabledKnown: afterFailureOwned,
         statusBefore,
-        statusAfter: sameAccountTarget(account, afterFailure) ? afterFailure.status || null : null,
-        statusAfterKnown: sameAccountTarget(account, afterFailure),
+        statusAfter: afterFailureOwned ? afterFailure.status || null : null,
+        statusAfterKnown: afterFailureOwned,
         durationMs: Date.now() - itemStartedAt,
       };
       results.push(result);
