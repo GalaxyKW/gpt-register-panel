@@ -1541,7 +1541,12 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
     });
     await assert.rejects(
       client.testAccount(1, { modelId: 'gpt-5.6-luna' }),
-      (error) => error.code === 'SUB2API_TEST_MODEL_MISMATCH',
+      (error) => error.code === 'SUB2API_TEST_MODEL_MISMATCH'
+        && error.requiresReconciliation === true
+        && error.reconciliationScope === 'test'
+        && error.testOutcomeUnknown !== true
+        && error.testSuccess === true
+        && error.testSuccessKnown === true,
     );
 
     global.fetch = async () => ({
@@ -1561,6 +1566,132 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
     assert.equal(tested.success, true);
     assert.equal(tested.model, null);
     assert.equal(JSON.stringify(tested).includes('sse-model-value'), false);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API account tests distinguish pre-dispatch interruption from unknown side effects', async () => {
+  const originalFetch = global.fetch;
+  const response = (body, overrides = {}) => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    body: null,
+    async text() { return body; },
+    ...overrides,
+  });
+  const assertUnknown = (error, code, reason) => error.code === code
+    && error.requiresReconciliation === true
+    && error.testOutcomeUnknown === true
+    && error.reconciliationScope === 'test'
+    && error.reconciliationReason === reason;
+  try {
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      maxResponseBytes: 1024,
+      testTimeoutMs: 10_000,
+    });
+
+    let fetchCalls = 0;
+    global.fetch = async () => {
+      fetchCalls += 1;
+      throw new Error('fetch must not run');
+    };
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await assert.rejects(
+      client.testAccount(1, { signal: preAborted.signal }),
+      (error) => error.code === 'JOB_INTERRUPTED'
+        && error.requiresReconciliation !== true
+        && error.testOutcomeUnknown !== true,
+    );
+    assert.equal(fetchCalls, 0);
+
+    global.fetch = async () => { throw new Error('Bearer transport-secret'); };
+    await assert.rejects(
+      client.testAccount(1),
+      (error) => assertUnknown(error, 'SUB2API_TEST_TRANSPORT_ERROR', 'transport')
+        && !error.message.includes('transport-secret'),
+    );
+
+    const runningAbort = new AbortController();
+    global.fetch = async (url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    });
+    const interrupted = client.testAccount(1, { signal: runningAbort.signal });
+    runningAbort.abort();
+    await assert.rejects(
+      interrupted,
+      (error) => assertUnknown(error, 'JOB_INTERRUPTED', 'external_abort'),
+    );
+
+    const timeoutClient = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      maxResponseBytes: 1024,
+      testTimeoutMs: 5,
+    });
+    global.fetch = async (url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    });
+    await assert.rejects(
+      timeoutClient.testAccount(1),
+      (error) => assertUnknown(error, 'SUB2API_TEST_TIMEOUT', 'timeout'),
+    );
+
+    const invalidResponses = [
+      {
+        body: 'x'.repeat(1025),
+        code: 'SUB2API_TEST_RESPONSE_TOO_LARGE',
+        reason: 'response_too_large',
+      },
+      { body: '', code: 'SUB2API_TEST_RESPONSE_INVALID', reason: 'empty_response' },
+      {
+        body: 'data: {not-json}\n\n',
+        code: 'SUB2API_TEST_RESPONSE_INVALID',
+        reason: 'missing_terminal',
+      },
+      {
+        body: 'data: {"type":"status","text":"running"}\n\n',
+        code: 'SUB2API_TEST_RESPONSE_INVALID',
+        reason: 'missing_terminal',
+      },
+    ];
+    for (const scenario of invalidResponses) {
+      global.fetch = async () => response(scenario.body);
+      await assert.rejects(
+        client.testAccount(1),
+        (error) => assertUnknown(error, scenario.code, scenario.reason),
+      );
+    }
+
+    global.fetch = async () => response('upstream unavailable', {
+      ok: false,
+      status: 502,
+      statusText: 'Bad Gateway',
+    });
+    await assert.rejects(
+      client.testAccount(1),
+      (error) => assertUnknown(error, 'SUB2API_TEST_REQUEST_REJECTED', 'response_rejected'),
+    );
+
+    global.fetch = async () => response(
+      'data: {"type":"error","error":"Bearer must-not-be-returned"}\n\n',
+    );
+    const explicitFailure = await client.testAccount(1);
+    assert.equal(explicitFailure.success, false);
+    assert.equal(explicitFailure.message, 'Sub2API 返回失败测试结果');
+    assert.equal(JSON.stringify(explicitFailure).includes('must-not-be-returned'), false);
   } finally {
     global.fetch = originalFetch;
   }

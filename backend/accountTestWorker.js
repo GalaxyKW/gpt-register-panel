@@ -40,8 +40,29 @@ function schedulerReconciliationError(error, reason = 'scheduler_write_unknown',
     target.writeOutcomeUnknown = true;
   }
   target.requiresReconciliation = true;
+  if (target.reconciliationScope !== 'test') target.reconciliationScope = 'scheduler';
   target.reconciliationReason = normalizedReconciliationReason(
     target.reconciliationReason || target.writeOutcomeReason || reason,
+    reason,
+  );
+  return target;
+}
+
+function accountTestReconciliationError(error, reason = 'account_test_state_unknown', options = {}) {
+  const target = error instanceof Error
+    ? error
+    : new Error('账号测试后状态无法确认');
+  target.requiresReconciliation = true;
+  target.reconciliationScope = 'test';
+  if (options.testOutcomeUnknown === true || target.testOutcomeUnknown === true) {
+    target.testOutcomeUnknown = true;
+  }
+  if (typeof options.testSuccess === 'boolean') {
+    target.testSuccess = options.testSuccess;
+    target.testSuccessKnown = true;
+  }
+  target.reconciliationReason = normalizedReconciliationReason(
+    target.reconciliationReason || reason,
     reason,
   );
   return target;
@@ -362,6 +383,15 @@ function resultForRejected(item) {
 
 async function auditResult(db, logger, result, actor, jobId, modelId) {
   if (!db) return;
+  const testSuccessKnown = result.testSuccessKnown === false
+    ? false
+    : typeof result.testSuccess === 'boolean';
+  const enabledKnown = result.enabledKnown === false
+    ? false
+    : typeof result.enabled === 'boolean';
+  const statusAfterKnown = result.statusAfterKnown === false
+    ? false
+    : typeof result.statusAfter === 'string' && result.statusAfter.length > 0;
   try {
     await db.audit({
       jobId,
@@ -376,14 +406,18 @@ async function auditResult(db, logger, result, actor, jobId, modelId) {
         code: result.code || null,
         message: result.message || null,
         durationMs: result.durationMs || 0,
-        testSuccess: result.testSuccess === true,
-        enabled: typeof result.enabled === 'boolean' ? result.enabled : null,
-        enabledKnown: typeof result.enabled === 'boolean',
+        testSuccess: testSuccessKnown ? result.testSuccess : null,
+        testSuccessKnown,
+        enabled: enabledKnown ? result.enabled : null,
+        enabledKnown,
+        statusAfterKnown,
         requiresReconciliation: result.requiresReconciliation === true,
         writeOutcomeUnknown: result.writeOutcomeUnknown === true,
+        testOutcomeUnknown: result.testOutcomeUnknown === true,
+        reconciliationScope: result.reconciliationScope || null,
         reconciliationReason: result.reconciliationReason || null,
         statusBefore: result.statusBefore || null,
-        statusAfter: result.statusAfter || null,
+        statusAfter: statusAfterKnown ? result.statusAfter : null,
       },
     });
   } catch (error) {
@@ -540,11 +574,21 @@ async function runAccountTestJobNow({
         timeoutMs: Math.max(1, deadline - Date.now()),
         signal,
       });
-      // A successful response can race SIGTERM. Do not start any new reads or
-      // scheduler mutation after the job has been cancelled.
+      testSucceeded = test?.success === true;
+      // A successful test has already allowed Sub2API to mutate runtime state.
+      // If shutdown wins before the panel can verify the result (and, for an
+      // error account, restore scheduling), persist the unfinished chain rather
+      // than silently relabelling it as an ordinary interrupted job.
+      if (signal?.aborted && testSucceeded) {
+        throw accountTestReconciliationError(
+          new Error('账号测试成功后恢复流程因面板停机中断'),
+          'post_test_interrupted',
+          { testSuccess: true },
+        );
+      }
       throwIfJobInterrupted(signal);
       if (!test.success) {
-        let afterFailure = account;
+        let afterFailure = null;
         try {
           afterFailure = await client.getAccount(id, { signal });
         } catch (readError) {
@@ -553,16 +597,28 @@ async function runAccountTestJobNow({
             throw readError;
           }
         }
+        if (afterFailure && !sameAccountTarget(account, afterFailure)) {
+          const error = new Error('账号测试后强身份已变化');
+          error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
+          throw accountTestReconciliationError(
+            error,
+            'post_test_target_changed',
+            { testSuccess: false },
+          );
+        }
+        const stateKnown = sameAccountTarget(account, afterFailure);
         const result = {
           accountId: id,
           accountName: account.name || null,
           status: 'failed',
           code: 'upstream_test_failed',
-          message: test.message || '常规请求失败，账号保持当前状态',
+          message: test.message || '常规请求失败',
           testSuccess: false,
           statusBefore,
-          enabled: sameAccountTarget(account, afterFailure) ? afterFailure.schedulable === true : false,
-          statusAfter: afterFailure?.status || account.status || statusBefore,
+          enabled: stateKnown ? afterFailure.schedulable === true : null,
+          enabledKnown: stateKnown,
+          statusAfter: stateKnown ? afterFailure.status || null : null,
+          statusAfterKnown: stateKnown,
           durationMs: Date.now() - itemStartedAt,
         };
         results.push(result);
@@ -578,14 +634,21 @@ async function runAccountTestJobNow({
         });
         continue;
       }
-      testSucceeded = true;
-
       // Sub2API's test endpoint already clears recoverable runtime state. The
       // panel only changes schedulable for accounts that started in error;
       // healthy or intentionally disabled accounts must keep their setting.
       if (!shouldRecover) {
         const after = await client.getAccount(id, { signal });
         const targetUnchanged = sameAccountTarget(account, after);
+        if (!targetUnchanged) {
+          const error = new Error('账号测试后强身份已变化');
+          error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
+          throw accountTestReconciliationError(
+            error,
+            'post_test_target_changed',
+            { testSuccess: true },
+          );
+        }
         const statusUnchanged = targetUnchanged && accountStatus(after) === accountStatus(account);
         const schedulableUnchanged = targetUnchanged && after.schedulable === schedulableBefore;
         if (!statusUnchanged || !schedulableUnchanged) {
@@ -596,9 +659,11 @@ async function runAccountTestJobNow({
             code: 'account_state_changed_after_test',
             message: '测试请求成功，但账号状态或调度设置发生变化，未标记为成功',
             testSuccess: true,
-            enabled: targetUnchanged && after.schedulable === true,
+            enabled: targetUnchanged ? after.schedulable === true : null,
+            enabledKnown: targetUnchanged,
             statusBefore,
-            statusAfter: after?.status || null,
+            statusAfter: targetUnchanged ? after?.status || null : null,
+            statusAfterKnown: targetUnchanged,
             durationMs: Date.now() - itemStartedAt,
           };
           results.push(result);
@@ -709,6 +774,7 @@ async function runAccountTestJobNow({
         throw error;
       }
 
+      throwIfJobInterrupted(signal);
       recoveryAttempted = true;
       recoveryMutation = {
         original: schedulableBefore,
@@ -716,7 +782,6 @@ async function runAccountTestJobNow({
         before: afterTest,
         after: null,
       };
-      throwIfJobInterrupted(signal);
       let writeResponse;
       try {
         writeResponse = await client.setSchedulable(id, true, { signal });
@@ -842,6 +907,17 @@ async function runAccountTestJobNow({
       let reconciliationError = writeRequiresReconciliation(error)
         ? schedulerReconciliationError(error)
         : null;
+      if (!reconciliationError
+          && testSucceeded
+          && !recoveryMutation) {
+        reconciliationError = accountTestReconciliationError(
+          error,
+          error?.code === 'JOB_INTERRUPTED' || signal?.aborted
+            ? 'post_test_interrupted'
+            : 'post_test_state_unconfirmed',
+          { testSuccess: true },
+        );
+      }
       if (recoveryMutation && !reconciliationError) {
         try {
           const rollback = await rollbackOwnedSchedulableMutation(
@@ -884,6 +960,15 @@ async function runAccountTestJobNow({
       }
       recoveryMutation = null;
       if (reconciliationError) {
+        const scope = reconciliationError.reconciliationScope === 'test'
+          ? 'test'
+          : 'scheduler';
+        const testOutcomeUnknown = scope === 'test'
+          && reconciliationError.testOutcomeUnknown === true;
+        const reconciledTestSuccess = reconciliationError.testSuccessKnown === true
+          && typeof reconciliationError.testSuccess === 'boolean'
+          ? reconciliationError.testSuccess
+          : testSucceeded;
         const causeCode = typeof reconciliationError.code === 'string'
           && /^[A-Z0-9_]{1,96}$/.test(reconciliationError.code)
           ? reconciliationError.code
@@ -892,30 +977,43 @@ async function runAccountTestJobNow({
           accountId: id,
           accountName: account?.name || null,
           status: 'failed',
-          code: 'account_scheduler_reconciliation_required',
+          code: scope === 'test'
+            ? 'account_test_reconciliation_required'
+            : 'account_scheduler_reconciliation_required',
           causeCode,
-          message: '测试成功，但调度设置写入或回滚结果无法确认；已停止后续测试，请人工核对该账号调度状态',
-          testSuccess: testSucceeded,
+          message: scope === 'test'
+            ? (testOutcomeUnknown
+              ? '账号测试请求已发出，但结果无法确认；已停止后续测试，请人工核对该账号状态'
+              : '账号测试已完成，但恢复状态或后续调度流程未能安全确认；已停止后续测试，请人工核对')
+            : '测试成功，但调度设置写入或回滚结果无法确认；已停止后续测试，请人工核对该账号调度状态',
+          testSuccess: testOutcomeUnknown ? null : reconciledTestSuccess,
+          testSuccessKnown: !testOutcomeUnknown,
           enabled: null,
           enabledKnown: false,
           requiresReconciliation: true,
           writeOutcomeUnknown: reconciliationError.writeOutcomeUnknown === true,
+          testOutcomeUnknown,
+          reconciliationScope: scope,
           reconciliationReason: normalizedReconciliationReason(
             reconciliationError.reconciliationReason
               || reconciliationError.writeOutcomeReason,
           ),
           statusBefore,
           statusAfter: null,
+          statusAfterKnown: false,
           durationMs: Date.now() - itemStartedAt,
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
-        writeLog(logger, 'error', 'account_test.scheduler_reconciliation_required', {
+        writeLog(logger, 'error', scope === 'test'
+          ? 'account_test.test_reconciliation_required'
+          : 'account_test.scheduler_reconciliation_required', {
           jobId,
           actor,
           accountId: id,
           accountName: account?.name || null,
           code: causeCode,
+          reconciliationScope: scope,
           reconciliationReason: result.reconciliationReason,
           durationMs: result.durationMs,
         });
@@ -929,7 +1027,7 @@ async function runAccountTestJobNow({
         throwIfJobInterrupted(signal);
         throw error;
       }
-      let afterFailure = account;
+      let afterFailure = null;
       try {
         afterFailure = await client.getAccount(id, { signal });
       } catch (readError) {
@@ -947,9 +1045,11 @@ async function runAccountTestJobNow({
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),
         message: safeErrorMessage(error),
         testSuccess: testSucceeded,
-        enabled: sameAccountTarget(account, afterFailure) && afterFailure.schedulable === true,
+        enabled: sameAccountTarget(account, afterFailure) ? afterFailure.schedulable === true : null,
+        enabledKnown: sameAccountTarget(account, afterFailure),
         statusBefore,
-        statusAfter: afterFailure?.status || account?.status || statusBefore,
+        statusAfter: sameAccountTarget(account, afterFailure) ? afterFailure.status || null : null,
+        statusAfterKnown: sameAccountTarget(account, afterFailure),
         durationMs: Date.now() - itemStartedAt,
       };
       results.push(result);
@@ -975,7 +1075,7 @@ async function runAccountTestJobNow({
         accountName: listedAccount?.name || null,
         status: 'skipped',
         code: 'account_test_not_attempted_reconciliation',
-        message: '前一账号的调度写入结果需要人工核对，本账号未执行测试',
+        message: '前一账号需要人工核对，本账号未执行测试',
         durationMs: 0,
       };
       results.push(result);

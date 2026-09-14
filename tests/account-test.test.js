@@ -630,6 +630,226 @@ test('unknown scheduler-rollback outcome requires reconciliation and is never re
   assert.equal(outcome.results[0].enabled, null);
 });
 
+test('unknown dispatched account-test outcome is persisted and halts without scheduler writes', async () => {
+  const controller = new AbortController();
+  const accounts = [
+    oauthTestAccount(31, 'error', false),
+    oauthTestAccount(32, 'active', true),
+  ];
+  const tested = [];
+  let schedulerWrites = 0;
+  let persisted = null;
+  const audits = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [31, 32],
+    targetBaselines: targetBaselines(...accounts),
+    db: {
+      async updateJob() {},
+      async audit(entry) { audits.push(entry); },
+    },
+    jobId: 'test-account-outcome-unknown',
+    signal: controller.signal,
+    persistResult: async (result) => { persisted = result; },
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id) { return { ...accounts.find((account) => account.id === id) }; },
+      async testAccount(id) {
+        tested.push(id);
+        controller.abort();
+        const error = new Error('Bearer must-not-enter-the-result');
+        error.code = 'JOB_INTERRUPTED';
+        error.requiresReconciliation = true;
+        error.testOutcomeUnknown = true;
+        error.reconciliationScope = 'test';
+        error.reconciliationReason = 'external_abort';
+        throw error;
+      },
+      async setSchedulable() { schedulerWrites += 1; },
+    },
+  });
+
+  assert.deepEqual(tested, [31]);
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'JOB_INTERRUPTED');
+  assert.equal(outcome.results[0].testOutcomeUnknown, true);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'external_abort');
+  assert.equal(outcome.results[0].testSuccess, null);
+  assert.equal(outcome.results[0].testSuccessKnown, false);
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[0].statusAfter, null);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.deepEqual(persisted, outcome);
+  assert.equal(audits[0].details.testSuccess, null);
+  assert.equal(audits[0].details.testSuccessKnown, false);
+  assert.equal(audits[0].details.enabled, null);
+  assert.equal(audits[0].details.enabledKnown, false);
+  assert.equal(audits[0].details.statusAfter, null);
+  assert.equal(audits[0].details.statusAfterKnown, false);
+  assert.equal(JSON.stringify(outcome).includes('must-not-enter-the-result'), false);
+});
+
+test('successful test interrupted before postflight is persisted for reconciliation', async () => {
+  const controller = new AbortController();
+  const accounts = [
+    oauthTestAccount(33, 'active', true),
+    oauthTestAccount(34, 'active', true),
+  ];
+  const tested = [];
+  let reads = 0;
+  let schedulerWrites = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [33, 34],
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-success-postflight-interrupted',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id) {
+        reads += 1;
+        return { ...accounts.find((account) => account.id === id) };
+      },
+      async testAccount(id) {
+        tested.push(id);
+        controller.abort();
+        return { success: true };
+      },
+      async setSchedulable() { schedulerWrites += 1; },
+    },
+  });
+
+  assert.deepEqual(tested, [33]);
+  assert.equal(reads, 1);
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_interrupted');
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[0].statusAfter, null);
+});
+
+test('known successful model mismatch is reconciled and stops the remaining batch', async () => {
+  const accounts = [
+    oauthTestAccount(36, 'active', true),
+    oauthTestAccount(37, 'active', true),
+  ];
+  const tested = [];
+  let schedulerWrites = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [36, 37],
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-model-mismatch-reconciliation',
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id) { return { ...accounts.find((account) => account.id === id) }; },
+      async testAccount(id) {
+        tested.push(id);
+        const error = new Error('Bearer must-not-enter-the-result');
+        error.code = 'SUB2API_TEST_MODEL_MISMATCH';
+        error.requiresReconciliation = true;
+        error.reconciliationScope = 'test';
+        error.reconciliationReason = 'model_mismatch';
+        error.testSuccess = true;
+        error.testSuccessKnown = true;
+        throw error;
+      },
+      async setSchedulable() { schedulerWrites += 1; },
+    },
+  });
+
+  assert.deepEqual(tested, [36]);
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'SUB2API_TEST_MODEL_MISMATCH');
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'model_mismatch');
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[0].statusAfter, null);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.equal(JSON.stringify(outcome).includes('must-not-enter-the-result'), false);
+});
+
+test('successful test reconciles a replaced non-error account without scheduler writes', async () => {
+  const account = oauthTestAccount(38, 'active', true);
+  const replacement = oauthTestAccount(38, 'active', true, {
+    identityKeys: ['account:replacement-account-38', 'user:replacement-user-38'],
+  });
+  let reads = 0;
+  let schedulerWrites = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [38],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-non-error-postflight-target-replaced',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() {
+        reads += 1;
+        return reads === 1 ? { ...account } : { ...replacement };
+      },
+      async testAccount() { return { success: true }; },
+      async setSchedulable() { schedulerWrites += 1; },
+    },
+  });
+
+  assert.equal(reads, 2);
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'ACCOUNT_TEST_TARGET_CHANGED');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_target_changed');
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[0].statusAfter, null);
+});
+
+test('ordinary diagnostic read failure never reports the pre-test state as current', async () => {
+  const account = oauthTestAccount(35, 'active', true);
+  let reads = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [35],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-failure-diagnostic-unavailable',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() {
+        reads += 1;
+        if (reads === 1) return { ...account };
+        throw new Error('diagnostic unavailable');
+      },
+      async testAccount() { return { success: false }; },
+    },
+  });
+
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'upstream_test_failed');
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[0].enabledKnown, false);
+  assert.equal(outcome.results[0].statusAfter, null);
+  assert.equal(outcome.results[0].statusAfterKnown, false);
+  assert.doesNotMatch(outcome.results[0].message, /保持当前状态/);
+});
+
 test('shutdown cancels the diagnostic read after an unsuccessful account test', async () => {
   const account = oauthTestAccount(28, 'active', true);
   const controller = new AbortController();

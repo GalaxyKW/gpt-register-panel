@@ -197,7 +197,7 @@ test('account-test worker propagates shutdown cancellation as a job interruption
   await assert.rejects(run, (error) => error.code === 'JOB_INTERRUPTED');
 });
 
-test('account-test cancellation after a successful probe starts no scheduler mutation', async () => {
+test('account-test cancellation after a successful probe records reconciliation without scheduler mutation', async () => {
   const account = {
     id: 18,
     name: 'free00018',
@@ -225,16 +225,22 @@ test('account-test cancellation after a successful probe starts no scheduler mut
       return { ...account, schedulable: true };
     },
   };
-  await assert.rejects(runAccountTestJobNow({
+  const outcome = await runAccountTestJobNow({
     accountIds: [18],
     targetBaselines: [accountTestTargetBaseline(account)],
     db: { async updateJob() {}, async audit() {} },
     jobId: 'job-account-post-test-interrupt',
     client,
     signal: controller.signal,
-  }), (error) => error.code === 'JOB_INTERRUPTED');
+  });
   assert.equal(reads, 1);
   assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_interrupted');
 });
 
 test('shutdown drains a concurrently completed job before interrupting remaining DB jobs', async () => {

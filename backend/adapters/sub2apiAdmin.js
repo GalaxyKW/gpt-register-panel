@@ -544,6 +544,28 @@ function markWriteOutcomeUnknown(error, reason) {
   return target;
 }
 
+function markAccountTestReconciliation(error, reason, options = {}) {
+  const target = error instanceof Error
+    ? error
+    : requestFailure('SUB2API_TEST_OUTCOME_UNKNOWN', 'Sub2API 账号测试结果无法确认');
+  if (options.testOutcomeUnknown === true) target.testOutcomeUnknown = true;
+  if (typeof options.testSuccess === 'boolean') {
+    target.testSuccess = options.testSuccess;
+    target.testSuccessKnown = true;
+  }
+  target.requiresReconciliation = true;
+  target.reconciliationScope = 'test';
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  target.reconciliationReason = /^[a-z0-9_]{1,64}$/.test(normalizedReason)
+    ? normalizedReason
+    : 'unknown';
+  return target;
+}
+
+function markAccountTestOutcomeUnknown(error, reason) {
+  return markAccountTestReconciliation(error, reason, { testOutcomeUnknown: true });
+}
+
 function writeAwareFailure(error, requestOptions, requestDispatched, reason) {
   if (requestOptions.writeOperation === true && requestDispatched) {
     return markWriteOutcomeUnknown(error, reason);
@@ -979,7 +1001,12 @@ class Sub2ApiAdminClient {
     }, callTimeoutMs);
     let response;
     let text = '';
+    let requestDispatched = false;
     try {
+      if (externalSignal?.aborted) {
+        throw interruptedRequestError('Sub2API 账号测试在发送前因面板停机中断');
+      }
+      requestDispatched = true;
       response = await fetch(this.baseUrl + pathname, {
         method: 'POST',
         headers,
@@ -991,52 +1018,82 @@ class Sub2ApiAdminClient {
       });
       text = await readResponseTextWithLimit(response, this.maxResponseBytes);
     } catch (error) {
+      let failure;
+      let reason = 'transport';
       if (abortSource === 'external') {
-        const interrupted = interruptedRequestError('Sub2API 账号测试因面板停机中断');
+        failure = interruptedRequestError('Sub2API 账号测试因面板停机中断');
+        reason = 'external_abort';
         writeLog(this.logger, 'warn', 'sub2api.account_test_interrupted', {
           ...this.logContext,
           accountId: Number(id),
           model: modelId || null,
           durationMs: Date.now() - startedAt,
         });
-        throw interrupted;
+      } else if (abortSource === 'timeout') {
+        failure = requestFailure('SUB2API_TEST_TIMEOUT', 'Sub2API 账号测试超时');
+        reason = 'timeout';
+      } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
+        failure = requestFailure('SUB2API_TEST_RESPONSE_TOO_LARGE', 'Sub2API 账号测试响应过大');
+        reason = 'response_too_large';
+      } else if (error?.code === 'JOB_INTERRUPTED') {
+        failure = error;
+        reason = 'external_abort';
+      } else {
+        failure = requestFailure('SUB2API_TEST_TRANSPORT_ERROR', 'Sub2API 账号测试请求失败');
       }
-      const message = error?.name === 'AbortError'
-        ? 'Sub2API 账号测试超时'
-        : 'Sub2API 账号测试请求失败: ' + String(error?.message || error);
+      if (requestDispatched) failure = markAccountTestOutcomeUnknown(failure, reason);
       writeLog(this.logger, 'error', 'sub2api.account_test_failed', {
         ...this.logContext,
         accountId: Number(id),
         model: modelId || null,
         durationMs: Date.now() - startedAt,
-        error: safeRemoteText(message),
+        error: safeRemoteText(failure.message),
+        testOutcomeUnknown: failure.testOutcomeUnknown === true,
       });
-      throw new Error(safeRemoteText(message));
+      throw failure;
     } finally {
       clearTimeout(timer);
       stopForwardingAbort();
     }
 
-    const events = parseSseEvents(text);
-    const errorMessage = sseErrorMessage(events);
-    const completed = [...events].reverse().find((event) => event?.type === 'test_complete');
-    const eventModel = safeModelId(completed?.model);
-    const completedModel = eventModel || modelId || null;
+    if (!text.trim()) {
+      throw markAccountTestOutcomeUnknown(
+        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试返回空响应'),
+        'empty_response',
+      );
+    }
     if (!response.ok) {
-      // Never persist arbitrary upstream prose here: an error stream can echo
-      // the caller's unlabelled prompt or a password that no pattern-based
-      // redactor can identify reliably.
-      const detail = 'Sub2API 账号测试请求被上游拒绝（HTTP ' + response.status + '）';
+      const error = markAccountTestOutcomeUnknown(
+        requestFailure('SUB2API_TEST_REQUEST_REJECTED', 'Sub2API 账号测试请求被上游拒绝（HTTP ' + response.status + '）'),
+        'response_rejected',
+      );
       writeLog(this.logger, 'warn', 'sub2api.account_test_rejected', {
         ...this.logContext,
         accountId: Number(id),
         model: modelId || null,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
-        error: detail,
+        error: error.message,
+        testOutcomeUnknown: true,
       });
-      throw new Error(detail);
+      throw error;
     }
+
+    const events = parseSseEvents(text);
+    const errorMessage = sseErrorMessage(events);
+    const completions = events.filter((event) => event?.type === 'test_complete');
+    const completed = completions.at(-1);
+    const terminalInvalid = completions.length > 1
+      || (completed && typeof completed.success !== 'boolean')
+      || Boolean(errorMessage && completed?.success === true);
+    if (terminalInvalid || (!completed && !errorMessage)) {
+      throw markAccountTestOutcomeUnknown(
+        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试缺少可确认的终态'),
+        terminalInvalid ? 'invalid_terminal' : 'missing_terminal',
+      );
+    }
+    const eventModel = safeModelId(completed?.model);
+    const completedModel = eventModel || modelId || null;
     if (completed?.success === true && modelId && eventModel && eventModel !== modelId) {
       const detail = 'Sub2API 返回的测试模型与请求不一致';
       writeLog(this.logger, 'warn', 'sub2api.account_test_model_mismatch', {
@@ -1050,7 +1107,7 @@ class Sub2ApiAdminClient {
       });
       const error = new Error(detail);
       error.code = 'SUB2API_TEST_MODEL_MISMATCH';
-      throw error;
+      throw markAccountTestReconciliation(error, 'model_mismatch', { testSuccess: true });
     }
     if (errorMessage || completed?.success !== true) {
       const detail = errorMessage
