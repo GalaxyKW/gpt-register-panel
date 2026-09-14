@@ -281,3 +281,28 @@ test('systemd deployment instructions never overwrite an existing secret file', 
   assert.match(readme, /重复安装或升级不得用 `\.env\.example`、`cp -f` 或 `install` 覆盖/);
   assert.equal(readme.includes('sudo test -d /mnt/nvme/tmp'), false);
 });
+
+test('systemd documentation keeps the root profile distinct from NTFS and service-user migration', () => {
+  const unitSource = fs.readFileSync(UNIT_PATH, 'utf8');
+  const readme = fs.readFileSync(README_PATH, 'utf8');
+  const systemdSection = readme.slice(
+    readme.indexOf('## systemd 服务'),
+    readme.indexOf('## 全程结构化日志'),
+  );
+
+  assert.match(unitSource, /root-specific production profile/);
+  assert.match(unitSource, /Changing only User\/Group is unsupported/);
+  assert.match(readme, /仓库 unit 是明确的 root 专用配置/);
+  assert.match(readme, /不能只把 unit 中的 `User=root`、`Group=root` 改成专用账号/);
+  assert.match(readme, /可执行代码为 UID 0/);
+  assert.match(readme, /由实际运行 UID 持有/);
+
+  assert.match(readme, /NTFS3 的 `uid=`、`gid=`、`dmask=`、`fmask=`/);
+  assert.match(readme, /findmnt -T \/mnt\/nvme\/item\/gpt-register-panel/);
+  assert.match(readme, /stat -c '%n uid=%u gid=%g mode=%a links=%h'/);
+  assert.match(readme, /`systemd-analyze verify` 不会执行 `ExecStartPre`/);
+  assert.match(readme, /不得把预检条件改宽来适配不安全挂载/);
+  assert.match(readme, /`UMask=0077` 也不会追溯修正旧文件/);
+  assert.equal(systemdSection.includes('\n    npm ci\n'), false);
+  assert.match(systemdSection, /不能用一次递归 `chown` 把未经核验的现有依赖/);
+});

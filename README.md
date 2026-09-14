@@ -63,9 +63,22 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 仓库提供 `deploy/gpt-register-panel.service`。该 unit 先在 root 管理的 `/run/gpt-register-panel` 下创建私有目录，再把项目代码只读绑定为 `code`、把 `runtime` 和 `gpt_register` 分别绑定为独立可写数据根；服务只从这些已经固定的可信别名启动。这样即使 `/mnt/nvme` 顶层可被普通本机用户写入，启动检查完成后再重命名或替换 `item`、项目目录或 `gpt_register` 的原路径，也不能把服务入口或 Phase3 重定向到替换树。启动前还会在私有挂载视图中检查关键目录和文件必须由 root 持有、类型正确、不是符号链接并且不可由组或其他用户写入，任一条件不满足都会拒绝启动。
 
-unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/backend/server.js`，并显式清空 `NODE_OPTIONS`、`NODE_PATH`，避免 system manager 默认环境或部署配置在预检及正式启动前注入 Node preload/import 或额外模块搜索路径。它通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`；子进程环境使用固定白名单，不会继承 `panel.env` 中的 `CONFIG_FILE` 或 `CONFIG_PROFILE`，Linux 下只会读取已验证的 `config.json` 和 `config.server.json`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/backend/server.js`，并显式清空 `NODE_OPTIONS`、`NODE_PATH`，避免 system manager 默认环境或部署配置在预检及正式启动前注入 Node preload/import 或额外模块搜索路径。它通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此仓库 unit 是明确的 root 专用配置，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`；子进程环境使用固定白名单，不会继承 `panel.env` 中的 `CONFIG_FILE` 或 `CONFIG_PROFILE`，Linux 下只会读取已验证的 `config.json` 和 `config.server.json`。
+
+不能只把 unit 中的 `User=root`、`Group=root` 改成专用账号：现有内联预检有意要求可执行代码为 UID 0，而应用自身又要求 `panel.env`、`GPT_REGISTER_ROOT`、`tokens`、`use_token` 和 `username.json` 由实际运行 UID 持有。`/etc/gpt-register-panel` 的遍历权限、两个私有 gpt_register 配置文件、`runtime` 以及全部可写状态也必须同时重新设计所有权。专用账号迁移应作为独立部署配置审查：保持面板代码、`index.js`、`src`、`node_modules` 和包清单由 root 持有且不可写；令运行账号持有私有配置和可写状态；再把 unit 的目录/文件 owner 预检拆成对应的两组并运行完整测试。不要为绕过启动失败而删除 owner/mode 检查或把整个 NTFS 树递归 `chown`。
 
 首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json`、`config.json` 和 `config.server.json`，并创建 unit 要求的运行目录。两个配置文件都是强制的 root 所有、单链接私有普通文件，必须可由所有者读取且权限不宽于 `0600`；缺失或不安全都会令服务拒绝启动，其他 profile 不会被 Phase3 子进程采用。unit 会以最多 50000 个条目、64 层深度递归核验面板的 `backend`、`frontend`、`node_modules` 以及 gpt_register 的 `src`、`node_modules`：普通文件和目录必须由 root 持有、不可由组或其他用户写入，也不能跨入其他文件系统；相对符号链接只允许指向同一个已绑定扫描根内并且同样经过核验的普通文件，此外仅为现有 node-gyp Python 链接保留了指向真实 `/usr/bin/python3` 的精确例外。其他符号链接、特殊文件、外部目标或超限依赖树都会令服务拒绝启动。
+
+NTFS3 的 `uid=`、`gid=`、`dmask=`、`fmask=` 是挂载级默认/映射信息，不足以单独证明每个已有条目的有效 owner 和 mode，也不能证明该挂载能持久保存后续的 `chown`/`chmod`。unit 和应用最终判断的是 `lstat`/`fstat` 返回的实际元数据。安装前应同时查看挂载视图和关键条目的有效属性；以下命令只输出路径与元数据，不读取配置内容：
+
+    findmnt -T /mnt/nvme/item/gpt-register-panel -o TARGET,SOURCE,FSTYPE,VFS-OPTIONS,FS-OPTIONS
+    stat -c '%n uid=%u gid=%g mode=%a links=%h' \
+        /mnt/nvme/item/gpt-register-panel /mnt/nvme/item/gpt-register-panel/runtime \
+        /mnt/nvme/gpt_register /mnt/nvme/gpt_register/tokens \
+        /mnt/nvme/gpt_register/use_token /mnt/nvme/gpt_register/username.json \
+        /mnt/nvme/gpt_register/config.json /mnt/nvme/gpt_register/config.server.json
+
+如果这些条目始终显示挂载级 UID/GID，或无法稳定保持所需的 `0700`/`0600`、单硬链接和禁止组/其他用户写入，则该挂载不满足模板的权限模型，新 unit 会按设计 fail-closed。应先修正挂载/ACL 策略，或把代码、秘密和运行态迁移到能落实 Unix 权限的文件系统；不得把预检条件改宽来适配不安全挂载。
 
 安装前先只读列出权限异常、全部符号链接和特殊文件。第一、第三条命令的结果必须为空；第二条列出的每个链接都必须符合上述内部目标或精确 Python 例外。发现异常时，应在离线维护窗口通过可信的软件包来源重新安装依赖，或逐项核验后修正所有者和权限，不要对整个 `gpt_register` 盲目递归 `chown`，以免把 token、账号文件或浏览器状态一并扩大到错误的信任范围：
 
@@ -73,10 +86,9 @@ unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/bac
     find backend frontend node_modules /mnt/nvme/gpt_register/src /mnt/nvme/gpt_register/node_modules -xdev -type l -printf '%p -> %l\n'
     find backend frontend node_modules /mnt/nvme/gpt_register/src /mnt/nvme/gpt_register/node_modules -xdev ! -type f ! -type d ! -type l -print
 
-当前生产依赖中若仍有历史遗留的非 root 文件，新 unit 会按设计 fail-closed；必须先处理这些异常，不能为尽快启动而放宽 unit。若已有项目本地 `.env`，可在不打印内容的情况下把它迁移为私有配置，然后立即更换过短或已暴露的令牌：
+当前生产依赖中若仍有历史遗留的非 root 文件，新 unit 会按设计 fail-closed；必须先处理这些异常，不能为尽快启动而放宽 unit。普通账号执行 `npm ci` 生成的依赖树也不会满足这个 root 专用 unit；应从锁文件和可信软件包来源重新构建 root 持有的部署树，不能用一次递归 `chown` 把未经核验的现有依赖直接“认领”为可信代码。若已有项目本地 `.env`，可在不打印内容的情况下把它迁移为私有配置，然后立即更换过短或已暴露的令牌：
 
     cd /mnt/nvme/item/gpt-register-panel
-    npm ci
     sudo install -d -o root -g root -m 0700 runtime /etc/gpt-register-panel
     if sudo test -L /etc/gpt-register-panel/panel.env; then
         echo '拒绝编辑符号链接 panel.env；请先人工核验并移除异常路径' >&2
@@ -117,7 +129,7 @@ unit 使用只读文件系统视图，只开放以下已经绑定并固定的服
 
     systemd-analyze verify /run/systemd/generator/mnt-nvme.mount deploy/gpt-register-panel.service
 
-该校验也会确认 `/mnt/nvme` 已由 systemd 的挂载生成器管理；找不到 `mnt-nvme.mount` 时应先修正挂载配置，不能删除 unit 的挂载绑定来绕过。安装后的沙箱评分可用 `systemd-analyze security gpt-register-panel.service` 查看。仓库中的 unit 更新不会自动覆盖 `/etc/systemd/system` 里已安装的版本，更新时需重新执行 `install`、`daemon-reload`，再在维护窗口重启。
+该静态校验会确认 `/mnt/nvme` 已由 systemd 的挂载生成器管理，但 `systemd-analyze verify` 不会执行 `ExecStartPre`，也不会证明 NTFS 条目的 owner/mode 合格；上面的实际元数据和依赖树检查仍然必须通过。找不到 `mnt-nvme.mount` 时应先修正挂载配置，不能删除 unit 的挂载绑定来绕过。安装后的沙箱评分可用 `systemd-analyze security gpt-register-panel.service` 查看。仓库中的 unit 更新不会自动覆盖 `/etc/systemd/system` 里已安装的版本，可先用 `sudo cmp --silent deploy/gpt-register-panel.service /etc/systemd/system/gpt-register-panel.service` 检查两者是否一致；更新时需重新执行 `install`、`daemon-reload`，再在维护窗口重启。
 
 ## 全程结构化日志
 
@@ -175,4 +187,4 @@ WebUI 会显示持久对账阻挡。只有通过管理员令牌认证的 `panel-
 
 Sub2API 管理地址使用明文 HTTP 时只允许回环主机；其他主机必须使用 HTTPS。仅在完全受控网络中才能显式设置 `SUB2API_ALLOW_INSECURE_HTTP=1`，该开关会让管理凭据和 OAuth 更新暴露于明文链路，因此不建议启用。
 
-生产环境的 API 凭据应放在仓库外的私有 `panel.env` 中，`PANEL_ADMIN_TOKEN` 至少 16 个随机字符（建议使用更长的高熵值），并保持 `PANEL_ALLOW_INSECURE_WRITE=0`。建议 `panel.env`、`username.json`、token JSON、日志、SQLite 和备份文件权限为 0600，包含它们的 `tokens`、`use_token`、`runtime`、备份及隔离目录权限为 0700，并使用专用低权限服务账号运行。若挂载参数、ACL 或文件系统无法落实这些权限，应先修正挂载策略或把敏感文件迁移到支持权限隔离的存储，再开放网络访问。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。Sub2API 升级后先运行 `npm test` 和只读快照，确认管理员 API 契约再打开写入开关。
+生产环境的 API 凭据应放在仓库外的私有 `panel.env` 中，`PANEL_ADMIN_TOKEN` 至少 16 个随机字符（建议使用更长的高熵值），并保持 `PANEL_ALLOW_INSECURE_WRITE=0`。建议 `panel.env`、`username.json`、token JSON、日志、SQLite 和备份文件权限为 0600，包含它们的 `tokens`、`use_token`、`runtime`、备份及隔离目录权限为 0700，并使用专用低权限服务账号运行。注意，当前 gpt_register 读取适配器为兼容既有生成器会强制 owner、单链接及“组/其他用户不可写”，但不会仅因已有 token 文件是 `0644` 而拒绝读取；unit 的 `UMask=0077` 也不会追溯修正旧文件。因此健康检查或快照成功不代表旧凭据已经具备本机读取隔离，部署者仍须单独核验并在维护窗口收紧已有敏感文件。若挂载参数、ACL 或文件系统无法落实这些权限，应先修正挂载策略或把敏感文件迁移到支持权限隔离的存储，再开放网络访问。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。Sub2API 升级后先运行 `npm test` 和只读快照，确认管理员 API 契约再打开写入开关。

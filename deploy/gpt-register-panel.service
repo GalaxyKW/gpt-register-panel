@@ -16,14 +16,16 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-# The current production tree is root-owned. Migrate User/Group together with
-# the gpt_register and runtime ownership before changing these values.
+# This checked-in unit is intentionally a root-specific production profile:
+# its inline preflight distinguishes UID-0 executable/configuration objects
+# from writable state. Changing only User/Group is unsupported; a dedicated
+# account needs a separately reviewed ownership split and matching preflight.
 User=root
 Group=root
 # Resolve the NTFS-backed sources exactly once while systemd constructs the
-# private mount namespace. RuntimeDirectory is root-owned and not reachable
-# through the locally writable /mnt/nvme mount root, so later ancestor renames
-# cannot redirect WorkingDirectory, ExecStart or Phase3 to replacement trees.
+# private mount namespace. In this root profile RuntimeDirectory is root-owned
+# and not reachable through the locally writable /mnt/nvme mount root, so later
+# ancestor renames cannot redirect WorkingDirectory, ExecStart or Phase3.
 RuntimeDirectory=gpt-register-panel
 RuntimeDirectoryMode=0700
 BindReadOnlyPaths=/mnt/nvme/item/gpt-register-panel:/run/gpt-register-panel/code
