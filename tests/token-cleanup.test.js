@@ -23,7 +23,7 @@ const { buildImportPlan, compareTokenRecordFreshness } = require('../backend/syn
 const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
 const { currentProcessOwner } = require('../backend/taskCoordinator');
 
-function jwt({ user = 'cleanup-user', email = 'cleanup@example.test', suffix = '' } = {}) {
+function jwt(email, { user = 'cleanup-user', suffix = '' } = {}) {
   return [
     'header',
     Buffer.from(JSON.stringify({ sub: user, email })).toString('base64url'),
@@ -84,13 +84,13 @@ function waitForClaimChild(child, timeoutMs = 5000) {
 test('fresh valid token wins over a newer expired duplicate', () => {
   const root = makeRoot();
   fs.writeFileSync(path.join(root, 'tokens', 'valid.json'), JSON.stringify({
-    access_token: jwt(),
+    access_token: jwt('cleanup@example.test'),
     refresh_token: 'refresh-valid',
     email: 'cleanup@example.test',
     expired: '2099-01-01T00:00:00.000Z',
   }));
   fs.writeFileSync(path.join(root, 'use_token', 'expired.json'), JSON.stringify({
-    access_token: jwt({ suffix: '-expired' }),
+    access_token: jwt('cleanup@example.test', { suffix: '-expired' }),
     refresh_token: 'refresh-expired',
     email: 'cleanup@example.test',
     expired: '2020-01-01T00:00:00.000Z',
@@ -122,12 +122,12 @@ test('fresh valid token wins over a newer expired duplicate', () => {
 test('invalid expiry cannot hide a usable duplicate token', () => {
   const root = makeRoot();
   fs.writeFileSync(path.join(root, 'tokens', 'usable.json'), JSON.stringify({
-    access_token: jwt(),
+    access_token: jwt('cleanup@example.test'),
     refresh_token: 'refresh-usable',
     email: 'cleanup@example.test',
   }));
   fs.writeFileSync(path.join(root, 'use_token', 'invalid-expiry.json'), JSON.stringify({
-    access_token: jwt({ suffix: '-invalid' }),
+    access_token: jwt('cleanup@example.test', { suffix: '-invalid' }),
     refresh_token: 'refresh-invalid',
     email: 'cleanup@example.test',
     expired: 'not-a-date',
@@ -183,12 +183,16 @@ test('later expiry wins before refresh-token presence, then refresh time and mti
 
 test('expired token cleanup is scoped, versioned, and does not expose credentials', () => {
   const root = makeRoot();
-  const expired = { access_token: jwt(), refresh_token: 'secret-refresh', email: 'old@example.test', expired: '2020-01-01T00:00:00.000Z' };
+  const expired = { access_token: jwt('old@example.test'), refresh_token: 'secret-refresh', email: 'old@example.test', expired: '2020-01-01T00:00:00.000Z' };
   fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify(expired));
-  fs.writeFileSync(path.join(root, 'use_token', 'expired.json'), JSON.stringify({ ...expired, email: 'old2@example.test' }));
+  fs.writeFileSync(path.join(root, 'use_token', 'expired.json'), JSON.stringify({
+    ...expired,
+    access_token: jwt('old2@example.test'),
+    email: 'old2@example.test',
+  }));
   fs.writeFileSync(path.join(root, 'tokens', 'active.json'), JSON.stringify({ ...expired, expired: '2099-01-01T00:00:00.000Z' }));
   fs.writeFileSync(path.join(root, 'tokens', 'invalid.json'), '{broken');
-  fs.writeFileSync(path.join(root, 'tokens', 'unknown.json'), JSON.stringify({ access_token: jwt(), email: 'unknown@example.test' }));
+  fs.writeFileSync(path.join(root, 'tokens', 'unknown.json'), JSON.stringify({ access_token: jwt('unknown@example.test'), email: 'unknown@example.test' }));
   const listing = listExpiredTokens({ rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') });
   assert.equal(listing.count, 2);
   assert.equal(JSON.stringify(listing).includes('secret-refresh'), false);
@@ -216,7 +220,10 @@ test('expired token listing uses a strict total path order and an order-independ
   const lowerPath = path.join(root, 'tokens', 'a1.json');
   const upperPath = path.join(root, 'tokens', 'A01.json');
   const document = (suffix) => JSON.stringify({
-    access_token: jwt({ user: 'ordering-' + suffix, suffix: '-' + suffix }),
+    access_token: jwt('ordering-' + suffix + '@example.test', {
+      user: 'ordering-' + suffix,
+      suffix: '-' + suffix,
+    }),
     email: 'ordering-' + suffix + '@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   });
@@ -266,7 +273,7 @@ test('cleanup scan reports an abandoned claim without changing it and ordinary d
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'guarded.json');
   const content = JSON.stringify({
-    access_token: jwt({ suffix: '-guarded' }),
+    access_token: jwt('guarded@example.test', { suffix: '-guarded' }),
     email: 'guarded@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   });
@@ -371,7 +378,7 @@ test('cleanup refuses a source that becomes writable by other users after listin
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired-permissions.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-permission-race' }),
+    access_token: jwt('permission-race@example.test', { suffix: '-permission-race' }),
     email: 'permission-race@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }), { mode: 0o600 });
@@ -410,7 +417,7 @@ test('cleanup opens the final source path nonblocking before checking its file t
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired-nonblocking.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-nonblocking-open' }),
+    access_token: jwt('nonblocking-open@example.test', { suffix: '-nonblocking-open' }),
     email: 'nonblocking-open@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -439,7 +446,7 @@ test('test isolation discards an inherited production quarantine path', () => {
   const root = makeRoot();
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-inherited-quarantine-'));
   fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
-    access_token: jwt({ suffix: '-isolated-quarantine' }),
+    access_token: jwt('isolated-quarantine@example.test', { suffix: '-isolated-quarantine' }),
     email: 'isolated-quarantine@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -455,7 +462,7 @@ test('test isolation discards an inherited production quarantine path', () => {
     '  expectedVersion: listing.version,',
     '  confirmation: CONFIRMATION,',
     '});',
-    'process.stdout.write(JSON.stringify({',
+    "require('node:fs').writeSync(1, JSON.stringify({",
     '  count: result.count,',
     '  quarantinePath: result.deleted[0]?.quarantinePath || null,',
     "  inheritedQuarantinePresent: Object.hasOwn(process.env, 'PANEL_TOKEN_QUARANTINE_DIR'),",
@@ -485,12 +492,12 @@ test('cleanup listing never combines stale expiry metadata with replacement byte
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'replaced.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-expired-before-list-race' }),
+    access_token: jwt('list-race@example.test', { suffix: '-expired-before-list-race' }),
     email: 'list-race@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
   const replacement = {
-    access_token: jwt({ suffix: '-active-after-list-race' }),
+    access_token: jwt('list-race@example.test', { suffix: '-active-after-list-race' }),
     email: 'list-race@example.test',
     expired: '2099-01-01T00:00:00.000Z',
   };
@@ -521,13 +528,13 @@ test('expired token cleanup atomically claims the source before validating a rep
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   const displacedPath = path.join(root, 'tokens', 'expired-before-race.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-old' }),
+    access_token: jwt('race@example.test', { suffix: '-old' }),
     email: 'race@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
   const listing = listExpiredTokens({ rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') });
   const freshDocument = {
-    access_token: jwt({ suffix: '-fresh' }),
+    access_token: jwt('race@example.test', { suffix: '-fresh' }),
     email: 'race@example.test',
     expired: '2099-01-01T00:00:00.000Z',
   };
@@ -567,7 +574,7 @@ test('a dead cleanup process requires an explicit pinned recovery before a later
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-recoverable-claim' }),
+    access_token: jwt('recoverable@example.test', { suffix: '-recoverable-claim' }),
     email: 'recoverable@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -990,7 +997,7 @@ test('cleanup claim recovery binds a live PID to the current system boot', (cont
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'boot-bound.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-boot-bound-claim' }),
+    access_token: jwt('boot-bound@example.test', { suffix: '-boot-bound-claim' }),
     email: 'boot-bound@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -1019,7 +1026,7 @@ test('cross-filesystem cleanup never unlinks a newly reusable original source pa
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-cross-device' }),
+    access_token: jwt('cross-device@example.test', { suffix: '-cross-device' }),
     email: 'cross-device@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -1070,7 +1077,9 @@ test('cleanup fails closed when a claimed file cannot be restored or quarantined
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired-recovery-failure.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-claimed-recovery-failure' }),
+    access_token: jwt('claimed-recovery-failure@example.test', {
+      suffix: '-claimed-recovery-failure',
+    }),
     email: 'claimed-recovery-failure@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }), { mode: 0o600 });
@@ -1161,7 +1170,7 @@ test('cleanup reports an unknown outcome instead of file_unavailable after sourc
   const tokensDirectory = path.join(root, 'tokens');
   const sourcePath = path.join(tokensDirectory, 'expired-unknown.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-move-outcome-unknown' }),
+    access_token: jwt('move-outcome-unknown@example.test', { suffix: '-move-outcome-unknown' }),
     email: 'move-outcome-unknown@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }), { mode: 0o600 });
@@ -1506,7 +1515,7 @@ test('same-filesystem cleanup reports unknown when the published target identity
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
-    access_token: jwt({ suffix: '-target-replacement' }),
+    access_token: jwt('target-replacement@example.test', { suffix: '-target-replacement' }),
     email: 'target-replacement@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -1561,7 +1570,10 @@ test('same-filesystem cleanup reports unknown when the published target identity
 test('cleanup fsyncs every newly-created quarantine parent before the first claim', () => {
   const root = makeRoot();
   const expired = (suffix) => JSON.stringify({
-    access_token: jwt({ user: 'durable-' + suffix, suffix: '-durable-' + suffix }),
+    access_token: jwt('durable-' + suffix + '@example.test', {
+      user: 'durable-' + suffix,
+      suffix: '-durable-' + suffix,
+    }),
     email: 'durable-' + suffix + '@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   });
@@ -1658,7 +1670,9 @@ test('cleanup fails before claiming when any new quarantine parent cannot be fsy
     const root = makeRoot();
     const sourcePath = path.join(root, 'tokens', 'expired-' + scenario.layer + '.json');
     fs.writeFileSync(sourcePath, JSON.stringify({
-      access_token: jwt({ suffix: '-fsync-' + scenario.layer }),
+      access_token: jwt('fsync-' + scenario.layer + '@example.test', {
+        suffix: '-fsync-' + scenario.layer,
+      }),
       email: 'fsync-' + scenario.layer + '@example.test',
       expired: '2020-01-01T00:00:00.000Z',
     }), { mode: 0o600 });
@@ -1734,7 +1748,9 @@ test('cleanup detects quarantine path replacement and restores its pinned source
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'replacement-race.json');
   const document = JSON.stringify({
-    access_token: jwt({ suffix: '-directory-replacement-race' }),
+    access_token: jwt('directory-replacement-race@example.test', {
+      suffix: '-directory-replacement-race',
+    }),
     email: 'directory-replacement-race@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   });
@@ -1782,7 +1798,7 @@ test('cleanup detects quarantine path replacement and restores its pinned source
 test('expired token cleanup rejects a symlinked quarantine parent', () => {
   const root = makeRoot();
   fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
-    access_token: jwt(),
+    access_token: jwt('symlink@example.test'),
     email: 'symlink@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
@@ -1807,7 +1823,7 @@ test('expired token cleanup rejects a symlinked quarantine parent', () => {
 test('expired token cleanup rejects a quarantine directory readable or writable by other users', () => {
   const root = makeRoot();
   fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
-    access_token: jwt({ suffix: '-unsafe-quarantine' }),
+    access_token: jwt('unsafe-quarantine@example.test', { suffix: '-unsafe-quarantine' }),
     email: 'unsafe-quarantine@example.test',
     expired: '2020-01-01T00:00:00.000Z',
   }));
