@@ -774,6 +774,121 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   await assert.rejects(abortedPromise, (error) => error.code === 'REQUEST_ABORTED');
 });
 
+test('client disconnect aborts an admitted mutation before durable enqueue or dispatch', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  delete process.env.PANEL_ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let server;
+  let releaseControlLock;
+  let requestObject;
+  let createCalls = 0;
+  let dispatchCalls = 0;
+  let observedSignal = null;
+  const controlLockRelease = new Promise((resolve) => { releaseControlLock = resolve; });
+  let markControlLockEntered;
+  const controlLockEntered = new Promise((resolve) => { markControlLockEntered = resolve; });
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-client-disconnect-test.sqlite3',
+        async getMutationReceipt() { return null; },
+        async createMutationSubmission() {
+          createCalls += 1;
+          throw new Error('disconnected request reached durable enqueue');
+        },
+      },
+      jobManager: undefined,
+      admissionControlPlaneLock: async (callback, options = {}) => {
+        observedSignal = options.signal;
+        markControlLockEntered();
+        await Promise.race([
+          controlLockRelease,
+          new Promise((resolve) => observedSignal.addEventListener('abort', resolve, { once: true })),
+        ]);
+        if (observedSignal.aborted) {
+          const error = new Error('request admission interrupted');
+          error.code = 'JOB_INTERRUPTED';
+          throw error;
+        }
+        return callback();
+      },
+      logger: {
+        requestId: () => 'client-disconnect-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    const originalBegin = server.panelJobManager.begin;
+    server.panelJobManager.begin = (...args) => {
+      dispatchCalls += 1;
+      return originalBegin(...args);
+    };
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const body = JSON.stringify({
+      snapshotVersion: 'a'.repeat(64),
+      planIntentVersion: validImportPlanIntentVersion,
+      selectedKeys: ['token:tokens:tokens/disconnect.json'],
+    });
+    const clientSettled = new Promise((resolve) => {
+      requestObject = http.request({
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: '/api/sync/import',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+          'idempotency-key': 'test-client-disconnect-before-dispatch',
+        },
+      }, (response) => {
+        response.resume();
+        response.once('end', resolve);
+      });
+      requestObject.once('error', resolve);
+      requestObject.end(body);
+    });
+    await controlLockEntered;
+    requestObject.destroy();
+    for (let attempt = 0; attempt < 100 && !observedSignal?.aborted; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(observedSignal?.aborted, true);
+    releaseControlLock();
+    releaseControlLock = null;
+    await clientSettled;
+    for (let attempt = 0; attempt < 100 && server.panelJobManager.admissionCount > 0; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(server.panelJobManager.admissionCount, 0);
+    assert.equal(createCalls, 0);
+    assert.equal(dispatchCalls, 0);
+  } finally {
+    if (releaseControlLock) releaseControlLock();
+    if (requestObject && !requestObject.destroyed) requestObject.destroy();
+    await closeHttpServer(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
 test('server startup waits for database initialization before listening', async () => {
   const sentinel = new Error('database initialization failed');
   const db = { dbPath: '/tmp/unused-panel-ready-test.sqlite3' };

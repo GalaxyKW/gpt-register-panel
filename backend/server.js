@@ -761,6 +761,30 @@ function writeLog(logger, level, event, fields = {}) {
   }
 }
 
+async function withCombinedAbortSignal(signals, callback) {
+  const controller = new AbortController();
+  const subscriptions = [];
+  try {
+    for (const signal of signals) {
+      if (!signal || typeof signal.addEventListener !== 'function') continue;
+      const abort = () => {
+        if (!controller.signal.aborted) controller.abort(signal.reason);
+      };
+      if (signal.aborted) abort();
+      else {
+        signal.addEventListener('abort', abort, { once: true });
+        subscriptions.push([signal, abort]);
+      }
+    }
+    throwIfJobInterrupted(controller.signal);
+    return await callback(controller.signal);
+  } finally {
+    for (const [signal, abort] of subscriptions) {
+      try { signal.removeEventListener('abort', abort); } catch {}
+    }
+  }
+}
+
 function readJsonBody(request, limit = 1024 * 1024) {
   return new Promise((resolve, reject) => {
     const chunks = [];
@@ -2505,6 +2529,17 @@ function createServer(options = {}) {
     const startedAt = Date.now();
     let requestPath = '<unknown-path>';
     let completed = false;
+    const requestDisconnectController = new AbortController();
+    // Admission is still reversible: its dispatch guard can interrupt a row
+    // proven not to have started. Once dispatch returns, the background job's
+    // own controller remains authoritative and a lost HTTP response must not
+    // cancel work that may already have crossed an external-write boundary.
+    const withRequestAdmission = (callback) => jobManager.withAdmission((admissionSignal) => (
+      withCombinedAbortSignal(
+        [admissionSignal, requestDisconnectController.signal],
+        callback,
+      )
+    ));
     response.setHeader('x-request-id', requestId);
     response.once('finish', () => {
       completed = true;
@@ -2519,6 +2554,7 @@ function createServer(options = {}) {
     });
     response.once('close', () => {
       if (!completed) {
+        requestDisconnectController.abort();
         writeLog(logger, 'warn', 'http.request_closed', {
           requestId,
           actor,
@@ -2803,7 +2839,7 @@ function createServer(options = {}) {
           actor,
           workflow: MUTATION_WORKFLOWS.import,
         });
-        const { submission, job } = await jobManager.withAdmission((signal) => (
+        const { submission, job } = await withRequestAdmission((signal) => (
           dispatchGuard.run(async ({ recordCommitted, dispatch }) => {
             const created = await admissionControlPlaneLock(async () => {
               throwIfJobInterrupted(signal);
@@ -2969,7 +3005,7 @@ function createServer(options = {}) {
           actor,
           workflow: MUTATION_WORKFLOWS.phase3,
         });
-        const admission = await jobManager.withAdmission((signal) => (
+        const admission = await withRequestAdmission((signal) => (
           dispatchGuard.run(async ({ recordCommitted, dispatch }) => {
             const submission = await admissionControlPlaneLock(async () => {
               throwIfJobInterrupted(signal);
@@ -3177,7 +3213,7 @@ function createServer(options = {}) {
           actor,
           workflow: MUTATION_WORKFLOWS.accountTest,
         });
-        const admission = await jobManager.withAdmission((signal) => (
+        const admission = await withRequestAdmission((signal) => (
           dispatchGuard.run(async ({ recordCommitted, dispatch }) => {
             const submitted = await withAccountTestSubmissionLock(() => (
               admissionControlPlaneLock(async () => {
@@ -3397,7 +3433,7 @@ function createServer(options = {}) {
           actor,
           workflow: MUTATION_WORKFLOWS.tokenCleanup,
         });
-        const { submission, job } = await jobManager.withAdmission((signal) => (
+        const { submission, job } = await withRequestAdmission((signal) => (
           dispatchGuard.run(async ({ recordCommitted, dispatch }) => {
             const created = await admissionControlPlaneLock(async () => {
               throwIfJobInterrupted(signal);
@@ -3527,7 +3563,7 @@ function createServer(options = {}) {
           jobId: reconciliationAckPath.jobId,
           resolution: body.resolution,
         });
-        const acknowledgement = await jobManager.withAdmission(async (signal) => {
+        const acknowledgement = await withRequestAdmission(async (signal) => {
           throwIfJobInterrupted(signal);
           return db.acknowledgeJobReconciliation(reconciliationAckPath.jobId, {
             actor,
