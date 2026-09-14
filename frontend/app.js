@@ -19,11 +19,9 @@ const state = {
   snapshotRequestSequence: 0,
   snapshotRequestsPending: 0,
   selectionRevision: 0,
-  resumeJobsPending: false,
   jobInventoryVerified: false,
   jobInventoryProbeSequence: 0,
   watchGeneration: 0,
-  snapshotRefreshGeneration: 0,
   accountTestModelRequestSequence: 0,
   accountTestModelsPending: false,
 };
@@ -630,15 +628,18 @@ function clearPendingMutation(pending) {
   }
 }
 
-function acceptedMutationResponse(body) {
+function acceptedMutationResponse(workflow, body) {
   if (!body || body.status !== 'queued') return false;
-  const jobIds = Array.isArray(body?.jobIds)
-    ? body.jobIds
-    : body?.jobId ? [body.jobId] : [];
+  if (['token_import', 'account_test', 'token_cleanup'].includes(workflow)) {
+    return /^job_[a-f0-9]{24}$/.test(String(body.jobId || ''))
+      && body.jobIds === undefined;
+  }
+  if (workflow !== 'phase3' || !Array.isArray(body.jobIds)) return false;
+  const jobIds = body.jobIds;
   return jobIds.length > 0 && jobIds.length <= 100
     && new Set(jobIds).size === jobIds.length
     && jobIds.every((jobId) => /^job_[a-f0-9]{24}$/.test(String(jobId)))
-    && (body.jobId === undefined || body.jobId === null || body.jobId === jobIds[0]);
+    && body.jobId === (jobIds.length === 1 ? jobIds[0] : null);
 }
 
 async function idempotentMutationFetch(workflow, url, body) {
@@ -667,7 +668,10 @@ async function idempotentMutationFetch(workflow, url, body) {
   } catch {
     throw new Error('服务器返回了无法确认的响应；再次提交将安全复用同一幂等键。');
   }
-  if (response.status === 202 && response.ok && acceptedMutationResponse(responseBody)) {
+  if (response.status === 202 && response.ok) {
+    if (!acceptedMutationResponse(workflow, responseBody)) {
+      throw new Error('服务器已接受写操作，但任务回执格式无效；结果未知，再次提交将安全复用同一幂等键。');
+    }
     clearPendingMutation(pending);
   }
   return { response, body: responseBody };
@@ -2123,10 +2127,6 @@ function stopJobPolling() {
 
 function beginJobWatchGeneration() {
   state.watchGeneration = Math.max(0, Number(state.watchGeneration) || 0) + 1;
-  if (state.snapshotRefreshPending
-      && state.snapshotRefreshGeneration !== state.watchGeneration) {
-    state.snapshotRefreshPending = false;
-  }
   return state.watchGeneration;
 }
 
@@ -2224,7 +2224,6 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         // afterwards because loadSnapshot intentionally clears stale notices.
         renderPlan(null);
         state.snapshotRefreshPending = true;
-        state.snapshotRefreshGeneration = generation;
         updateActionState();
         const snapshotRefreshed = await loadSnapshot({ isCurrent: watcherIsCurrent });
         if (!watcherIsCurrent()) return;
@@ -2273,13 +2272,23 @@ async function watchJob(jobId, type = 'phase3') {
   return watchJobs([jobId], type);
 }
 
-async function resumeActiveJob() {
+async function resumeActiveJob(options = {}) {
+  // A loadSnapshot({ resumeJobs: true }) call asks only for the bounded
+  // inventory proof here, then starts its snapshot and watcher itself. This
+  // avoids a terminal watcher recursively blocking the outer refresh.
+  const deferWatch = options.deferWatch === true;
+  const scheduleRetry = options.scheduleRetry !== false;
   const previouslyWatchedTypes = new Set((state.jobs || []).map((job) => job?.type).filter(Boolean));
   stopJobPolling();
   beginJobWatchGeneration();
   state.jobInventoryProbeSequence = Math.max(0, Number(state.jobInventoryProbeSequence) || 0) + 1;
   const probeSequence = state.jobInventoryProbeSequence;
   state.jobInventoryVerified = false;
+  // A newer task inventory can invalidate both the old plan and the safety
+  // ordering of the displayed snapshot. Only a subsequent aligned snapshot
+  // may clear this barrier.
+  state.snapshotRefreshPending = true;
+  renderPlan(null);
   // Until the initial list request succeeds, absence of a rendered task is not
   // evidence that no worker is active. Lock mutations before yielding to I/O.
   state.job = {
@@ -2294,7 +2303,9 @@ async function resumeActiveJob() {
   try {
     const response = await apiFetch('/api/jobs?limit=200');
     const body = await response.json();
-    if (probeSequence !== state.jobInventoryProbeSequence) return;
+    if (probeSequence !== state.jobInventoryProbeSequence) {
+      return { verified: false, stale: true, probeSequence, activeJobs: [] };
+    }
     if (!response.ok) throw new Error(body.message || body.error || '任务列表读取失败');
     if (!Array.isArray(body.jobs)) throw new Error('任务列表响应格式无效');
     const listedJobs = body.jobs;
@@ -2334,8 +2345,10 @@ async function resumeActiveJob() {
         + (Number.isSafeInteger(activeReturned) ? activeReturned : '?') + '/'
         + (Number.isSafeInteger(activeTotal) ? activeTotal : '?')
         + ' 个；已保持操作锁定并将在后台重试。', 'notice-warning');
-      state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
-      return;
+      if (scheduleRetry) {
+        state.jobPollTimer = window.setTimeout(() => loadSnapshot({ resumeJobs: true }), 15000);
+      }
+      return { verified: false, stale: false, probeSequence, activeJobs };
     }
     const holdListingInvalid = !Number.isSafeInteger(holdTotal) || holdTotal < 0
       || !Number.isSafeInteger(holdReturned) || holdReturned < 0
@@ -2353,8 +2366,10 @@ async function resumeActiveJob() {
       renderJob(state.job);
       updateActionState();
       showNotice('待对账任务列表不完整；已保持操作锁定并将在后台重试。', 'notice-warning');
-      state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
-      return;
+      if (scheduleRetry) {
+        state.jobPollTimer = window.setTimeout(() => loadSnapshot({ resumeJobs: true }), 15000);
+      }
+      return { verified: false, stale: false, probeSequence, activeJobs };
     }
     if (!activeJobs.some((job) => job.type === 'phase3') && previouslyWatchedTypes.has('phase3')) {
       state.phase3RequestPending = false;
@@ -2387,7 +2402,8 @@ async function resumeActiveJob() {
         }
         updateActionState();
       }
-      return;
+      if (!deferWatch) await loadSnapshot({ expectedInventoryProbeSequence: probeSequence });
+      return { verified: true, stale: false, probeSequence, activeJobs: [] };
     }
     if (activeJobs.some((job) => job.type === 'phase3')) state.phase3RequestPending = true;
     if (activeJobs.some((job) => job.type === 'token_import')) state.importRequestPending = true;
@@ -2397,10 +2413,16 @@ async function resumeActiveJob() {
     state.job = aggregateJobs(activeJobs);
     renderJob(state.job);
     updateActionState();
+    if (deferWatch) {
+      return { verified: true, stale: false, probeSequence, activeJobs };
+    }
     await watchJobs(activeJobs.map((job) => job.id), activeJobs.length === 1 ? activeJobs[0].type : 'batch');
     if (state.reconciliationHolds.total > 0 && !activeJobPending()) await resumeActiveJob();
+    return { verified: true, stale: false, probeSequence, activeJobs };
   } catch (error) {
-    if (probeSequence !== state.jobInventoryProbeSequence) return;
+    if (probeSequence !== state.jobInventoryProbeSequence) {
+      return { verified: false, stale: true, probeSequence, activeJobs: [] };
+    }
     // A task can still run even when the optional resume request is not
     // available. Treat the initial state as unknown and keep all mutations
     // locked until a later list request proves there is no active task.
@@ -2415,27 +2437,52 @@ async function resumeActiveJob() {
     renderJob(state.job);
     updateActionState();
     showNotice('任务状态恢复失败：' + error.message + '。已保持操作锁定，并将在后台重试。', 'notice-warning');
-    state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
+    if (scheduleRetry) {
+      state.jobPollTimer = window.setTimeout(() => loadSnapshot({ resumeJobs: true }), 15000);
+    }
+    return { verified: false, stale: false, probeSequence, activeJobs: [] };
   }
 }
 
 async function loadSnapshot(options = {}) {
-  if (options.resumeJobs && !state.resumeJobsPending) {
-    state.resumeJobsPending = true;
-    void resumeActiveJob().finally(() => {
-      state.resumeJobsPending = false;
-    });
-  }
   const requestIsCurrent = typeof options.isCurrent === 'function'
     ? options.isCurrent
     : () => true;
   const requestId = ++state.snapshotRequestSequence;
   state.snapshotRequestsPending += 1;
+  // Keep the previous snapshot visible for diagnosis, but invalidate every
+  // write decision before yielding. Failure must leave this barrier set.
+  state.snapshotRefreshPending = true;
+  renderPlan(null);
   let loaded = false;
+  let requiredInventoryProbeSequence = options.expectedInventoryProbeSequence
+    ?? state.jobInventoryProbeSequence;
   elements.loadingLabel.hidden = false;
   elements.refreshButton.disabled = true;
   updateActionState();
   try {
+    if (options.resumeJobs) {
+      const inventory = await resumeActiveJob({ deferWatch: true, scheduleRetry: false });
+      if (requestId !== state.snapshotRequestSequence || !requestIsCurrent()) return false;
+      if (!inventory?.verified) {
+        const retryRequestId = requestId;
+        state.jobPollTimer = window.setTimeout(() => {
+          if (retryRequestId === state.snapshotRequestSequence) {
+            void loadSnapshot({ resumeJobs: true });
+          }
+        }, 15000);
+        return false;
+      }
+      requiredInventoryProbeSequence = inventory.probeSequence;
+      if (inventory.activeJobs.length > 0) {
+        // Do not await the watcher: a fast terminal result refreshes through a
+        // newer request sequence instead of nesting inside this refresh.
+        void watchJobs(
+          inventory.activeJobs.map((job) => job.id),
+          inventory.activeJobs.length === 1 ? inventory.activeJobs[0].type : 'batch',
+        );
+      }
+    }
     const query = new URLSearchParams({ withSub2api: '1' });
     if (elements.historicalToggle?.checked) query.set('includeHistorical', '1');
     const response = await apiFetch('/api/snapshot?' + query.toString());
@@ -2485,7 +2532,14 @@ async function loadSnapshot(options = {}) {
     }
     applyFilters();
     void loadAccountTestModels(snapshot, []);
-    loaded = true;
+    const inventoryAligned = state.jobInventoryVerified === true
+      && state.jobInventoryProbeSequence === requiredInventoryProbeSequence;
+    if (inventoryAligned) {
+      state.snapshotRefreshPending = false;
+      loaded = true;
+    } else {
+      showNotice('账号快照已读取，但任务清单验证已变化；已保持操作锁定，请重新刷新。', 'notice-warning');
+    }
   } catch (error) {
     if (requestId === state.snapshotRequestSequence && requestIsCurrent()) {
       showNotice(error.message, 'notice-danger');
