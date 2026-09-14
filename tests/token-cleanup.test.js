@@ -262,7 +262,7 @@ test('expired token listing uses a strict total path order and an order-independ
   );
 });
 
-test('cleanup mutation guard runs before recovering an abandoned claim', () => {
+test('cleanup scan reports an abandoned claim without changing it and ordinary deletion stays read-only', () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'guarded.json');
   const content = JSON.stringify({
@@ -277,10 +277,23 @@ test('cleanup mutation guard runs before recovering an abandoned claim', () => {
     '.panel-token-cleanup-claim-v1-999999-0-' + contentHash + '-' + encodedName + '-0123456789abcdef',
   );
   fs.writeFileSync(claimPath, content, { mode: 0o600 });
-  let guardCalls = 0;
-  const guardError = new Error('audit checkpoint unavailable');
-  guardError.code = 'AUDIT_LOG_UNAVAILABLE';
+  const claimBefore = fs.lstatSync(claimPath);
+  const namesBefore = fs.readdirSync(path.dirname(claimPath)).sort();
+  const scan = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  const claimAfterScan = fs.lstatSync(claimPath);
+  assert.equal(scan.recoveryRequired, true);
+  assert.equal(scan.claimCount, 1);
+  assert.equal(scan.claimCountTruncated, false);
+  assert.equal(scan.count, 0);
+  assert.equal(JSON.stringify(scan).includes(path.basename(claimPath)), false);
+  assert.equal(claimAfterScan.dev, claimBefore.dev);
+  assert.equal(claimAfterScan.ino, claimBefore.ino);
+  assert.deepEqual(fs.readdirSync(path.dirname(claimPath)).sort(), namesBefore);
 
+  let guardCalls = 0;
   assert.throws(
     () => deleteExpiredTokens({
       rootDirectory: root,
@@ -288,14 +301,69 @@ test('cleanup mutation guard runs before recovering an abandoned claim', () => {
       confirmation: CONFIRMATION,
       beforeMutation() {
         guardCalls += 1;
-        throw guardError;
       },
     }),
-    (error) => error === guardError,
+    (error) => error.code === 'TOKEN_CLEANUP_STALE',
   );
-  assert.equal(guardCalls, 1);
+  assert.equal(guardCalls, 0);
+  assert.equal(fs.lstatSync(claimPath).ino, claimBefore.ino);
+  assert.deepEqual(fs.readdirSync(path.dirname(claimPath)).sort(), namesBefore);
+
+  assert.throws(
+    () => deleteExpiredTokens({
+      rootDirectory: root,
+      expectedVersion: scan.version,
+      confirmation: CONFIRMATION,
+      beforeMutation() {
+        guardCalls += 1;
+      },
+    }),
+    (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_REQUIRED'
+      && error.recoveryRequired === true
+      && error.claimCount === 1
+      && error.claimCountTruncated === false
+      && error.retryAllowed === false
+      && error.doNotRetry === true,
+  );
+  assert.equal(guardCalls, 0);
   assert.equal(fs.existsSync(claimPath), true);
   assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.lstatSync(claimPath).ino, claimBefore.ino);
+  assert.deepEqual(fs.readdirSync(path.dirname(claimPath)).sort(), namesBefore);
+  assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+});
+
+test('cleanup scan fail-closes on malformed claims and bounds public claim metadata', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  for (let index = 0; index < 1001; index += 1) {
+    fs.writeFileSync(
+      path.join(directory, '.panel-token-cleanup-claim-malformed-' + String(index).padStart(4, '0')),
+      'opaque-' + index,
+      { mode: 0o600 },
+    );
+  }
+  const listing = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  assert.equal(listing.recoveryRequired, true);
+  assert.equal(listing.claimCount, 1000);
+  assert.equal(listing.claimCountTruncated, true);
+  assert.equal(JSON.stringify(listing).includes('malformed-0000'), false);
+  assert.throws(
+    () => deleteExpiredTokens({
+      rootDirectory: root,
+      expectedVersion: listing.version,
+      confirmation: CONFIRMATION,
+    }),
+    (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_REQUIRED'
+      && error.claimCount === 1000
+      && error.claimCountTruncated === true
+      && error.blockedBeforeStart === true
+      && error.executionOutcome === 'not_started',
+  );
+  assert.equal(fs.readdirSync(directory).length, 1001);
   assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
 });
 
@@ -495,7 +563,7 @@ test('expired token cleanup atomically claims the source before validating a rep
   }
 });
 
-test('a dead cleanup process leaves a self-describing claim that the next delete recovers', async () => {
+test('a dead cleanup process requires an explicit pinned recovery before a later delete', async () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
@@ -524,7 +592,26 @@ test('a dead cleanup process leaves a self-describing claim that the next delete
     await new Promise((resolve) => child.once('exit', resolve));
   }
   assert.equal(fs.existsSync(sourcePath), false);
-  assert.equal(fs.existsSync(path.join(root, 'tokens', claimed.name)), true);
+  const claimPath = path.join(root, 'tokens', claimed.name);
+  assert.equal(fs.existsSync(claimPath), true);
+  const claimBefore = fs.lstatSync(claimPath);
+  const strandedListing = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  assert.equal(strandedListing.recoveryRequired, true);
+  assert.equal(strandedListing.claimCount, 1);
+  assert.throws(
+    () => deleteExpiredTokens({
+      rootDirectory: root,
+      expectedVersion: listing.version,
+      confirmation: CONFIRMATION,
+      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+    }),
+    (error) => error.code === 'TOKEN_CLEANUP_STALE',
+  );
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.lstatSync(claimPath).ino, claimBefore.ino);
 
   const originalLinkSync = fs.linkSync;
   let pinnedRecoveryObserved = false;
@@ -535,18 +622,25 @@ test('a dead cleanup process leaves a self-describing claim that the next delete
     }
     return originalLinkSync.call(fs, from, to);
   };
-  let result;
   try {
-    result = deleteExpiredTokens({
-      rootDirectory: root,
-      expectedVersion: listing.version,
-      confirmation: CONFIRMATION,
-      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
-    });
+    assert.deepEqual(recoverTokenCleanupClaims(root), ['tokens/expired.json']);
   } finally {
     fs.linkSync = originalLinkSync;
   }
   assert.equal(pinnedRecoveryObserved, true);
+  assert.equal(fs.existsSync(sourcePath), true);
+  const recoveredListing = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  assert.equal(recoveredListing.recoveryRequired, false);
+  assert.equal(recoveredListing.claimCount, 0);
+  const result = deleteExpiredTokens({
+    rootDirectory: root,
+    expectedVersion: recoveredListing.version,
+    confirmation: CONFIRMATION,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
   assert.equal(result.count, 1);
   assert.equal(fs.existsSync(sourcePath), false);
   assert.equal(fs.readdirSync(path.join(root, 'tokens')).some((name) => name.startsWith('.panel-token-cleanup-claim-')), false);

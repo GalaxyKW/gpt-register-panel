@@ -9,8 +9,10 @@ const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator'
 
 const CONFIRMATION = 'DELETE_EXPIRED_TOKENS';
 const SOURCES = new Set(['tokens', 'use_token']);
+const CLAIM_PREFIX = '.panel-token-cleanup-claim-';
 const CLAIM_PREFIX_V1 = '.panel-token-cleanup-claim-v1-';
 const CLAIM_PREFIX_V2 = '.panel-token-cleanup-claim-v2-';
+const MAX_REPORTED_CLEANUP_CLAIMS = 1000;
 const DEFAULT_TOKEN_MAX_BYTES = 4 * 1024 * 1024;
 const HARD_TOKEN_MAX_BYTES = 16 * 1024 * 1024;
 
@@ -371,7 +373,7 @@ function closeCleanupDirectoryPins(pins) {
   for (const pin of [...pins].reverse()) try { fs.closeSync(pin.fd); } catch {}
 }
 
-function prepareCleanupSourceDirectories(rootDirectory) {
+function prepareCleanupSourceDirectories(rootDirectory, options = {}) {
   const pins = [];
   const sourcePins = new Map();
   try {
@@ -380,7 +382,7 @@ function prepareCleanupSourceDirectories(rootDirectory) {
     for (const source of SOURCES) {
       const displayPath = path.join(rootDirectory, source);
       const pin = openCleanupDirectory(cleanupFdPath(rootPin, source), displayPath, source + ' 目录');
-      strictFsyncCleanupDirectory(pin);
+      if (options.sync === true) strictFsyncCleanupDirectory(pin);
       pins.push(pin);
       sourcePins.set(source, pin);
     }
@@ -389,6 +391,51 @@ function prepareCleanupSourceDirectories(rootDirectory) {
     closeCleanupDirectoryPins(pins);
     throw error;
   }
+}
+
+function inspectTokenCleanupClaims(preparedSources) {
+  let claimCount = 0;
+  let claimCountTruncated = false;
+  assertPreparedCleanupDirectories(preparedSources);
+  for (const source of SOURCES) {
+    const pin = preparedSources.sourcePins.get(source);
+    if (!pin) throw cleanupDirectoryError(null, source + ' 目录');
+    let names;
+    try {
+      names = fs.readdirSync(cleanupFdPath(pin));
+    } catch (error) {
+      throw cleanupDirectoryError(error, source + ' 目录');
+    }
+    for (const name of names) {
+      // Unknown or malformed claim generations are deliberately included.
+      // Treating an unparseable staging name as ordinary input could strand or
+      // overwrite the only recoverable copy of a token.
+      if (!String(name).startsWith(CLAIM_PREFIX)) continue;
+      if (claimCount < MAX_REPORTED_CLEANUP_CLAIMS) claimCount += 1;
+      else claimCountTruncated = true;
+    }
+    assertCleanupDirectoryPin(pin);
+  }
+  assertPreparedCleanupDirectories(preparedSources);
+  return {
+    recoveryRequired: claimCount > 0 || claimCountTruncated,
+    claimCount,
+    claimCountTruncated,
+  };
+}
+
+function assertTokenCleanupRecoveryNotRequired(status) {
+  if (status?.recoveryRequired !== true) return;
+  const error = new Error('检测到未完成的 token 清理 claim；普通清理已阻断且不会自动恢复，请由管理员核验后处理');
+  error.code = 'TOKEN_CLEANUP_RECOVERY_REQUIRED';
+  error.recoveryRequired = true;
+  error.claimCount = boundedCleanupCount(status.claimCount);
+  error.claimCountTruncated = status.claimCountTruncated === true;
+  error.blockedBeforeStart = true;
+  error.executionOutcome = 'not_started';
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  throw error;
 }
 
 function prepareQuarantineDirectories(rootDirectory, quarantineRoot, sources) {
@@ -922,7 +969,7 @@ function safeItem(record, snapshot) {
   };
 }
 
-function recoverTokenCleanupClaims(rootDirectory, options = {}) {
+function recoverTokenCleanupClaimsFromDirectories(rootDirectory, options = {}) {
   const discovered = [];
   // Discovery and validation are deliberately separated from restoration.
   // A conflict in the last directory must not be able to surface only after
@@ -1051,6 +1098,24 @@ function recoverTokenCleanupClaims(rootDirectory, options = {}) {
   return recovered;
 }
 
+function recoverTokenCleanupClaims(rootDirectory, options = {}) {
+  const resolvedRoot = ensureDirectory(rootDirectory || cleanupRoot(options), 'GPT_REGISTER_ROOT');
+  if (options.sourceDirectories?.get) {
+    return recoverTokenCleanupClaimsFromDirectories(resolvedRoot, options);
+  }
+  const preparedSources = prepareCleanupSourceDirectories(resolvedRoot, { sync: true });
+  try {
+    return recoverTokenCleanupClaimsFromDirectories(resolvedRoot, {
+      ...options,
+      sourceDirectories: new Map([...preparedSources.sourcePins].map(
+        ([source, pin]) => [source, cleanupFdPath(pin)],
+      )),
+    });
+  } finally {
+    closeCleanupDirectoryPins(preparedSources.pins);
+  }
+}
+
 function versionForItems(items) {
   return crypto.createHash('sha256')
     .update(JSON.stringify([...items].sort(compareCleanupPaths).map((item) => ({
@@ -1082,45 +1147,58 @@ function publicExpiredTokenItem(item) {
 
 function listExpiredTokens(options = {}) {
   const rootDirectory = ensureDirectory(cleanupRoot(options), 'GPT_REGISTER_ROOT');
-  const nowMs = Number(options.nowMs || Date.now());
-  const sources = readGptRegisterSources({ rootDirectory });
-  const items = [];
-  for (const record of sources.tokens || []) {
-    if (!SOURCES.has(record.source)
-        || record.historical === true
-        || record.parseStatus !== 'ok'
-        || record.expiryStatus === 'invalid'
-        || !record.expiresAt) continue;
-    const expiresAtMs = Date.parse(record.expiresAt);
-    if (!Number.isFinite(expiresAtMs) || expiresAtMs > nowMs) continue;
-    const directory = sourceDirectory(sources, record.source);
-    const absolutePath = safeAbsolutePath(directory, record.fileName);
-    if (!absolutePath) continue;
-    try {
-      const snapshot = regularFileSnapshot(absolutePath);
-      // `record` was parsed from the adapter's verified FD snapshot. If the
-      // path now names different bytes, never combine old expiry metadata with
-      // a new token's hash and accidentally classify the replacement expired.
-      if (!/^[a-f0-9]{64}$/i.test(String(record.contentHash || ''))
-          || snapshot.contentHash !== String(record.contentHash).toLowerCase()) continue;
-      items.push(safeItem(record, snapshot));
-    } catch {
-      // Files that disappear or cannot be read are left untouched.
+  const preparedSources = prepareCleanupSourceDirectories(rootDirectory);
+  try {
+    const claimsBefore = inspectTokenCleanupClaims(preparedSources);
+    const nowMs = Number(options.nowMs || Date.now());
+    const sources = readGptRegisterSources({ rootDirectory });
+    const items = [];
+    for (const record of sources.tokens || []) {
+      if (!SOURCES.has(record.source)
+          || record.historical === true
+          || record.parseStatus !== 'ok'
+          || record.expiryStatus === 'invalid'
+          || !record.expiresAt) continue;
+      const expiresAtMs = Date.parse(record.expiresAt);
+      if (!Number.isFinite(expiresAtMs) || expiresAtMs > nowMs) continue;
+      const directory = sourceDirectory(sources, record.source);
+      const absolutePath = safeAbsolutePath(directory, record.fileName);
+      if (!absolutePath) continue;
+      try {
+        const snapshot = regularFileSnapshot(absolutePath);
+        // `record` was parsed from the adapter's verified FD snapshot. If the
+        // path now names different bytes, never combine old expiry metadata with
+        // a new token's hash and accidentally classify the replacement expired.
+        if (!/^[a-f0-9]{64}$/i.test(String(record.contentHash || ''))
+            || snapshot.contentHash !== String(record.contentHash).toLowerCase()) continue;
+        items.push(safeItem(record, snapshot));
+      } catch {
+        // Files that disappear or cannot be read are left untouched.
+      }
     }
+    const claimsAfter = inspectTokenCleanupClaims(preparedSources);
+    const claimStatus = {
+      recoveryRequired: claimsBefore.recoveryRequired || claimsAfter.recoveryRequired,
+      claimCount: Math.max(claimsBefore.claimCount, claimsAfter.claimCount),
+      claimCountTruncated: claimsBefore.claimCountTruncated || claimsAfter.claimCountTruncated,
+    };
+    items.sort(compareCleanupPaths);
+    const listing = {
+      generatedAt: new Date(nowMs).toISOString(),
+      rootDirectory,
+      version: versionForItems(items),
+      count: items.length,
+      items: items.map(publicExpiredTokenItem),
+      ...claimStatus,
+    };
+    Object.defineProperty(listing, '_internalItems', {
+      value: items,
+      enumerable: false,
+    });
+    return listing;
+  } finally {
+    closeCleanupDirectoryPins(preparedSources.pins);
   }
-  items.sort(compareCleanupPaths);
-  const listing = {
-    generatedAt: new Date(nowMs).toISOString(),
-    rootDirectory,
-    version: versionForItems(items),
-    count: items.length,
-    items: items.map(publicExpiredTokenItem),
-  };
-  Object.defineProperty(listing, '_internalItems', {
-    value: items,
-    enumerable: false,
-  });
-  return listing;
 }
 
 function deleteExpiredTokens(options = {}) {
@@ -1130,22 +1208,13 @@ function deleteExpiredTokens(options = {}) {
     throw error;
   }
   throwIfJobInterrupted(options.signal);
-  if (typeof options.beforeMutation === 'function') options.beforeMutation();
-  throwIfJobInterrupted(options.signal);
   const rootDirectory = ensureDirectory(cleanupRoot(options), 'GPT_REGISTER_ROOT');
-  const preparedSources = prepareCleanupSourceDirectories(rootDirectory);
+  const preparedSources = prepareCleanupSourceDirectories(rootDirectory, { sync: true });
   let preparedQuarantine = null;
   let cleanupResult = null;
   let quarantineRoot = null;
   let batchDirectory = null;
   try {
-    // Claim recovery can rename or relink files, so no validation or audit
-    // checkpoint that protects mutations may be placed below this line.
-    recoverTokenCleanupClaims(rootDirectory, {
-      sourceDirectories: new Map([...preparedSources.sourcePins].map(
-        ([source, pin]) => [source, cleanupFdPath(pin)],
-      )),
-    });
     assertPreparedCleanupDirectories(preparedSources);
     const current = listExpiredTokens({ ...options, rootDirectory });
     assertPreparedCleanupDirectories(preparedSources);
@@ -1156,11 +1225,20 @@ function deleteExpiredTokens(options = {}) {
       error.currentVersion = current.version;
       throw error;
     }
+    const latestClaimStatus = inspectTokenCleanupClaims(preparedSources);
+    assertTokenCleanupRecoveryNotRequired({
+      recoveryRequired: current.recoveryRequired || latestClaimStatus.recoveryRequired,
+      claimCount: Math.max(current.claimCount, latestClaimStatus.claimCount),
+      claimCountTruncated: current.claimCountTruncated || latestClaimStatus.claimCountTruncated,
+    });
     const deleted = [];
     const skipped = [];
     if ((current._internalItems || []).length === 0) {
       return { version: current.version, deleted, skipped, count: 0 };
     }
+    throwIfJobInterrupted(options.signal);
+    if (typeof options.beforeMutation === 'function') options.beforeMutation();
+    throwIfJobInterrupted(options.signal);
     const plannedSources = new Set(
       (current._internalItems || []).map((item) => item.source).filter((source) => SOURCES.has(source)),
     );
@@ -1356,6 +1434,7 @@ module.exports = {
   moveToQuarantine,
   claimSourcePath,
   recoverTokenCleanupClaims,
+  assertTokenCleanupRecoveryNotRequired,
   restoreClaimedPath,
   quarantineDirectory,
   versionForItems,

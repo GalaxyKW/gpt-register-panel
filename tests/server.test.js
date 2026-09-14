@@ -1077,6 +1077,9 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.equal(expiredListing.status, 200);
     const expiredBody = JSON.parse(expiredListing.body);
     assert.equal(expiredBody.count, 1);
+    assert.equal(expiredBody.recoveryRequired, false);
+    assert.equal(expiredBody.claimCount, 0);
+    assert.equal(expiredBody.claimCountTruncated, false);
     assert.equal(expiredListing.body.includes('expired-refresh-hidden'), false);
     const expiredDelete = await postJson(baseUrl, '/api/tokens/expired/delete', {
       version: expiredBody.version,
@@ -1265,7 +1268,7 @@ test('expired token deletion reports reconciliation and forbids retry when compl
   }
 });
 
-test('token cleanup retains a durable hold when claim recovery is followed by a stale listing', async () => {
+test('token cleanup never recovers a claim from a stale ordinary delete and reports recovery required', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-boundary-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
@@ -1292,7 +1295,10 @@ test('token cleanup retains a durable hold when claim recovery is followed by a 
     const listing = listExpiredTokens();
     const createJob = db.createJob.bind(db);
     let injected = false;
+    let injectedClaimPath = null;
+    let cleanupJobCreates = 0;
     db.createJob = async (...args) => {
+      if (args[0] === 'token_cleanup') cleanupJobCreates += 1;
       const job = await createJob(...args);
       if (!injected && args[0] === 'token_cleanup') {
         injected = true;
@@ -1304,6 +1310,7 @@ test('token cleanup retains a durable hold when claim recovery is followed by a 
             + encodedName + '-0123456789abcdef',
         );
         fs.renameSync(sourcePath, claimPath);
+        injectedClaimPath = claimPath;
         fs.writeFileSync(path.join(root, 'use_token', 'new-expired.json'), JSON.stringify({
           access_token: 'second-expired-access',
           email: 'second-boundary@example.test',
@@ -1335,27 +1342,33 @@ test('token cleanup retains a durable hold when claim recovery is followed by a 
     assert.equal(response.status, 202);
     const job = await waitForTerminalJob(baseUrl, JSON.parse(response.body).jobId);
     assert.equal(job.status, 'failed');
-    assert.equal(job.result.code, 'TOKEN_CLEANUP_OUTCOME_UNKNOWN');
-    assert.equal(job.result.causeCode, 'TOKEN_CLEANUP_STALE');
-    assert.equal(job.result.reconciliationReason, 'mutation_boundary_failure');
-    assert.equal(job.result.requiresReconciliation, true);
-    assert.equal(job.result.reconciliationHold, true);
-    assert.equal(job.result.retryAllowed, false);
-    assert.equal(job.result.doNotRetry, true);
-    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(job.result.code, 'TOKEN_CLEANUP_STALE');
+    assert.equal(job.result.requiresReconciliation, undefined);
+    assert.equal(job.result.reconciliationHold, undefined);
+    assert.equal(fs.existsSync(sourcePath), false);
+    assert.equal(fs.existsSync(injectedClaimPath), true);
     assert.equal(fs.existsSync(path.join(root, 'use_token', 'new-expired.json')), true);
-    const detail = reconciliationReviewDetail(job);
-    assert.equal(detail.type, 'token_cleanup');
-    assert.equal(detail.targetContext.truncated, false);
-    assert.equal(detail.targetContext.targets[1].sourcePath, 'tokens/expired.json');
-    assert.match(detail.targetContext.targets[1].contentHash, /^[a-f0-9]{64}$/);
-    assert.equal(JSON.stringify(detail).includes('expired-access'), false);
+    assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+    const recoveryScan = await request(baseUrl, '/api/tokens/expired');
+    assert.equal(recoveryScan.status, 200);
+    const recoveryBody = JSON.parse(recoveryScan.body);
+    assert.equal(recoveryBody.recoveryRequired, true);
+    assert.equal(recoveryBody.claimCount, 1);
+    assert.equal(recoveryBody.claimCountTruncated, false);
+    assert.equal(recoveryScan.body.includes(path.basename(injectedClaimPath)), false);
     const blocked = await postJson(baseUrl, '/api/tokens/expired/delete', {
-      version: listExpiredTokens().version,
+      version: recoveryBody.version,
       confirmation: 'DELETE_EXPIRED_TOKENS',
     });
     assert.equal(blocked.status, 409);
-    assert.equal(JSON.parse(blocked.body).error, 'JOB_RECONCILIATION_REQUIRED');
+    const blockedBody = JSON.parse(blocked.body);
+    assert.equal(blockedBody.error, 'TOKEN_CLEANUP_RECOVERY_REQUIRED');
+    assert.equal(blockedBody.recoveryRequired, true);
+    assert.equal(blockedBody.claimCount, 1);
+    assert.equal(blockedBody.claimCountTruncated, false);
+    assert.equal(cleanupJobCreates, 1);
+    assert.equal(fs.existsSync(sourcePath), false);
+    assert.equal(fs.existsSync(injectedClaimPath), true);
   } finally {
     await closeHttpServer(server);
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;

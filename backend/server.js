@@ -47,7 +47,12 @@ const {
   redactText,
   safeErrorText,
 } = require('./logger');
-const { CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION, listExpiredTokens, deleteExpiredTokens } = require('./tokenCleanup');
+const {
+  CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION,
+  assertTokenCleanupRecoveryNotRequired,
+  listExpiredTokens,
+  deleteExpiredTokens,
+} = require('./tokenCleanup');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const {
@@ -1231,6 +1236,11 @@ function tokenCleanupFailureMetadata(error, completedResult = null) {
   if (currentSourcePath) output.currentSourcePath = currentSourcePath;
   const recoveredCount = boundedCleanupCount(error?.recoveredCount);
   if (recoveredCount > 0) output.recoveredCount = recoveredCount;
+  if (error?.recoveryRequired === true) {
+    output.recoveryRequired = true;
+    output.claimCount = boundedCleanupCount(error?.claimCount);
+    output.claimCountTruncated = error?.claimCountTruncated === true;
+  }
   const causeCode = safePhase3FailureCode(error?.causeCode);
   if (causeCode) output.causeCode = causeCode;
   return output;
@@ -2715,6 +2725,9 @@ function createServer(options = {}) {
           version: listing.version,
           count: listing.count,
           items: listing.items.map(safeExpiredTokenItem),
+          recoveryRequired: listing.recoveryRequired === true,
+          claimCount: boundedCleanupCount(listing.claimCount),
+          claimCountTruncated: listing.claimCountTruncated === true,
         });
       } catch (error) {
         writeLog(logger, 'error', 'token_cleanup.scan_failed', {
@@ -2759,6 +2772,7 @@ function createServer(options = {}) {
               error.currentVersion = listing.version;
               throw error;
             }
+            assertTokenCleanupRecoveryNotRequired(listing);
             const createdJob = await db.createJob(
               TOKEN_CLEANUP_JOB_TYPE,
               tokenCleanupJobPayload(listing),
@@ -2800,7 +2814,8 @@ function createServer(options = {}) {
           error: safeErrorMessage(error),
           durationMs: Date.now() - cleanupStartedAt,
         });
-        const status = ['TOKEN_CLEANUP_STALE', 'JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
+        const status = ['TOKEN_CLEANUP_STALE', 'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+          'JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
           : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
             'JOB_RECONCILIATION_GUARD_UNAVAILABLE'].includes(error?.code)
             ? 503
@@ -2809,6 +2824,13 @@ function createServer(options = {}) {
           error: error?.code || 'token_cleanup_failed',
           message: safeErrorMessage(error),
           currentVersion: error?.currentVersion || undefined,
+          recoveryRequired: error?.recoveryRequired === true || undefined,
+          claimCount: error?.recoveryRequired === true
+            ? boundedCleanupCount(error?.claimCount)
+            : undefined,
+          claimCountTruncated: error?.recoveryRequired === true
+            ? error?.claimCountTruncated === true
+            : undefined,
         });
       }
       return;
