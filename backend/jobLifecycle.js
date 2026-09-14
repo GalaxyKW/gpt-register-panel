@@ -54,10 +54,12 @@ async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
 
 function createBackgroundJobManager({ db } = {}) {
   const active = new Map();
+  const pendingAdmissions = new Set();
   let shuttingDown = false;
   let admissions = 0;
 
   function begin(job, type, actor = 'local') {
+    if (shuttingDown) throw interruptedJobError();
     const controller = new AbortController();
     const record = {
       id: String(job?.id || ''),
@@ -68,7 +70,6 @@ function createBackgroundJobManager({ db } = {}) {
     };
     if (!record.id) throw new Error('后台任务缺少 job id');
     active.set(record.id, record);
-    if (shuttingDown) controller.abort(interruptedJobError());
     return record;
   }
 
@@ -87,11 +88,40 @@ function createBackgroundJobManager({ db } = {}) {
   async function withAdmission(callback) {
     if (shuttingDown) throw interruptedJobError();
     admissions += 1;
-    try {
-      return await callback();
-    } finally {
+    const controller = new AbortController();
+    pendingAdmissions.add(controller);
+    const signal = controller.signal;
+    const operation = Promise.resolve().then(() => {
+      throwIfJobInterrupted(signal);
+      return callback(signal);
+    });
+    operation.then(() => {
       admissions -= 1;
-    }
+      pendingAdmissions.delete(controller);
+    }, () => {
+      admissions -= 1;
+      pendingAdmissions.delete(controller);
+    });
+    // The HTTP caller should receive a deterministic interruption immediately,
+    // while `admissions` continues tracking the underlying callback until it
+    // has unwound. This keeps shutdown from closing persistence underneath an
+    // admission that was already inside a non-cancellable operation.
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (callbackFn, value) => {
+        if (settled) return;
+        settled = true;
+        try { signal.removeEventListener('abort', onAbort); } catch {}
+        callbackFn(value);
+      };
+      const onAbort = () => finish(reject, interruptedJobError());
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) onAbort();
+      operation.then(
+        (value) => finish(resolve, value),
+        (error) => finish(reject, error),
+      );
+    });
   }
 
   async function waitForIdle(timeoutMs) {
@@ -113,6 +143,7 @@ function createBackgroundJobManager({ db } = {}) {
   async function shutdown(options = {}) {
     shuttingDown = true;
     const reason = interruptedJobError();
+    for (const controller of pendingAdmissions) controller.abort(reason);
     for (const record of active.values()) record.controller.abort(reason);
     // Phase3's default TERM + KILL deadlines total ten seconds. Keep the drain
     // below twelve seconds, leaving the rest of systemd's 45-second stop

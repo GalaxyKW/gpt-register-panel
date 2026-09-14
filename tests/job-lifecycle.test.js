@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
+const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
@@ -16,12 +17,15 @@ const {
 } = require('../backend/accountTestWorker');
 const {
   createBackgroundJobManager,
+  throwIfJobInterrupted,
   updateTerminalJob,
 } = require('../backend/jobLifecycle');
 const {
+  createServer,
   installShutdownSignalHandlers,
   shutdownServer,
 } = require('../backend/server');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 test('terminal job updates retry a bounded number of times with one stable timestamp', async () => {
   const patches = [];
@@ -260,6 +264,136 @@ test('shutdown drains a concurrently completed job before interrupting remaining
   assert.equal(result.active, 0);
   assert.equal(jobStatus, 'succeeded');
   assert.deepEqual(events, ['worker-aborted', 'worker-finished', 'interrupt-db']);
+});
+
+test('shutdown aborts admission callers while tracking their underlying unwind', async () => {
+  let releaseAdmission;
+  let markAdmissionEntered;
+  let mutations = 0;
+  let interruptedWrites = 0;
+  const admissionEntered = new Promise((resolve) => { markAdmissionEntered = resolve; });
+  const manager = createBackgroundJobManager({
+    db: {
+      async interruptOwnedActiveJobs() {
+        interruptedWrites += 1;
+        return [];
+      },
+    },
+  });
+  const admission = manager.withAdmission(async (signal) => {
+    markAdmissionEntered(signal);
+    await new Promise((resolve) => { releaseAdmission = resolve; });
+    throwIfJobInterrupted(signal);
+    mutations += 1;
+  });
+  const signal = await admissionEntered;
+  assert.equal(signal.aborted, false);
+
+  const shutdown = manager.shutdown({ timeoutMs: 0 });
+  await assert.rejects(admission, (error) => error.code === 'JOB_INTERRUPTED');
+  assert.equal(signal.aborted, true);
+  assert.equal(manager.admissionCount, 1);
+  assert.throws(
+    () => manager.begin({ id: 'must-not-start' }, 'phase3'),
+    (error) => error.code === 'JOB_INTERRUPTED',
+  );
+  await shutdown;
+  assert.equal(interruptedWrites, 1);
+
+  releaseAdmission();
+  for (let attempt = 0; manager.admissionCount > 0 && attempt < 20; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  assert.equal(manager.admissionCount, 0);
+  assert.equal(mutations, 0);
+});
+
+test('HTTP shutdown cancels a queued import admission before job creation', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let releaseLock;
+  let markLockEntered;
+  let server;
+  let createdJobs = 0;
+  const lockEntered = new Promise((resolve) => { markLockEntered = resolve; });
+  const heldLock = withControlPlaneLock(async () => {
+    markLockEntered();
+    await new Promise((resolve) => { releaseLock = resolve; });
+  });
+  try {
+    await lockEntered;
+    const db = {
+      dbPath: path.join(os.tmpdir(), 'unused-panel-admission-shutdown.sqlite3'),
+      async createJob() {
+        createdJobs += 1;
+        return { id: 'must-not-exist', type: 'token_import', status: 'queued' };
+      },
+      async interruptOwnedActiveJobs() { return []; },
+    };
+    server = createServer({
+      db,
+      logger: {
+        requestId: () => 'admission-shutdown-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const address = server.address();
+    const responsePromise = new Promise((resolve, reject) => {
+      const request = http.request({
+        host: '127.0.0.1',
+        port: address.port,
+        path: '/api/sync/import',
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+      }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body }));
+      });
+      request.on('error', reject);
+      request.end(JSON.stringify({
+        snapshotVersion: 'a'.repeat(64),
+        selectedKeys: ['account:queued-during-stop'],
+      }));
+    });
+    for (let attempt = 0;
+      server.panelJobManager.admissionCount === 0 && attempt < 100;
+      attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(server.panelJobManager.admissionCount, 1);
+
+    const shutdown = shutdownServer(server, { signal: 'test', timeoutMs: 500 });
+    const response = await responsePromise;
+    assert.equal(response.status, 503);
+    assert.equal(JSON.parse(response.body).error, 'JOB_INTERRUPTED');
+    await shutdown;
+    assert.equal(createdJobs, 0);
+    assert.equal(server.panelJobManager.activeCount, 0);
+  } finally {
+    if (releaseLock) releaseLock();
+    await heldLock;
+    await withControlPlaneLock(async () => {});
+    if (server?.listening) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
 });
 
 test('Phase3 command abort terminates the child and reports an interrupted job', async () => {

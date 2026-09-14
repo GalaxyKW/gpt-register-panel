@@ -978,7 +978,7 @@ function createServer(options = {}) {
       if (jobManager.shuttingDown) {
         response.setHeader('connection', 'close');
         jsonResponse(response, 503, {
-          error: 'server_shutting_down',
+          error: 'JOB_INTERRUPTED',
           message: '面板服务正在停止，请稍后重试',
         });
         return;
@@ -1179,11 +1179,17 @@ function createServer(options = {}) {
         const requestError = importRequestError(body);
         if (requestError) throw requestError;
         const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
-        const { job, trackedImport } = await jobManager.withAdmission(async () => {
-          const created = await withControlPlaneLock(async () => db.createJob('token_import', {
-            snapshotVersion: body.snapshotVersion,
-            selectedKeys,
-          }, actor, { claimKeys: ['token_import'] }));
+        const { job, trackedImport } = await jobManager.withAdmission(async (signal) => {
+          const created = await withControlPlaneLock(async () => {
+            throwIfJobInterrupted(signal);
+            const createdJob = await db.createJob('token_import', {
+              snapshotVersion: body.snapshotVersion,
+              selectedKeys,
+            }, actor, { claimKeys: ['token_import'] });
+            throwIfJobInterrupted(signal);
+            return createdJob;
+          }, { signal });
+          throwIfJobInterrupted(signal);
           return {
             job: created,
             trackedImport: jobManager.begin(created, 'token_import', actor),
@@ -1299,7 +1305,8 @@ function createServer(options = {}) {
           durationMs: Date.now() - importRequestStartedAt,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
+        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
           : error?.code === 'JOB_ALREADY_CLAIMED' ? 409 : 400;
         jsonResponse(response, status, { error: error?.code || 'import_failed', message: safeErrorMessage(error) });
       }
@@ -1322,114 +1329,120 @@ function createServer(options = {}) {
           message: '同一请求中账号重复，已合并为一个任务',
         })).concat(resolved.rejected);
         let enqueueFailure = null;
-        const enqueue = async () => {
-        const batchClaimKeys = new Set();
-        const maximumActive = boundedEnvNumber('PANEL_PHASE3_MAX_ACTIVE_JOBS', 100, 1, 100);
-        let activeCount = await db.countActiveJobs('phase3');
-        for (const requestItem of resolvedRequests) {
-          if (activeCount >= maximumActive) {
-            rejected.push({
-              index: requestItem.originalIndex,
-              email: requestItem.email || null,
-              phone: requestItem.phone || null,
-              error: 'phase3_queue_full',
-              message: 'Phase 3 活跃任务已达到安全上限',
-            });
-            continue;
-          }
-          const claimKeys = phase3ClaimKeys(requestItem);
-          if (claimKeys.some((key) => batchClaimKeys.has(key))) {
-            rejected.push({
-              index: requestItem.originalIndex,
-              email: requestItem.email || null,
-              phone: requestItem.phone || null,
-              error: 'duplicate_in_request',
-              message: '同一请求中账号重复，已合并为一个任务',
-            });
-            continue;
-          }
-          claimKeys.forEach((key) => batchClaimKeys.add(key));
-          const existingPhase3Job = getActivePhase3Job(requestItem);
-          if (existingPhase3Job) {
-            rejected.push({
-              index: requestItem.originalIndex,
-              email: requestItem.email || null,
-              phone: requestItem.phone || null,
-              error: 'phase3_already_running',
-              message: '该账号已有 Phase 3 任务排队或运行中',
-              jobId: existingPhase3Job.jobId || null,
-            });
-            writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
-              requestId,
-              actor,
-              email: requestItem.email || null,
-              phone: requestItem.phone || null,
-              existingJobId: existingPhase3Job.jobId || null,
-            });
-            continue;
-          }
-          let job;
-          try {
-            job = await db.createJob('phase3', {
-            email: requestItem.email || null,
-            phone: requestItem.phone || null,
-            canonicalKeys: requestItem.canonicalKeys,
-            selectedKey: requestItem.selectedKey || null,
-            batch: resolvedRequests.length > 1,
-            }, actor, {
-              claimKeys,
-            });
-          } catch (error) {
-            if (error?.code !== 'JOB_ALREADY_CLAIMED') {
-              enqueueFailure = error;
+        const enqueue = async (signal) => {
+          throwIfJobInterrupted(signal);
+          const batchClaimKeys = new Set();
+          const maximumActive = boundedEnvNumber('PANEL_PHASE3_MAX_ACTIVE_JOBS', 100, 1, 100);
+          let activeCount = await db.countActiveJobs('phase3');
+          throwIfJobInterrupted(signal);
+          for (const requestItem of resolvedRequests) {
+            throwIfJobInterrupted(signal);
+            if (activeCount >= maximumActive) {
               rejected.push({
                 index: requestItem.originalIndex,
                 email: requestItem.email || null,
                 phone: requestItem.phone || null,
-                error: 'phase3_enqueue_failed',
-                message: 'Phase 3 任务入队失败，已停止本批后续入队',
+                error: 'phase3_queue_full',
+                message: 'Phase 3 活跃任务已达到安全上限',
               });
-              break;
+              continue;
             }
-            rejected.push({
-              index: requestItem.originalIndex,
-              email: requestItem.email || null,
-              phone: requestItem.phone || null,
-              error: 'phase3_already_running',
-              message: '该账号已有 Phase 3 任务排队或运行中',
-              jobId: error.existingJobId || null,
-            });
-            writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
+            const claimKeys = phase3ClaimKeys(requestItem);
+            if (claimKeys.some((key) => batchClaimKeys.has(key))) {
+              rejected.push({
+                index: requestItem.originalIndex,
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                error: 'duplicate_in_request',
+                message: '同一请求中账号重复，已合并为一个任务',
+              });
+              continue;
+            }
+            claimKeys.forEach((key) => batchClaimKeys.add(key));
+            const existingPhase3Job = getActivePhase3Job(requestItem);
+            if (existingPhase3Job) {
+              rejected.push({
+                index: requestItem.originalIndex,
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                error: 'phase3_already_running',
+                message: '该账号已有 Phase 3 任务排队或运行中',
+                jobId: existingPhase3Job.jobId || null,
+              });
+              writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
+                requestId,
+                actor,
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                existingJobId: existingPhase3Job.jobId || null,
+              });
+              continue;
+            }
+            let job;
+            try {
+              throwIfJobInterrupted(signal);
+              job = await db.createJob('phase3', {
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                canonicalKeys: requestItem.canonicalKeys,
+                selectedKey: requestItem.selectedKey || null,
+                batch: resolvedRequests.length > 1,
+              }, actor, {
+                claimKeys,
+              });
+              throwIfJobInterrupted(signal);
+            } catch (error) {
+              if (error?.code !== 'JOB_ALREADY_CLAIMED') {
+                enqueueFailure = error;
+                rejected.push({
+                  index: requestItem.originalIndex,
+                  email: requestItem.email || null,
+                  phone: requestItem.phone || null,
+                  error: 'phase3_enqueue_failed',
+                  message: 'Phase 3 任务入队失败，已停止本批后续入队',
+                });
+                break;
+              }
+              rejected.push({
+                index: requestItem.originalIndex,
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                error: 'phase3_already_running',
+                message: '该账号已有 Phase 3 任务排队或运行中',
+                jobId: error.existingJobId || null,
+              });
+              writeLog(logger, 'warn', 'phase3.duplicate_rejected', {
+                requestId,
+                actor,
+                email: requestItem.email || null,
+                phone: requestItem.phone || null,
+                existingJobId: error.existingJobId || null,
+              });
+              continue;
+            }
+            queued.push({ ...requestItem, job });
+            activeCount += 1;
+            writeLog(logger, 'info', 'phase3.job_queued', {
               requestId,
+              jobId: job.id,
               actor,
               email: requestItem.email || null,
               phone: requestItem.phone || null,
-              existingJobId: error.existingJobId || null,
+              batch: resolvedRequests.length > 1,
+              durationMs: Date.now() - phase3RequestStartedAt,
             });
-            continue;
           }
-          queued.push({ ...requestItem, job });
-          activeCount += 1;
-          writeLog(logger, 'info', 'phase3.job_queued', {
-            requestId,
-            jobId: job.id,
-            actor,
-            email: requestItem.email || null,
-            phone: requestItem.phone || null,
-            batch: resolvedRequests.length > 1,
-            durationMs: Date.now() - phase3RequestStartedAt,
-          });
-        }
         };
-        await jobManager.withAdmission(async () => {
+        await jobManager.withAdmission(async (signal) => {
           try {
-            await withControlPlaneLock(enqueue);
+            await withControlPlaneLock(() => enqueue(signal), { signal });
           } catch (error) {
             enqueueFailure = error;
           }
           // Jobs already persisted before a later batch failure must always be
           // observed; otherwise they would remain queued with live claims until
           // the whole service restarts.
+          throwIfJobInterrupted(signal);
           for (const item of queued) {
             observePhase3Job({
               job: item.job,
@@ -1486,7 +1499,8 @@ function createServer(options = {}) {
           durationMs: Date.now() - phase3RequestStartedAt,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413 : 400;
+        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413 : 400;
         jsonResponse(response, status, { error: error?.code || 'phase3_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -1534,11 +1548,19 @@ function createServer(options = {}) {
       try {
         const body = await readJsonBody(request);
         const requestData = normalizeAccountTestRequest(body);
-        const { submission, taskRecord } = await jobManager.withAdmission(async () => {
+        const { submission, taskRecord } = await jobManager.withAdmission(async (signal) => {
           const submitted = await withAccountTestSubmissionLock(async () => {
+            throwIfJobInterrupted(signal);
             const client = new Sub2ApiAdminClient({ logger, logContext: { requestId, actor } });
-            const accounts = await client.listAccounts({ platform: 'openai', type: 'oauth', pageSize: 200 });
+            const accounts = await client.listAccounts({
+              platform: 'openai',
+              type: 'oauth',
+              pageSize: 200,
+              signal,
+            });
+            throwIfJobInterrupted(signal);
             const jobs = await db.listJobs(200);
+            throwIfJobInterrupted(signal);
             const classified = classifyAccountTestTargets(accounts, requestData.accountIds, activeAccountTestJobs(jobs));
             if (classified.eligible.length === 0) return classified;
             const accountIds = classified.eligible.map((item) => item.id);
@@ -1548,6 +1570,7 @@ function createServer(options = {}) {
               error.code = 'ACCOUNT_TEST_BASELINE_INVALID';
               throw error;
             }
+            throwIfJobInterrupted(signal);
             const job = await db.createJob('account_test', {
               accountIds,
               targetBaselines,
@@ -1560,8 +1583,10 @@ function createServer(options = {}) {
             }, actor, {
               claimKeys: accountIds.map((id) => 'account_test:' + String(id)),
             });
+            throwIfJobInterrupted(signal);
             return { ...classified, accountIds, targetBaselines, job };
           });
+          throwIfJobInterrupted(signal);
           return {
             submission: submitted,
             taskRecord: submitted.job
@@ -1619,7 +1644,8 @@ function createServer(options = {}) {
           code: error?.code || null,
           error: safeErrorMessage(error),
         });
-        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
+        const status = error?.code === 'JOB_INTERRUPTED' ? 503
+          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
           : error?.code === 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS' ? 409
             : error?.code === 'JOB_ALREADY_CLAIMED' ? 409
             : error?.message?.includes('required') ? 503 : 400;
