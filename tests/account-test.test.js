@@ -322,8 +322,9 @@ test('account test target classification accepts non-error accounts and rejects 
     oauthTestAccount(1, 'error', false, { name: 'error' }),
     oauthTestAccount(2, 'active', true, { name: 'active' }),
     oauthTestAccount(3, 'error', false, { name: 'other-error' }),
-  ], [1, 2, 3, 4], new Map([['3', activeJob]]));
-  assert.deepEqual(result.eligible.map((item) => item.id), [1, 2]);
+    oauthTestAccount(5, 'inactive', false, { name: 'inactive' }),
+  ], [1, 2, 3, 4, 5], new Map([['3', activeJob]]));
+  assert.deepEqual(result.eligible.map((item) => item.id), [1, 2, 5]);
   assert.deepEqual(result.rejected.map((item) => item.code), [
     'account_test_already_running',
     'account_not_found',
@@ -351,6 +352,14 @@ test('account test baseline binds normalized submission state without raw identi
   assert.equal(JSON.stringify(baseline).includes('test-account-21'), false);
   assert.equal(JSON.stringify(baseline).includes('test-user-21'), false);
   assert.equal(JSON.stringify(baseline).includes('test-fingerprint-21'), false);
+
+  const inactiveBaseline = accountTestTargetBaseline(
+    oauthTestAccount(22, 'INACTIVE', false),
+  );
+  assert.equal(inactiveBaseline.status, 'inactive');
+  assert.equal(inactiveBaseline.statusKnown, true);
+  assert.equal(inactiveBaseline.schedulable, false);
+  assert.match(inactiveBaseline.targetDigest, /^[a-f0-9]{64}$/);
 });
 
 function fakeWorkerDb() {
@@ -748,6 +757,29 @@ test('non-error success re-reads state and does not report a stale pre-test snap
   assert.equal(outcome.results[0].statusBefore, 'active');
   assert.equal(outcome.results[0].statusAfter, 'error');
   assert.equal(outcome.results[0].enabled, false);
+});
+
+test('inactive accounts remain testable without silently enabling their scheduler', async () => {
+  const account = oauthTestAccount(131, 'inactive', false);
+  let schedulerWrites = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [account.id],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-inactive-account-preserved',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() { return { success: true }; },
+      async setSchedulable() { schedulerWrites += 1; },
+    },
+  });
+  assert.equal(outcome.succeeded, 1);
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.results[0].statusBefore, 'inactive');
+  assert.equal(outcome.results[0].statusAfter, 'inactive');
+  assert.equal(outcome.results[0].enabled, false);
+  assert.equal(schedulerWrites, 0);
 });
 
 test('account tests do not probe an ID whose strong identity changed after listing', async () => {

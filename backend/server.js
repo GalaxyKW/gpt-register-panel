@@ -868,6 +868,7 @@ const REVIEW_AVAILABILITY_REASONS = new Set([
   'sub2api_schema_invalid',
   'sub2api_status_unknown',
   'sub2api_status_missing',
+  'sub2api_status_inactive',
   'sub2api_status_disabled',
   'sub2api_status_error',
   'sub2api_schedulable_missing',
@@ -1026,7 +1027,7 @@ function accountTestReviewTargets(job) {
         : undefined,
       baselineStatus: safeReviewCode(
         baseline?.status,
-        new Set(['active', 'disabled', 'error']),
+        new Set(['active', 'inactive', 'disabled', 'error']),
       ) || undefined,
       baselineSchedulable: typeof baseline?.schedulable === 'boolean'
         ? baseline.schedulable
@@ -2574,7 +2575,13 @@ function createServer(options = {}) {
         return;
       }
       try {
-        jsonResponse(response, 200, await buildSnapshot(requestUrl.searchParams, { logger, requestId, actor }));
+        const snapshot = await buildSnapshot(requestUrl.searchParams, { logger, requestId, actor });
+        jsonResponse(response, 200, {
+          ...snapshot,
+          capabilities: {
+            phase3Enabled: booleanEnvEnabled('PANEL_PHASE3_ENABLED', false),
+          },
+        });
       } catch (error) {
         writeLog(logger, 'error', 'http.snapshot_failed', {
           requestId,
@@ -2822,6 +2829,15 @@ function createServer(options = {}) {
           sendMutationReceipt(response, priorReceipt, true);
           return;
         }
+        // The feature flag is process configuration, so a new request can be
+        // rejected before waiting for admission. Keep the identical check
+        // under the lock below as a defence against in-process configuration
+        // changes and preserve receipt lookup ahead of both checks.
+        if (!booleanEnvEnabled('PANEL_PHASE3_ENABLED', false)) {
+          const error = new Error('Phase 3 未启用，请设置 PANEL_PHASE3_ENABLED=1 后重启面板');
+          error.code = 'PHASE3_DISABLED';
+          throw error;
+        }
         let resolvedRequests = [];
         let initiallyRejected = [];
         const rejectionFromDatabase = (item) => {
@@ -2868,6 +2884,17 @@ function createServer(options = {}) {
               const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
               if (lockedReceipt) {
                 return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
+              }
+              // Do not create durable jobs that the worker is configured to
+              // reject. This must follow the receipt recheck under the lock:
+              // an earlier accepted request remains safely recoverable after
+              // a restart even if Phase 3 has since been disabled.
+              if (!booleanEnvEnabled('PANEL_PHASE3_ENABLED', false)) {
+                const error = new Error(
+                  'Phase 3 未启用，请设置 PANEL_PHASE3_ENABLED=1 后重启面板',
+                );
+                error.code = 'PHASE3_DISABLED';
+                throw error;
               }
               // Resolution reads mutable gpt_register files and validates the
               // process-local target revision. It must happen only after the

@@ -261,7 +261,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     targetBaselines: [{
       accountId: 381,
       identityDigest: 'd'.repeat(64),
-      status: 'error',
+      status: 'inactive',
       statusKnown: true,
       schedulable: false,
       schedulableKnown: true,
@@ -295,7 +295,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
           'credential:' + secretCanary,
         ],
         availability: 'unavailable',
-        availabilityReason: 'sub2api_status_error',
+        availabilityReason: 'sub2api_status_inactive',
         requiresReconciliation: true,
         writeOutcomeUnknown: true,
         outcome: 'requires_reconciliation',
@@ -355,7 +355,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
           'user:22222222-2222-4222-8222-222222222222',
         ],
         availability: 'unavailable',
-        availabilityReason: 'sub2api_status_error',
+        availabilityReason: 'sub2api_status_inactive',
       }],
     });
     const serialized = JSON.stringify(response.json);
@@ -374,7 +374,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     assert.deepEqual(accountDetail.json.targetContext.targets, [{
       remoteAccountId: 381,
       identityDigest: 'd'.repeat(64),
-      baselineStatus: 'error',
+      baselineStatus: 'inactive',
       baselineSchedulable: false,
     }]);
 

@@ -1061,13 +1061,99 @@ test('all mutation routes require one strict key and replay before live validati
   }
 });
 
+test('disabled Phase3 rejects before admission but still replays an existing receipt', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+    phase3Enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  process.env.PANEL_PHASE3_ENABLED = '0';
+  const replayKey = 'idem_v1_phase3_disabled_replay';
+  const responseJobId = 'job_' + '6'.repeat(24);
+  let admissions = 0;
+  let resolutions = 0;
+  let server;
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-phase3-disabled.sqlite3',
+        async getMutationReceipt(context) {
+          return context.idempotencyKey === replayKey
+            ? { statusCode: 202, response: { jobId: responseJobId, status: 'queued' } }
+            : null;
+        },
+      },
+      phase3RequestResolver() {
+        resolutions += 1;
+        throw new Error('disabled Phase3 must not resolve mutable targets');
+      },
+      jobManager: {
+        shuttingDown: false,
+        activeCount: 0,
+        async withAdmission() {
+          admissions += 1;
+          throw new Error('disabled Phase3 must not wait for admission');
+        },
+      },
+      logger: {
+        requestId: () => 'phase3-disabled-gate-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const body = {
+      accounts: [{
+        email: 'disabled@example.test',
+        selectedKey: 'token:tokens:tokens/disabled.json',
+        phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+      }],
+      selectedKeys: ['token:tokens:tokens/disabled.json'],
+    };
+    const rejected = await postJson(baseUrl, '/api/phase3', body, {
+      'idempotency-key': 'idem_v1_phase3_disabled_new',
+    });
+    assert.equal(rejected.status, 403);
+    assert.equal(JSON.parse(rejected.body).error, 'PHASE3_DISABLED');
+    assert.equal(admissions, 0);
+    assert.equal(resolutions, 0);
+
+    const replayed = await postJson(baseUrl, '/api/phase3', body, {
+      'idempotency-key': replayKey,
+    });
+    assert.equal(replayed.status, 202);
+    assert.equal(replayed.headers['idempotency-replayed'], 'true');
+    assert.deepEqual(JSON.parse(replayed.body), { jobId: responseJobId, status: 'queued' });
+    assert.equal(admissions, 0);
+    assert.equal(resolutions, 0);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+    if (previous.phase3Enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.phase3Enabled;
+  }
+});
+
 test('the locked receipt recheck wins before every mutable live validator', async () => {
   const previous = {
     writeEnabled: process.env.PANEL_WRITE_ENABLED,
     allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+    phase3Enabled: process.env.PANEL_PHASE3_ENABLED,
   };
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  process.env.PANEL_PHASE3_ENABLED = '1';
   const receiptCalls = new Map();
   const liveCalls = { phase3: 0, accountTest: 0, cleanup: 0, create: 0 };
   let admissions = 0;
@@ -1174,6 +1260,8 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
     else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
     if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
     else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+    if (previous.phase3Enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.phase3Enabled;
   }
 });
 
@@ -1810,6 +1898,7 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
   };
   let server = null;
   process.env.PANEL_WRITE_ENABLED = '0';
+  process.env.PANEL_PHASE3_ENABLED = '0';
   process.env.GPT_REGISTER_ROOT = root;
   try {
     fs.mkdirSync(path.join(root, 'tokens'));
@@ -1904,7 +1993,9 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.match(snapshot.body, /server@example.test/);
     assert.equal(snapshot.body.includes('hidden-password'), false);
     assert.equal(snapshot.body.includes('refresh-hidden'), false);
-    const snapshotRows = JSON.parse(snapshot.body).rows;
+    const snapshotBody = JSON.parse(snapshot.body);
+    assert.deepEqual(snapshotBody.capabilities, { phase3Enabled: false });
+    const snapshotRows = snapshotBody.rows;
     const phase3RevisionFor = (relativePath) => snapshotRows.find(
       (row) => row.relativePath === relativePath,
     )?.phase3TargetRevision;
@@ -1953,6 +2044,26 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
 
     const selectedTokenKey = 'token:tokens:tokens/token.json';
     const currentPhase3Revision = phase3RevisionFor('tokens/token.json');
+    const disabledPhase3 = await postJson(baseUrl, '/api/phase3', {
+      accounts: [{
+        email: 'server@example.test',
+        selectedKey: selectedTokenKey,
+        phase3TargetRevision: currentPhase3Revision,
+      }],
+      selectedKeys: [selectedTokenKey],
+    });
+    assert.equal(disabledPhase3.status, 403);
+    assert.equal(JSON.parse(disabledPhase3.body).error, 'PHASE3_DISABLED');
+    const jobsAfterDisabledRequest = await request(baseUrl, '/api/jobs?limit=200');
+    assert.equal(jobsAfterDisabledRequest.status, 200);
+    assert.equal(JSON.parse(jobsAfterDisabledRequest.body).jobs.some(
+      (job) => job.type === 'phase3',
+    ), false);
+
+    // The remaining assertions exercise revision and batch admission with the
+    // feature enabled. The temporary test root has no runnable index.js, so
+    // accepted jobs terminate without invoking the real registration project.
+    process.env.PANEL_PHASE3_ENABLED = '1';
     const forgedPhase3Revision = currentPhase3Revision.slice(0, -1)
       + (currentPhase3Revision.endsWith('A') ? 'B' : 'A');
     const forgedPhase3 = await postJson(baseUrl, '/api/phase3', {
@@ -2002,7 +2113,7 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
       batchBody.jobIds.map((jobId) => waitForTerminalJob(baseUrl, jobId)),
     );
     assert.equal(phase3Jobs.every((job) => job.status === 'failed'), true);
-    assert.equal(phase3Jobs.every((job) => job.result?.code === 'PHASE3_DISABLED'), true);
+    assert.equal(phase3Jobs.some((job) => job.result?.code === 'PHASE3_DISABLED'), false);
 
     const expiredListing = await request(baseUrl, '/api/tokens/expired');
     assert.equal(expiredListing.status, 200);

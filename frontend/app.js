@@ -53,6 +53,7 @@ const elements = {
   previewButton: document.querySelector('#previewButton'),
   importButton: document.querySelector('#importButton'),
   phase3Button: document.querySelector('#phase3Button'),
+  phase3ButtonLabel: document.querySelector('#phase3ButtonLabel'),
   accountTestButton: document.querySelector('#accountTestButton'),
   accountTestModelSelect: document.querySelector('#accountTestModelSelect'),
   cleanupButton: document.querySelector('#cleanupButton'),
@@ -89,7 +90,8 @@ const RECONCILIATION_ACK_RESOLUTIONS = new Set([
 ]);
 const RECONCILIATION_AVAILABILITY_REASONS = new Set([
   'not_in_sub2api', 'sub2api_schema_invalid', 'sub2api_status_unknown',
-  'sub2api_status_missing', 'sub2api_status_disabled', 'sub2api_status_error',
+  'sub2api_status_missing', 'sub2api_status_inactive', 'sub2api_status_disabled',
+  'sub2api_status_error',
   'sub2api_schedulable_missing', 'sub2api_unschedulable',
   'sub2api_auto_pause_invalid', 'sub2api_expiry_invalid', 'sub2api_expired',
   'sub2api_temp_unschedulable_invalid', 'sub2api_temp_unschedulable',
@@ -216,6 +218,7 @@ function actionReasonLabel(reason) {
     sub2api_availability_unknown: 'Sub2API 可用性未知，跳过',
     sub2api_status_unknown: 'Sub2API 状态未知，跳过',
     sub2api_status_missing: 'Sub2API 缺少状态，跳过',
+    sub2api_status_inactive: 'Sub2API 账号已停用',
     sub2api_schedulable_missing: 'Sub2API 缺少调度状态，跳过',
     sub2api_auto_pause_invalid: 'Sub2API 自动停用字段无效，跳过',
     sub2api_expiry_invalid: 'Sub2API 过期时间无效，跳过',
@@ -255,14 +258,17 @@ function effectivePlanReason(item) {
 function statusClass(value) {
   const status = String(value || '').toLowerCase();
   if (status === 'active' || status === 'enabled') return 'status-active';
-  if (status === 'error' || status === 'disabled' || status === 'account_deleted') return 'status-error';
+  if (status === 'error' || status === 'inactive' || status === 'disabled'
+      || status === 'account_deleted') return 'status-error';
   return 'status-unknown';
 }
 
 function statusLabel(value) {
   return {
+    inactive: '已停用',
+    disabled: '已禁用',
     account_deleted: '已处置',
-  }[String(value || '')] || value || '-';
+  }[String(value || '').trim().toLowerCase()] || value || '-';
 }
 
 function sourceClass(value) {
@@ -923,6 +929,10 @@ function comparisonAvailable(snapshot = state.snapshot) {
     && (status === undefined || status === 'complete');
 }
 
+function phase3CapabilityAvailable(snapshot = state.snapshot) {
+  return snapshot?.capabilities?.phase3Enabled === true;
+}
+
 function validImportPlanIntentVersion(value) {
   return typeof value === 'string'
     && /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/.test(value);
@@ -1315,6 +1325,7 @@ function availabilityReasonLabel(reason) {
   return {
     sub2api_available: '可用',
     sub2api_status_active: '账号状态正常',
+    sub2api_status_inactive: '账号已停用',
     sub2api_status_disabled: '账号已禁用',
     sub2api_status_error: '账号处于 error',
     sub2api_status_unknown: '账号状态无法识别',
@@ -2024,7 +2035,7 @@ function reconciliationTargetIsValid(workflow, target) {
     if (target.identityDigest !== undefined
         && !/^[a-f0-9]{64}$/.test(String(target.identityDigest))) return false;
     if (target.baselineStatus !== undefined
-        && !['active', 'disabled', 'error'].includes(target.baselineStatus)) return false;
+        && !['active', 'inactive', 'disabled', 'error'].includes(target.baselineStatus)) return false;
     if (target.baselineSchedulable !== undefined
         && typeof target.baselineSchedulable !== 'boolean') return false;
     return true;
@@ -2818,6 +2829,10 @@ elements.importButton.addEventListener('click', async () => {
 
 elements.phase3Button.addEventListener('click', async () => {
   if (state.phase3RequestPending) return;
+  if (!phase3CapabilityAvailable()) {
+    showNotice('无法提交 Phase 3：服务端未声明 Phase 3 已启用。', 'notice-warning');
+    return;
+  }
   const selectionVisibilityProblem = hiddenSelectionProblem();
   if (selectionVisibilityProblem) {
     showNotice('无法提交 Phase 3：' + selectionVisibilityProblem + '。', 'notice-warning');
@@ -3005,6 +3020,7 @@ function updateActionState() {
     && !state.accountTestModelsPending
     && !state.snapshot?.readOnly;
   const canRunPhase3 = state.selected.size > 0
+    && phase3CapabilityAvailable()
     && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
     && phase3Targets.length > 0
@@ -3014,6 +3030,11 @@ function updateActionState() {
   const writeBlocked = reconciliationWriteBlocked();
   const mutationLocked = locked || writeBlocked;
   elements.phase3Button.disabled = mutationLocked || !canRunPhase3;
+  if (elements.phase3ButtonLabel) {
+    elements.phase3ButtonLabel.textContent = state.snapshot && !phase3CapabilityAvailable()
+      ? '本地 Phase 3（未启用）'
+      : '本地 Phase 3';
+  }
   if (elements.accountTestButton) {
     elements.accountTestButton.disabled = mutationLocked || !canRunAccountTest;
     if (writeBlocked) {
@@ -3070,6 +3091,8 @@ function updateActionState() {
     elements.phase3Button.title = '正在确认后台任务和待对账项，暂不可操作';
   } else if (locked) {
     elements.phase3Button.title = '另一个任务或请求执行中';
+  } else if (!phase3CapabilityAvailable()) {
+    elements.phase3Button.title = '服务端未启用 Phase 3；请设置 PANEL_PHASE3_ENABLED=1 后重启面板';
   } else if (selectionVisibilityProblem) {
     elements.phase3Button.title = selectionVisibilityProblem;
   } else if (!canRunPhase3) {

@@ -49,7 +49,7 @@ function canonicalStrongIdentities(account) {
 function knownAccountState(account) {
   const status = String(account?.status || '').trim().toLowerCase();
   const statusKnown = account?.statusKnown === undefined
-    ? ['active', 'disabled', 'error'].includes(status)
+    ? ['active', 'inactive', 'disabled', 'error'].includes(status)
     : account.statusKnown === true;
   const schedulableKnown = account?.schedulableKnown === undefined
     ? typeof account?.schedulable === 'boolean'

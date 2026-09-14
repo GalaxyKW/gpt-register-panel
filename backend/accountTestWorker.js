@@ -273,7 +273,7 @@ function accountTestState(account) {
   return {
     status,
     statusKnown: account?.statusKnown === undefined
-      ? ['active', 'disabled', 'error'].includes(status)
+      ? ['active', 'inactive', 'disabled', 'error'].includes(status)
       : account.statusKnown === true,
     schedulable: typeof account?.schedulable === 'boolean'
       ? account.schedulable
@@ -369,7 +369,7 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
         || !/^[a-f0-9]{64}$/.test(identityDigest)
         || !/^[a-f0-9]{64}$/.test(targetDigest)
         || baseline?.statusKnown !== true
-        || !['active', 'disabled', 'error'].includes(status)
+        || !['active', 'inactive', 'disabled', 'error'].includes(status)
         || baseline?.schedulableKnown !== true
         || typeof baseline?.schedulable !== 'boolean') {
       const error = new Error('账号测试任务的目标身份基线无效');
@@ -1081,8 +1081,9 @@ async function runAccountTestJobNow({
         throw error;
       }
       // Evaluate the state that would exist after enabling scheduling before
-      // issuing any write. Enabling cannot repair an error/disabled status,
-      // expiry, rate limit, temporary pause, overload, or malformed runtime
+      // issuing any write. Enabling cannot repair an error/inactive status
+      // (including the legacy disabled spelling), expiry, rate limit,
+      // temporary pause, overload, or malformed runtime
       // metadata; toggling true and then rolling back only adds an avoidable
       // mutation window and can overwrite a concurrent administrator change.
       const availabilityIfEnabled = getAccountAvailability({

@@ -1274,6 +1274,47 @@ test('frontend account-test confirmation describes upstream state side effects a
   assert.doesNotMatch(source, /其他账号只测试不修改调度设置/);
 });
 
+test('frontend recognizes and safely renders the real Sub2API inactive status', () => {
+  const statusContract = sourceSection('function actionReasonLabel', 'function sourceClass');
+  const availabilityContract = sourceSection('function availabilityReasonLabel', 'function renderRemoteState');
+  const reconciliationConstants = sourceSection(
+    'const RECONCILIATION_ACK_CONFIRMATION',
+    'function escapeHtml',
+  );
+  const reconciliationContract = sourceSection(
+    'function boundedReconciliationDisplay',
+    'function reconciliationReviewDetailError',
+  );
+  const context = {};
+  vm.runInNewContext(statusContract + '\n' + availabilityContract + '\n'
+    + reconciliationConstants + '\n' + reconciliationContract + `
+      result = {
+        cssClass: statusClass('inactive'),
+        status: statusLabel('INACTIVE'),
+        availability: availabilityReasonLabel('sub2api_status_inactive'),
+        actionReason: actionReasonLabel('sub2api_status_inactive'),
+        importReview: reconciliationTargetIsValid('token_import', {
+          remoteAccountId: 266,
+          availability: 'unavailable',
+          availabilityReason: 'sub2api_status_inactive',
+        }),
+        testReview: reconciliationTargetIsValid('account_test', {
+          remoteAccountId: 266,
+          baselineStatus: 'inactive',
+          baselineSchedulable: false,
+        }),
+      };
+    `, context);
+  assert.deepEqual({ ...context.result }, {
+    cssClass: 'status-error',
+    status: '已停用',
+    availability: '账号已停用',
+    actionReason: 'Sub2API 账号已停用',
+    importReview: true,
+    testReview: true,
+  });
+});
+
 test('frontend treats expired token cleanup as a durable polled task', () => {
   const cleanupHandler = sourceSection(
     "if (elements.cleanupButton) {",
@@ -2015,7 +2056,7 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
 });
 
 test('frontend identifies the local and Sub2API sides of mutation buttons', () => {
-  assert.match(htmlSource, /<span>本地 Phase 3<\/span>/);
+  assert.match(htmlSource, /<span id="phase3ButtonLabel">本地 Phase 3<\/span>/);
   assert.match(htmlSource, /<span>测试 Sub2API 账号<\/span>/);
   assert.match(source, /本地 gpt_register 账号运行 Phase 3 并更新 token/);
   assert.match(source, /测试 Sub2API 账号/);
@@ -2368,6 +2409,7 @@ test('frontend Phase3 submits selected keys in the same order as account targets
       phase3RequestPending: false,
       selected: new Set(['snapshot-second', 'snapshot-first']),
     },
+    phase3CapabilityAvailable: () => true,
     hiddenSelectionProblem: () => '',
     selectedRowsFromSelection: () => [{ key: 'snapshot-first' }, { key: 'snapshot-second' }],
     phase3TargetsFromRows: () => targets,
@@ -2394,6 +2436,83 @@ test('frontend Phase3 submits selected keys in the same order as account targets
   });
 });
 
+test('frontend disables Phase3 unless the snapshot explicitly declares it enabled', async () => {
+  const capabilityContract = sourceSection(
+    'function phase3CapabilityAvailable',
+    'function validImportPlanIntentVersion',
+  );
+  const reasonContract = sourceSection('function phase3ReasonLabel', 'function effectivePlanAction');
+  const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
+  const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  const handlerContract = sourceSection(
+    "elements.phase3Button.addEventListener('click'",
+    'if (elements.accountTestButton)',
+  );
+  const revision = 'phase3-target-v1.' + 'A'.repeat(43);
+  const stateForTest = {
+    selected: new Set(['row-one']),
+    rows: [{ key: 'row-one' }],
+    phase3RequestPending: false,
+    jobInventoryVerified: true,
+    snapshot: {
+      readOnly: false,
+      capabilities: { phase3Enabled: false },
+      rows: [{
+        key: 'row-one',
+        phase3Email: 'source@example.test',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      }],
+    },
+  };
+  const notices = [];
+  let clickHandler;
+  let mutationRequests = 0;
+  const context = {
+    state: stateForTest,
+    elements: {
+      phase3Button: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          clickHandler = handler;
+        },
+      },
+      phase3ButtonLabel: {},
+      accountTestButton: null,
+      accountTestModelSelect: null,
+      clearSelectionButton: {},
+      selectAll: {},
+      previewButton: {},
+      importButton: {},
+      cleanupButton: null,
+      reconciliationAckButton: null,
+    },
+    document: { querySelectorAll: () => [] },
+    accountTestTargetsFromRows: () => ({ targets: [], problem: '' }),
+    actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
+    syncSelectionProblem: () => '',
+    updateImportButtonState() {},
+    comparisonAvailable: () => true,
+    showNotice: (...args) => notices.push(args),
+    idempotentMutationFetch: async () => { mutationRequests += 1; },
+  };
+  vm.runInNewContext(capabilityContract + '\n' + reasonContract + '\n' + targetContract
+    + '\n' + updateContract + '\n' + handlerContract
+    + '\nupdateActionState();', context);
+  assert.equal(context.elements.phase3Button.disabled, true);
+  assert.equal(context.elements.phase3ButtonLabel.textContent, '本地 Phase 3（未启用）');
+  assert.match(context.elements.phase3Button.title, /服务端未启用 Phase 3/);
+  await clickHandler();
+  assert.equal(mutationRequests, 0);
+  assert.match(notices[0][0], /服务端未声明 Phase 3 已启用/);
+
+  stateForTest.snapshot.capabilities.phase3Enabled = true;
+  vm.runInNewContext('updateActionState();', context);
+  assert.equal(context.elements.phase3Button.disabled, false);
+  assert.equal(context.elements.phase3ButtonLabel.textContent, '本地 Phase 3');
+});
+
 test('frontend disables Phase3 and explains a backend-rejected selected row', () => {
   const reasonContract = sourceSection('function phase3ReasonLabel', 'function effectivePlanAction');
   const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
@@ -2405,6 +2524,7 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
       jobInventoryVerified: true,
       snapshot: {
         readOnly: false,
+        capabilities: { phase3Enabled: true },
         rows: [{
           key: 'row-one',
           phase3Email: 'source@example.test',
@@ -2424,6 +2544,7 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
     },
     document: { querySelectorAll: () => [] },
     accountTestTargetsFromRows: () => ({ targets: [], problem: '' }),
+    phase3CapabilityAvailable: () => true,
     actionsLocked: () => false,
     reconciliationWriteBlocked: () => false,
     syncSelectionProblem: () => '',
