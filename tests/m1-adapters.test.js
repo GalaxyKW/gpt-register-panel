@@ -12,6 +12,7 @@ const {
   buildIdentityKeys,
   normalizeIdentityValue,
   normalizeTokenDocument,
+  parseJwtPayload,
   tokenFingerprint,
 } = require('../backend/lib/token');
 const {
@@ -120,6 +121,43 @@ test('token parsing rejects contradictory email evidence across files and JWT cl
     .find((item) => item.relativePath === 'tokens/b.json');
   assert.equal(equivalent.parseStatus, 'ok');
   assert.equal(equivalent.email, 'first@example.test');
+});
+
+test('token claims are read only from a structurally valid, lossless compact JWT payload', () => {
+  const payload = Buffer.from(JSON.stringify({
+    sub: 'must-not-authorize-malformed-jwt',
+  })).toString('base64url');
+  const invalidUtf8Payload = Buffer.concat([
+    Buffer.from('{"sub":"safe-subject","ignored":"'),
+    Buffer.from([0xff]),
+    Buffer.from('"}'),
+  ]).toString('base64url');
+  const malformed = [
+    'header.' + payload,
+    'header.' + payload + '.signature.extra',
+    'header.' + payload + '.signature!',
+    'header.' + payload + '!.signature',
+    'header.' + invalidUtf8Payload + '.signature',
+  ];
+
+  for (const accessToken of malformed) {
+    assert.equal(parseJwtPayload(accessToken), null);
+    const token = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/malformed-jwt.json',
+      fileName: 'malformed-jwt.json',
+      mtimeMs: 1,
+      data: { access_token: accessToken },
+    });
+    assert.equal(token.parseStatus, 'invalid');
+    assert.equal(token.accountId, '');
+    assert.equal(token.userId, '');
+    assert.deepEqual(token.identityKeys, []);
+  }
+
+  assert.deepEqual(parseJwtPayload('header.' + payload + '.signature'), {
+    sub: 'must-not-authorize-malformed-jwt',
+  });
 });
 
 test('token parsing rejects secret-like or confusing strong identities without exposing them', () => {
@@ -355,6 +393,43 @@ test('malformed token JSON reports a stable error without parser input fragments
   assert.equal(malformed.parseStatus, 'invalid');
   assert.equal(malformed.parseError, 'token JSON 无效');
   assert.equal(JSON.stringify(malformed).includes('parser-secret-value'), false);
+});
+
+test('source JSON rejects malformed UTF-8 instead of replacing credential or identity bytes', () => {
+  const fixture = fixtureRoot();
+  const tokenPath = path.join(fixture.root, 'tokens', 'invalid-utf8.json');
+  fs.writeFileSync(tokenPath, Buffer.concat([
+    Buffer.from('{"access_token":"invalid-'),
+    Buffer.from([0xff]),
+    Buffer.from('","account_id":"utf8-account"}'),
+  ]));
+
+  const diagnostic = readGptRegisterSources({
+    rootDirectory: fixture.root,
+    includeRaw: true,
+  });
+  const token = diagnostic.tokens.find((item) => item.fileName === 'invalid-utf8.json');
+  assert.equal(token.parseStatus, 'invalid');
+  assert.equal(token.parseError, 'token JSON 无效');
+  assert.equal(Object.prototype.hasOwnProperty.call(token, 'raw'), false);
+  assert.equal(JSON.stringify(token).includes('\ufffd'), false);
+
+  fs.writeFileSync(path.join(fixture.root, 'username.json'), Buffer.concat([
+    Buffer.from('[{"email":"invalid-'),
+    Buffer.from([0xff]),
+    Buffer.from('@example.test","password":"present","status":"oauth_done"}]'),
+  ]));
+  const usernameDiagnostic = readGptRegisterSources({ rootDirectory: fixture.root });
+  assert.deepEqual(usernameDiagnostic.usernames, []);
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    }),
+    (error) => error.code === 'GPT_REGISTER_USERNAME_INVALID'
+      && !String(error.message).includes('\ufffd'),
+  );
 });
 
 test('write-plan source reads reject malformed username JSON', () => {

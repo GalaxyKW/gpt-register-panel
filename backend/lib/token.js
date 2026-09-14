@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { TextDecoder } = require('node:util');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
@@ -9,6 +10,7 @@ const CREDENTIAL_IDENTITY_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|crede
 const CREDENTIAL_IDENTITY_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
 const LONG_OPAQUE_IDENTITY = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
 const RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
+const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]+$/;
 
 function asString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
@@ -84,11 +86,17 @@ function parseDateValue(value) {
 function parseJwtPayload(token) {
   const value = asString(token);
   const parts = value.split('.');
-  if (parts.length < 2) return null;
+  // Only compact JWS tokens have a payload whose claims are meaningful here.
+  // Buffer's base64url decoder is intentionally permissive, so validate the
+  // shape and require a canonical payload segment before trusting identities
+  // or expiry metadata extracted from it.
+  if (parts.length !== 3 || parts.some((part) => !BASE64URL_SEGMENT.test(part))) return null;
   try {
-    const json = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const bytes = Buffer.from(parts[1], 'base64url');
+    if (bytes.length === 0 || bytes.toString('base64url') !== parts[1]) return null;
+    const json = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
     const payload = JSON.parse(json);
-    return payload && typeof payload === 'object' ? payload : null;
+    return payload && typeof payload === 'object' && !Array.isArray(payload) ? payload : null;
   } catch {
     return null;
   }

@@ -1,6 +1,7 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { TextDecoder } = require('node:util');
 const {
   normalizeTokenDocument,
   toSafeTokenSummary,
@@ -33,6 +34,14 @@ const HARD_TOKEN_TOTAL_MAX_BYTES = 1024 * 1024 * 1024;
 const REQUIRED_SOURCE_NAMES = Object.freeze(['tokens', 'use_token', 'username.json']);
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
+
+function decodeUtf8Json(bytes) {
+  // Buffer#toString silently replaces malformed byte sequences with U+FFFD.
+  // That can turn a damaged credential or identity into a different, yet
+  // syntactically valid, JSON value. Source bytes must therefore decode
+  // losslessly before they can participate in a snapshot or write plan.
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+}
 
 function gptPathError(label, cause) {
   const error = new Error(label + ' 不存在、不可读取、已变化或包含符号链接');
@@ -479,7 +488,7 @@ function readJsonArraySnapshot(filePath, options = {}) {
     assertDirectoryHandleCurrent(rootHandle, 'JSON 父目录');
     const contentHash = crypto.createHash('sha256').update(bytes).digest('hex');
     try {
-      const value = JSON.parse(bytes.toString('utf8'));
+      const value = JSON.parse(decodeUtf8Json(bytes));
       if (options.requireValidJson === true
           && !Array.isArray(value)
           && (!value || typeof value !== 'object')) {
@@ -1008,7 +1017,7 @@ function readTokenDirectory(directory, source, rootDirectory, includeRaw = false
       const contentHash = crypto.createHash('sha256').update(bytes).digest('hex');
       let data;
       let parseError = null;
-      try { data = JSON.parse(bytes.toString('utf8')); } catch {
+      try { data = JSON.parse(decodeUtf8Json(bytes)); } catch {
         parseError = new Error('token JSON 无效');
         parseError.code = 'TOKEN_JSON_INVALID';
       }
