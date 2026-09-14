@@ -788,6 +788,49 @@ test('logger secures the full rotated namespace and refuses unsafe rotation targ
   assert.equal(fs.readFileSync(runtimeOutside, 'utf8'), 'outside-original\n');
 });
 
+test('logger scans its directory with a bounded stream instead of an unbounded readdir', () => {
+  const streamingDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-stream-'));
+  const streamingPath = path.join(streamingDirectory, 'panel.log');
+  const originalReaddirSync = fs.readdirSync;
+  fs.readdirSync = function rejectUnboundedLoggerRead() {
+    throw new Error('logger must not materialize the complete directory');
+  };
+  try {
+    const logger = new PanelLogger({ filePath: streamingPath, console: false });
+    assert.equal(logger.health().healthy, true);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+  }
+
+  const oversizedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-scan-limit-'));
+  const oversizedPath = path.join(oversizedDirectory, 'panel.log');
+  const originalOpenDirectory = fs.opendirSync;
+  let closed = false;
+  fs.opendirSync = function syntheticOversizedDirectory(target, ...args) {
+    if (!String(target).startsWith('/proc/self/fd/') && path.resolve(String(target)) !== oversizedDirectory) {
+      return originalOpenDirectory.call(fs, target, ...args);
+    }
+    let index = 0;
+    return {
+      readSync() {
+        index += 1;
+        return index <= 20_001 ? { name: 'unrelated-' + String(index) } : null;
+      },
+      closeSync() { closed = true; },
+    };
+  };
+  try {
+    assert.throws(
+      () => new PanelLogger({ filePath: oversizedPath, console: false }),
+      { code: 'PANEL_LOG_INITIALIZATION_FAILED' },
+    );
+  } finally {
+    fs.opendirSync = originalOpenDirectory;
+  }
+  assert.equal(closed, true);
+  assert.equal(fs.existsSync(oversizedPath), false);
+});
+
 test('fatal stderr formatting preserves a bounded stack without exposing credentials', () => {
   const script = [
     "const { safeErrorText } = require('./backend/logger');",

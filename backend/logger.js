@@ -25,6 +25,10 @@ const STORED_REDACTION_LIMITS = Object.freeze({
 });
 const MAX_LOG_ENTRY_BYTES = 256 * 1024;
 const MAX_LOG_NAMESPACE_FILES = 1000;
+// Count every directory entry, not only files in the rotation namespace. A
+// directory full of unrelated names must not make startup materialize an
+// unbounded readdir result before the namespace limit can be enforced.
+const MAX_LOG_DIRECTORY_ENTRIES = 20_000;
 const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
@@ -662,12 +666,31 @@ class PanelLogger {
   validateLogNamespace(pinnedDirectory, currentUid) {
     this.assertPinnedDirectory(pinnedDirectory);
     const baseName = path.basename(this.filePath);
-    const names = fs.readdirSync(pinnedDirectory.accessDirectory)
-      .filter((name) => name === baseName
-        || (name.startsWith(baseName + '.') && /^\d+$/.test(name.slice(baseName.length + 1))));
-    if (names.length > MAX_LOG_NAMESPACE_FILES) {
-      throw new Error('日志轮转文件数量超过安全上限');
+    const names = [];
+    let entryCount = 0;
+    let directory;
+    try {
+      directory = fs.opendirSync(pinnedDirectory.accessDirectory);
+      for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+        entryCount += 1;
+        if (entryCount > MAX_LOG_DIRECTORY_ENTRIES) {
+          throw new Error('日志目录条目数量超过安全上限');
+        }
+        const name = entry.name;
+        if (name === baseName
+            || (name.startsWith(baseName + '.') && /^\d+$/.test(name.slice(baseName.length + 1)))) {
+          names.push(name);
+          if (names.length > MAX_LOG_NAMESPACE_FILES) {
+            throw new Error('日志轮转文件数量超过安全上限');
+          }
+        }
+      }
+    } finally {
+      if (directory) {
+        directory.closeSync();
+      }
     }
+    this.assertPinnedDirectory(pinnedDirectory);
     let permissionsChanged = false;
     for (const name of names) {
       permissionsChanged = this.validateExistingLogFile(
