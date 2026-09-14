@@ -157,6 +157,50 @@ test('free-text redaction covers compound headers, structured values, and opaque
   assert.equal(longUrl, 'https://[redacted]@host.example/path');
 });
 
+test('redaction covers private-key material and common cloud signing credentials', () => {
+  const pemSecret = [
+    '-----BEGIN PRIVATE KEY-----',
+    'fake-private-pem-material',
+    '-----END PRIVATE KEY-----',
+  ].join('\n');
+  const structured = redactValue({
+    privateKey: 'fake-structured-private-key',
+    secretAccessKey: 'fake-cloud-secret-access-key',
+    accessKeyId: 'fake-cloud-access-key-id',
+    signingKey: 'fake-signing-key',
+    keyMaterial: 'fake-key-material',
+    diagnostic: pemSecret,
+    privateKeyFingerprint: 'safe-private-key-fingerprint',
+  });
+  for (const key of [
+    'privateKey',
+    'secretAccessKey',
+    'accessKeyId',
+    'signingKey',
+    'keyMaterial',
+  ]) assert.equal(structured[key], '[redacted]');
+  assert.equal(structured.diagnostic.includes('fake-private-pem-material'), false);
+  assert.equal(structured.privateKeyFingerprint, 'safe-private-key-fingerprint');
+
+  const freeText = redactText([
+    'private_key=fake-assigned-private-key',
+    'secret access key fake-space-cloud-key accepted',
+    'signing key: "fake signing key value"',
+    pemSecret,
+  ].join('; '));
+  for (const secret of [
+    'fake-assigned-private-key',
+    'fake-space-cloud-key',
+    'fake signing key value',
+    'fake-private-pem-material',
+  ]) assert.equal(freeText.includes(secret), false, secret + ' leaked');
+
+  const incompletePem = redactText(
+    'failure: -----BEGIN OPENSSH PRIVATE KEY-----\nfake-incomplete-private-material',
+  );
+  assert.equal(incompletePem.includes('fake-incomplete-private-material'), false);
+});
+
 test('logger startup writes and fsyncs one valid JSONL preflight record', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
   const filePath = path.join(directory, 'panel.log');
