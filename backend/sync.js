@@ -1445,7 +1445,7 @@ function buildCodexSessionDocument(item) {
   };
 }
 
-function buildCodexImportIdempotencyKey(item, context = {}) {
+function buildCodexImportIdempotencyKey(item) {
   const contentHash = String(item?._record?.contentHash || '').toLowerCase();
   const strongIdentity = [];
   for (const prefix of ['account:', 'user:']) {
@@ -1455,7 +1455,6 @@ function buildCodexImportIdempotencyKey(item, context = {}) {
   }
   strongIdentity.sort((left, right) => left.localeCompare(right, 'en'));
   const material = {
-    jobId: String(context?.jobId || ''),
     action: 'create',
     sourceIdentityKeys: strongIdentity,
     sourceContentHash: /^[a-f0-9]{64}$/.test(contentHash) ? contentHash : '',
@@ -1469,13 +1468,16 @@ function buildCodexImportIdempotencyKey(item, context = {}) {
     targetName: String(item?.accountName || ''),
   };
   const digest = crypto.createHash('sha256')
-    .update('gpt-register-panel/create/v1\n')
+    .update('gpt-register-panel/create/v2\n')
     .update(JSON.stringify(material))
     .digest('hex');
-  // Printable ASCII, 81 bytes. The key contains only a domain label and a
-  // one-way digest; raw tokens, identities and account names never cross the
-  // HTTP header or logs through this value.
-  return 'gptreg-create-v1-' + digest;
+  // The key deliberately excludes job IDs, timestamps and randomness. The
+  // same immutable create intent therefore keeps one key across queued-job
+  // retries and separately submitted jobs. This protects an unknown remote
+  // outcome from being turned into a duplicate create merely by submitting a
+  // new panel job. Printable ASCII, 81 bytes; raw tokens, identities and names
+  // never cross the HTTP header or logs through this one-way digest.
+  return 'gptreg-create-v2-' + digest;
 }
 
 function canonicalIdentitySet(keys = []) {
@@ -1780,7 +1782,7 @@ async function executeImportPlanItem({
     skip_default_group_bind: false,
     confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
   };
-  const idempotencyKey = buildCodexImportIdempotencyKey(writeItem, context);
+  const idempotencyKey = buildCodexImportIdempotencyKey(writeItem);
   throwIfJobInterrupted(signal);
   let writeResponseReceived = false;
   let rawResult = null;

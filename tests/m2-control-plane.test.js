@@ -2017,7 +2017,7 @@ test('create preflight requires a canonical name and rejects casefold-equivalent
   assert.equal(writes, 0);
 });
 
-test('Codex create documents use the current expiry field and deterministic secret-free keys', () => {
+test('Codex create documents use the current expiry field and cross-job stable secret-free keys', () => {
   const accessSecret = 'access-secret-must-not-enter-header';
   const refreshSecret = 'refresh-secret-must-not-enter-header';
   const source = syntheticToken(
@@ -2042,7 +2042,7 @@ test('Codex create documents use the current expiry field and deterministic secr
 
   const context = { jobId: 'durable-job-123' };
   const first = buildCodexImportIdempotencyKey(item, context);
-  const retry = buildCodexImportIdempotencyKey(item, { ...context });
+  const retry = buildCodexImportIdempotencyKey(item, { jobId: 'different-job-456' });
   assert.equal(first, retry);
   assert.equal(buildCodexImportIdempotencyKey({
     ...item,
@@ -2052,7 +2052,7 @@ test('Codex create documents use the current expiry field and deterministic secr
       'user:idempotent-user',
     ],
   }, context), first);
-  assert.match(first, /^gptreg-create-v1-[a-f0-9]{64}$/);
+  assert.match(first, /^gptreg-create-v2-[a-f0-9]{64}$/);
   assert.equal(first.length <= 128, true);
   assert.match(first, /^[\x21-\x7e]+$/);
   for (const secret of [accessSecret, refreshSecret, source.email, source.accountId, source.userId]) {
@@ -2076,7 +2076,7 @@ test('Codex create documents use the current expiry field and deterministic secr
     ...item,
     sourceIdentityKeys: ['account:another-account', 'user:idempotent-user'],
   }, context), first);
-  assert.notEqual(buildCodexImportIdempotencyKey(item, { jobId: 'another-job' }), first);
+  assert.equal(buildCodexImportIdempotencyKey(item, { jobId: 'another-job' }), first);
 });
 
 test('candidate grouping merges partial versions but keeps different workspace users separate', () => {
@@ -3366,7 +3366,7 @@ test('create verification consumes the nested Codex import account ID', async ()
   assert.equal(importDocument.expires_at, source.expiresAt);
   assert.equal(Object.hasOwn(importDocument, 'expired'), false);
   assert.match(importPayload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
-  assert.match(importOptions.idempotencyKey, /^gptreg-create-v1-[a-f0-9]{64}$/);
+  assert.match(importOptions.idempotencyKey, /^gptreg-create-v2-[a-f0-9]{64}$/);
   assert.equal(importOptions.idempotencyKey.includes(source.raw.access_token), false);
   assert.equal(importOptions.idempotencyKey.includes(source.raw.refresh_token), false);
   assert.equal(outcome.result.accountId, 42);
@@ -3586,7 +3586,7 @@ test('create postflight fails closed on a concurrent duplicate strong identity',
         async importCodexSession(payload, options) {
           importCalls += 1;
           assert.equal(payload.update_existing, false);
-          assert.match(options.idempotencyKey, /^gptreg-create-v1-/);
+          assert.match(options.idempotencyKey, /^gptreg-create-v2-/);
           return {
             total: 1,
             created: 1,
