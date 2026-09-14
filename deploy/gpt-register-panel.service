@@ -23,9 +23,11 @@ Group=root
 WorkingDirectory=/mnt/nvme/item/gpt-register-panel
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# The executable entrypoint validates and loads the project .env itself. Do not
-# copy credentials into this unit or expose them through EnvironmentFile.
-ExecStartPre=/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/.env
+# Keep secrets on a filesystem that enforces Unix permissions. PANEL_ENV_FILE
+# contains only a path; credentials are never copied into the unit or exposed
+# through EnvironmentFile/systemd's environment inspection interfaces.
+Environment=PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env
+ExecStartPre=/usr/bin/test -r /etc/gpt-register-panel/panel.env
 ExecStartPre=/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/backend/server.js
 ExecStartPre=/usr/bin/test -d /mnt/nvme/gpt_register
 ExecStartPre=/usr/bin/test -d /mnt/nvme/item/gpt-register-panel/runtime
@@ -71,6 +73,10 @@ ReadOnlyPaths=-/mnt/nvme/gpt_register/config.json
 ReadOnlyPaths=-/mnt/nvme/gpt_register/config.local.json
 ReadOnlyPaths=-/mnt/nvme/gpt_register/config.server.json
 ReadOnlyPaths=-/mnt/nvme/gpt_register/cloudflare-email-worker.js
+ReadOnlyPaths=/etc/gpt-register-panel/panel.env
+# The legacy project-local file may live on NTFS and cannot reliably enforce
+# 0600. Hide it from the service after migrating its values to /etc.
+InaccessiblePaths=-/mnt/nvme/item/gpt-register-panel/.env
 InaccessiblePaths=-/mnt/nvme/item/gpt-register-panel/.git
 InaccessiblePaths=-/mnt/nvme/gpt_register/.git
 ProtectHostname=true

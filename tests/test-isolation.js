@@ -8,6 +8,7 @@ const path = require('node:path');
 // preloaded by `npm test` and is also required by each test file before any
 // application module, so direct `node --test tests/foo.test.js` runs are safe.
 const deploymentVariables = [
+  'PANEL_ENV_FILE',
   'SUB2API_BASE_URL',
   'SUB2API_ADMIN_API_KEY',
   'SUB2API_JWT',

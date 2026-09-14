@@ -8,6 +8,7 @@ require('./test-isolation');
 
 const {
   BOOLEAN_ENV_NAMES,
+  configuredEnvFile,
   loadEnv,
   readEnvFile,
   validateBooleanEnvironment,
@@ -16,7 +17,11 @@ const {
 test('loadEnv reads a regular file without overwriting existing environment values', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-'));
   const filePath = path.join(directory, '.env');
-  fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_NEW=loaded\nPANEL_CONFIG_TEST_EXISTING=replaced\n');
+  fs.writeFileSync(
+    filePath,
+    'PANEL_CONFIG_TEST_NEW=loaded\nPANEL_CONFIG_TEST_EXISTING=replaced\n',
+    { mode: 0o600 },
+  );
   const environment = { PANEL_CONFIG_TEST_EXISTING: 'kept' };
   assert.equal(loadEnv(filePath, environment), true);
   assert.equal(environment.PANEL_CONFIG_TEST_NEW, 'loaded');
@@ -31,7 +36,7 @@ test('loadEnv rejects duplicate keys without partially applying earlier values',
     'PANEL_CONFIG_TEST_DUPLICATE=first',
     'PANEL_CONFIG_TEST_DUPLICATE=second',
     '',
-  ].join('\n'));
+  ].join('\n'), { mode: 0o600 });
   // Duplicate detection must not be bypassed just because the parent process
   // already supplied the same key and would otherwise win precedence.
   const environment = { PANEL_CONFIG_TEST_DUPLICATE: 'parent-value' };
@@ -58,7 +63,7 @@ test('loadEnv validates boolean settings before applying any values', () => {
     'PANEL_CONFIG_TEST_ATOMIC=must-not-apply',
     'PANEL_WRITE_ENABLED=true',
     '',
-  ].join('\n'));
+  ].join('\n'), { mode: 0o600 });
   const environment = {};
   assert.throws(
     () => loadEnv(filePath, environment),
@@ -83,12 +88,39 @@ test('every declared boolean environment setting accepts only 0 or 1', () => {
   }
 });
 
+test('configured environment file must be an explicit absolute path', () => {
+  const selected = path.join(os.tmpdir(), 'panel.env');
+  assert.equal(configuredEnvFile({ PANEL_ENV_FILE: selected }), selected);
+  assert.throws(
+    () => configuredEnvFile({ PANEL_ENV_FILE: 'relative.env' }),
+    (error) => error.code === 'ENV_FILE_PATH_INVALID',
+  );
+  assert.throws(
+    () => configuredEnvFile({ PANEL_ENV_FILE: '' }),
+    (error) => error.code === 'ENV_FILE_PATH_INVALID',
+  );
+  assert.throws(
+    () => readEnvFile('relative.env'),
+    (error) => error.code === 'ENV_FILE_PATH_INVALID',
+  );
+});
+
+test('loadEnv uses PANEL_ENV_FILE without exposing or copying its values', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-external-env-'));
+  const filePath = path.join(directory, 'panel.env');
+  fs.writeFileSync(filePath, 'PANEL_CONFIG_EXTERNAL=loaded\n', { mode: 0o600 });
+  const environment = { PANEL_ENV_FILE: filePath };
+  assert.equal(loadEnv(undefined, environment), true);
+  assert.equal(environment.PANEL_CONFIG_EXTERNAL, 'loaded');
+  assert.equal(environment.PANEL_ENV_FILE, filePath);
+});
+
 test('readEnvFile rejects final and parent-directory symlinks', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-'));
   const realDirectory = path.join(directory, 'real');
   fs.mkdirSync(realDirectory);
   const realFile = path.join(realDirectory, '.env');
-  fs.writeFileSync(realFile, 'PANEL_CONFIG_TEST_VALUE=fake\n');
+  fs.writeFileSync(realFile, 'PANEL_CONFIG_TEST_VALUE=fake\n', { mode: 0o600 });
   const fileLink = path.join(directory, 'linked.env');
   const directoryLink = path.join(directory, 'linked-directory');
   fs.symlinkSync(realFile, fileLink);
@@ -96,11 +128,11 @@ test('readEnvFile rejects final and parent-directory symlinks', () => {
 
   assert.throws(
     () => readEnvFile(fileLink),
-    (error) => error.code === 'ENV_PATH_INVALID',
+    (error) => error.code === 'ENV_FILE_TYPE_INVALID',
   );
   assert.throws(
     () => readEnvFile(path.join(directoryLink, '.env')),
-    (error) => error.code === 'ENV_PATH_INVALID',
+    (error) => error.code === 'ENV_PARENT_INVALID',
   );
   assert.equal(readEnvFile(path.join(directory, 'missing.env')), null);
 });
@@ -113,8 +145,12 @@ test('readEnvFile pins the verified parent before opening the file', () => {
   fs.mkdirSync(trustedDirectory);
   fs.mkdirSync(outsideDirectory);
   const filePath = path.join(trustedDirectory, '.env');
-  fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_VALUE=trusted\n');
-  fs.writeFileSync(path.join(outsideDirectory, '.env'), 'PANEL_CONFIG_TEST_VALUE=outside\n');
+  fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_VALUE=trusted\n', { mode: 0o600 });
+  fs.writeFileSync(
+    path.join(outsideDirectory, '.env'),
+    'PANEL_CONFIG_TEST_VALUE=outside\n',
+    { mode: 0o600 },
+  );
 
   const originalOpenSync = fs.openSync;
   let swapped = false;
@@ -129,7 +165,7 @@ test('readEnvFile pins the verified parent before opening the file', () => {
   try {
     assert.throws(
       () => readEnvFile(filePath),
-      (error) => error.code === 'ENV_PATH_INVALID',
+      (error) => error.code === 'ENV_FILE_CHANGED',
     );
   } finally {
     fs.openSync = originalOpenSync;
@@ -143,14 +179,14 @@ test('readEnvFile pins the verified parent before opening the file', () => {
 test('readEnvFile rejects oversized and concurrently modified environment files', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-env-'));
   const oversized = path.join(directory, 'oversized.env');
-  fs.writeFileSync(oversized, Buffer.alloc(1024 * 1024 + 1, 0x78));
+  fs.writeFileSync(oversized, Buffer.alloc(1024 * 1024 + 1, 0x78), { mode: 0o600 });
   assert.throws(
     () => readEnvFile(oversized),
-    (error) => error.code === 'ENV_PATH_INVALID',
+    (error) => error.code === 'ENV_FILE_TOO_LARGE',
   );
 
   const changing = path.join(directory, 'changing.env');
-  fs.writeFileSync(changing, 'SAFE_VALUE=fake\n');
+  fs.writeFileSync(changing, 'SAFE_VALUE=fake\n', { mode: 0o600 });
   const originalReadSync = fs.readSync;
   let modified = false;
   fs.readSync = function guardedRead(descriptor, ...args) {
@@ -164,21 +200,29 @@ test('readEnvFile rejects oversized and concurrently modified environment files'
   try {
     assert.throws(
       () => readEnvFile(changing),
-      (error) => error.code === 'ENV_PATH_INVALID',
+      (error) => error.code === 'ENV_FILE_CHANGED',
     );
   } finally {
     fs.readSync = originalReadSync;
   }
 });
 
-test('readEnvFile rejects writable-by-others and multiply linked secret files', () => {
+test('readEnvFile rejects any group or other access and multiply linked secret files', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-env-permissions-'));
   const writable = path.join(directory, 'writable.env');
   fs.writeFileSync(writable, 'SAFE_VALUE=fake\n', { mode: 0o600 });
   fs.chmodSync(writable, 0o666);
   assert.throws(
     () => readEnvFile(writable),
-    (error) => error.code === 'ENV_PATH_INVALID',
+    (error) => error.code === 'ENV_FILE_PERMISSIONS_INVALID',
+  );
+
+  const readable = path.join(directory, 'readable.env');
+  fs.writeFileSync(readable, 'SAFE_VALUE=fake\n', { mode: 0o600 });
+  fs.chmodSync(readable, 0o644);
+  assert.throws(
+    () => readEnvFile(readable),
+    (error) => error.code === 'ENV_FILE_PERMISSIONS_INVALID',
   );
 
   const linked = path.join(directory, 'linked.env');
@@ -187,6 +231,6 @@ test('readEnvFile rejects writable-by-others and multiply linked secret files', 
   fs.linkSync(linked, secondName);
   assert.throws(
     () => readEnvFile(linked),
-    (error) => error.code === 'ENV_PATH_INVALID',
+    (error) => error.code === 'ENV_FILE_LINK_INVALID',
   );
 });

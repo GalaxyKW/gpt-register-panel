@@ -52,10 +52,12 @@ test('systemd unit pins its executable and refuses a missing or read-only data m
     '/usr/bin/node /mnt/nvme/item/gpt-register-panel/backend/server.js',
   );
   assert.equal(values(unit, 'Service', 'EnvironmentFile').length, 0);
+  assert.ok(values(unit, 'Service', 'Environment')
+    .includes('PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env'));
   assert.equal(/(?:^|\s)(?:\/bin\/)?(?:ba|z|da)?sh(?:\s|$)/m.test(source), false);
 
   const preflight = values(unit, 'Service', 'ExecStartPre');
-  assert.ok(preflight.includes('/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/.env'));
+  assert.ok(preflight.includes('/usr/bin/test -r /etc/gpt-register-panel/panel.env'));
   assert.ok(preflight.includes('/usr/bin/test -x /usr/bin/node'));
   assert.ok(preflight.includes('/usr/bin/test -d /mnt/nvme/item/gpt-register-panel/runtime'));
 });
@@ -92,6 +94,9 @@ test('systemd unit limits privilege and writable scope without blocking Phase3 n
   assert.ok(protectedPhase3Paths.includes('/mnt/nvme/gpt_register/index.js'));
   assert.ok(protectedPhase3Paths.includes('/mnt/nvme/gpt_register/src'));
   assert.ok(protectedPhase3Paths.includes('/mnt/nvme/gpt_register/node_modules'));
+  assert.ok(protectedPhase3Paths.includes('/etc/gpt-register-panel/panel.env'));
+  assert.ok(values(unit, 'Service', 'InaccessiblePaths')
+    .includes('-/mnt/nvme/item/gpt-register-panel/.env'));
   assert.ok(values(unit, 'Service', 'InaccessiblePaths')
     .includes('-/mnt/nvme/gpt_register/.git'));
 });

@@ -19,32 +19,53 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 默认只读取 gpt_register 文件：
 
-    npm run snapshot
+    PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env npm run snapshot
 
 同时读取 Sub2API 管理 API：
 
     SUB2API_BASE_URL=http://127.0.0.1:8080 \
     SUB2API_ADMIN_API_KEY=... \
+    PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env \
     npm run snapshot:sub2api
 
 也可以使用 SUB2API_JWT 代替管理员 API key。输出只包含邮箱、编号、状态、过期时间、统计和 token 指纹，不包含 token 原文、密码或验证码。
 
 ## WebUI（默认只读）
 
-    cp .env.example .env
-    # 在 .env 中填写有效的 Sub2API 管理 API key 或 JWT，以及随机的 PANEL_ADMIN_TOKEN
-    npm start
+先安装 Node.js 18.17 或更高版本，并按锁文件安装依赖：
+
+    node --version
+    npm ci
+
+敏感配置必须位于支持 Unix 权限的文件系统，文件由启动面板的账号持有且权限不宽于 `0600`。可用 `PANEL_ENV_FILE` 指定绝对路径；不要在 NTFS 上的项目目录中继续使用无法落实私有权限的 `.env`：
+
+    sudo install -d -o root -g root -m 0700 /etc/gpt-register-panel
+    sudo install -o root -g root -m 0600 .env.example /etc/gpt-register-panel/panel.env
+    sudoedit /etc/gpt-register-panel/panel.env
+    sudo env PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env npm start
+
+在 `panel.env` 中填写有效的 Sub2API 管理 API key 或 JWT，以及至少 16 位的随机 `PANEL_ADMIN_TOKEN`。项目本地 `.env` 只保留为开发兼容默认值，也必须满足相同权限检查；父进程已有的环境变量优先于文件中的同名配置。
 
 默认只监听 127.0.0.1:4170，打开 http://127.0.0.1:4170/ 即可查看账号表格。页面支持筛选、搜索、勾选、差异预览、上游账号测试和任务查询；模型列表会优先从 Sub2API 读取，并保证可选择 `5.6-luna`（实际请求 ID 为 `gpt-5.6-luna`）。
 
 ## systemd 服务
 
-仓库提供 `deploy/gpt-register-panel.service`。该 unit 直接执行固定的 `/usr/bin/node` 和 `backend/server.js`，由应用自身安全读取项目 `.env`，不会把管理员令牌或 Sub2API 凭据复制到 systemd 配置中。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+仓库提供 `deploy/gpt-register-panel.service`。该 unit 直接执行固定的 `/usr/bin/node` 和 `backend/server.js`，通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
 
-安装并启用：
+首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json` 和所需配置，并创建 unit 要求的运行目录。若已有项目本地 `.env`，可在不打印内容的情况下把它迁移为私有配置，然后立即更换过短或已暴露的令牌：
+
+    cd /mnt/nvme/item/gpt-register-panel
+    npm ci
+    sudo install -d -o root -g root -m 0700 runtime /etc/gpt-register-panel
+    sudo test -d /mnt/nvme/tmp
+    sudo install -o root -g root -m 0600 .env /etc/gpt-register-panel/panel.env
+    sudoedit /etc/gpt-register-panel/panel.env
+
+迁移完成后应轮换其中全部秘密，并在确认新服务正常后退役项目目录中的旧 `.env`；仅在 unit 中隐藏旧文件不能阻止其他本机用户直接读取 NTFS 上的副本。确认新配置属于实际服务账号且权限为 `0600` 后，再安装并启用：
 
     sudo install -o root -g root -m 0644 deploy/gpt-register-panel.service /etc/systemd/system/gpt-register-panel.service
     sudo systemctl daemon-reload
+    sudo systemd-analyze verify /run/systemd/generator/mnt-nvme.mount /etc/systemd/system/gpt-register-panel.service
     sudo systemctl enable --now gpt-register-panel.service
 
 常用操作：
@@ -54,7 +75,7 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
     sudo systemctl stop gpt-register-panel.service
     journalctl -u gpt-register-panel.service -n 100 --no-pager
 
-服务不仅声明 `RequiresMountsFor=/mnt/nvme`，还绑定对应 mount unit，并要求该路径确实是可写挂载点：这既避免磁盘未挂载时把生产数据写入根分区下的同名目录，也会在运行中挂载消失时停止面板。异常退出会自动重启；停止时先向主进程发送 SIGTERM，让面板在最长 40 秒内停止接收任务、终止 Phase3 并落库，45 秒总期限到达后 systemd 会清理整个 cgroup。
+服务不仅声明 `RequiresMountsFor=/mnt/nvme`，还绑定对应 mount unit，并要求该路径确实是可写挂载点：这既避免磁盘未挂载时把生产数据写入根分区下的同名目录，也会在运行中挂载消失时停止面板。异常退出会自动重启；停止时先向主进程发送 SIGTERM，应用默认等待任务 10 秒且硬上限为 12 秒，45 秒总期限到达后 systemd 会清理整个 cgroup。挂载消失后，即使磁盘稍后恢复，也不能假定面板会自动回来；先用 `findmnt` 确认同一设备已在 `/mnt/nvme` 可写挂载，再检查并显式启动服务。
 
 unit 使用只读文件系统视图，只开放以下默认写路径：
 
@@ -64,9 +85,9 @@ unit 使用只读文件系统视图，只开放以下默认写路径：
 
 `gpt_register` 根目录必须可写，因为 Phase3 会在其中原子替换 `username.json` 等状态文件；unit 会把 `index.js`、`src`、`node_modules`、包清单和配置文件重新覆盖为只读，并隐藏两个项目的 `.git`。同时启用私有设备视图、禁止子进程新建 namespace、禁用 core dump、限制进程数和 socket address family；保留 Chromium/Xvfb 所需的 Unix、IPv4、IPv6 与 netlink socket。上线新版 unit 前仍应在真实环境跑一次非破坏性的 Phase3 验证，因为 Chromium 或显示环境升级可能引入新的设备需求。
 
-模板按上述固定默认路径收口。若 `.env` 或 `gpt_register/config.json` 把数据库、日志、备份、隔离目录、token 输出目录、浏览器 profile 或截图目录移到其他位置，只改应用配置还不够；应在 unit 中加入对应的精确可信路径，并保留代码及配置的只读覆盖，不能直接把 `/`、`/mnt` 或整个 `/mnt/nvme` 设为可写。所有列入 `ReadWritePaths` 的目录必须在服务启动前存在且由服务账号安全持有。
+模板按上述固定默认路径收口。若 `panel.env` 或 `gpt_register/config.json` 把数据库、日志、备份、隔离目录、控制面锁、token 输出目录、浏览器 profile 或截图目录移到其他位置，只改应用配置还不够；应在 unit 中加入对应的精确可信路径，并保留代码及配置的只读覆盖。若 `GPT_REGISTER_ROOT` 或挂载点变化，还必须同步修改全部启动检查、`RequiresMountsFor`、`BindsTo` 和读写路径；不能直接把 `/`、`/mnt` 或整个 `/mnt/nvme` 设为可写。所有列入 `ReadWritePaths` 的目录必须在服务启动前存在且由服务账号安全持有。
 
-修改项目 `.env`、代码或 unit 后使用 `systemctl restart` 生效；不要把真实凭据写入 unit 或提交到仓库。安装前可做静态校验：
+修改 `/etc/gpt-register-panel/panel.env` 或应用代码后使用 `systemctl restart` 生效。修改仓库中的 unit 时，必须重新执行 `install`、`systemctl daemon-reload`、静态校验和维护窗口重启；单独 `restart` 不会安装仓库副本。不要把真实凭据写入 unit 或提交到仓库。安装前可做静态校验：
 
     systemd-analyze verify /run/systemd/generator/mnt-nvme.mount deploy/gpt-register-panel.service
 
@@ -89,7 +110,7 @@ unit 使用只读文件系统视图，只开放以下默认写路径：
 
 配置了 `PANEL_ADMIN_TOKEN` 或启用 `PANEL_REQUIRE_AUTH=1` 后，所有 `/api/*` 接口都需要通过 `x-panel-token` 或 `Authorization: Bearer ...` 访问；WebUI 收到 401 会提示输入令牌并仅保存在当前浏览器会话。客户端不能通过 `x-panel-actor` 伪造审计操作者，日志中的操作者只会是 `panel-admin`、`local` 或 `anonymous`。认证失败按来源地址限流，超过阈值会短暂返回 429。日志会自动脱敏 access/refresh/id token、JWT、Bearer、API key、密码和 Phase 3 输出，不记录请求体或 token 原文。
 
-示例配置默认 `PANEL_REQUIRE_AUTH=1`。`PANEL_ADMIN_TOKEN` 应使用至少 16 个字符的随机值，并放在未提交的 `.env` 中。若将 `PANEL_HOST` 改成非回环地址，没有管理员令牌时面板会拒绝启动；只有明确设置 `PANEL_ALLOW_INSECURE_REMOTE=1` 才会放行（不建议）。
+示例配置默认 `PANEL_REQUIRE_AUTH=1`。`PANEL_ADMIN_TOKEN` 应使用至少 16 个字符的随机值，并放在仓库外的私有 `panel.env` 中。若将 `PANEL_HOST` 改成非回环地址，没有管理员令牌时面板会拒绝启动；只有明确设置 `PANEL_ALLOW_INSECURE_REMOTE=1` 才会放行（不建议）。
 
 ## 写入开关
 
@@ -120,4 +141,4 @@ Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 
 
 Sub2API 管理地址使用明文 HTTP 时只允许回环主机；其他主机必须使用 HTTPS。仅在完全受控网络中才能显式设置 `SUB2API_ALLOW_INSECURE_HTTP=1`，该开关会让管理凭据和 OAuth 更新暴露于明文链路，因此不建议启用。
 
-生产环境的 API 凭据应放在未提交的 `.env` 中，`PANEL_ADMIN_TOKEN` 至少 16 个随机字符（建议使用更长的高熵值），并保持 `PANEL_ALLOW_INSECURE_WRITE=0`。建议 `.env`、`username.json`、token JSON、日志、SQLite 和备份文件权限为 0600，包含它们的 `tokens`、`use_token`、`runtime`、备份及隔离目录权限为 0700，并使用专用低权限服务账号运行。若挂载参数、ACL 或文件系统无法落实这些权限，应先修正挂载策略或把敏感文件迁移到支持权限隔离的存储，再开放网络访问。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。Sub2API 升级后先运行 `npm test` 和只读快照，确认管理员 API 契约再打开写入开关。
+生产环境的 API 凭据应放在仓库外的私有 `panel.env` 中，`PANEL_ADMIN_TOKEN` 至少 16 个随机字符（建议使用更长的高熵值），并保持 `PANEL_ALLOW_INSECURE_WRITE=0`。建议 `panel.env`、`username.json`、token JSON、日志、SQLite 和备份文件权限为 0600，包含它们的 `tokens`、`use_token`、`runtime`、备份及隔离目录权限为 0700，并使用专用低权限服务账号运行。若挂载参数、ACL 或文件系统无法落实这些权限，应先修正挂载策略或把敏感文件迁移到支持权限隔离的存储，再开放网络访问。公开 GitHub 仓库不应包含 tokens、use_token、browser-profile、备份、SQLite 数据库或日志。Sub2API 升级后先运行 `npm test` 和只读快照，确认管理员 API 契约再打开写入开关。

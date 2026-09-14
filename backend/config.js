@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const MAX_ENV_BYTES = 1024 * 1024;
+const DEFAULT_ENV_FILE = path.resolve(__dirname, '..', '.env');
 const BOOLEAN_ENV_NAMES = Object.freeze([
   'PANEL_LOG_CONSOLE',
   'PANEL_REQUIRE_AUTH',
@@ -23,9 +24,9 @@ function parseValue(value) {
   return trimmed;
 }
 
-function envPathError() {
-  const error = new Error('.env 必须是位于非符号链接目录中的普通文件');
-  error.code = 'ENV_PATH_INVALID';
+function envPathError(code = 'ENV_PATH_INVALID', message = '环境配置必须是位于可信目录中的私有普通文件') {
+  const error = new Error(message);
+  error.code = code;
   return error;
 }
 
@@ -90,13 +91,33 @@ function sameFileState(left, right) {
     && left.ctimeMs === right.ctimeMs;
 }
 
-function secureEnvFileStat(stat) {
+function envFileStatError(stat) {
   const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
-  return stat.isFile()
-    && !stat.isSymbolicLink()
-    && stat.nlink === 1
-    && (currentUid === null || stat.uid === currentUid)
-    && (stat.mode & 0o022) === 0;
+  if (!stat?.isFile() || stat.isSymbolicLink()) {
+    return envPathError('ENV_FILE_TYPE_INVALID', '环境配置必须是普通文件且不能是符号链接');
+  }
+  if (stat.nlink !== 1) {
+    return envPathError('ENV_FILE_LINK_INVALID', '环境配置不能有额外硬链接');
+  }
+  if (currentUid !== null && stat.uid !== currentUid) {
+    return envPathError('ENV_FILE_OWNER_INVALID', '环境配置必须由服务账号持有');
+  }
+  if ((stat.mode & 0o400) === 0 || (stat.mode & 0o077) !== 0) {
+    return envPathError(
+      'ENV_FILE_PERMISSIONS_INVALID',
+      '环境配置必须可由所有者读取且不能授予组或其他用户任何权限',
+    );
+  }
+  return null;
+}
+
+function assertSecureEnvFileStat(stat) {
+  const error = envFileStatError(stat);
+  if (error) throw error;
+}
+
+function isEnvironmentFileError(error) {
+  return typeof error?.code === 'string' && error.code.startsWith('ENV_');
 }
 
 function readBoundedFile(descriptor, maximumBytes) {
@@ -109,21 +130,32 @@ function readBoundedFile(descriptor, maximumBytes) {
     chunks.push(Buffer.from(buffer.subarray(0, bytesRead)));
     total += bytesRead;
   }
-  if (total > maximumBytes) throw envPathError();
+  if (total > maximumBytes) {
+    throw envPathError('ENV_FILE_TOO_LARGE', '环境配置超过允许的大小上限');
+  }
   return Buffer.concat(chunks, total).toString('utf8');
 }
 
 function readEnvFile(filePath) {
+  if (typeof filePath !== 'string' || filePath.length === 0
+      || filePath.length > 4096 || filePath.includes('\0')
+      || !path.isAbsolute(filePath)) {
+    throw envConfigurationError('ENV_FILE_PATH_INVALID', '环境配置路径必须是非空绝对路径');
+  }
   const absolute = path.resolve(filePath);
   let initialStat;
   try { initialStat = fs.lstatSync(absolute); } catch (error) {
     if (error?.code === 'ENOENT') return null;
-    throw envPathError();
+    throw envPathError('ENV_FILE_STAT_FAILED', '无法安全检查环境配置');
   }
-  if (!secureEnvFileStat(initialStat)) throw envPathError();
-  try { assertDirectoryTree(path.dirname(absolute), '.env 父目录'); } catch { throw envPathError(); }
+  assertSecureEnvFileStat(initialStat);
+  try { assertDirectoryTree(path.dirname(absolute), '环境配置父目录'); } catch {
+    throw envPathError('ENV_PARENT_INVALID', '环境配置父目录不可信');
+  }
   let realParent;
-  try { realParent = fs.realpathSync(path.dirname(absolute)); } catch { throw envPathError(); }
+  try { realParent = fs.realpathSync(path.dirname(absolute)); } catch {
+    throw envPathError('ENV_PARENT_INVALID', '环境配置父目录无法解析');
+  }
   const expectedPath = path.join(realParent, path.basename(absolute));
 
   let descriptor;
@@ -133,21 +165,26 @@ function readEnvFile(filePath) {
       fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0),
     );
     const descriptorStat = fs.fstatSync(descriptor);
-    if (!secureEnvFileStat(descriptorStat)
-        || descriptorStat.dev !== initialStat.dev
-        || descriptorStat.ino !== initialStat.ino
-        || descriptorStat.size > MAX_ENV_BYTES) throw envPathError();
+    assertSecureEnvFileStat(descriptorStat);
+    if (descriptorStat.dev !== initialStat.dev || descriptorStat.ino !== initialStat.ino) {
+      throw envPathError('ENV_FILE_CHANGED', '环境配置在打开前发生变化');
+    }
+    if (descriptorStat.size > MAX_ENV_BYTES) {
+      throw envPathError('ENV_FILE_TOO_LARGE', '环境配置超过允许的大小上限');
+    }
 
     try {
-      if (fs.realpathSync('/proc/self/fd/' + descriptor) !== expectedPath) throw envPathError();
+      if (fs.realpathSync('/proc/self/fd/' + descriptor) !== expectedPath) {
+        throw envPathError('ENV_FILE_CHANGED', '环境配置路径在打开期间发生变化');
+      }
     } catch (error) {
-      if (error?.code === 'ENV_PATH_INVALID') throw error;
+      if (isEnvironmentFileError(error)) throw error;
       const latest = fs.lstatSync(absolute);
       const current = fs.statSync(absolute);
       if (fs.realpathSync(path.dirname(absolute)) !== realParent
-          || !secureEnvFileStat(latest)
+          || envFileStatError(latest)
           || current.dev !== descriptorStat.dev || current.ino !== descriptorStat.ino) {
-        throw envPathError();
+        throw envPathError('ENV_FILE_CHANGED', '环境配置路径在打开期间发生变化');
       }
     }
     const content = readBoundedFile(descriptor, MAX_ENV_BYTES);
@@ -156,14 +193,14 @@ function readEnvFile(filePath) {
     const current = fs.statSync(absolute);
     if (!sameFileState(descriptorStat, finalDescriptorStat)
         || fs.realpathSync(path.dirname(absolute)) !== realParent
-        || !secureEnvFileStat(latest)
+        || envFileStatError(latest)
         || current.dev !== finalDescriptorStat.dev || current.ino !== finalDescriptorStat.ino) {
-      throw envPathError();
+      throw envPathError('ENV_FILE_CHANGED', '环境配置在读取期间发生变化');
     }
     return content;
   } catch (error) {
-    if (error?.code === 'ENV_PATH_INVALID') throw error;
-    throw envPathError();
+    if (isEnvironmentFileError(error)) throw error;
+    throw envPathError('ENV_FILE_OPEN_FAILED', '无法安全打开环境配置');
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
@@ -171,8 +208,22 @@ function readEnvFile(filePath) {
   }
 }
 
-function loadEnv(filePath = path.resolve(__dirname, '..', '.env'), environment = process.env) {
-  const content = readEnvFile(filePath);
+function configuredEnvFile(environment = process.env) {
+  const configured = environment.PANEL_ENV_FILE;
+  if (configured === undefined) return DEFAULT_ENV_FILE;
+  if (typeof configured !== 'string' || configured.length === 0
+      || configured.length > 4096 || configured.includes('\0')
+      || !path.isAbsolute(configured)) {
+    throw envConfigurationError(
+      'ENV_FILE_PATH_INVALID',
+      'PANEL_ENV_FILE 必须是非空绝对路径',
+    );
+  }
+  return path.normalize(configured);
+}
+
+function loadEnv(filePath, environment = process.env) {
+  const content = readEnvFile(filePath === undefined ? configuredEnvFile(environment) : filePath);
   if (content === null) return false;
   // Parse and validate the complete file before mutating process.env. This
   // prevents an invalid trailing line or duplicate from leaving a partially
@@ -192,6 +243,7 @@ function loadEnv(filePath = path.resolve(__dirname, '..', '.env'), environment =
 module.exports = {
   BOOLEAN_ENV_NAMES,
   booleanEnvEnabled,
+  configuredEnvFile,
   loadEnv,
   parseEnvContent,
   readEnvFile,
