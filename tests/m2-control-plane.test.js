@@ -4066,6 +4066,199 @@ test('credential backups require a private directory and enforce file retention'
   }
 });
 
+test('credential backup pruning stops before deletion when its bounded scan is exhausted', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-scan-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const oldName = 'sub2api-2000-01-01T00-00-00-000Z-old.json';
+  const oldPath = path.join(backupDir, oldName);
+  fs.writeFileSync(oldPath, '{}', { mode: 0o600 });
+  const previous = new Map([
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+    ['PANEL_BACKUP_MAX_FILES', process.env.PANEL_BACKUP_MAX_FILES],
+    ['PANEL_BACKUP_MAX_TOTAL_BYTES', process.env.PANEL_BACKUP_MAX_TOTAL_BYTES],
+  ]);
+  const originalOpendirSync = fs.opendirSync;
+  let fakeDirectoryClosed = false;
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  process.env.PANEL_BACKUP_MAX_FILES = '1';
+  process.env.PANEL_BACKUP_MAX_TOTAL_BYTES = String(1024 * 1024);
+  fs.opendirSync = function boundedBackupDirectoryScan(directoryPath, ...args) {
+    const text = String(directoryPath);
+    if (text === backupDir || text.startsWith('/proc/self/fd/')) {
+      let reads = 0;
+      return {
+        readSync() {
+          reads += 1;
+          return reads <= 20_001 ? { name: 'unrelated-entry-' + reads } : null;
+        },
+        closeSync() { fakeDirectoryClosed = true; },
+      };
+    }
+    return originalOpendirSync.call(fs, directoryPath, ...args);
+  };
+  try {
+    assert.throws(
+      () => writeBackup({ accounts: [], proxies: [] }),
+      (error) => error.code === 'SUB2API_BACKUP_SCAN_LIMIT_EXCEEDED',
+    );
+  } finally {
+    fs.opendirSync = originalOpendirSync;
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(fakeDirectoryClosed, true);
+  assert.equal(fs.existsSync(oldPath), true);
+  assert.equal(fs.readdirSync(backupDir).filter((name) => name.endsWith('.json')).length, 2);
+});
+
+test('a durably published credential backup survives post-retention fsync failure', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-fsync-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const previousDirectory = process.env.PANEL_BACKUP_DIR;
+  const originalFsyncSync = fs.fsyncSync;
+  let directoryFsyncs = 0;
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  fs.fsyncSync = function failPostRetentionFsync(descriptor) {
+    if (fs.fstatSync(descriptor).isDirectory()) {
+      directoryFsyncs += 1;
+      if (directoryFsyncs === 2) {
+        const error = new Error('simulated backup directory fsync failure');
+        error.code = 'EIO';
+        throw error;
+      }
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    assert.throws(
+      () => writeBackup({ accounts: [], proxies: [] }),
+      (error) => error.code === 'EIO',
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+    if (previousDirectory === undefined) delete process.env.PANEL_BACKUP_DIR;
+    else process.env.PANEL_BACKUP_DIR = previousDirectory;
+  }
+  assert.equal(directoryFsyncs, 2);
+  assert.equal(fs.readdirSync(backupDir).filter((name) => name.endsWith('.json')).length, 1);
+});
+
+test('credential backup retention reports deletion failure and keeps the fresh backup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-unlink-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const oldName = 'sub2api-2000-01-01T00-00-00-000Z-old.json';
+  const oldPath = path.join(backupDir, oldName);
+  fs.writeFileSync(oldPath, '{}', { mode: 0o600 });
+  const previous = new Map([
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+    ['PANEL_BACKUP_MAX_FILES', process.env.PANEL_BACKUP_MAX_FILES],
+    ['PANEL_BACKUP_MAX_TOTAL_BYTES', process.env.PANEL_BACKUP_MAX_TOTAL_BYTES],
+  ]);
+  const originalUnlinkSync = fs.unlinkSync;
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  process.env.PANEL_BACKUP_MAX_FILES = '1';
+  process.env.PANEL_BACKUP_MAX_TOTAL_BYTES = String(1024 * 1024);
+  fs.unlinkSync = function failOldBackupDeletion(filePath, ...args) {
+    if (path.basename(String(filePath)) === oldName) {
+      const error = new Error('simulated old backup deletion failure');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalUnlinkSync.call(fs, filePath, ...args);
+  };
+  try {
+    assert.throws(
+      () => writeBackup({ accounts: [], proxies: [] }),
+      (error) => error.code === 'SUB2API_BACKUP_RETENTION_FAILED',
+    );
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(fs.existsSync(oldPath), true);
+  assert.equal(fs.readdirSync(backupDir).filter((name) => name.endsWith('.json')).length, 2);
+});
+
+test('credential backup retention rechecks limits after cleanup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-recheck-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const oldName = 'sub2api-2000-01-01T00-00-00-000Z-old.json';
+  const injectedName = 'sub2api-2099-01-01T00-00-00-000Z-concurrent.json';
+  const oldPath = path.join(backupDir, oldName);
+  const injectedPath = path.join(backupDir, injectedName);
+  fs.writeFileSync(oldPath, '{}', { mode: 0o600 });
+  const previous = new Map([
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+    ['PANEL_BACKUP_MAX_FILES', process.env.PANEL_BACKUP_MAX_FILES],
+    ['PANEL_BACKUP_MAX_TOTAL_BYTES', process.env.PANEL_BACKUP_MAX_TOTAL_BYTES],
+  ]);
+  const originalUnlinkSync = fs.unlinkSync;
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  process.env.PANEL_BACKUP_MAX_FILES = '1';
+  process.env.PANEL_BACKUP_MAX_TOTAL_BYTES = String(1024 * 1024);
+  fs.unlinkSync = function injectAfterOldBackupDeletion(filePath, ...args) {
+    const result = originalUnlinkSync.call(fs, filePath, ...args);
+    if (path.basename(String(filePath)) === oldName) {
+      fs.writeFileSync(injectedPath, '{}', { mode: 0o600 });
+    }
+    return result;
+  };
+  try {
+    assert.throws(
+      () => writeBackup({ accounts: [], proxies: [] }),
+      (error) => error.code === 'SUB2API_BACKUP_RETENTION_FAILED',
+    );
+  } finally {
+    fs.unlinkSync = originalUnlinkSync;
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(fs.existsSync(oldPath), false);
+  assert.equal(fs.existsSync(injectedPath), true);
+  assert.equal(fs.readdirSync(backupDir).filter((name) => name.endsWith('.json')).length, 2);
+});
+
+test('credential backup size preflight never deletes an existing backup', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-preflight-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const oldName = 'sub2api-2000-01-01T00-00-00-000Z-old.json';
+  const oldPath = path.join(backupDir, oldName);
+  fs.writeFileSync(oldPath, '{}', { mode: 0o600 });
+  const previous = new Map([
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+    ['PANEL_BACKUP_MAX_FILES', process.env.PANEL_BACKUP_MAX_FILES],
+    ['PANEL_BACKUP_MAX_TOTAL_BYTES', process.env.PANEL_BACKUP_MAX_TOTAL_BYTES],
+  ]);
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  process.env.PANEL_BACKUP_MAX_FILES = '1';
+  process.env.PANEL_BACKUP_MAX_TOTAL_BYTES = String(1024 * 1024);
+  try {
+    assert.throws(
+      () => writeBackup({ padding: 'x'.repeat(1024 * 1024) }),
+      (error) => error.code === 'SUB2API_BACKUP_LIMIT_EXCEEDED',
+    );
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+  assert.equal(fs.existsSync(oldPath), true);
+  assert.deepEqual(fs.readdirSync(backupDir), [oldName]);
+});
+
 test('credential backups uniquely cover every update target with restorable identity and tokens', () => {
   const oldAccess = 'test-only-backup-old-access';
   const oldRefresh = 'test-only-backup-old-refresh';
@@ -4226,6 +4419,80 @@ test('token import rejects an uncovered update backup before any remote write', 
       (error) => error.code === 'SUB2API_BACKUP_FAILED'
         && error.causeCode === 'SUB2API_BACKUP_COVERAGE_INVALID',
     );
+    assert.equal(remoteWrites, 0);
+    assert.deepEqual(fs.readdirSync(backupRoot), []);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('token import checkpoints the credential backup before creating any backup file', async () => {
+  const { root } = fixture();
+  const backupRoot = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-checkpoint-')),
+    'backups',
+  );
+  fs.mkdirSync(backupRoot, { mode: 0o700 });
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['PANEL_ALLOW_UNBACKED_WRITES', process.env.PANEL_ALLOW_UNBACKED_WRITES],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  delete process.env.PANEL_ALLOW_UNBACKED_WRITES;
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.PANEL_BACKUP_DIR = backupRoot;
+  try {
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      client: { async listAccounts() { return []; } },
+    });
+    const plan = buildImportPlan(preview._internal.sources, []);
+    assert.equal(plan.length, 1);
+    assert.equal(plan[0].action, 'create');
+    const checkpoints = [];
+    let remoteWrites = 0;
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        selectedKeys: [plan[0].key],
+        actor: 'tester',
+        jobId: 'backup-checkpoint-job',
+        db: { async startMutationJob() {} },
+        logger: {
+          checkpoint(event, fields) {
+            checkpoints.push({ event, fields });
+            return event !== 'import.credential_backup_checkpoint';
+          },
+        },
+        client: {
+          async listAccounts() { return []; },
+          async exportAccounts() { return { accounts: [], proxies: [] }; },
+          async applyOAuthCredentials() { remoteWrites += 1; },
+          async importCodexSession() { remoteWrites += 1; },
+        },
+      }),
+      (error) => error.code === 'SUB2API_BACKUP_FAILED'
+        && error.causeCode === 'AUDIT_LOG_UNAVAILABLE',
+    );
+    assert.deepEqual(checkpoints, [{
+      event: 'import.credential_backup_checkpoint',
+      fields: {
+        jobId: 'backup-checkpoint-job',
+        actor: 'tester',
+        updateTargetCount: 0,
+      },
+    }]);
     assert.equal(remoteWrites, 0);
     assert.deepEqual(fs.readdirSync(backupRoot), []);
   } finally {

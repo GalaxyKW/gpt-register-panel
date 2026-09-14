@@ -46,6 +46,7 @@ let syncQueue = Promise.resolve();
 const OPENAI_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const POSTFLIGHT_READ_ATTEMPTS = 3;
 const POSTFLIGHT_RETRY_DELAY_MS = 25;
+const BACKUP_DIRECTORY_SCAN_LIMIT = 20_000;
 
 function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
@@ -1905,55 +1906,152 @@ function unlinkBackupIfSame(filePath, expected) {
   } catch {}
 }
 
-function pruneBackups(pinned, newestName) {
-  const retentionDays = backupLimit('PANEL_BACKUP_RETENTION_DAYS', 30, 1, 3650);
-  const maximumFiles = backupLimit('PANEL_BACKUP_MAX_FILES', 100, 1, 1000);
-  const maximumBytes = backupLimit(
-    'PANEL_BACKUP_MAX_TOTAL_BYTES',
-    512 * 1024 * 1024,
-    1024 * 1024,
-    4 * 1024 * 1024 * 1024,
-  );
-  const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000;
-  const entries = fs.readdirSync(pinned.accessDirectory)
-    .filter((name) => /^sub2api-[A-Za-z0-9-]+\.json$/.test(name))
-    .map((name) => {
-      const filePath = path.join(pinned.accessDirectory, name);
-      const stat = fs.lstatSync(filePath);
-      if (stat.isSymbolicLink() || !stat.isFile()) {
-        const error = new Error('Sub2API 备份目录包含不安全的同名条目');
-        error.code = 'SUB2API_BACKUP_PATH_INVALID';
-        throw error;
+function backupRetentionPolicy() {
+  return {
+    retentionDays: backupLimit('PANEL_BACKUP_RETENTION_DAYS', 30, 1, 3650),
+    maximumFiles: backupLimit('PANEL_BACKUP_MAX_FILES', 100, 1, 1000),
+    maximumBytes: backupLimit(
+      'PANEL_BACKUP_MAX_TOTAL_BYTES',
+      512 * 1024 * 1024,
+      1024 * 1024,
+      4 * 1024 * 1024 * 1024,
+    ),
+  };
+}
+
+function backupPathError(message, code = 'SUB2API_BACKUP_PATH_INVALID', cause) {
+  const error = new Error(message);
+  error.code = code;
+  if (cause) error.cause = cause;
+  return error;
+}
+
+function scanBackupEntries(pinned) {
+  let directory;
+  let operationError = null;
+  const entries = [];
+  let scannedEntries = 0;
+  try {
+    directory = fs.opendirSync(pinned.accessDirectory);
+    for (;;) {
+      const dirent = directory.readSync();
+      if (dirent === null) break;
+      scannedEntries += 1;
+      if (scannedEntries > BACKUP_DIRECTORY_SCAN_LIMIT) {
+        throw backupPathError(
+          'Sub2API 备份目录条目过多，已在删除前停止保留策略',
+          'SUB2API_BACKUP_SCAN_LIMIT_EXCEEDED',
+        );
       }
-      return { name, filePath, stat };
-    })
-    .sort((left, right) => {
-      if (left.name === newestName) return -1;
-      if (right.name === newestName) return 1;
-      return right.stat.mtimeMs - left.stat.mtimeMs
-        || right.name.localeCompare(left.name, 'en');
-    });
+      const name = dirent.name;
+      if (typeof name !== 'string' || !/^sub2api-[A-Za-z0-9-]+\.json$/.test(name)) continue;
+      const filePath = path.join(pinned.accessDirectory, name);
+      let stat;
+      try { stat = fs.lstatSync(filePath); } catch (error) {
+        throw backupPathError('Sub2API 备份目录条目无法安全检查', undefined, error);
+      }
+      if (stat.isSymbolicLink() || !stat.isFile()
+          || !Number.isSafeInteger(stat.size) || stat.size < 0
+          || !Number.isFinite(stat.mtimeMs)) {
+        throw backupPathError('Sub2API 备份目录包含不安全的同名条目');
+      }
+      entries.push({ name, filePath, stat });
+    }
+  } catch (error) {
+    operationError = error;
+    throw error;
+  } finally {
+    if (directory) {
+      try { directory.closeSync(); } catch (error) {
+        if (!operationError) throw error;
+      }
+    }
+  }
+  return entries;
+}
+
+function retentionFailure(cause) {
+  return backupPathError(
+    'Sub2API 备份保留策略未能安全完成',
+    'SUB2API_BACKUP_RETENTION_FAILED',
+    cause,
+  );
+}
+
+function unlinkBackupForRetention(entry) {
+  let latest;
+  try { latest = fs.lstatSync(entry.filePath); } catch (error) { throw retentionFailure(error); }
+  if (latest.isSymbolicLink() || !latest.isFile() || !sameFileIdentity(latest, entry.stat)) {
+    throw retentionFailure();
+  }
+  try { fs.unlinkSync(entry.filePath); } catch (error) { throw retentionFailure(error); }
+  try {
+    fs.lstatSync(entry.filePath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw retentionFailure(error);
+  }
+  throw retentionFailure();
+}
+
+function assertBackupRetention(entries, newestEntry, policy, cutoff) {
+  const newest = entries.find((entry) => entry.name === newestEntry.name);
+  if (!newest || !sameFileIdentity(newest.stat, newestEntry.stat)) throw retentionFailure();
+  const totalBytes = entries.reduce((sum, entry) => sum + entry.stat.size, 0);
+  const containsExpired = entries.some((entry) => (
+    entry.name !== newestEntry.name && entry.stat.mtimeMs < cutoff
+  ));
+  if (entries.length > policy.maximumFiles
+      || totalBytes > policy.maximumBytes
+      || containsExpired) {
+    throw retentionFailure();
+  }
+}
+
+function pruneBackups(pinned, newestName, policy = backupRetentionPolicy()) {
+  const cutoff = Date.now() - policy.retentionDays * 24 * 60 * 60 * 1000;
+  // Finish a bounded, read-only inventory before deleting anything. This keeps
+  // an unexpectedly huge or hostile directory from causing partial pruning.
+  const entries = scanBackupEntries(pinned).sort((left, right) => {
+    if (left.name === newestName) return -1;
+    if (right.name === newestName) return 1;
+    return right.stat.mtimeMs - left.stat.mtimeMs
+      || right.name.localeCompare(left.name, 'en');
+  });
+  const newestEntry = entries.find((entry) => entry.name === newestName);
+  if (!newestEntry) {
+    throw backupPathError('Sub2API 新备份在保留检查前已丢失');
+  }
+  if (newestEntry.stat.size > policy.maximumBytes) {
+    const error = new Error('Sub2API 备份保留上限不足以保存本次备份');
+    error.code = 'SUB2API_BACKUP_LIMIT_EXCEEDED';
+    throw error;
+  }
   let keptFiles = 0;
   let keptBytes = 0;
   let newestKept = false;
+  const removals = [];
   for (const entry of entries) {
     const keep = entry.name === newestName
       || (entry.stat.mtimeMs >= cutoff
-        && keptFiles < maximumFiles
-        && keptBytes + entry.stat.size <= maximumBytes);
-    if (keep && keptFiles < maximumFiles && keptBytes + entry.stat.size <= maximumBytes) {
+        && keptFiles < policy.maximumFiles
+        && keptBytes + entry.stat.size <= policy.maximumBytes);
+    if (keep && keptFiles < policy.maximumFiles
+        && keptBytes + entry.stat.size <= policy.maximumBytes) {
       keptFiles += 1;
       keptBytes += entry.stat.size;
       if (entry.name === newestName) newestKept = true;
       continue;
     }
-    unlinkBackupIfSame(entry.filePath, entry.stat);
+    removals.push(entry);
   }
-  if (!newestKept || keptFiles > maximumFiles || keptBytes > maximumBytes) {
+  if (!newestKept || keptFiles > policy.maximumFiles || keptBytes > policy.maximumBytes) {
     const error = new Error('Sub2API 备份保留上限不足以保存本次备份');
     error.code = 'SUB2API_BACKUP_LIMIT_EXCEEDED';
     throw error;
   }
+  for (const entry of removals) unlinkBackupForRetention(entry);
+  assertBackupRetention(scanBackupEntries(pinned), newestEntry, policy, cutoff);
 }
 
 function writeBackup(payload) {
@@ -1976,13 +2074,20 @@ function writeBackup(payload) {
   let descriptor;
   let temporaryStat = null;
   let published = false;
-  let completed = false;
+  let durablyPublished = false;
+  let retentionCompleted = false;
   try {
     const content = Buffer.from(JSON.stringify(payload), 'utf8');
     const maximumSingleBytes = 32 * 1024 * 1024;
     if (content.length > maximumSingleBytes) {
       const error = new Error('Sub2API 备份响应超过安全上限');
       error.code = 'SUB2API_BACKUP_TOO_LARGE';
+      throw error;
+    }
+    const retentionPolicy = backupRetentionPolicy();
+    if (content.length > retentionPolicy.maximumBytes) {
+      const error = new Error('Sub2API 备份保留上限不足以保存本次备份');
+      error.code = 'SUB2API_BACKUP_LIMIT_EXCEEDED';
       throw error;
     }
     descriptor = fs.openSync(
@@ -2009,20 +2114,25 @@ function writeBackup(payload) {
     descriptor = undefined;
     unlinkBackupIfSame(temporaryPath, temporaryStat);
     fs.fsyncSync(pinned.descriptor);
-    pruneBackups(pinned, fileName);
+    durablyPublished = true;
+    pruneBackups(pinned, fileName, retentionPolicy);
     fs.fsyncSync(pinned.descriptor);
-    completed = true;
+    retentionCompleted = true;
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
     }
     if (temporaryStat) unlinkBackupIfSame(temporaryPath, temporaryStat);
-    if (published && !completed && temporaryStat) unlinkBackupIfSame(filePath, temporaryStat);
+    // Before the first directory fsync the published name can still be rolled
+    // back. Afterwards it is the only known-good fresh backup and must survive
+    // retention or post-retention fsync failures.
+    if (published && !durablyPublished && temporaryStat) unlinkBackupIfSame(filePath, temporaryStat);
     if (pinned?.descriptor !== undefined) {
       try { fs.closeSync(pinned.descriptor); } catch {}
     }
   }
-  if (!published) throw new Error('Sub2API 备份未安全发布');
+  if (!durablyPublished) throw new Error('Sub2API 备份未安全发布');
+  if (!retentionCompleted) throw new Error('Sub2API 备份保留策略未完成');
   return logicalFilePath;
 }
 
@@ -2273,7 +2383,12 @@ async function executeImport({
       try {
         const exported = await client.exportAccounts([], { signal });
         throwIfJobInterrupted(signal);
-        assertBackupCoversUpdateTargets(exported, plan);
+        const backupCoverage = assertBackupCoversUpdateTargets(exported, plan);
+        assertAuditLogCheckpoint(logger, 'import.credential_backup_checkpoint', {
+          jobId,
+          actor,
+          updateTargetCount: backupCoverage.updateTargetCount,
+        });
         backupPath = writeBackup(exported);
         writeLog(logger, 'info', 'import.backup_succeeded', { jobId, actor, backupPath });
       } catch (error) {
