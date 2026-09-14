@@ -497,6 +497,44 @@ test('frontend renders a completed Phase3 result without bogus zero counters', (
   assert.doesNotMatch(context.result, /成功 0/);
 });
 
+test('frontend reports an omitted large job summary without inventing zero totals', () => {
+  const renderJob = sourceSection('function renderJob', 'function stopJobPolling');
+  const context = {
+    elements: {
+      jobPanel: { dataset: {} },
+      jobTitle: {},
+      jobStatus: {},
+      jobMeta: {},
+    },
+    jobStatusClass: () => 'badge-success',
+    jobStatusLabel: () => '已完成',
+    jobNeedsReconciliation: () => false,
+    formatDate: () => '现在',
+  };
+  vm.runInNewContext(renderJob + `
+    renderJob({
+      id: 'large-account-test',
+      type: 'account_test',
+      status: 'succeeded',
+      result: { summaryUnavailable: true, summaryReason: 'result_too_large' },
+      finishedAt: 'now',
+    });
+    accountDetail = elements.jobMeta.textContent;
+    renderJob({
+      id: 'large-token-import',
+      type: 'token_import',
+      status: 'succeeded',
+      result: { summaryUnavailable: true, summaryReason: 'result_too_large' },
+      finishedAt: 'now',
+    });
+    tokenDetail = elements.jobMeta.textContent;
+  `, context);
+  for (const detail of [context.accountDetail, context.tokenDetail]) {
+    assert.match(detail, /列表未加载详细摘要/);
+    assert.doesNotMatch(detail, /成功 0|失败 0|跳过 0/);
+  }
+});
+
 test('token import terminal status distinguishes total failure from partial success', () => {
   assert.equal(tokenImportJobStatus({
     imported: [{ action: 'update', error: 'failed' }, { action: 'create', error: 'failed' }],

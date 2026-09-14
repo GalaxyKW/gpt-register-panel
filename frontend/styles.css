@@ -191,6 +191,7 @@ code { color: #355e69; font-size: 11px; }
 .reconciliation-target { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; background: #f8faf9; color: var(--muted); font-size: 12px; }
 .reconciliation-target code { overflow-wrap: anywhere; color: var(--ink-soft); }
 .reconciliation-target strong { color: var(--ink-soft); font-weight: 700; }
+.reconciliation-target pre { min-width: 0; margin: 0; max-height: 190px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--ink-soft); font: inherit; line-height: 1.5; }
 .dialog-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
 
 @media (max-width: 980px) {

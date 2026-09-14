@@ -22,6 +22,12 @@ const MAX_AUDIT_DETAILS_BYTES = 512 * 1024;
 const MAX_JOB_CLAIM_KEYS = 1000;
 const MAX_JOB_CLAIM_KEY_BYTES = 512;
 const MAX_RECONCILIATION_LIST_JOBS = 100;
+// Public history pages need only a compact operational summary. Individual
+// results may legitimately approach MAX_JOB_RESULT_BYTES, so transferring,
+// parsing and recursively redacting hundreds of them on every poll would let
+// old jobs monopolize the event loop. Full (still bounded/redacted) results
+// remain available through getJob().
+const MAX_JOB_LIST_RESULT_BYTES = 16 * 1024;
 const LEGACY_GLOBAL_CLAIM_PREFIX = 'reconciliation:legacy-global:';
 const RECONCILIATION_ACK_CONFIRMATION = '我已按强身份完成人工核对';
 const RECONCILIATION_ACK_RESOLUTIONS = Object.freeze([
@@ -904,6 +910,25 @@ function normalizedJobListLimit(limit, fallback = 50) {
 function boundedJobListText(value, maximumCharacters) {
   if (value === null || value === undefined) return null;
   return redactText(String(value)).slice(0, maximumCharacters);
+}
+
+function durableReconciliationListSummary(row) {
+  if (Number(row?.reconciliation_hold) !== 1) return {};
+  const digest = String(row?.reconciliation_claim_digest || '');
+  const holdScope = row?.reconciliation_scope === 'global'
+    ? 'all_future_jobs'
+    : row?.reconciliation_scope === 'claims' ? 'claim_keys' : undefined;
+  return {
+    requiresReconciliation: true,
+    reconciliationHold: true,
+    reconciliationResolved: false,
+    futureOperationsUnblocked: false,
+    reconciliationClaimDigest: /^[a-f0-9]{64}$/.test(digest) ? digest : undefined,
+    reconciliationHoldScope: holdScope,
+    reconciliationBlockScope: 'all_mutating_operations',
+    retryAllowed: false,
+    doNotRetry: true,
+  };
 }
 
 class PanelDb {
@@ -2092,8 +2117,29 @@ class PanelDb {
     if (!listSummary) {
       try { payload = redactValue(JSON.parse(row.payload_json)); } catch {}
     }
-    try { result = row.result_json ? redactValue(JSON.parse(row.result_json)) : null; } catch {}
-    if (listSummary && result !== null) result = reconciliationResultSummary(result);
+    const resultSummaryOmitted = listSummary && Number(row.result_summary_omitted) === 1;
+    if (!resultSummaryOmitted) {
+      try { result = row.result_json ? redactValue(JSON.parse(row.result_json)) : null; } catch {}
+    }
+    if (listSummary) {
+      result = result !== null ? reconciliationResultSummary(result) : null;
+      const durableHold = durableReconciliationListSummary(row);
+      if (resultSummaryOmitted) {
+        const resultBytes = Number(row.result_bytes);
+        result = {
+          summaryUnavailable: true,
+          summaryReason: 'result_too_large',
+          resultBytes: Number.isSafeInteger(resultBytes) && resultBytes >= 0
+            && resultBytes <= MAX_JOB_RESULT_BYTES ? resultBytes : undefined,
+          ...durableHold,
+        };
+      } else if (durableHold.reconciliationHold === true) {
+        // The dedicated columns are the authoritative public-list contract.
+        // Do not let a stale or partially migrated JSON summary hide a durable
+        // safety barrier from the administrator.
+        result = { ...(result || {}), ...durableHold };
+      }
+    }
     return {
       id: listSummary ? boundedJobListText(row.id, 128) : row.id,
       type: listSummary ? boundedJobListText(row.type, 64) : row.type,
@@ -2131,14 +2177,28 @@ class PanelDb {
       // implying that the returned list is complete. Global upgrade barriers
       // and oldest holds come first so the blocking path remains actionable.
       const held = resultRows(database.exec(`SELECT id, type, status, requested_by,
-          result_json, error, created_at, started_at, finished_at
+          CASE WHEN length(CAST(result_json AS BLOB)) <= ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN result_json ELSE NULL END AS result_json,
+          CASE WHEN result_json IS NOT NULL
+              AND length(CAST(result_json AS BLOB)) > ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN 1 ELSE 0 END AS result_summary_omitted,
+          length(CAST(result_json AS BLOB)) AS result_bytes,
+          reconciliation_hold, reconciliation_scope, reconciliation_claim_digest,
+          error, created_at, started_at, finished_at
         FROM sync_jobs
         WHERE reconciliation_hold = 1
         ORDER BY CASE WHEN reconciliation_scope = 'global' THEN 0 ELSE 1 END,
           created_at ASC, id ASC
         LIMIT ${MAX_RECONCILIATION_LIST_JOBS}`));
       const ordinary = resultRows(database.exec(`SELECT id, type, status, requested_by,
-          result_json, error, created_at, started_at, finished_at
+          CASE WHEN length(CAST(result_json AS BLOB)) <= ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN result_json ELSE NULL END AS result_json,
+          CASE WHEN result_json IS NOT NULL
+              AND length(CAST(result_json AS BLOB)) > ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN 1 ELSE 0 END AS result_summary_omitted,
+          length(CAST(result_json AS BLOB)) AS result_bytes,
+          reconciliation_hold, reconciliation_scope, reconciliation_claim_digest,
+          error, created_at, started_at, finished_at
         FROM sync_jobs
         WHERE reconciliation_hold = 0
         ORDER BY created_at DESC LIMIT ${safeLimit}`));

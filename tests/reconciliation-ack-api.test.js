@@ -11,7 +11,7 @@ const {
   PanelDb,
   RECONCILIATION_ACK_CONFIRMATION,
 } = require('../backend/db');
-const { createServer } = require('../backend/server');
+const { createServer, sourcePathFromSelectionKey } = require('../backend/server');
 const { CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION } = require('../backend/tokenCleanup');
 
 const ADMIN_TOKEN = 'panel-test-token-16-chars';
@@ -72,6 +72,21 @@ async function heldJob(db, claimKey) {
   });
   return db.getJob(job.id);
 }
+
+test('review source paths normalize real selection keys and reject cross-source ambiguity', () => {
+  assert.equal(
+    sourcePathFromSelectionKey('token:tokens:tokens/free-account.json'),
+    'tokens/free-account.json',
+  );
+  assert.equal(
+    sourcePathFromSelectionKey('token:use_token:phase3-account.json'),
+    'use_token/phase3-account.json',
+  );
+  assert.equal(
+    sourcePathFromSelectionKey('token:tokens:use_token/wrong-source.json'),
+    null,
+  );
+});
 
 function acknowledgementBody(job, resolution = 'state_manually_reconciled') {
   return {
@@ -204,6 +219,179 @@ test('acknowledgement route requires an authenticated administrator and a durabl
     assert.equal(serializedLogs.includes(RECONCILIATION_ACK_CONFIRMATION), false);
     assert.equal(serializedLogs.includes('phase3:api-auth'), false);
     assert.ok(logRecords.some((record) => record.event === 'job.reconciliation_acknowledge_checkpoint'));
+  } finally {
+    await close(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.insecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.insecureWrite;
+  }
+});
+
+test('reconciliation detail is path-bound and exposes only bounded workflow target context', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    insecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_ADMIN_TOKEN = ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '1';
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '0';
+  const db = new PanelDb(testDbPath('safe-detail'));
+  const secretCanary = 'must-not-leak-review-payload';
+  const job = await db.createJob('token_import', {
+    snapshotVersion: 'a'.repeat(64),
+    selectedKeys: ['token:tokens:tokens/free-account.json'],
+    unrelatedNote: secretCanary,
+  }, 'tester', { claimKeys: ['token_import'] });
+  const accountJob = await db.createJob('account_test', {
+    accountIds: [381],
+    targetBaselines: [{
+      accountId: 381,
+      identityDigest: 'd'.repeat(64),
+      status: 'error',
+      statusKnown: true,
+      schedulable: false,
+      schedulableKnown: true,
+    }],
+    prompt: secretCanary,
+  }, 'tester', { claimKeys: ['account_test:381'] });
+  const phase3Job = await db.createJob('phase3', {
+    email: 'phase3@example.test',
+    phone: '13800138000',
+    selectedKey: 'token:use_token:use_token/phase3-account.json',
+    sourcePath: 'use_token/phase3-account.json',
+    canonicalKeys: ['email:phase3@example.test', 'credential:' + secretCanary],
+  }, 'tester', { claimKeys: ['phase3:email:phase3@example.test'] });
+  await db.updateJob(job.id, {
+    status: 'failed',
+    result: {
+      writeOutcomeUnknown: true,
+      unrelatedResult: secretCanary,
+      imported: [{
+        source: 'tokens',
+        relativePath: 'tokens/free-account.json',
+        accountId: 266,
+        accountName: 'free00006',
+        email: 'account@example.test',
+        action: 'update',
+        fingerprints: { access: 'b'.repeat(16) },
+        sourceIdentityKeys: [
+          'account:11111111-1111-4111-8111-111111111111',
+          'user:22222222-2222-4222-8222-222222222222',
+          'email:account@example.test',
+          'credential:' + secretCanary,
+        ],
+        availability: 'unavailable',
+        availabilityReason: 'sub2api_status_error',
+        requiresReconciliation: true,
+        writeOutcomeUnknown: true,
+        outcome: 'requires_reconciliation',
+        credentials: { access_token: 'raw-access-token-canary' },
+      }],
+    },
+    error: secretCanary,
+    finishedAt: new Date().toISOString(),
+  });
+  await db.updateJob(accountJob.id, {
+    status: 'failed',
+    result: {
+      writeOutcomeUnknown: true,
+      results: [{ accountId: 381, requiresReconciliation: true }],
+    },
+    finishedAt: new Date().toISOString(),
+  });
+  await db.updateJob(phase3Job.id, {
+    status: 'failed',
+    result: { writeOutcomeUnknown: true },
+    finishedAt: new Date().toISOString(),
+  });
+  const held = await db.getJob(job.id);
+  const logger = {
+    requestId: () => 'ack-detail-request',
+    probe: () => true,
+    checkpoint: () => true,
+    info() {}, warn() {}, error() {},
+  };
+  const server = createServer({ db, logger });
+  try {
+    const baseUrl = await listen(server);
+    const route = '/api/jobs/' + encodeURIComponent(job.id) + '/reconciliation';
+    assert.equal((await requestJson(baseUrl, route)).status, 401);
+
+    const response = await requestJson(baseUrl, route, { token: ADMIN_TOKEN });
+    assert.equal(response.status, 200);
+    assert.equal(response.json.version, 1);
+    assert.equal(response.json.id, job.id);
+    assert.equal(response.json.type, 'token_import');
+    assert.equal(response.json.reconciliationClaimDigest,
+      held.result.reconciliationClaimDigest);
+    assert.deepEqual(response.json.targetContext, {
+      available: true,
+      total: 1,
+      returned: 1,
+      truncated: false,
+      targets: [{
+        sourcePath: 'tokens/free-account.json',
+        remoteAccountId: 266,
+        accountName: 'free00006',
+        email: 'account@example.test',
+        action: 'update',
+        accessFingerprint: 'b'.repeat(16),
+        strongIdentityKeys: [
+          'account:11111111-1111-4111-8111-111111111111',
+          'user:22222222-2222-4222-8222-222222222222',
+        ],
+        availability: 'unavailable',
+        availabilityReason: 'sub2api_status_error',
+      }],
+    });
+    const serialized = JSON.stringify(response.json);
+    assert.equal(serialized.includes(secretCanary), false);
+    assert.equal(serialized.includes('raw-access-token-canary'), false);
+    assert.equal(Object.hasOwn(response.json, 'payload'), false);
+    assert.equal(Object.hasOwn(response.json, 'result'), false);
+    assert.equal(Object.hasOwn(response.json, 'error'), false);
+
+    const accountDetail = await requestJson(
+      baseUrl,
+      '/api/jobs/' + encodeURIComponent(accountJob.id) + '/reconciliation',
+      { token: ADMIN_TOKEN },
+    );
+    assert.equal(accountDetail.status, 200);
+    assert.deepEqual(accountDetail.json.targetContext.targets, [{
+      remoteAccountId: 381,
+      identityDigest: 'd'.repeat(64),
+      baselineStatus: 'error',
+      baselineSchedulable: false,
+    }]);
+
+    const phase3Detail = await requestJson(
+      baseUrl,
+      '/api/jobs/' + encodeURIComponent(phase3Job.id) + '/reconciliation',
+      { token: ADMIN_TOKEN },
+    );
+    assert.equal(phase3Detail.status, 200);
+    assert.deepEqual(phase3Detail.json.targetContext.targets, [{
+      sourcePath: 'use_token/phase3-account.json',
+      email: 'phase3@example.test',
+      phone: '13800138000',
+    }]);
+    assert.equal(JSON.stringify(phase3Detail.json).includes(secretCanary), false);
+
+    const invalidPath = await requestJson(
+      baseUrl,
+      '/api/jobs/not-a-job/reconciliation',
+      { token: ADMIN_TOKEN },
+    );
+    assert.equal(invalidPath.status, 400);
+    assert.equal(invalidPath.json.error, 'JOB_RECONCILIATION_JOB_ID_INVALID');
   } finally {
     await close(server);
     if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;

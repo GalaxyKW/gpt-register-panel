@@ -1070,6 +1070,57 @@ test('public job pages are compact while internal listJobs retains active payloa
   assert.ok(Buffer.byteLength(JSON.stringify(page)) < 20_000);
 });
 
+test('public job pages do not parse oversized results and retain durable hold metadata', async () => {
+  const db = new PanelDb(databasePath('list-oversized-result'));
+  const ordinary = await db.createJob('account_test', {}, 'tester', {
+    claimKeys: ['account_test:oversized-result'],
+  });
+  await db.updateJob(ordinary.id, {
+    status: 'succeeded',
+    result: { succeeded: 1, padding: 'x'.repeat(256 * 1024) },
+  });
+  const held = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:oversized-hold'],
+  });
+  await db.updateJob(held.id, {
+    status: 'failed',
+    result: {
+      writeOutcomeUnknown: true,
+      requiresReconciliation: true,
+      padding: 'y'.repeat(256 * 1024),
+    },
+  });
+
+  const originalParse = JSON.parse;
+  let largestParsedBytes = 0;
+  JSON.parse = function observedParse(value, ...args) {
+    largestParsedBytes = Math.max(largestParsedBytes, Buffer.byteLength(String(value), 'utf8'));
+    return originalParse.call(JSON, value, ...args);
+  };
+  let page;
+  try {
+    page = await db.listJobsPage(10);
+  } finally {
+    JSON.parse = originalParse;
+  }
+
+  assert.ok(largestParsedBytes <= 16 * 1024);
+  const ordinarySummary = page.jobs.find((item) => item.id === ordinary.id);
+  assert.equal(ordinarySummary.result.summaryUnavailable, true);
+  assert.equal(ordinarySummary.result.summaryReason, 'result_too_large');
+  assert.equal(ordinarySummary.result.resultBytes > 256 * 1024, true);
+  assert.equal(ordinarySummary.result.requiresReconciliation, undefined);
+
+  const heldSummary = page.jobs.find((item) => item.id === held.id);
+  assert.equal(heldSummary.result.summaryUnavailable, true);
+  assert.equal(heldSummary.result.requiresReconciliation, true);
+  assert.equal(heldSummary.result.reconciliationHold, true);
+  assert.equal(heldSummary.result.reconciliationResolved, false);
+  assert.equal(heldSummary.result.reconciliationHoldScope, 'claim_keys');
+  assert.match(heldSummary.result.reconciliationClaimDigest, /^[a-f0-9]{64}$/);
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) < 20_000);
+});
+
 test('new jobs reject invalid and reserved claim keys instead of silently dropping them', async () => {
   const db = new PanelDb(databasePath('invalid'));
   await assert.rejects(

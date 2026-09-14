@@ -41,7 +41,12 @@ const {
   safeErrorMessage: safeAccountTestErrorMessage,
   withAccountTestSubmissionLock,
 } = require('./accountTestWorker');
-const { assertAuditLogCheckpoint, createLogger, safeErrorText } = require('./logger');
+const {
+  assertAuditLogCheckpoint,
+  createLogger,
+  redactText,
+  safeErrorText,
+} = require('./logger');
 const { CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION, listExpiredTokens, deleteExpiredTokens } = require('./tokenCleanup');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree } = require('./lib/safeFs');
@@ -464,6 +469,277 @@ function reconciliationAcknowledgePath(pathname) {
   try { jobId = decodeURIComponent(encoded); } catch {}
   if (!/^job_[a-f0-9]{24}$/.test(String(jobId || ''))) jobId = null;
   return { matched: true, jobId };
+}
+
+function reconciliationReviewPath(pathname) {
+  const prefix = '/api/jobs/';
+  const suffix = '/reconciliation';
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
+    return { matched: false, jobId: null };
+  }
+  const encoded = pathname.slice(prefix.length, -suffix.length);
+  let jobId = null;
+  try { jobId = decodeURIComponent(encoded); } catch {}
+  if (!/^job_[a-f0-9]{24}$/.test(String(jobId || ''))) jobId = null;
+  return { matched: true, jobId };
+}
+
+const UNSAFE_REVIEW_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+const REVIEW_AVAILABILITY_REASONS = new Set([
+  'not_in_sub2api',
+  'sub2api_schema_invalid',
+  'sub2api_status_unknown',
+  'sub2api_status_missing',
+  'sub2api_status_disabled',
+  'sub2api_status_error',
+  'sub2api_schedulable_missing',
+  'sub2api_unschedulable',
+  'sub2api_auto_pause_invalid',
+  'sub2api_expiry_invalid',
+  'sub2api_expired',
+  'sub2api_temp_unschedulable_invalid',
+  'sub2api_temp_unschedulable',
+  'sub2api_rate_limit_invalid',
+  'sub2api_rate_limited',
+  'sub2api_overload_invalid',
+  'sub2api_overloaded',
+  'sub2api_available',
+]);
+
+function boundedReviewText(value, maximum = 256) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > maximum || UNSAFE_REVIEW_TEXT.test(text)) return null;
+  return redactText(text).slice(0, maximum);
+}
+
+function safeReviewRelativePath(value) {
+  const text = boundedReviewText(value, 512);
+  if (!text || path.isAbsolute(text) || text.includes('\\')) return null;
+  const segments = text.split('/');
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  return text;
+}
+
+function normalizedReviewSourcePath(source, relativeValue) {
+  if (!['tokens', 'use_token'].includes(source)) return null;
+  const relativePath = safeReviewRelativePath(relativeValue);
+  if (!relativePath) return null;
+  const firstSegment = relativePath.split('/', 1)[0];
+  if (['tokens', 'use_token'].includes(firstSegment)) {
+    return firstSegment === source ? relativePath : null;
+  }
+  return source + '/' + relativePath;
+}
+
+function sourcePathFromSelectionKey(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || text.length > 1024 || UNSAFE_REVIEW_TEXT.test(text)
+      || !text.startsWith('token:')) return null;
+  const separator = text.indexOf(':', 'token:'.length);
+  if (separator < 0) return null;
+  const source = text.slice('token:'.length, separator);
+  return normalizedReviewSourcePath(source, text.slice(separator + 1));
+}
+
+function safeReviewSourcePath(value) {
+  if (typeof value !== 'string') return null;
+  const separator = value.indexOf('/');
+  if (separator < 0) return null;
+  const source = value.slice(0, separator);
+  return normalizedReviewSourcePath(source, value.slice(separator + 1));
+}
+
+function safeReviewAccountId(value) {
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function safeReviewFingerprint(value) {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return /^[a-f0-9]{8,128}$/.test(text) ? text : null;
+}
+
+function safeReviewCode(value, allowed = null) {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  if (!/^[a-z0-9_]{1,64}$/.test(text)) return null;
+  return !allowed || allowed.has(text) ? text : null;
+}
+
+function safeReviewStrongIdentities(value) {
+  if (!Array.isArray(value)) return { keys: [], truncated: false };
+  const keys = [];
+  const seen = new Set();
+  for (const rawKey of value.slice(0, 1000)) {
+    if (typeof rawKey !== 'string' || rawKey.length > 520
+        || UNSAFE_REVIEW_TEXT.test(rawKey)) continue;
+    const separator = rawKey.indexOf(':');
+    const prefix = rawKey.slice(0, separator + 1);
+    if (!['account:', 'user:'].includes(prefix)) continue;
+    const identity = boundedReviewText(rawKey.slice(separator + 1), 512);
+    const key = identity ? prefix + identity : null;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    keys.push(key);
+  }
+  keys.sort();
+  return { keys: keys.slice(0, 10), truncated: value.length > 1000 || keys.length > 10 };
+}
+
+function tokenImportReviewTargets(job) {
+  const targets = [];
+  const resultItems = Array.isArray(job?.result?.imported)
+    ? job.result.imported.slice(0, 1000)
+    : [];
+  const uncertain = resultItems.filter((item) => (
+    item?.requiresReconciliation === true || item?.writeOutcomeUnknown === true
+      || item?.outcome === 'requires_reconciliation'
+  ));
+  const selectedItems = uncertain.length > 0 ? uncertain : resultItems;
+  for (const item of selectedItems) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+    const source = safeReviewCode(item.source, new Set(['tokens', 'use_token']));
+    const sourcePath = source
+      ? normalizedReviewSourcePath(source, item.relativePath || item.fileName)
+      : null;
+    const remoteAccountId = safeReviewAccountId(
+      item.accountId ?? item.sub2apiAccountId ?? item.sub2apiId ?? item?.verification?.accountId,
+    );
+    const strongIdentities = safeReviewStrongIdentities(item.sourceIdentityKeys);
+    if (!sourcePath && !remoteAccountId) continue;
+    targets.push({
+      sourcePath: sourcePath || undefined,
+      remoteAccountId: remoteAccountId || undefined,
+      accountName: boundedReviewText(item.accountName ?? item?.verification?.accountName, 128)
+        || undefined,
+      email: boundedReviewText(item.email, 320) || undefined,
+      action: safeReviewCode(item.action, new Set(['create', 'update'])) || undefined,
+      accessFingerprint: safeReviewFingerprint(item?.fingerprints?.access) || undefined,
+      strongIdentityKeys: strongIdentities.keys.length > 0 ? strongIdentities.keys : undefined,
+      strongIdentityTruncated: strongIdentities.truncated || undefined,
+      availability: safeReviewCode(
+        item.availability,
+        new Set(['available', 'unavailable', 'unknown', 'not_present']),
+      ) || undefined,
+      availabilityReason: safeReviewCode(item.availabilityReason, REVIEW_AVAILABILITY_REASONS)
+        || undefined,
+    });
+  }
+  if (targets.length === 0) {
+    const selectedSourcePaths = Array.isArray(job?.payload?.selectedSourcePaths)
+      ? job.payload.selectedSourcePaths.slice(0, 1000)
+      : [];
+    for (const selectedPath of selectedSourcePaths) {
+      const sourcePath = safeReviewSourcePath(selectedPath);
+      if (sourcePath) targets.push({ sourcePath });
+    }
+  }
+  return targets;
+}
+
+function accountTestReviewTargets(job) {
+  const baselines = new Map();
+  for (const baseline of Array.isArray(job?.payload?.targetBaselines)
+    ? job.payload.targetBaselines.slice(0, 1000) : []) {
+    const accountId = safeReviewAccountId(baseline?.accountId);
+    if (!accountId || baselines.has(accountId)) continue;
+    baselines.set(accountId, {
+      identityDigest: /^[a-f0-9]{64}$/.test(String(baseline?.identityDigest || ''))
+        ? baseline.identityDigest
+        : undefined,
+      baselineStatus: safeReviewCode(
+        baseline?.status,
+        new Set(['active', 'disabled', 'error']),
+      ) || undefined,
+      baselineSchedulable: typeof baseline?.schedulable === 'boolean'
+        ? baseline.schedulable
+        : undefined,
+    });
+  }
+  const resultItems = Array.isArray(job?.result?.results)
+    ? job.result.results.slice(0, 1000)
+    : [];
+  const uncertainIds = new Set(resultItems.filter((item) => (
+    item?.requiresReconciliation === true || item?.writeOutcomeUnknown === true
+      || item?.outcome === 'requires_reconciliation'
+  )).map((item) => safeReviewAccountId(item?.accountId)).filter(Boolean));
+  const payloadIds = Array.isArray(job?.payload?.accountIds)
+    ? job.payload.accountIds.slice(0, 1000)
+    : [];
+  const ids = uncertainIds.size > 0 ? [...uncertainIds] : payloadIds;
+  const targets = [];
+  const seen = new Set();
+  for (const value of ids) {
+    const remoteAccountId = safeReviewAccountId(value);
+    if (!remoteAccountId || seen.has(remoteAccountId)) continue;
+    seen.add(remoteAccountId);
+    targets.push({ remoteAccountId, ...(baselines.get(remoteAccountId) || {}) });
+  }
+  return targets;
+}
+
+function phase3ReviewTargets(job) {
+  const payload = job?.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)
+    ? job.payload
+    : {};
+  const sourcePath = safeReviewSourcePath(payload.sourcePath)
+    || sourcePathFromSelectionKey(payload.selectedKey);
+  const email = boundedReviewText(payload.email, 320);
+  const rawPhone = typeof payload.phone === 'string' ? payload.phone.trim() : '';
+  const phone = /^\d{1,80}$/.test(rawPhone) ? rawPhone : null;
+  if (!sourcePath && !email && !phone) return [];
+  return [{
+    sourcePath: sourcePath || undefined,
+    email: email || undefined,
+    phone: phone || undefined,
+  }];
+}
+
+function reconciliationReviewDetail(job) {
+  if (!job) {
+    const error = new Error('待对账任务不存在');
+    error.code = 'JOB_RECONCILIATION_NOT_FOUND';
+    throw error;
+  }
+  const digest = String(job?.result?.reconciliationClaimDigest || '');
+  if (!['succeeded', 'partial', 'failed', 'interrupted'].includes(job.status)
+      || job?.result?.requiresReconciliation !== true
+      || job?.result?.reconciliationHold !== true
+      || job?.result?.reconciliationResolved === true
+      || !/^[a-f0-9]{64}$/.test(digest)) {
+    const error = new Error('该任务当前没有可供人工核对的持久阻挡');
+    error.code = 'JOB_RECONCILIATION_NOT_HELD';
+    throw error;
+  }
+  let targets = [];
+  if (job.type === 'token_import') targets = tokenImportReviewTargets(job);
+  else if (job.type === 'account_test') targets = accountTestReviewTargets(job);
+  else if (job.type === 'phase3') targets = phase3ReviewTargets(job);
+  if (targets.length === 0) {
+    const error = new Error('该任务未保留足够的安全目标信息，不能从面板确认人工对账');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE';
+    throw error;
+  }
+  const returnedTargets = targets.slice(0, 100);
+  return {
+    version: 1,
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    reconciliationHold: true,
+    reconciliationResolved: false,
+    reconciliationClaimDigest: digest,
+    reconciliationHoldScope: safeReviewCode(job.result.reconciliationHoldScope) || null,
+    reconciliationBlockScope: safeReviewCode(job.result.reconciliationBlockScope) || null,
+    targetContext: {
+      available: true,
+      total: targets.length,
+      returned: returnedTargets.length,
+      truncated: targets.length > returnedTargets.length,
+      targets: returnedTargets,
+    },
+  };
 }
 
 function reconciliationAcknowledgeRequestError(body, jobId) {
@@ -1152,6 +1428,7 @@ function createServer(options = {}) {
       const requestUrl = new URL(request.url || '/', 'http://localhost');
       requestPath = requestUrl.pathname;
       const reconciliationAckPath = reconciliationAcknowledgePath(requestUrl.pathname);
+      const reconciliationReviewRoute = reconciliationReviewPath(requestUrl.pathname);
       if (jobManager.shuttingDown) {
         response.setHeader('connection', 'close');
         jsonResponse(response, 503, {
@@ -1364,6 +1641,11 @@ function createServer(options = {}) {
             const createdJob = await db.createJob('token_import', {
               snapshotVersion: body.snapshotVersion,
               selectedKeys,
+              // Keep a separately validated, non-secret display path because
+              // generic text redaction intentionally masks `token:...` values.
+              selectedSourcePaths: selectedKeys
+                .map(sourcePathFromSelectionKey)
+                .filter(Boolean),
             }, actor, { claimKeys: ['token_import'] });
             throwIfJobInterrupted(signal);
             return createdJob;
@@ -1580,6 +1862,9 @@ function createServer(options = {}) {
                 phone: requestItem.phone || null,
                 canonicalKeys: requestItem.canonicalKeys,
                 selectedKey: requestItem.selectedKey || null,
+                // selectedKey itself is redacted in persisted job payloads;
+                // retain only its validated source-relative path for review.
+                sourcePath: sourcePathFromSelectionKey(requestItem.selectedKey),
                 batch: resolvedRequests.length > 1,
               }, actor, {
                 claimKeys,
@@ -2165,6 +2450,37 @@ function createServer(options = {}) {
       return;
     }
 
+    if (request.method === 'GET' && reconciliationReviewRoute.matched) {
+      if (actor !== 'panel-admin') {
+        jsonResponse(response, 403, {
+          error: 'JOB_RECONCILIATION_ADMIN_REQUIRED',
+          message: '只允许经过认证的面板管理员读取人工对账目标',
+        });
+        return;
+      }
+      if (!reconciliationReviewRoute.jobId) {
+        jsonResponse(response, 400, {
+          error: 'JOB_RECONCILIATION_JOB_ID_INVALID',
+          message: '待对账任务标识无效',
+        });
+        return;
+      }
+      try {
+        const job = await db.getJob(reconciliationReviewRoute.jobId);
+        jsonResponse(response, 200, reconciliationReviewDetail(job));
+      } catch (error) {
+        const status = error?.code === 'JOB_RECONCILIATION_NOT_FOUND' ? 404
+          : ['JOB_RECONCILIATION_NOT_HELD', 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE']
+              .includes(error?.code) ? 409
+            : 503;
+        jsonResponse(response, status, {
+          error: error?.code || 'JOB_RECONCILIATION_DETAIL_FAILED',
+          message: safeErrorMessage(error),
+        });
+      }
+      return;
+    }
+
     if (request.method === 'GET' && requestUrl.pathname === '/api/jobs') {
       const page = typeof db.listJobsPage === 'function'
         ? await db.listJobsPage(requestUrl.searchParams.get('limit'))
@@ -2412,4 +2728,5 @@ module.exports = {
   phase3ClaimKeys,
   reconciliationAcknowledgePath,
   reconciliationAcknowledgeRequestError,
+  sourcePathFromSelectionKey,
 };

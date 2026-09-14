@@ -66,6 +66,7 @@ const elements = {
   reconciliationAckJobId: document.querySelector('#reconciliationAckJobId'),
   reconciliationAckScope: document.querySelector('#reconciliationAckScope'),
   reconciliationAckDigest: document.querySelector('#reconciliationAckDigest'),
+  reconciliationAckContext: document.querySelector('#reconciliationAckContext'),
   reconciliationAckResolution: document.querySelector('#reconciliationAckResolution'),
   reconciliationAckConfirmation: document.querySelector('#reconciliationAckConfirmation'),
   reconciliationAckError: document.querySelector('#reconciliationAckError'),
@@ -81,6 +82,15 @@ const RECONCILIATION_ACK_RESOLUTIONS = new Set([
   'operation_applied',
   'operation_not_applied',
   'state_manually_reconciled',
+]);
+const RECONCILIATION_AVAILABILITY_REASONS = new Set([
+  'not_in_sub2api', 'sub2api_schema_invalid', 'sub2api_status_unknown',
+  'sub2api_status_missing', 'sub2api_status_disabled', 'sub2api_status_error',
+  'sub2api_schedulable_missing', 'sub2api_unschedulable',
+  'sub2api_auto_pause_invalid', 'sub2api_expiry_invalid', 'sub2api_expired',
+  'sub2api_temp_unschedulable_invalid', 'sub2api_temp_unschedulable',
+  'sub2api_rate_limit_invalid', 'sub2api_rate_limited',
+  'sub2api_overload_invalid', 'sub2api_overloaded', 'sub2api_available',
 ]);
 
 function escapeHtml(value) {
@@ -1375,10 +1385,15 @@ function renderJob(job) {
     return;
   }
   let detail = needsReconciliation && job.type === 'account_test'
+      && job.result?.summaryUnavailable !== true
     ? accountTestResultsDetail([job.result])
     : job.error;
   if (!detail && job.result) {
-    if (job.type === 'account_test') {
+    if (job.result.summaryUnavailable === true) {
+      detail = needsReconciliation
+        ? '任务结果较大，列表仅保留待人工核对标记；请打开核对详情确认目标，确认前勿重试'
+        : '任务结果较大，列表未加载详细摘要；任务状态仍以服务端终态为准';
+    } else if (job.type === 'account_test') {
       detail = '测试成功 ' + (job.result.succeeded || 0)
         + ' · 失败 ' + (job.result.failed || 0)
         + ' · 跳过 ' + (job.result.skipped || 0);
@@ -1413,37 +1428,197 @@ function setReconciliationDialogPending(pending) {
   }
 }
 
-function openReconciliationDialog() {
+function boundedReconciliationDisplay(value, maximum = 256) {
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  return text && text.length <= maximum
+    && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(text)
+    ? text
+    : null;
+}
+
+function reconciliationTargetIsValid(workflow, target) {
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return false;
+  const sourcePath = boundedReconciliationDisplay(target.sourcePath, 512);
+  const remoteAccountId = Number(target.remoteAccountId);
+  const hasRemoteAccountId = Number.isSafeInteger(remoteAccountId) && remoteAccountId > 0;
+  const email = boundedReconciliationDisplay(target.email, 320);
+  const phone = typeof target.phone === 'string' && /^\d{1,80}$/.test(target.phone)
+    ? target.phone
+    : null;
+  if (workflow === 'token_import') {
+    if (!sourcePath && !hasRemoteAccountId) return false;
+    if (target.accountName !== undefined
+        && !boundedReconciliationDisplay(target.accountName, 128)) return false;
+    if (target.email !== undefined && !email) return false;
+    if (target.action !== undefined && !['create', 'update'].includes(target.action)) return false;
+    if (target.accessFingerprint !== undefined
+        && !/^[a-f0-9]{8,128}$/.test(String(target.accessFingerprint))) return false;
+    if (target.strongIdentityKeys !== undefined
+        && (!Array.isArray(target.strongIdentityKeys)
+          || target.strongIdentityKeys.length === 0
+          || target.strongIdentityKeys.length > 10
+          || new Set(target.strongIdentityKeys).size !== target.strongIdentityKeys.length
+          || target.strongIdentityKeys.some((key) => {
+            const text = boundedReconciliationDisplay(key, 520);
+            return !text || !/^(?:account|user):.+$/.test(text);
+          }))) return false;
+    if (target.strongIdentityTruncated === true) return false;
+    if (target.strongIdentityTruncated !== undefined
+        && target.strongIdentityTruncated !== false) return false;
+    if (target.availability !== undefined
+        && !['available', 'unavailable', 'unknown', 'not_present']
+          .includes(target.availability)) return false;
+    if (target.availabilityReason !== undefined
+        && !RECONCILIATION_AVAILABILITY_REASONS.has(target.availabilityReason)) return false;
+    return true;
+  }
+  if (workflow === 'account_test') {
+    if (!hasRemoteAccountId) return false;
+    if (target.identityDigest !== undefined
+        && !/^[a-f0-9]{64}$/.test(String(target.identityDigest))) return false;
+    if (target.baselineStatus !== undefined
+        && !['active', 'disabled', 'error'].includes(target.baselineStatus)) return false;
+    if (target.baselineSchedulable !== undefined
+        && typeof target.baselineSchedulable !== 'boolean') return false;
+    return true;
+  }
+  if (workflow === 'phase3') {
+    if (!sourcePath && !email && !phone) return false;
+    if (target.email !== undefined && !email) return false;
+    if (target.phone !== undefined && !phone) return false;
+    return true;
+  }
+  return false;
+}
+
+function reconciliationReviewDetailError(detail, expected) {
+  if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return '人工核对详情格式无效';
+  if (detail.version !== 1 || detail.id !== expected.id
+      || detail.type !== expected.type
+      || detail.reconciliationClaimDigest !== expected.digest) {
+    return '任务标识或保护键摘要与列表不一致';
+  }
+  if (!terminalJob(detail.status) || detail.reconciliationHold !== true
+      || detail.reconciliationResolved !== false) return '任务已不再处于可确认的待核对状态';
+  const context = detail.targetContext;
+  if (!context || context.available !== true || !Array.isArray(context.targets)
+      || context.targets.length === 0 || context.targets.length > 100) {
+    return '任务未提供可安全核对的目标信息';
+  }
+  const total = Number(context.total);
+  const returned = Number(context.returned);
+  if (!Number.isSafeInteger(total) || !Number.isSafeInteger(returned)
+      || total < returned || returned !== context.targets.length
+      || context.truncated !== (total > returned)
+      || !context.targets.every((target) => reconciliationTargetIsValid(detail.type, target))) {
+    return '人工核对目标详情不完整或格式无效';
+  }
+  return null;
+}
+
+function reconciliationTargetContextText(detail) {
+  const workflowLabels = {
+    token_import: 'Token 导入',
+    account_test: '账号测试',
+    phase3: 'Phase 3',
+  };
+  const lines = ['工作流：' + workflowLabels[detail.type]];
+  detail.targetContext.targets.forEach((target, index) => {
+    const fields = [];
+    if (target.sourcePath) fields.push('文件 ' + target.sourcePath);
+    if (target.remoteAccountId) fields.push('Sub2API ID ' + target.remoteAccountId);
+    if (target.accountName) fields.push('名称 ' + target.accountName);
+    if (target.email) fields.push('邮箱 ' + target.email);
+    if (target.phone) fields.push('手机 ' + target.phone);
+    if (target.action) fields.push('原动作 ' + (target.action === 'create' ? '创建' : '更新'));
+    if (target.baselineStatus) fields.push('提交时状态 ' + target.baselineStatus);
+    if (typeof target.baselineSchedulable === 'boolean') {
+      fields.push('提交时调度 ' + (target.baselineSchedulable ? '启用' : '停用'));
+    }
+    if (target.identityDigest) fields.push('强身份摘要 ' + target.identityDigest);
+    if (target.strongIdentityKeys) {
+      fields.push('来源强身份 ' + target.strongIdentityKeys.join(' / '));
+    }
+    if (target.accessFingerprint) fields.push('Access 指纹 ' + target.accessFingerprint);
+    if (target.availability) {
+      fields.push('计划时可用性 ' + target.availability
+        + (target.availabilityReason ? ' (' + target.availabilityReason + ')' : ''));
+    }
+    lines.push(String(index + 1) + '. ' + fields.join(' · '));
+  });
+  if (detail.targetContext.truncated) {
+    lines.push('仅显示前 ' + detail.targetContext.returned + '/' + detail.targetContext.total
+      + ' 项；详情不完整，禁止在面板确认。');
+  }
+  return lines.join('\n');
+}
+
+async function openReconciliationDialog() {
+  if (state.reconciliationAckPending) return;
   const target = reconciliationHoldTarget();
   const dialog = elements.reconciliationAckDialog;
   if (!target || !dialog || typeof dialog.showModal !== 'function') {
     showNotice('无法打开人工核对确认框，持久阻挡未变更。', 'notice-danger');
     return;
   }
-  state.reconciliationAckTarget = {
+  const expected = {
     id: target.id,
+    type: target.type,
     digest: target.result.reconciliationClaimDigest,
   };
-  if (elements.reconciliationAckJobId) elements.reconciliationAckJobId.textContent = target.id;
-  if (elements.reconciliationAckScope) {
-    elements.reconciliationAckScope.textContent = target.result.reconciliationHoldScope === 'all_future_jobs'
-      ? '全部新写操作（旧版任务无法还原原保护键）'
-      : '当前键已保留；安全策略阻止全部新写操作';
-  }
-  if (elements.reconciliationAckDigest) {
-    elements.reconciliationAckDigest.textContent = target.result.reconciliationClaimDigest;
-  }
-  if (elements.reconciliationAckResolution) elements.reconciliationAckResolution.value = '';
-  if (elements.reconciliationAckConfirmation) elements.reconciliationAckConfirmation.value = '';
-  setReconciliationDialogError('');
-  setReconciliationDialogPending(false);
+  state.reconciliationAckPending = true;
+  state.reconciliationAckTarget = null;
+  renderReconciliationAction(state.job);
+  updateActionState();
   try {
+    const response = await apiFetch(
+      '/api/jobs/' + encodeURIComponent(expected.id) + '/reconciliation',
+    );
+    const detail = await response.json();
+    if (!response.ok) {
+      const error = new Error(detail.message || detail.error || '人工核对目标读取失败');
+      error.httpStatus = response.status;
+      throw error;
+    }
+    const detailError = reconciliationReviewDetailError(detail, expected);
+    const current = reconciliationHoldJobs(state.job).find((job) => (
+      job.id === expected.id && job.result.reconciliationClaimDigest === expected.digest
+    ));
+    if (detailError || !current) {
+      throw new Error(detailError || '任务或保护键摘要已变化，请刷新后重试');
+    }
+    if (detail.targetContext.truncated) {
+      throw new Error('人工核对目标超过单次安全显示上限，不能从面板确认');
+    }
+    state.reconciliationAckTarget = { ...expected, reviewVerified: true };
+    if (elements.reconciliationAckJobId) elements.reconciliationAckJobId.textContent = detail.id;
+    if (elements.reconciliationAckScope) {
+      elements.reconciliationAckScope.textContent = detail.reconciliationHoldScope === 'all_future_jobs'
+        ? '全部新写操作（旧版任务无法还原原保护键）'
+        : '当前键已保留；安全策略阻止全部新写操作';
+    }
+    if (elements.reconciliationAckDigest) {
+      elements.reconciliationAckDigest.textContent = detail.reconciliationClaimDigest;
+    }
+    if (elements.reconciliationAckContext) {
+      elements.reconciliationAckContext.textContent = reconciliationTargetContextText(detail);
+    }
+    if (elements.reconciliationAckResolution) elements.reconciliationAckResolution.value = '';
+    if (elements.reconciliationAckConfirmation) elements.reconciliationAckConfirmation.value = '';
+    setReconciliationDialogError('');
+    setReconciliationDialogPending(false);
     dialog.returnValue = '';
     dialog.showModal();
     elements.reconciliationAckResolution?.focus();
-  } catch {
+  } catch (error) {
     state.reconciliationAckTarget = null;
-    showNotice('无法打开人工核对确认框，持久阻挡未变更。', 'notice-danger');
+    if (error?.httpStatus === 409) await resumeActiveJob();
+    showNotice((error.message || '无法读取人工核对目标') + '，持久阻挡未变更。', 'notice-danger');
+  } finally {
+    state.reconciliationAckPending = false;
+    renderReconciliationAction(state.job);
+    updateActionState();
   }
 }
 
@@ -1459,7 +1634,7 @@ async function submitReconciliationAcknowledgement(event) {
   const current = reconciliationHoldJobs(state.job).find((job) => (
     job.id === target?.id && job.result.reconciliationClaimDigest === target?.digest
   ));
-  if (!current) {
+  if (!current || target?.reviewVerified !== true) {
     setReconciliationDialogError('任务或保护键摘要已变化，请关闭后刷新。');
     return;
   }
@@ -1493,7 +1668,11 @@ async function submitReconciliationAcknowledgement(event) {
       },
     );
     const body = await response.json();
-    if (!response.ok) throw new Error(body.message || body.error || '人工对账确认失败');
+    if (!response.ok) {
+      const requestError = new Error(body.message || body.error || '人工对账确认失败');
+      requestError.httpStatus = response.status;
+      throw requestError;
+    }
     elements.reconciliationAckDialog?.close('acknowledged');
     state.reconciliationAckTarget = null;
     await resumeActiveJob();
@@ -1504,6 +1683,11 @@ async function submitReconciliationAcknowledgement(event) {
       showNotice('已记录人工核对结论并解除该任务对未来操作的阻挡；原任务仍不可重试。', 'notice-info');
     }
   } catch (error) {
+    if (error?.httpStatus === 409) {
+      state.reconciliationAckTarget = null;
+      elements.reconciliationAckDialog?.close('stale');
+      await resumeActiveJob();
+    }
     setReconciliationDialogError(error.message || '人工对账确认失败；持久阻挡未变更。');
     showNotice(error.message || '人工对账确认失败。', 'notice-danger');
   } finally {
@@ -1799,7 +1983,7 @@ async function loadSnapshot(options = {}) {
   return loaded;
 }
 
-elements.refreshButton.addEventListener('click', loadSnapshot);
+elements.refreshButton.addEventListener('click', () => loadSnapshot({ resumeJobs: true }));
 async function previewSelection() {
   if (state.previewRequestPending) return;
   if (!comparisonAvailable()) {
@@ -2100,7 +2284,9 @@ document.querySelectorAll('[data-column-toggle]').forEach((input) => {
 });
 
 if (elements.reconciliationAckButton) {
-  elements.reconciliationAckButton.addEventListener('click', openReconciliationDialog);
+  elements.reconciliationAckButton.addEventListener('click', () => {
+    void openReconciliationDialog();
+  });
 }
 if (elements.reconciliationAckForm) {
   elements.reconciliationAckForm.addEventListener('submit', submitReconciliationAcknowledgement);
