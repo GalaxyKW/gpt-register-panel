@@ -729,6 +729,57 @@ test('phase3 admission rejects an old UI revision after same-path token or usern
   }
 });
 
+test('phase3 resolver revalidates lossy identity and token selection input', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-input-boundary-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email: 'strict-input@example.test',
+    phone: '138-0000',
+    password: 'test-password',
+    status: 'oauth_done',
+  }]));
+  fs.writeFileSync(path.join(root, 'tokens', 'strict.json'), JSON.stringify({
+    access_token: 'test-access-value',
+    email: 'strict-input@example.test',
+  }));
+  const previousRoot = process.env.GPT_REGISTER_ROOT;
+  process.env.GPT_REGISTER_ROOT = root;
+  try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const selectedKey = 'token:tokens:tokens/strict.json';
+    const revision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
+    assert.match(revision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
+    for (const request of [
+      {
+        email: 'strict-input@example.test',
+        phone: '138letters0000',
+        selectedKey,
+      },
+      {
+        email: 'strict-input@example.test',
+        phone: '138-0000',
+        selectedKey: selectedKey + ' ',
+      },
+    ]) {
+      const resolved = resolvePhase3Requests([{
+        originalIndex: 0,
+        phase3TargetRevision: revision,
+        ...request,
+      }]);
+      assert.equal(resolved.eligible.length, 0);
+      assert.equal(resolved.rejected[0].error, 'phase3_request_invalid');
+    }
+  } finally {
+    if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previousRoot;
+  }
+});
+
 test('Phase3 aborts promptly from its private queue without starting queued work', async () => {
   let markEntered;
   let releaseBlocker;

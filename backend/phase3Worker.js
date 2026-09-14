@@ -11,6 +11,14 @@ const {
 } = require('./adapters/gptRegisterFs');
 const { isExpired, isExpiryInvalid } = require('./diff');
 const { normalizeEmail } = require('./lib/token');
+const {
+  PHASE3_PHONE_USERNAME_MAX_BYTES,
+  normalizePhase3CanonicalKeys,
+  normalizePhase3Identity,
+  normalizePhase3Phone,
+  normalizePhase3SelectedKey,
+  phase3SelectedKeyForToken,
+} = require('./lib/phase3Identity');
 const { phase3TargetRevisionMatches } = require('./phase3TargetRevision');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
@@ -391,8 +399,12 @@ function phase3Environment() {
   return environment;
 }
 
-function normalizePhone(value) {
-  return String(value || '').trim().replace(/[^0-9]/g, '');
+function normalizeUsernamePhone(value) {
+  return normalizePhase3Phone(value, {
+    maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
+    allowNumber: true,
+    allowNull: true,
+  });
 }
 
 function recordFingerprint(record) {
@@ -426,7 +438,7 @@ function usernameExecutionDigest(index, record) {
 }
 
 function tokenSelectionKey(token) {
-  return 'token:' + String(token?.source || '') + ':' + String(token?.relativePath || '');
+  return phase3SelectedKeyForToken(token);
 }
 
 function tokenExecutionDigest(token) {
@@ -468,9 +480,11 @@ function assertTokenExecutionBinding(binding, sources, entry, request = {}) {
   ));
   const token = matches.length === 1 ? matches[0] : null;
   const tokenEmail = normalizeEmail(token?.email);
-  const requestEmail = normalizeEmail(request.email);
-  const requestPhone = normalizePhone(request.phone);
+  const requestIdentity = normalizePhase3Identity(request, { allowNull: true });
+  const requestEmail = requestIdentity?.email || '';
+  const requestPhone = requestIdentity?.phone || '';
   if (!token || token.historical === true || token.parseStatus !== 'ok'
+      || !requestIdentity
       || !executionDigestsEqual(binding.digest, tokenExecutionDigest(token))
       || !tokenEmail || tokenEmail !== entry.email
       || (requestEmail && requestEmail !== tokenEmail)
@@ -600,13 +614,23 @@ function findUsernameEntry({
     );
   }
   const records = snapshot.records;
-  const normalizedEmail = normalizeEmail(email);
-  const normalizedPhone = normalizePhone(phone);
+  const identity = normalizePhase3Identity({ email, phone }, { allowNull: true });
+  if (!identity) {
+    throw phase3BindingError(
+      'PHASE3_IDENTITY_INVALID',
+      'Phase3 账号身份字段无效',
+    );
+  }
+  const normalizedEmail = identity.email;
+  const normalizedPhone = identity.phone;
   const eligible = records.map((record, index) => ({ record, index })).filter(({ record }) => {
     if (!record || !record.password) return false;
+    const recordPhone = normalizeUsernamePhone(record.phone);
+    if (recordPhone === null) return false;
     const emailMatches = normalizedEmail && record.email
       && normalizeEmail(record.email) === normalizedEmail;
-    const phoneMatches = normalizedPhone && normalizePhone(record.phone) === normalizedPhone;
+    const phoneMatches = normalizedPhone
+      && recordPhone === normalizedPhone;
     // When both identifiers are supplied they must identify the same row.
     // Matching email from one account and phone from another is ambiguous.
     if (normalizedEmail && normalizedPhone) return emailMatches && phoneMatches;
@@ -630,7 +654,7 @@ function findUsernameEntry({
   const entry = {
     index,
     email: normalizeEmail(record.email),
-    phone: normalizePhone(record.phone),
+    phone: normalizeUsernamePhone(record.phone),
     createdAt: record.createdAt || null,
     recordFingerprint: recordFingerprint(record),
     transitionBaseFingerprint: phase3TransitionBaseFingerprint(record),
@@ -685,7 +709,8 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
     throw new Error('username.json 账号记录已变化，无法持久化处置状态');
   }
   const current = records[entry.index];
-  if (normalizeEmail(current?.email) !== entry.email || normalizePhone(current?.phone) !== entry.phone) {
+  if (normalizeEmail(current?.email) !== entry.email
+      || normalizeUsernamePhone(current?.phone) !== entry.phone) {
     throw new Error('username.json 账号索引已变化，拒绝覆盖错误记录');
   }
   if (entry.recordFingerprint && recordFingerprint(current) !== entry.recordFingerprint) {
@@ -896,7 +921,7 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
       );
       const current = snapshot.records[entry.index];
       childRecordedTerminal = normalizeEmail(current?.email) === entry.email
-        && normalizePhone(current?.phone) === entry.phone
+        && normalizeUsernamePhone(current?.phone) === entry.phone
         && TERMINAL_ACCOUNT_STATUSES.has(String(current?.status || '').trim().toLowerCase())
         && String(current?.phase3Disposition || '').trim().toLowerCase() === 'discard'
         && String(current?.phase3LastErrorCode || '').trim() === 'ACCOUNT_DEACTIVATED';
@@ -1701,26 +1726,10 @@ async function runPhase3JobNow({
   }
 }
 
-function phase3Key({ email, phone } = {}) {
-  const normalizedEmail = normalizeEmail(email);
-  if (normalizedEmail) return 'email:' + normalizedEmail;
-  const normalizedPhone = normalizePhone(phone);
-  return normalizedPhone ? 'phone:' + normalizedPhone : null;
-}
-
-function phase3Keys({ email, phone } = {}) {
-  return [
-    normalizeEmail(email) ? 'email:' + normalizeEmail(email) : null,
-    normalizePhone(phone) ? 'phone:' + normalizePhone(phone) : null,
-  ].filter(Boolean);
-}
-
-function safeProvidedCanonicalKeys(value) {
-  if (!Array.isArray(value) || value.length === 0 || value.length > 2) return null;
-  const keys = value
-    .map((key) => String(key || '').trim().toLowerCase())
-    .filter((key) => /^(?:email:[^\s]{1,320}|phone:\d{1,80})$/.test(key));
-  return keys.length > 0 ? [...new Set(keys)].sort() : null;
+function phase3IdentityError(code = 'PHASE3_IDENTITY_INVALID') {
+  const error = new Error('Phase3 账号身份或规范锁键无效');
+  error.code = code;
+  return error;
 }
 
 function resolvePhase3Requests(requests = []) {
@@ -1736,20 +1745,19 @@ function resolvePhase3Requests(requests = []) {
   const eligible = [];
   const rejected = [];
   for (const request of requests) {
-    const email = normalizeEmail(request?.email);
-    const phone = normalizePhone(request?.phone);
-    const selectedKey = typeof request?.selectedKey === 'string'
-      ? request.selectedKey.trim()
-      : '';
+    const identity = normalizePhase3Identity(request || {});
+    const email = identity?.email || '';
+    const phone = identity?.phone || '';
+    const selectedKey = normalizePhase3SelectedKey(request?.selectedKey);
     const selectedTokenMatches = sources.tokens.filter((token) => (
-      tokenSelectionKey(token) === selectedKey
+      selectedKey && tokenSelectionKey(token) === selectedKey
     ));
     const selectedToken = selectedTokenMatches.length === 1
       ? selectedTokenMatches[0]
       : null;
     const matches = records.filter((record) => {
       const emailMatches = email && normalizeEmail(record?.email) === email;
-      const phoneMatches = phone && normalizePhone(record?.phone) === phone;
+      const phoneMatches = phone && normalizeUsernamePhone(record?.phone) === phone;
       if (email && phone) return emailMatches && phoneMatches;
       return emailMatches || phoneMatches;
     });
@@ -1761,7 +1769,10 @@ function resolvePhase3Requests(requests = []) {
       username: record,
       usernameContentHash: sources.usernameContentHash,
     } : null;
-    if (!phase3TargetRevisionMatches(request?.phase3TargetRevision, revisionEvidence)) {
+    if (!identity || !selectedKey) {
+      code = 'phase3_request_invalid';
+      message = 'Phase3 账号身份或 token 选择键无效';
+    } else if (!phase3TargetRevisionMatches(request?.phase3TargetRevision, revisionEvidence)) {
       code = 'phase3_target_revision_changed';
       message = '所选 Phase 3 目标已变化或快照凭证无效，请刷新后重新选择';
     } else if (!selectedKey || selectedTokenMatches.length !== 1) {
@@ -1801,7 +1812,7 @@ function resolvePhase3Requests(requests = []) {
       continue;
     }
     const resolvedEmail = normalizeEmail(record.email) || email;
-    const resolvedPhone = normalizePhone(record.phone) || phone;
+    const resolvedPhone = normalizeUsernamePhone(record.phone) || phone;
     if (!resolvedEmail || normalizeEmail(selectedToken.email) !== resolvedEmail) {
       rejected.push({
         index: request?.originalIndex,
@@ -1826,7 +1837,21 @@ function resolvePhase3Requests(requests = []) {
         'username.json 在 Phase3 入队检查期间发生变化',
       );
     }
-    const canonicalKeys = phase3Keys({ email: resolvedEmail, phone: resolvedPhone }).sort();
+    const resolvedIdentity = normalizePhase3Identity({
+      email: resolvedEmail,
+      phone: resolvedPhone || undefined,
+    });
+    if (!resolvedIdentity) {
+      rejected.push({
+        index: request?.originalIndex,
+        email: email || null,
+        phone: phone || null,
+        error: 'phase3_account_invalid',
+        message: 'username.json 中的 Phase3 身份字段无效',
+      });
+      continue;
+    }
+    const canonicalKeys = [...resolvedIdentity.keys].sort();
     const resolvedRequest = {
       ...request,
       email: resolvedEmail,
@@ -1850,31 +1875,51 @@ function resolvePhase3Requests(requests = []) {
 }
 
 function canonicalPhase3Keys(args = {}) {
-  const provided = safeProvidedCanonicalKeys(args.canonicalKeys);
-  if (provided) return provided;
-  const keys = new Set(phase3Keys(args));
+  const identity = normalizePhase3Identity(args, { allowNull: true });
+  if (!identity) throw phase3IdentityError();
+  const hasProvided = Object.hasOwn(args, 'canonicalKeys');
+  const provided = hasProvided
+    ? normalizePhase3CanonicalKeys(args.canonicalKeys, { requiredKeys: identity.keys })
+    : null;
+  if (hasProvided && !provided) {
+    throw phase3IdentityError('PHASE3_CANONICAL_KEYS_INVALID');
+  }
+  const keys = new Set(identity.keys);
   try {
     const records = readRegularJsonArraySnapshot(
       path.join(registerRoot(), 'username.json'),
       'username.json',
     ).records;
-    const normalizedEmail = normalizeEmail(args.email);
-    const normalizedPhone = normalizePhone(args.phone);
+    const normalizedEmail = identity.email;
+    const normalizedPhone = identity.phone;
     const matches = records.filter((item) => {
+      const itemPhone = normalizeUsernamePhone(item?.phone);
+      if (itemPhone === null) return false;
       const emailMatches = normalizedEmail && normalizeEmail(item?.email) === normalizedEmail;
-      const phoneMatches = normalizedPhone && normalizePhone(item?.phone) === normalizedPhone;
+      const phoneMatches = normalizedPhone
+        && itemPhone === normalizedPhone;
       if (normalizedEmail && normalizedPhone) return emailMatches && phoneMatches;
       return emailMatches || phoneMatches;
     });
     const record = matches.length === 1 ? matches[0] : null;
     if (record) {
       if (normalizeEmail(record.email)) keys.add('email:' + normalizeEmail(record.email));
-      if (normalizePhone(record.phone)) keys.add('phone:' + normalizePhone(record.phone));
+      if (normalizeUsernamePhone(record.phone)) {
+        keys.add('phone:' + normalizeUsernamePhone(record.phone));
+      }
     }
   } catch {
     // The definitive username/password validation happens when the worker runs.
   }
-  return [...keys];
+  const canonicalKeys = normalizePhase3CanonicalKeys([...keys], {
+    requiredKeys: identity.keys,
+  });
+  if (!canonicalKeys) throw phase3IdentityError('PHASE3_CANONICAL_KEYS_INVALID');
+  if (hasProvided && (provided.length !== canonicalKeys.length
+      || provided.some((key, index) => key !== canonicalKeys[index]))) {
+    throw phase3IdentityError('PHASE3_CANONICAL_KEYS_INVALID');
+  }
+  return canonicalKeys;
 }
 
 function getActivePhase3Job({ email, phone } = {}) {
@@ -1887,7 +1932,14 @@ function getActivePhase3Job({ email, phone } = {}) {
 
 function runPhase3Job(args = {}) {
   if (phase3ProcessTreeUnsafe) return Promise.reject(phase3SupervisionError());
-  const keys = canonicalPhase3Keys(args);
+  let keys;
+  let identity;
+  try {
+    keys = canonicalPhase3Keys(args);
+    identity = normalizePhase3Identity(args, { allowNull: true });
+  } catch (error) {
+    return Promise.reject(error);
+  }
   const key = keys[0] || null;
   if (!key) return Promise.reject(new Error('email 或 phone 必须提供一个'));
   const duplicate = keys.map((item) => activePhase3Jobs.get(item)).find(Boolean);
@@ -1900,8 +1952,8 @@ function runPhase3Job(args = {}) {
   const queuedAt = Date.now();
   const activeRecord = {
     jobId: args.jobId || null,
-    email: normalizeEmail(args.email),
-    phone: normalizePhone(args.phone) || null,
+    email: identity.email,
+    phone: identity.phone || null,
     queuedAt,
   };
   for (const activeKey of keys) activePhase3Jobs.set(activeKey, activeRecord);

@@ -382,6 +382,10 @@ test('complete source snapshots reject malformed username identity and terminal 
     { email: 'bidi\u202e@example.test', password: 'present', status: 'oauth_done' },
     { email: 'c1\u0085@example.test', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', phone: '138\n0000', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', phone: '138\u00a00000', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', phone: '138letters0000', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', phone: ' +().- ', password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', phone: '1'.repeat(65), password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', name: 'display\tname', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', password: 'password-lure\r\nnext', status: 'oauth_done' },
     { email: 'valid@example.test', password: 'present', status: 'oauth_done\n' },
@@ -963,6 +967,23 @@ test('snapshot rows receive safe username phone and Phase3 eligibility', async (
   assert.equal(row.phase3Email, 'example@email.test');
   assert.equal(row.phase3Eligible, true);
   assert.match(row.phase3TargetRevision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
+});
+
+test('diagnostic snapshots never issue a Phase3 revision for an invalid username phone', async () => {
+  const fixture = fixtureRoot();
+  fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([{
+    email: 'example@email.test',
+    phone: '138letters0000',
+    password: 'fixture-only',
+    status: 'oauth_done',
+  }]));
+  const snapshot = await buildSnapshot(new URLSearchParams(), {
+    rootDirectory: fixture.root,
+    readSub2Api: false,
+  });
+  const row = snapshot.rows.find((item) => item.fileName === 'b.json');
+  assert.equal(row.phone, '');
+  assert.equal(row.phase3TargetRevision, null);
 });
 
 test('classifies old_codex files as hidden historical backups', () => {

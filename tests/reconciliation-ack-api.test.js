@@ -77,14 +77,14 @@ async function heldJob(db, claimKey) {
   return db.getJob(job.id);
 }
 
-test('review source paths normalize real selection keys and reject cross-source ambiguity', () => {
+test('review source paths accept only exact source-bound selection keys', () => {
   assert.equal(
     sourcePathFromSelectionKey('token:tokens:tokens/free-account.json'),
     'tokens/free-account.json',
   );
   assert.equal(
     sourcePathFromSelectionKey('token:use_token:phase3-account.json'),
-    'use_token/phase3-account.json',
+    null,
   );
   assert.equal(
     sourcePathFromSelectionKey('token:tokens:use_token/wrong-source.json'),

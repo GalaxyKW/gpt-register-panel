@@ -1305,6 +1305,38 @@ test('Phase3 claim keys include every canonical email and phone identity', () =>
     ];
     assert.deepEqual(phase3ClaimKeys({ email: 'canonical@example.test' }), expected);
     assert.deepEqual(phase3ClaimKeys({ phone: '15550000002' }), expected);
+    assert.deepEqual(phase3ClaimKeys({
+      email: 'canonical@example.test',
+      phone: '15550000002',
+      canonicalKeys: [
+        'phone:15550000002',
+        'email:canonical@example.test',
+      ],
+    }), expected);
+    assert.throws(
+      () => phase3ClaimKeys({
+        email: 'canonical@example.test',
+        canonicalKeys: ['email:canonical@example.test'],
+      }),
+      (error) => error.code === 'PHASE3_CANONICAL_KEYS_INVALID',
+    );
+    assert.throws(
+      () => phase3ClaimKeys({
+        email: 'canonical@example.test',
+        canonicalKeys: [
+          'email:canonical@example.test',
+          'phone:19999999999',
+        ],
+      }),
+      (error) => error.code === 'PHASE3_CANONICAL_KEYS_INVALID',
+    );
+    assert.throws(
+      () => phase3ClaimKeys({
+        email: 'canonical@example.test',
+        phone: '1555letters0002',
+      }),
+      (error) => error.code === 'PHASE3_IDENTITY_INVALID',
+    );
   } finally {
     if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previousRoot;

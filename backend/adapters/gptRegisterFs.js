@@ -9,6 +9,10 @@ const {
 } = require('../lib/token');
 const { assertDirectoryTree } = require('../lib/safeFs');
 const { compareNaturalStrings } = require('../lib/stableOrder');
+const {
+  PHASE3_PHONE_USERNAME_MAX_BYTES,
+  normalizePhase3Phone,
+} = require('../lib/phase3Identity');
 const { redactText } = require('../logger');
 
 const READ_ONLY_FLAGS = fs.constants.O_RDONLY
@@ -126,11 +130,11 @@ function validateUsernameRecords(records) {
       }
     }
     if (record.phone !== undefined && record.phone !== null) {
-      const rawPhone = typeof record.phone === 'string' || typeof record.phone === 'number'
-        ? String(record.phone)
-        : '';
-      const phone = rawPhone.trim();
-      if (!phone || phone.length > 64 || C0_OR_DEL.test(rawPhone) || !/^[+\d\s().-]+$/.test(phone)) {
+      const phone = normalizePhase3Phone(record.phone, {
+        maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
+        allowNumber: true,
+      });
+      if (!phone) {
         throw usernameInvalidError();
       }
     }
@@ -1076,12 +1080,13 @@ function safeUsernameRecords(records) {
     const rawPhoneValue = typeof item?.phone === 'string' || typeof item?.phone === 'number'
       ? String(item.phone)
       : '';
-    const rawPhone = rawPhoneValue.trim();
-    const phone = rawPhone.length <= 64
-      && !C0_OR_DEL.test(rawPhoneValue)
-      && /^[+\d\s().-]*$/.test(rawPhone)
-      ? rawPhone
-      : '';
+    const normalizedPhone = normalizePhase3Phone(item?.phone, {
+      maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
+      allowNumber: true,
+      allowNull: true,
+    });
+    const phoneValid = normalizedPhone !== null;
+    const phone = phoneValid ? rawPhoneValue.trim() : '';
     const rawName = typeof item?.name === 'string' ? item.name : '';
     const name = redactText(rawName.replace(/[\u0000-\u001f\u007f]/g, ' ')).slice(0, 200);
     const rawStatus = typeof item?.status === 'string' ? item.status.trim() : '';
@@ -1090,6 +1095,7 @@ function safeUsernameRecords(records) {
       index,
       email,
       phone,
+      phoneValid,
       name,
       createdAt: parseDateValue(item?.createdAt),
       status,

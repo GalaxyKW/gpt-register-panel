@@ -1,13 +1,15 @@
 const crypto = require('node:crypto');
 
 const { normalizeEmail, normalizeIdentityValue } = require('./lib/token');
+const {
+  PHASE3_PHONE_USERNAME_MAX_BYTES,
+  normalizePhase3Phone,
+  normalizePhase3RelativePath,
+  phase3SelectedKeyForToken,
+} = require('./lib/phase3Identity');
 
 const REVISION_PREFIX = 'phase3-target-v1.';
 const REVISION_PATTERN = /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/;
-
-function normalizePhone(value) {
-  return String(value || '').trim().replace(/[^0-9]/g, '');
-}
 
 function canonicalIdentityValues(token, kind) {
   const prefix = kind + ':';
@@ -35,19 +37,24 @@ function canonicalPhase3Target({ token, username, usernameContentHash } = {}) {
   const usernameIndex = Number(username?.index);
   const email = normalizeEmail(token?.email);
   const usernameEmail = normalizeEmail(username?.email);
-  const phone = normalizePhone(username?.phone);
+  const phone = normalizePhase3Phone(username?.phone, {
+    maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
+    allowNumber: true,
+    allowNull: true,
+  });
   const accountIdentities = canonicalIdentityValues(token, 'account');
   const userIdentities = canonicalIdentityValues(token, 'user');
   const status = String(username?.status || '').trim().toLowerCase();
   if (!['tokens', 'use_token'].includes(source)
-      || !relativePath.startsWith(source + '/')
-      || relativePath.length > 512
+      || !normalizePhase3RelativePath(relativePath, source)
+      || !phase3SelectedKeyForToken(token)
       || !/^[a-f0-9]{64}$/.test(contentHash)
       || !/^[a-f0-9]{64}$/.test(usernameHash)
       || !Number.isSafeInteger(usernameIndex) || usernameIndex < 0
       || token?.historical === true || token?.parseStatus !== 'ok'
       || !email || email !== usernameEmail
       || username?.hasPassword !== true
+      || username?.phoneValid === false || phone === null
       || accountIdentities.invalid || userIdentities.invalid
       || status.length > 64 || (status && !/^[a-z0-9_-]+$/.test(status))) return null;
   return {

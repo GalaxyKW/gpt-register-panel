@@ -57,6 +57,10 @@ const {
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const {
+  normalizePhase3Identity,
+  normalizePhase3SelectedKey,
+} = require('./lib/phase3Identity');
+const {
   createAdmissionDispatchGuard,
   createBackgroundJobManager,
   throwIfJobInterrupted,
@@ -685,10 +689,8 @@ function normalizedReviewSourcePath(source, relativeValue) {
 }
 
 function sourcePathFromSelectionKey(value) {
-  if (typeof value !== 'string') return null;
-  const text = value.trim();
-  if (!text || text.length > 1024 || UNSAFE_REVIEW_TEXT.test(text)
-      || !text.startsWith('token:')) return null;
+  const text = normalizePhase3SelectedKey(value);
+  if (!text) return null;
   const separator = text.indexOf(':', 'token:'.length);
   if (separator < 0) return null;
   const source = text.slice('token:'.length, separator);
@@ -1109,10 +1111,10 @@ function normalizePhase3Requests(body) {
     error.code = 'PHASE3_SELECTION_INVALID';
     throw error;
   }
-  const selectedKeys = rawSelectedKeys.map((value) => value.trim());
-  if (selectedKeys.some((value) => !value || value.length > 512)
+  const selectedKeys = rawSelectedKeys.map(normalizePhase3SelectedKey);
+  if (selectedKeys.some((value) => !value)
       || new Set(selectedKeys).size !== selectedKeys.length) {
-    const error = new Error('Phase 3 账号选择键不能为空或重复');
+    const error = new Error('Phase 3 账号选择键格式无效或重复');
     error.code = 'PHASE3_SELECTION_INVALID';
     throw error;
   }
@@ -1126,38 +1128,29 @@ function normalizePhase3Requests(body) {
       error.code = 'PHASE3_ACCOUNT_INVALID';
       throw error;
     }
-    const selectedKey = typeof rawItem.selectedKey === 'string'
-      ? rawItem.selectedKey.trim()
-      : '';
-    if (!selectedKey || selectedKey.length > 512 || itemSelectedKeys.has(selectedKey)) {
+    const selectedKey = normalizePhase3SelectedKey(rawItem.selectedKey);
+    if (!selectedKey || itemSelectedKeys.has(selectedKey)
+        || selectedKey !== selectedKeys[index]) {
       const error = new Error('每个 Phase 3 账号必须提供唯一的 selectedKey');
       error.code = 'PHASE3_SELECTION_INVALID';
       throw error;
     }
     itemSelectedKeys.add(selectedKey);
     const phase3TargetRevision = typeof rawItem.phase3TargetRevision === 'string'
-      ? rawItem.phase3TargetRevision.trim()
+      ? rawItem.phase3TargetRevision
       : '';
     if (!/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(phase3TargetRevision)) {
       const error = new Error('每个 Phase 3 账号必须提供当前快照的目标 revision');
       error.code = 'PHASE3_TARGET_REVISION_INVALID';
       throw error;
     }
-    const email = typeof rawItem.email === 'string' ? rawItem.email.trim().toLowerCase() : '';
-    const phone = typeof rawItem.phone === 'string' ? rawItem.phone.trim() : '';
-    const normalizedPhone = phone.replace(/[^0-9]/g, '');
-    if (!email && !normalizedPhone) {
-      const error = new Error('每个 Phase 3 账号必须提供 email 或 phone');
+    const identity = normalizePhase3Identity(rawItem);
+    if (!identity) {
+      const error = new Error('Phase 3 email 或 phone 格式或长度无效');
       error.code = 'PHASE3_ACCOUNT_INVALID';
       throw error;
     }
-    if (email.length > 320 || phone.length > 80) {
-      const error = new Error('Phase 3 email 或 phone 长度无效');
-      error.code = 'PHASE3_ACCOUNT_INVALID';
-      throw error;
-    }
-    const keys = [email ? 'email:' + email : null, normalizedPhone ? 'phone:' + normalizedPhone : null]
-      .filter(Boolean);
+    const { email, phone, keys } = identity;
     if (keys.some((key) => seenKeys.has(key))) {
       duplicateIndexes.push(index);
       return;
@@ -1166,37 +1159,21 @@ function normalizePhase3Requests(body) {
     requests.push({
       originalIndex: index,
       email,
-      phone: normalizedPhone || phone,
+      phone,
       selectedKey,
       phase3TargetRevision,
     });
   });
-  if (selectedKeys.some((key) => !itemSelectedKeys.has(key))
-      || [...itemSelectedKeys].some((key) => !selectedKeys.includes(key))) {
-    const error = new Error('selectedKeys 与 Phase 3 账号项不一致');
-    error.code = 'PHASE3_SELECTION_INVALID';
-    throw error;
-  }
   if (requests.length === 0) {
     const error = new Error('Phase 3 账号均为重复项，未创建任务');
     error.code = 'PHASE3_BATCH_EMPTY';
     throw error;
   }
-  return { requests, duplicateIndexes };
+  return { requests, duplicateIndexes, selectedKeys };
 }
 
 function phase3ClaimKeys(requestItem = {}) {
-  const fallback = [
-    requestItem.email ? 'email:' + String(requestItem.email).trim().toLowerCase() : null,
-    requestItem.phone ? 'phone:' + String(requestItem.phone).replace(/[^0-9]/g, '') : null,
-  ].filter(Boolean);
-  let identityKeys;
-  try { identityKeys = canonicalPhase3Keys(requestItem); } catch { identityKeys = fallback; }
-  const safeKeys = (Array.isArray(identityKeys) && identityKeys.length > 0 ? identityKeys : fallback)
-    .map((key) => String(key || '').trim())
-    .filter((key) => /^(?:email:[^\s]{1,320}|phone:\d{1,80})$/.test(key));
-  const effectiveKeys = safeKeys.length > 0 ? safeKeys : fallback;
-  return [...new Set(effectiveKeys)].sort().map((key) => 'phase3:' + key);
+  return canonicalPhase3Keys(requestItem).map((key) => 'phase3:' + key);
 }
 
 function safeExpiredTokenItem(item) {
@@ -2530,8 +2507,11 @@ function createServer(options = {}) {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
         if (bodyError) throw bodyError;
-        const { requests, duplicateIndexes } = normalizePhase3Requests(body);
-        const normalizedSelectedKeys = body.selectedKeys.map((value) => value.trim());
+        const {
+          requests,
+          duplicateIndexes,
+          selectedKeys: normalizedSelectedKeys,
+        } = normalizePhase3Requests(body);
         const idempotency = mutationContext(request, MUTATION_WORKFLOWS.phase3, {
           accounts: requests.map((item) => ({
             originalIndex: item.originalIndex,

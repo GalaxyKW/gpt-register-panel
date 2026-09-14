@@ -17,6 +17,14 @@ const {
 } = require('../backend/server');
 const { safeImportResult, buildSnapshot } = require('../backend/sync');
 const { normalizeTokenDocument, tokenCredentialField } = require('../backend/lib/token');
+const {
+  normalizePhase3CanonicalKeys,
+  normalizePhase3Phone,
+  normalizePhase3RelativePath,
+  normalizePhase3SelectedKey,
+  phase3SelectedKeyForToken,
+} = require('../backend/lib/phase3Identity');
+const { canonicalPhase3Target } = require('../backend/phase3TargetRevision');
 const { buildDiff } = require('../backend/diff');
 const { PanelDb } = require('../backend/db');
 const { findUsernameEntry, persistAccountDisposition } = require('../backend/phase3Worker');
@@ -83,6 +91,79 @@ test('JSON API body validation rejects scalar values', () => {
   assert.equal(requestBodyObjectError([])?.code, 'INVALID_REQUEST_BODY');
 });
 
+test('Phase3 phone normalization accepts legacy punctuation but rejects lossy input', () => {
+  assert.equal(normalizePhase3Phone(' +86 (138) 0013-8000. '), '8613800138000');
+  assert.equal(normalizePhase3Phone('1'), '1');
+  assert.equal(normalizePhase3Phone(''), '');
+  for (const value of [
+    '138abc0000',
+    '138\t0000',
+    '138\u00850000',
+    '138\u00a00000',
+    '138\u200b0000',
+    '138\u202e0000',
+    ' +().- ',
+    '1'.repeat(81),
+    1380000,
+    null,
+    {},
+  ]) {
+    assert.equal(normalizePhase3Phone(value), null, String(value));
+  }
+  assert.equal(normalizePhase3Phone(1380000, { allowNumber: true }), '1380000');
+});
+
+test('Phase3 token selection keys are exact bounded source-relative JSON paths', () => {
+  const valid = [
+    'token:tokens:tokens/account.json',
+    'token:use_token:use_token/nested/account.JSON',
+    'token:tokens:tokens/账号 01.json',
+  ];
+  for (const key of valid) assert.equal(normalizePhase3SelectedKey(key), key);
+  assert.equal(normalizePhase3RelativePath('tokens/account.JSON', 'tokens'), 'tokens/account.JSON');
+  assert.equal(phase3SelectedKeyForToken({
+    source: 'tokens',
+    relativePath: 'tokens/account.json',
+  }), 'token:tokens:tokens/account.json');
+  for (const key of [
+    '',
+    ' token:tokens:tokens/account.json',
+    'token:tokens:tokens/account.json ',
+    'token:tokens:use_token/account.json',
+    'token:other:other/account.json',
+    'token:tokens:/tokens/account.json',
+    'token:tokens:tokens//account.json',
+    'token:tokens:tokens/./account.json',
+    'token:tokens:tokens/../account.json',
+    'token:tokens:tokens\\account.json',
+    'token:tokens:tokens/account.txt',
+    'token:tokens:tokens/account\u0000.json',
+    'token:tokens:tokens/account\u200b.json',
+    'token:tokens:tokens/account\u202e.json',
+    'token:tokens:tokens/' + 'a'.repeat(490) + '.json',
+  ]) {
+    assert.equal(normalizePhase3SelectedKey(key), null, key);
+  }
+});
+
+test('Phase3 canonical key groups reject partial, duplicate, and noncanonical entries', () => {
+  const required = ['email:one@example.test', 'phone:1380000'];
+  assert.deepEqual(normalizePhase3CanonicalKeys([...required].reverse(), {
+    requiredKeys: required,
+  }), required);
+  for (const value of [
+    ['email:one@example.test'],
+    ['email:one@example.test', 'phone:1380000', 'phone:1390000'],
+    ['email:one@example.test', 'email:two@example.test'],
+    ['email:ONE@example.test', 'phone:1380000'],
+    ['email:one@example.test', 'phone:+1380000'],
+    ['email:one@example.test', 'credential:opaque-value'],
+    ['email:one@example.test', 'phone:138\u200b0000'],
+  ]) {
+    assert.equal(normalizePhase3CanonicalKeys(value, { requiredKeys: required }), null);
+  }
+});
+
 test('Phase 3 accepts batches and removes duplicate email/phone targets', () => {
   const phase3TargetRevision = 'phase3-target-v1.' + 'A'.repeat(43);
   const batch = normalizePhase3Requests({
@@ -118,6 +199,20 @@ test('Phase 3 requires an exact one-to-one selected-key set', () => {
     { accounts },
     { accounts, selectedKeys: [] },
     { accounts, selectedKeys: ['token:tokens:tokens/other.json'] },
+    {
+      accounts: [
+        accounts[0],
+        {
+          email: 'two@example.test',
+          selectedKey: 'token:tokens:tokens/two.json',
+          phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+        },
+      ],
+      selectedKeys: [
+        'token:tokens:tokens/two.json',
+        'token:tokens:tokens/one.json',
+      ],
+    },
     { accounts: [...accounts, { ...accounts[0] }], selectedKeys: [
       'token:tokens:tokens/one.json',
       'token:tokens:tokens/one.json',
@@ -128,6 +223,63 @@ test('Phase 3 requires an exact one-to-one selected-key set', () => {
       (error) => error.code === 'PHASE3_SELECTION_INVALID',
     );
   }
+});
+
+test('Phase 3 rejects invalid explicit identity fields instead of dropping one side', () => {
+  const selectedKey = 'token:tokens:tokens/one.json';
+  const phase3TargetRevision = 'phase3-target-v1.' + 'A'.repeat(43);
+  const invalidAccounts = [
+    { email: 'not-an-email', phone: '1380000' },
+    { email: 'one@example.test', phone: '138abc0000' },
+    { email: 'one@example.test', phone: '138\u00a00000' },
+    { email: 'one@example.test', phone: 1380000 },
+    { email: ['one@example.test'], phone: '1380000' },
+    { email: 'one@example.test', phone: null },
+  ];
+  for (const account of invalidAccounts) {
+    assert.throws(
+      () => normalizePhase3Requests({
+        accounts: [{ ...account, selectedKey, phase3TargetRevision }],
+        selectedKeys: [selectedKey],
+      }),
+      (error) => error.code === 'PHASE3_ACCOUNT_INVALID',
+    );
+  }
+});
+
+test('Phase3 target revisions reject malformed phone and token paths', () => {
+  const base = {
+    token: {
+      source: 'tokens',
+      relativePath: 'tokens/account.json',
+      contentHash: 'a'.repeat(64),
+      parseStatus: 'ok',
+      historical: false,
+      email: 'one@example.test',
+      identityKeys: [],
+    },
+    username: {
+      index: 0,
+      email: 'one@example.test',
+      phone: '+86 138-0000',
+      status: 'oauth_done',
+      hasPassword: true,
+    },
+    usernameContentHash: 'b'.repeat(64),
+  };
+  assert.ok(canonicalPhase3Target(base));
+  assert.equal(canonicalPhase3Target({
+    ...base,
+    username: { ...base.username, phone: '138abc0000' },
+  }), null);
+  assert.equal(canonicalPhase3Target({
+    ...base,
+    token: { ...base.token, relativePath: 'tokens/../account.json' },
+  }), null);
+  assert.equal(canonicalPhase3Target({
+    ...base,
+    token: { ...base.token, relativePath: 'use_token/account.json' },
+  }), null);
 });
 
 test('Phase 3 refuses missing or malformed snapshot target revisions', () => {
