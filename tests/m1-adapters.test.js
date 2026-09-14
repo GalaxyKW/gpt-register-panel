@@ -2021,6 +2021,18 @@ test('Sub2API base URL rejects query strings and fragments', () => {
     () => new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080/#fragment', apiKey: 'test-key' }),
     /查询参数/,
   );
+  assert.throws(
+    () => new Sub2ApiAdminClient({ baseUrl: 'https://user:password@example.test', apiKey: 'test-key' }),
+    (error) => !error.message.includes('user') && !error.message.includes('password'),
+  );
+  assert.throws(
+    () => new Sub2ApiAdminClient({
+      baseUrl: 'http://%31%32%37.0.0.1:8080',
+      apiKey: 'test-key',
+      allowInsecureHttp: true,
+    }),
+    (error) => /http\(s\)/.test(error.message),
+  );
 });
 
 test('Sub2API permits plaintext HTTP only for loopback unless explicitly overridden', () => {
@@ -2033,9 +2045,32 @@ test('Sub2API permits plaintext HTTP only for loopback unless explicitly overrid
     assert.doesNotThrow(
       () => new Sub2ApiAdminClient({ baseUrl: 'http://[::1]:8080', apiKey: 'test-key' }),
     );
-    assert.throws(
-      () => new Sub2ApiAdminClient({ baseUrl: 'http://192.0.2.10:8080', apiKey: 'test-key' }),
-      (error) => error.code === 'SUB2API_INSECURE_HTTP',
+    // WHATWG URL canonicalizes these numeric IPv4 spellings before the
+    // loopback decision; they still resolve to an explicit 127/8 address.
+    assert.doesNotThrow(
+      () => new Sub2ApiAdminClient({ baseUrl: 'http://127.1:8080', apiKey: 'test-key' }),
+    );
+    assert.doesNotThrow(
+      () => new Sub2ApiAdminClient({ baseUrl: 'http://2130706433:8080', apiKey: 'test-key' }),
+    );
+    for (const baseUrl of [
+      'http://localhost:8080',
+      'http://LOCALHOST:8080',
+      'http://local%68ost:8080',
+      'http://192.0.2.10:8080',
+      'http://evil.example:8080',
+      'http://[::ffff:127.0.0.1]:8080',
+    ]) {
+      assert.throws(
+        () => new Sub2ApiAdminClient({ baseUrl, apiKey: 'test-key' }),
+        (error) => error.code === 'SUB2API_INSECURE_HTTP',
+      );
+    }
+    assert.doesNotThrow(
+      () => new Sub2ApiAdminClient({ baseUrl: 'https://localhost:8080', apiKey: 'test-key' }),
+    );
+    assert.doesNotThrow(
+      () => new Sub2ApiAdminClient({ baseUrl: 'https://evil.example:8080', apiKey: 'test-key' }),
     );
     assert.doesNotThrow(
       () => new Sub2ApiAdminClient({
@@ -2047,6 +2082,106 @@ test('Sub2API permits plaintext HTTP only for loopback unless explicitly overrid
   } finally {
     if (previous === undefined) delete process.env.SUB2API_ALLOW_INSECURE_HTTP;
     else process.env.SUB2API_ALLOW_INSECURE_HTTP = previous;
+  }
+});
+
+test('Sub2API generic requests reject ambiguous targets before logging or fetch', async () => {
+  const originalFetch = global.fetch;
+  const records = [];
+  let fetchCalls = 0;
+  const logger = Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+    level,
+    (event, fields) => records.push({ level, event, fields }),
+  ]));
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger,
+  });
+  global.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('fetch must not run');
+  };
+  try {
+    for (const method of ['get', 'DELETE', 'HEAD', '', new String('GET')]) {
+      await assert.rejects(
+        client.request(method, '/api/v1/admin/accounts'),
+        (error) => error.code === 'SUB2API_REQUEST_METHOD_INVALID'
+          && error.message === 'Sub2API 管理请求方法无效',
+      );
+    }
+    const marker = 'opaque-invalid-target-marker';
+    for (const pathname of [
+      '',
+      'api/v1/admin/accounts',
+      'https://evil.example/api',
+      '//user@evil.example/api',
+      '/\\evil.example/api',
+      '/%2f%2fuser%40evil.example/api',
+      '/%5cevil.example/api',
+      '/api/v1/admin/accounts?invalid=%encoding',
+      '/api/v1/admin/accounts#fragment',
+      '/api/v1/admin/accounts\u0000' + marker,
+      '/api/v1/admin/accounts\r\n' + marker,
+      '/' + 'a'.repeat(4097),
+      { toString() { throw new Error(marker); } },
+    ]) {
+      await assert.rejects(
+        client.request('GET', pathname),
+        (error) => error.code === 'SUB2API_REQUEST_TARGET_INVALID'
+          && error.message === 'Sub2API 管理请求目标无效'
+          && !error.message.includes(marker),
+      );
+    }
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(records, []);
+
+    // Even if a caller tampers with the otherwise constructor-owned base URL,
+    // the final parsed origin and userinfo checks fail closed before dispatch.
+    client.baseUrl = 'http://user@127.0.0.1:8080';
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_REQUEST_TARGET_INVALID',
+    );
+    client.baseUrl = 'http://evil.example';
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_REQUEST_TARGET_INVALID',
+    );
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(records, []);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API generic requests preserve bounded dynamic queries and disable redirects', async () => {
+  const originalFetch = global.fetch;
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+  });
+  let captured = null;
+  try {
+    global.fetch = async (url, options) => {
+      captured = { url, options };
+      return new Response(JSON.stringify({ code: 0, data: { accepted: true } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    assert.deepEqual(
+      await client.request('GET', '/api/v1/admin/accounts?search=a%40b%2Fc&page=1'),
+      { accepted: true },
+    );
+    assert.equal(
+      captured.url,
+      'http://127.0.0.1:8080/api/v1/admin/accounts?search=a%40b%2Fc&page=1',
+    );
+    assert.equal(captured.options.method, 'GET');
+    assert.equal(captured.options.redirect, 'error');
+  } finally {
+    global.fetch = originalFetch;
   }
 });
 

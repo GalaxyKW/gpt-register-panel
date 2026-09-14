@@ -29,6 +29,7 @@ const {
   safeStaticPath,
   shutdownServer,
   startServer,
+  validateListenConfiguration,
   validateRuntimeConfiguration,
 } = require('../backend/server');
 const { listExpiredTokens } = require('../backend/tokenCleanup');
@@ -526,6 +527,51 @@ test('listen host and port reject ambiguous deployment values', () => {
       () => configuredListenPort(undefined, { PANEL_PORT: invalid }),
       (error) => error.code === 'PANEL_PORT_INVALID',
     );
+  }
+});
+
+test('listen loopback exemption requires an unbracketed numeric loopback address', () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    allowRemote: process.env.PANEL_ALLOW_INSECURE_REMOTE,
+  };
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  delete process.env.PANEL_ADMIN_TOKEN;
+  delete process.env.PANEL_ALLOW_INSECURE_REMOTE;
+  try {
+    for (const host of ['127.0.0.1', '127.255.255.254', '::1', '0:0:0:0:0:0:0:1']) {
+      assert.doesNotThrow(() => validateListenConfiguration(host));
+    }
+    for (const host of [
+      'localhost',
+      'LOCALHOST',
+      '[::1]',
+      '127.example.invalid',
+      '::ffff:127.0.0.1',
+    ]) {
+      assert.throws(
+        () => validateListenConfiguration(host),
+        (error) => error.code === 'PANEL_REMOTE_AUTH_REQUIRED',
+      );
+    }
+
+    process.env.PANEL_ADMIN_TOKEN = 'test-admin-token-123456';
+    for (const host of ['localhost', '[::1]']) {
+      assert.throws(
+        () => validateListenConfiguration(host),
+        (error) => error.code === 'PANEL_REMOTE_HTTP_CONFIRMATION_REQUIRED',
+      );
+    }
+    process.env.PANEL_ALLOW_INSECURE_REMOTE = '1';
+    assert.doesNotThrow(() => validateListenConfiguration('localhost'));
+  } finally {
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.allowRemote === undefined) delete process.env.PANEL_ALLOW_INSECURE_REMOTE;
+    else process.env.PANEL_ALLOW_INSECURE_REMOTE = previous.allowRemote;
   }
 });
 

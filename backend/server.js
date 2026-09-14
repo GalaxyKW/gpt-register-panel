@@ -558,8 +558,16 @@ function isLoopbackAddress(address) {
 }
 
 function isLoopbackHost(host) {
-  const value = String(host || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
-  return value === 'localhost' || isLoopbackAddress(value);
+  if (typeof host !== 'string') return false;
+  const value = host.trim().toLowerCase();
+  const family = net.isIP(value);
+  if (family === 4) return isLoopbackAddress(value);
+  // Listening hosts are passed directly to net.Server. Do not grant the
+  // loopback deployment exemption to DNS names, bracket notation, or an
+  // IPv4-mapped spelling: only the IPv6 loopback address itself is trusted.
+  return family === 6
+    && !value.startsWith('::ffff:')
+    && isLoopbackAddress(value);
 }
 
 function configuredListenHost(optionHost, environment = process.env) {

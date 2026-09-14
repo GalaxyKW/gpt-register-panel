@@ -6,6 +6,7 @@ const {
   normalizeIdentityValue,
 } = require('../lib/token');
 const crypto = require('node:crypto');
+const net = require('node:net');
 const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 
@@ -13,6 +14,8 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
+const MAX_ADMIN_REQUEST_PATH_BYTES = 4096;
+const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST']);
 const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
@@ -269,12 +272,58 @@ function boundedTimeout(value, fallback, maximum) {
 }
 
 function isLoopbackHostname(hostname) {
-  const value = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
-  if (value === 'localhost' || value === '::1') return true;
-  const ipv4 = /^(\d+)\.(\d+)\.(\d+)\.(\d+)$/.exec(value);
-  return Boolean(ipv4
-    && ipv4.slice(1).every((part) => Number(part) >= 0 && Number(part) <= 255)
-    && Number(ipv4[1]) === 127);
+  if (typeof hostname !== 'string') return false;
+  // WHATWG URL keeps brackets around IPv6 hostnames and canonicalizes IPv4
+  // alternative spellings before this function is called. Strip only a
+  // complete bracket pair, then require a numeric address.
+  const normalized = hostname.toLowerCase();
+  const value = normalized.startsWith('[') && normalized.endsWith(']')
+    ? normalized.slice(1, -1)
+    : normalized;
+  const family = net.isIP(value);
+  if (family === 6) return value === '::1';
+  if (family !== 4) return false;
+  return Number(value.split('.')[0]) === 127;
+}
+
+function adminRequestTargetError(code) {
+  const error = new Error(code === 'SUB2API_REQUEST_METHOD_INVALID'
+    ? 'Sub2API 管理请求方法无效'
+    : 'Sub2API 管理请求目标无效');
+  error.code = code;
+  return error;
+}
+
+function validatedAdminRequestTarget(baseUrl, baseOrigin, method, pathname) {
+  if (typeof method !== 'string' || !ADMIN_REQUEST_METHODS.has(method)) {
+    throw adminRequestTargetError('SUB2API_REQUEST_METHOD_INVALID');
+  }
+  const queryOffset = typeof pathname === 'string' ? pathname.indexOf('?') : -1;
+  const pathOnly = typeof pathname === 'string' && queryOffset >= 0
+    ? pathname.slice(0, queryOffset)
+    : pathname;
+  if (typeof pathname !== 'string'
+      || pathname.length === 0
+      || Buffer.byteLength(pathname, 'utf8') > MAX_ADMIN_REQUEST_PATH_BYTES
+      || pathname[0] !== '/'
+      || pathname.startsWith('//')
+      || pathname.includes('\\')
+      || pathname.includes('#')
+      || /[\u0000-\u001f\u007f-\u009f]/.test(pathname)
+      || /%(?:2f|5c)/i.test(pathOnly)
+      || /%(?![0-9a-f]{2})/i.test(pathname)) {
+    throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
+  }
+  let target;
+  try {
+    target = new URL(baseUrl + pathname);
+  } catch {
+    throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
+  }
+  if (target.origin !== baseOrigin || target.username || target.password || target.hash) {
+    throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
+  }
+  return { method, pathname, url: target.toString() };
 }
 
 function normalizedAccountIds(ids) {
@@ -1054,6 +1103,7 @@ class Sub2ApiAdminClient {
     try {
       const parsedBaseUrl = new URL(this.baseUrl);
       if (!['http:', 'https:'].includes(parsedBaseUrl.protocol)) throw new Error('unsupported protocol');
+      if (!parsedBaseUrl.hostname) throw new Error('hostname is required');
       if (parsedBaseUrl.username || parsedBaseUrl.password) throw new Error('embedded credentials are not allowed');
       if (parsedBaseUrl.search || parsedBaseUrl.hash) throw new Error('query and fragment are not allowed');
       const allowInsecureHttp = options.allowInsecureHttp === true
@@ -1066,6 +1116,7 @@ class Sub2ApiAdminClient {
         throw error;
       }
       this.baseUrl = parsedBaseUrl.toString().replace(/\/$/, '');
+      this.baseOrigin = parsedBaseUrl.origin;
     } catch (error) {
       if (error?.code === 'SUB2API_INSECURE_HTTP') throw error;
       throw new Error('SUB2API_BASE_URL 必须是无查询参数、片段或内嵌凭据的 http(s) 地址');
@@ -1076,6 +1127,14 @@ class Sub2ApiAdminClient {
   }
 
   async request(method, pathname, body, requestOptions = {}) {
+    const target = validatedAdminRequestTarget(
+      this.baseUrl,
+      this.baseOrigin,
+      method,
+      pathname,
+    );
+    method = target.method;
+    pathname = target.pathname;
     const startedAt = Date.now();
     writeLog(this.logger, 'info', 'sub2api.request_started', { ...this.logContext, method, path: pathname });
     const headers = { Accept: 'application/json' };
@@ -1121,7 +1180,7 @@ class Sub2ApiAdminClient {
         throw interruptedRequestError('Sub2API 管理请求在发送前因面板停机中断');
       }
       requestDispatched = true;
-      response = await fetch(this.baseUrl + pathname, {
+      response = await fetch(target.url, {
         ...fetchOptions,
         // Admin calls must never silently follow a redirect to another host.
         redirect: 'error',
