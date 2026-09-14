@@ -1156,7 +1156,7 @@ function phase3TokenPostflightError(cause) {
 }
 
 function phase3TokenIdentityMismatchError() {
-  const error = new Error('Phase 3 已生成与所选账号强身份不兼容的 token；必须人工对账，禁止直接重试');
+  const error = new Error('Phase 3 已生成无法用强身份确认属于所选账号的 token；必须人工对账，禁止直接重试');
   error.code = 'PHASE3_TOKEN_IDENTITY_MISMATCH';
   error.writeOutcomeUnknown = true;
   error.requiresReconciliation = true;
@@ -1172,8 +1172,11 @@ function phase3TokenMatchesBoundIdentity(token, selectedToken) {
   const selectedKeys = Array.isArray(selectedToken.identityKeys)
     ? selectedToken.identityKeys
     : [];
-  if (!hasStrongIdentity(selectedKeys)) return true;
   const tokenKeys = Array.isArray(token?.identityKeys) ? token.identityKeys : [];
+  // A legacy email-only source cannot prove which account/user produced a
+  // same-email output. Require the newly fetched artifact to contribute its
+  // own strong identity instead of declaring success from email alone.
+  if (!hasStrongIdentity(selectedKeys)) return hasStrongIdentity(tokenKeys);
   return identitiesStronglyCompatible(selectedKeys, tokenKeys);
 }
 
@@ -1904,9 +1907,9 @@ async function runPhase3JobNow({
     }
     const tokenObservedAt = Date.now();
     const beforeByPath = new Map(beforeTokens.map((item) => [item.relativePath, item]));
-    const beforeCredentialVersions = new Set(beforeTokens
+    const beforeAccessFingerprints = new Set(beforeTokens
       .filter((item) => item.access)
-      .map((item) => item.access + ':' + (item.refresh || '')));
+      .map((item) => item.access));
     const observedChangedTokens = sources.tokens
       .filter((item) => isUsablePhase3Token(item, tokenObservedAt) && item.email === entry.email)
       .filter((item) => {
@@ -1924,13 +1927,12 @@ async function runPhase3JobNow({
     )) {
       throw phase3TokenIdentityMismatchError();
     }
-    // A second path containing credentials that were already present before
-    // the child started is only a copy, not proof that OAuth refreshed them.
+    // A second path reusing an access token that was already present before
+    // the child started is only a copy or metadata/refresh-token rewrite, not
+    // proof that OAuth produced a fresh access credential.
     const changedTokens = observedChangedTokens.filter((item) => {
-      if (beforeByPath.has(item.relativePath)) return true;
       const access = item.fingerprints?.access || null;
-      const refresh = item.fingerprints?.refresh || null;
-      return !access || !beforeCredentialVersions.has(access + ':' + (refresh || ''));
+      return Boolean(access) && !beforeAccessFingerprints.has(access);
     });
     changedTokens.sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
     const token = changedTokens[0];

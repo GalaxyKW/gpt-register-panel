@@ -1211,7 +1211,97 @@ test('Phase3 refuses a changed token that contradicts the selected strong identi
   }
 });
 
-test('Phase3 does not treat a same-credential copy at a new path as a refreshed token', async () => {
+test('Phase3 never accepts a new email-only token from an email-only selected source', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-email-only-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const email = 'phase3-email-only@example.test';
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email,
+    password: 'hidden',
+  }]));
+  const selectedKey = 'token:tokens:tokens/selected.json';
+  fs.writeFileSync(path.join(root, 'tokens', 'selected.json'), JSON.stringify({
+    access_token: 'legacy-access-value',
+    refresh_token: 'legacy-refresh-value',
+    email,
+  }));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    `fs.writeFileSync(path.join(process.cwd(), 'tokens', 'email-only.json'), JSON.stringify({`,
+    "  access_token: 'new-email-only-access-value',",
+    "  refresh_token: 'new-email-only-refresh-value',",
+    `  email: ${JSON.stringify(email)},`,
+    '}));',
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const phase3TargetRevision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
+    const resolved = resolvePhase3Requests([{
+      originalIndex: 0,
+      email,
+      phone: '',
+      selectedKey,
+      phase3TargetRevision,
+    }]);
+    assert.equal(resolved.eligible.length, 1);
+    const target = resolved.eligible[0];
+    await assert.rejects(
+      runPhase3Job({
+        ...target,
+        executionBinding: target.executionBinding,
+        jobId: 'phase3-email-only-output-job',
+        db: { async audit() {}, async startMutationJob() {} },
+        logger: successfulCheckpointLogger,
+      }),
+      (error) => error.code === 'PHASE3_TOKEN_IDENTITY_MISMATCH'
+        && error.requiresReconciliation === true
+        && error.doNotRetry === true,
+    );
+
+    fs.writeFileSync(path.join(root, 'index.js'), [
+      "const fs = require('node:fs');",
+      "const path = require('node:path');",
+      `fs.writeFileSync(path.join(process.cwd(), 'tokens', 'strong.json'), JSON.stringify({`,
+      "  access_token: 'new-strong-access-value',",
+      "  refresh_token: 'new-strong-refresh-value',",
+      `  email: ${JSON.stringify(email)},`,
+      "  chatgpt_account_id: 'new-strong-workspace',",
+      "  chatgpt_user_id: 'new-strong-user',",
+      '}));',
+    ].join('\n'));
+    const result = await runPhase3Job({
+      ...target,
+      executionBinding: target.executionBinding,
+      jobId: 'phase3-strong-output-job',
+      db: { async audit() {}, async startMutationJob() {} },
+      logger: successfulCheckpointLogger,
+    });
+    assert.equal(result.tokenFile, 'tokens/strong.json');
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('Phase3 does not treat mtime changes or degraded same-access copies as a refresh', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-output-copy-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
@@ -1235,8 +1325,14 @@ test('Phase3 does not treat a same-credential copy at a new path as a refreshed 
   fs.writeFileSync(path.join(root, 'index.js'), [
     "const fs = require('node:fs');",
     "const path = require('node:path');",
-    "const original = fs.readFileSync(path.join(process.cwd(), 'tokens', 'selected.json'));",
+    "const selected = path.join(process.cwd(), 'tokens', 'selected.json');",
+    "const original = fs.readFileSync(selected);",
     "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'copied.json'), original);",
+    'const degraded = JSON.parse(original);',
+    'delete degraded.refresh_token;',
+    "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'degraded.json'), JSON.stringify(degraded));",
+    'const touchedAt = new Date(Date.now() + 1000);',
+    'fs.utimesSync(selected, touchedAt, touchedAt);',
   ].join('\n'));
   const previous = {
     root: process.env.GPT_REGISTER_ROOT,
@@ -1273,6 +1369,7 @@ test('Phase3 does not treat a same-credential copy at a new path as a refreshed 
       (error) => error.code === 'PHASE3_TOKEN_UNCHANGED',
     );
     assert.equal(fs.existsSync(path.join(root, 'tokens', 'copied.json')), true);
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'degraded.json')), true);
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous.root;
