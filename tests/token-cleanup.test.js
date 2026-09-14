@@ -695,6 +695,81 @@ test('expired token cleanup atomically claims the source before validating a rep
   }
 });
 
+test('cleanup never quarantines a claim path replaced after its verified snapshot', () => {
+  const root = makeRoot();
+  const tokensDirectory = path.join(root, 'tokens');
+  const sourcePath = path.join(tokensDirectory, 'claim-swap.json');
+  const originalContent = JSON.stringify({
+    access_token: jwt('claim-swap@example.test', { suffix: '-claim-swap' }),
+    email: 'claim-swap@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  const replacementContent = JSON.stringify({ marker: 'unrelated-claim-replacement' });
+  fs.writeFileSync(sourcePath, originalContent, { mode: 0o600 });
+  const options = {
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  };
+  const listing = listExpiredTokens(options);
+  assert.equal(listing.count, 1);
+
+  const originalLinkSync = fs.linkSync;
+  const originalRenameSync = fs.renameSync;
+  let injected = false;
+  let visibleClaimPath = null;
+  let displacedClaimPath = null;
+  fs.linkSync = function replaceVerifiedClaimBeforeQuarantine(from, to) {
+    const fromName = path.basename(String(from));
+    const targetDirectory = operationDirectory(path.dirname(String(to)));
+    if (!injected
+        && fromName.startsWith('.panel-token-cleanup-claim-')
+        && targetDirectory.includes(path.join('.panel-quarantine', 'expired-tokens'))) {
+      visibleClaimPath = path.join(tokensDirectory, fromName);
+      displacedClaimPath = visibleClaimPath + '.verified-original';
+      originalRenameSync.call(fs, from, displacedClaimPath);
+      fs.writeFileSync(from, replacementContent, { mode: 0o600 });
+      injected = true;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN'
+          && error.requiresReconciliation === true
+          && error.doNotRetry === true;
+      },
+    );
+  } finally {
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(displacedClaimPath, 'utf8'), originalContent);
+  assert.equal(fs.readFileSync(visibleClaimPath, 'utf8'), replacementContent);
+  const quarantineRoot = path.join(root, '.panel-quarantine', 'expired-tokens');
+  const [batchName] = fs.readdirSync(quarantineRoot);
+  assert.equal(fs.existsSync(path.join(
+    quarantineRoot,
+    batchName,
+    'tokens',
+    path.basename(sourcePath),
+  )), false);
+  assert.deepEqual(failure.currentItem, {
+    source: 'tokens',
+    relativePath: 'tokens/claim-swap.json',
+  });
+});
+
 test('a dead cleanup process requires an explicit pinned recovery before a later delete', async () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
@@ -1198,16 +1273,17 @@ test('cross-filesystem cleanup never unlinks a newly reusable original source pa
   }
 });
 
-test('cleanup fails closed when a claimed file cannot be restored or quarantined', () => {
+test('cleanup leaves an unverified claim untouched when its first snapshot fails', () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired-recovery-failure.json');
-  fs.writeFileSync(sourcePath, JSON.stringify({
+  const originalContent = JSON.stringify({
     access_token: jwt('claimed-recovery-failure@example.test', {
       suffix: '-claimed-recovery-failure',
     }),
     email: 'claimed-recovery-failure@example.test',
     expired: '2020-01-01T00:00:00.000Z',
-  }), { mode: 0o600 });
+  });
+  fs.writeFileSync(sourcePath, originalContent, { mode: 0o600 });
   const options = {
     rootDirectory: root,
     nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
@@ -1218,8 +1294,7 @@ test('cleanup fails closed when a claimed file cannot be restored or quarantined
   const originalOpenSync = fs.openSync;
   const originalLinkSync = fs.linkSync;
   let snapshotFailureInjected = false;
-  let restoreFailureInjected = false;
-  let fallbackFailureInjected = false;
+  let claimMoveAttemptCount = 0;
   fs.openSync = function failFirstClaimSnapshot(filePath, ...args) {
     if (!snapshotFailureInjected
         && path.basename(String(filePath)).startsWith('.panel-token-cleanup-claim-')) {
@@ -1230,17 +1305,9 @@ test('cleanup fails closed when a claimed file cannot be restored or quarantined
     }
     return originalOpenSync.call(fs, filePath, ...args);
   };
-  fs.linkSync = function failClaimRecovery(from, to) {
+  fs.linkSync = function recordClaimMove(from, to) {
     if (path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
-      const error = new Error('simulated ordinary claim recovery failure');
-      if (operationPathEquals(to, sourcePath)) {
-        restoreFailureInjected = true;
-        error.code = 'EACCES';
-      } else {
-        fallbackFailureInjected = true;
-        error.code = 'EPERM';
-      }
-      throw error;
+      claimMoveAttemptCount += 1;
     }
     return originalLinkSync.call(fs, from, to);
   };
@@ -1264,6 +1331,95 @@ test('cleanup fails closed when a claimed file cannot be restored or quarantined
   }
 
   assert.equal(snapshotFailureInjected, true);
+  assert.equal(claimMoveAttemptCount, 0);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(failure.outcome, 'unknown');
+  assert.equal(failure.reconciliationScope, 'expired_token_cleanup');
+  assert.equal(failure.reconciliationReason, 'token_claim_recovery_outcome_unknown');
+  assert.equal(failure.causeCode, 'EIO');
+  assert.deepEqual(failure.currentItem, {
+    source: 'tokens',
+    relativePath: 'tokens/expired-recovery-failure.json',
+  });
+  assert.equal(failure.completedCount, 0);
+  assert.equal(failure.skippedCount, 0);
+  assert.equal(Object.hasOwn(failure.currentItem, 'email'), false);
+  assert.equal(Object.hasOwn(failure.currentItem, 'fingerprint'), false);
+  assert.equal(failure.message.includes('simulated'), false);
+  assert.equal(fs.existsSync(sourcePath), false);
+  const remainingClaims = fs.readdirSync(path.join(root, 'tokens')).filter(
+    (name) => name.startsWith('.panel-token-cleanup-claim-'),
+  );
+  assert.equal(remainingClaims.length, 1);
+  assert.equal(
+    fs.readFileSync(path.join(root, 'tokens', remainingClaims[0]), 'utf8'),
+    originalContent,
+  );
+  const quarantineRoot = path.join(root, '.panel-quarantine', 'expired-tokens');
+  const [batchName] = fs.readdirSync(quarantineRoot);
+  assert.deepEqual(fs.readdirSync(path.join(quarantineRoot, batchName, 'tokens')), []);
+});
+
+test('cleanup fails closed when a verified claim cannot be restored or quarantined', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'expired-recovery-failure.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: jwt('claimed-recovery-failure@example.test', {
+      suffix: '-claimed-recovery-failure',
+    }),
+    email: 'claimed-recovery-failure@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }), { mode: 0o600 });
+  const options = {
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  };
+  const listing = listExpiredTokens(options);
+  assert.equal(listing.count, 1);
+
+  const originalLinkSync = fs.linkSync;
+  let moveFailureInjected = false;
+  let restoreFailureInjected = false;
+  let fallbackFailureInjected = false;
+  fs.linkSync = function failClaimRecovery(from, to) {
+    if (path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
+      const error = new Error('simulated ordinary claim recovery failure');
+      if (operationPathEquals(to, sourcePath)) {
+        restoreFailureInjected = true;
+        error.code = 'EACCES';
+      } else if (!moveFailureInjected) {
+        moveFailureInjected = true;
+        error.code = 'EIO';
+      } else {
+        fallbackFailureInjected = true;
+        error.code = 'EPERM';
+      }
+      throw error;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(moveFailureInjected, true);
   assert.equal(restoreFailureInjected, true);
   assert.equal(fallbackFailureInjected, true);
   assert.equal(failure.writeOutcomeUnknown, true);
@@ -1402,6 +1558,45 @@ test('cross-filesystem quarantine refuses oversized files without leaving a part
   } finally {
     fs.linkSync = originalLinkSync;
   }
+});
+
+test('cross-filesystem fallback reopens its verified source without blocking', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'cross-device-nonblocking.json');
+  const targetDirectory = path.join(root, 'quarantine-target');
+  const targetPath = path.join(targetDirectory, 'cross-device-nonblocking.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'cross-device-nonblocking-content', { mode: 0o600 });
+  const originalLinkSync = fs.linkSync;
+  const originalOpenSync = fs.openSync;
+  let forcedCrossDevice = false;
+  let verifiedNonblockingOpen = false;
+  fs.linkSync = function forceCrossDeviceOnce(from, to) {
+    if (!forcedCrossDevice && from === sourcePath && to === targetPath) {
+      forcedCrossDevice = true;
+      const error = new Error('simulated cross-device link');
+      error.code = 'EXDEV';
+      throw error;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+  fs.openSync = function requireNonblockingCrossDeviceSource(filePath, flags, ...args) {
+    if (forcedCrossDevice && filePath === sourcePath) {
+      verifiedNonblockingOpen = true;
+      assert.notEqual(flags & fs.constants.O_NONBLOCK, 0);
+    }
+    return originalOpenSync.call(fs, filePath, flags, ...args);
+  };
+  try {
+    moveToQuarantine(sourcePath, targetPath);
+  } finally {
+    fs.linkSync = originalLinkSync;
+    fs.openSync = originalOpenSync;
+  }
+  assert.equal(forcedCrossDevice, true);
+  assert.equal(verifiedNonblockingOpen, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), 'cross-device-nonblocking-content');
 });
 
 test('same-filesystem target rollback becomes unknown when its directory flush fails', () => {

@@ -551,19 +551,30 @@ function assertPublishedCleanupTarget(targetPath, targetDescriptor, expectedStat
   }
 }
 
+function assertCleanupMoveSource(stat, expectedSnapshot = null) {
+  const currentUid = cleanupProcessUid();
+  if (!stat?.isFile() || stat.isSymbolicLink()
+      || stat.nlink !== 1
+      || (currentUid !== null && stat.uid !== currentUid)
+      || (stat.mode & 0o022) !== 0
+      || (expectedSnapshot && !sameClaimSnapshot(stat, expectedSnapshot))) {
+    throw new Error('隔离来源与已验证的普通文件快照不一致');
+  }
+}
+
 function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let targetLinked = false;
   let linkedTargetDescriptor;
   let targetIdentity = null;
   let sourceRemoved = false;
+  let sourceIdentityBeforeLink = null;
   try {
     // Hard-link + unlink is a no-overwrite move on one filesystem. If the
     // process crashes between the two operations, both names still reference
     // the same recoverable inode instead of losing the only copy.
     const sourceBeforeLink = fs.lstatSync(sourcePath);
-    if (sourceBeforeLink.isSymbolicLink() || !sourceBeforeLink.isFile()) {
-      throw new Error('隔离来源必须是普通文件');
-    }
+    assertCleanupMoveSource(sourceBeforeLink, options.expectedSourceSnapshot);
+    sourceIdentityBeforeLink = sourceBeforeLink;
     targetIdentity = sourceBeforeLink;
     fs.linkSync(sourcePath, targetPath);
     targetLinked = true;
@@ -572,6 +583,8 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     targetIdentity = targetStat;
     if (sourceStat.isSymbolicLink() || targetStat.isSymbolicLink()
         || !sourceStat.isFile() || !targetStat.isFile()
+        || !sameInode(sourceStat, sourceBeforeLink)
+        || sourceStat.nlink !== 2 || targetStat.nlink !== 2
         || sourceStat.dev !== targetStat.dev || sourceStat.ino !== targetStat.ino) {
       throw new Error('隔离目标不是来源文件的预期硬链接');
     }
@@ -592,7 +605,9 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
         || latestTarget.isSymbolicLink() || !latestTarget.isFile()
         || !sameInode(latestSource, targetStat)
         || !sameInode(latestTarget, targetStat)
-        || !sameInode(finalOpenedTarget, targetStat)) {
+        || !sameInode(finalOpenedTarget, targetStat)
+        || latestSource.nlink !== 2 || latestTarget.nlink !== 2
+        || finalOpenedTarget.nlink !== 2) {
       throw new Error('隔离来源或目标在发布后发生变化');
     }
     if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
@@ -641,9 +656,17 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let temporaryIdentity = null;
   let copiedSourceRemoved = false;
   try {
-    sourceDescriptor = fs.openSync(sourcePath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+    sourceDescriptor = fs.openSync(
+      sourcePath,
+      fs.constants.O_RDONLY
+        | (fs.constants.O_NOFOLLOW || 0)
+        | (fs.constants.O_NONBLOCK || 0),
+    );
     const before = fs.fstatSync(sourceDescriptor);
-    if (!before.isFile()) throw new Error('隔离来源必须是普通文件');
+    assertCleanupMoveSource(before, options.expectedSourceSnapshot);
+    if (!sourceIdentityBeforeLink || !sameClaimSnapshot(before, sourceIdentityBeforeLink)) {
+      throw new Error('隔离来源在跨文件系统回退前发生变化');
+    }
     targetDescriptor = fs.openSync(
       temporaryPath,
       fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
@@ -689,6 +712,7 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
         || finalSource.ctimeMs !== after.ctimeMs) {
       throw new Error('隔离来源在发布前发生变化');
     }
+    assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
     if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
     fs.unlinkSync(sourcePath);
     copiedSourceRemoved = true;
@@ -1332,6 +1356,7 @@ function deleteExpiredTokens(options = {}) {
       let sourceFolder = null;
       let operationSourceFolder = null;
       let claimPath = null;
+      let claimedSnapshot = null;
       let quarantinedPath = null;
       let quarantinedDisplayPath = null;
       try {
@@ -1369,16 +1394,17 @@ function deleteExpiredTokens(options = {}) {
         assertPreparedCleanupDirectories(preparedSources);
         assertPreparedCleanupDirectories(preparedQuarantine);
         claimPath = claimSourcePath(absolutePath, item.contentHash);
-        const claimedSnapshot = regularFileSnapshot(claimPath);
+        claimedSnapshot = regularFileSnapshot(claimPath);
         assertPreparedCleanupDirectories(preparedSources);
         assertPreparedCleanupDirectories(preparedQuarantine);
         if (claimedSnapshot.contentHash !== item.contentHash) {
-          if (!restoreClaimedPath(claimPath, absolutePath)) {
+          if (!restoreClaimedPath(claimPath, absolutePath, claimedSnapshot)) {
             const changedPath = path.join(
               operationSourceFolder,
               'changed-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
             );
             moveToQuarantine(claimPath, changedPath, {
+              expectedSourceSnapshot: claimedSnapshot,
               beforeSourceUnlink: assertAllDirectoryPins,
               afterSourceUnlink: assertAllDirectoryPins,
             });
@@ -1400,6 +1426,7 @@ function deleteExpiredTokens(options = {}) {
           continue;
         }
         moveToQuarantine(claimPath, quarantinedPath, {
+          expectedSourceSnapshot: claimedSnapshot,
           beforeSourceUnlink: assertAllDirectoryPins,
           afterSourceUnlink: assertAllDirectoryPins,
         });
@@ -1438,6 +1465,18 @@ function deleteExpiredTokens(options = {}) {
           throw error;
         }
         if (claimPath) {
+          // A successful rename only proves that some directory entry now has
+          // the random claim name. If its first verified snapshot failed, no
+          // trusted inode/content baseline exists for either restoration or
+          // quarantine. Leave the claim untouched for manual reconciliation.
+          if (!claimedSnapshot) {
+            throw attachCleanupProgress(
+              cleanupClaimRecoveryOutcomeUnknown(error),
+              item,
+              deleted.length,
+              skipped.length,
+            );
+          }
           if (error?.cleanupInfrastructureInvalid === true) {
             try {
               // Restoring a claimed token is itself a namespace mutation. A
@@ -1455,7 +1494,7 @@ function deleteExpiredTokens(options = {}) {
           }
           let restored = false;
           try {
-            restored = restoreClaimedPath(claimPath, absolutePath);
+            restored = restoreClaimedPath(claimPath, absolutePath, claimedSnapshot);
           } catch (recoveryError) {
             throw attachCleanupProgress(
               cleanupClaimRecoveryOutcomeUnknown(recoveryError),
@@ -1490,6 +1529,7 @@ function deleteExpiredTokens(options = {}) {
               );
               recoveryDisplayPath = path.join(sourceFolder, path.basename(recoveryPath));
               moveToQuarantine(claimPath, recoveryPath, {
+                expectedSourceSnapshot: claimedSnapshot,
                 beforeSourceUnlink: () => {
                   assertPreparedCleanupDirectories(preparedSources);
                   assertPreparedCleanupDirectories(preparedQuarantine);
