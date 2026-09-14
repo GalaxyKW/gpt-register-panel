@@ -11,7 +11,7 @@ const {
 } = require('./adapters/gptRegisterFs');
 const { isExpired, isExpiryInvalid } = require('./diff');
 const { normalizeEmail } = require('./lib/token');
-const { redactText } = require('./logger');
+const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
@@ -578,6 +578,7 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
   };
   const temporaryPath = filePath + '.tmp-' + process.pid + '-' + crypto.randomBytes(8).toString('hex');
   let descriptor;
+  let replacementStarted = false;
   try {
     descriptor = fs.openSync(temporaryPath, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL, 0o600);
     const content = Buffer.from(JSON.stringify(records, null, 2) + '\n', 'utf8');
@@ -592,13 +593,99 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
     if (!sameFileSnapshot(latest, snapshot)) {
       throw new Error('username.json 在写入前发生变化，拒绝覆盖');
     }
+    // Once rename has been dispatched, a thrown error can no longer prove
+    // whether the new disposition is visible (or durable). Callers must
+    // reconcile the pinned username row and must never retry Phase3.
+    replacementStarted = true;
     fs.renameSync(temporaryPath, filePath);
     syncDirectory(path.dirname(filePath));
+  } catch (error) {
+    if (!replacementStarted) throw error;
+    const target = error instanceof Error
+      ? error
+      : new Error('账号处置写入结果无法确认');
+    try {
+      Object.assign(target, {
+        writeOutcomeUnknown: true,
+        requiresReconciliation: true,
+        retryAllowed: false,
+        doNotRetry: true,
+        reconciliationScope: 'phase3_account_disposition',
+        reconciliationReason: 'account_disposition_write_unknown',
+      });
+    } catch {
+      const wrapped = new Error('账号处置写入结果无法确认');
+      wrapped.code = 'PHASE3_ACCOUNT_DISPOSITION_WRITE_UNKNOWN';
+      wrapped.writeOutcomeUnknown = true;
+      wrapped.requiresReconciliation = true;
+      wrapped.retryAllowed = false;
+      wrapped.doNotRetry = true;
+      wrapped.reconciliationScope = 'phase3_account_disposition';
+      wrapped.reconciliationReason = 'account_disposition_write_unknown';
+      throw wrapped;
+    }
+    throw target;
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
     }
     try { fs.unlinkSync(temporaryPath); } catch {}
+  }
+}
+
+function safePhase3ErrorCode(value, fallback) {
+  const code = String(value || '').trim().toUpperCase();
+  return /^[A-Z0-9_]{1,96}$/.test(code) ? code : fallback;
+}
+
+function phase3DispositionFailure(primaryError, dispositionError) {
+  const writeOutcomeUnknown = dispositionError?.writeOutcomeUnknown === true;
+  const checkpointUnavailable = dispositionError?.code === 'AUDIT_LOG_UNAVAILABLE';
+  const annotations = {
+    requiresReconciliation: true,
+    retryAllowed: false,
+    doNotRetry: true,
+    reconciliationScope: 'phase3_account_disposition',
+    reconciliationReason: writeOutcomeUnknown
+      ? 'account_disposition_write_unknown'
+      : checkpointUnavailable
+        ? 'account_disposition_checkpoint_unavailable'
+        : 'account_disposition_not_persisted',
+    dispositionPersisted: writeOutcomeUnknown ? null : false,
+    dispositionOutcome: writeOutcomeUnknown ? 'unknown' : 'not_persisted',
+    dispositionWriteOutcomeUnknown: writeOutcomeUnknown,
+    dispositionErrorCode: safePhase3ErrorCode(
+      dispositionError?.code,
+      checkpointUnavailable
+        ? 'AUDIT_LOG_UNAVAILABLE'
+        : 'PHASE3_ACCOUNT_DISPOSITION_WRITE_FAILED',
+    ),
+  };
+  if (writeOutcomeUnknown) annotations.writeOutcomeUnknown = true;
+
+  const target = primaryError instanceof Error
+    ? primaryError
+    : new Error('Phase3 失败，且账号处置状态需要人工对账');
+  try {
+    Object.assign(target, annotations);
+    return target;
+  } catch {
+    // Preserve the primary safety code even for a frozen or non-extensible
+    // thrown value. Never attach the raw secondary error or its filesystem
+    // diagnostics to the replacement error.
+    const message = redactText(String(primaryError?.message || '账号处置状态需要人工对账'))
+      .slice(0, 1000);
+    const wrapped = new Error(message || '账号处置状态需要人工对账');
+    wrapped.code = safePhase3ErrorCode(primaryError?.code, 'PHASE3_FAILED');
+    if (primaryError?.accountDisposition === 'discard') wrapped.accountDisposition = 'discard';
+    if (primaryError?.dispositionCode) {
+      wrapped.dispositionCode = safePhase3ErrorCode(
+        primaryError.dispositionCode,
+        'ACCOUNT_DEACTIVATED',
+      );
+    }
+    Object.assign(wrapped, annotations);
+    return wrapped;
   }
 }
 
@@ -701,6 +788,22 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
     // above for the in-memory classifier only and must never escape through a
     // job error, API response, audit record, or persistent logger.
     error.details = phase3ProcessSummary(details);
+  }
+  if (error?.code === 'PHASE3_TERMINATION_UNCONFIRMED') {
+    // A still-running supervised process can continue changing token or
+    // username state after the panel has stopped observing it. Preserve this
+    // primary error and prohibit both disposition writes and automatic retry.
+    error.writeOutcomeUnknown = true;
+    error.requiresReconciliation = true;
+    error.retryAllowed = false;
+    error.doNotRetry = true;
+    error.reconciliationScope = 'phase3_process_tree';
+    error.reconciliationReason = 'phase3_process_tree_unconfirmed';
+    if (error.accountDisposition === 'discard') {
+      error.dispositionPersisted = false;
+      error.dispositionOutcome = 'not_attempted';
+      error.dispositionWriteOutcomeUnknown = false;
+    }
   }
   return error;
 }
@@ -1162,13 +1265,6 @@ async function runPhase3JobNow({
       createdAt: entry.createdAt,
     });
     const processStartedAt = Date.now();
-    writeLog(logger, 'info', 'phase3.process_started', {
-      jobId,
-      actor,
-      email: entry.email,
-      command: path.basename(nodePath),
-      script: 'index.js',
-    });
     let result;
     let processError = null;
     try {
@@ -1177,7 +1273,8 @@ async function runPhase3JobNow({
         ? '--phone=' + entry.phone
         : '--email=' + entry.email;
       const pinnedRootPath = '/proc/self/fd/' + PHASE3_ROOT_CHILD_FD;
-      result = await runCommand('/proc/self/fd/' + PHASE3_NODE_CHILD_FD, [
+      const command = '/proc/self/fd/' + PHASE3_NODE_CHILD_FD;
+      const commandArguments = [
         '--preserve-symlinks',
         '--preserve-symlinks-main',
         '-e',
@@ -1185,7 +1282,8 @@ async function runPhase3JobNow({
         '--',
         '--phase3',
         phase3Argument,
-      ], {
+      ];
+      const commandOptions = {
         cwd: pinnedRootPath,
         env: phase3Environment(),
         timeoutMs: process.env.PANEL_PHASE3_TIMEOUT_MS,
@@ -1197,7 +1295,22 @@ async function runPhase3JobNow({
           rootHandle.descriptor,
         ],
         signal,
+      };
+      writeLog(logger, 'info', 'phase3.process_started', {
+        jobId,
+        actor,
+        email: entry.email,
+        command: path.basename(nodePath),
+        script: 'index.js',
       });
+      assertAuditLogCheckpoint(logger, 'phase3.process_spawn_checkpoint', {
+        jobId,
+        actor,
+        email: entry.email,
+        command: path.basename(nodePath),
+        script: 'index.js',
+      });
+      result = await runCommand(command, commandArguments, commandOptions);
     } catch (error) {
       const shutdownInterruption = error?.code === 'JOB_INTERRUPTED';
       classifyPhase3ProcessError(error, entry, rootHandle);
@@ -1335,26 +1448,56 @@ async function runPhase3JobNow({
   } catch (error) {
     classifyPhase3ProcessError(error, entry, rootHandle);
     if (entry && error?.accountDisposition === 'discard') {
-      try {
-        persistAccountDisposition(
-          entry,
-          error.dispositionCode || error.code || 'ACCOUNT_DEACTIVATED',
-          rootHandle,
-        );
-        writeLog(logger, 'warn', 'phase3.account_discarded', {
+      if (error?.details?.terminationConfirmed !== true) {
+        // The child tree may still be mutating the pinned file. Even an atomic
+        // replace here could race a late child write, so leave the row untouched
+        // and make the supervision failure the durable reconciliation signal.
+        error.dispositionPersisted = false;
+        error.dispositionOutcome = 'not_attempted';
+        error.dispositionWriteOutcomeUnknown = false;
+        writeLog(logger, 'error', 'phase3.account_disposition_deferred', {
           jobId,
           actor,
           email: entry.email,
-          status: 'account_deleted',
           code: error.code || null,
+          reason: 'phase3_process_tree_unconfirmed',
         });
-      } catch (dispositionError) {
-        writeLog(logger, 'error', 'phase3.account_disposition_failed', {
-          jobId,
-          actor,
-          email: entry.email,
-          error: redactText(String(dispositionError?.message || dispositionError)),
-        });
+      } else {
+        try {
+          const dispositionCode = error.dispositionCode || error.code || 'ACCOUNT_DEACTIVATED';
+          assertAuditLogCheckpoint(logger, 'phase3.account_disposition_checkpoint', {
+            jobId,
+            actor,
+            email: entry.email,
+            disposition: 'discard',
+            status: 'account_deleted',
+            code: safePhase3ErrorCode(dispositionCode, 'ACCOUNT_DEACTIVATED'),
+          });
+          persistAccountDisposition(entry, dispositionCode, rootHandle);
+          error.dispositionPersisted = true;
+          error.dispositionOutcome = 'persisted';
+          error.dispositionWriteOutcomeUnknown = false;
+          writeLog(logger, 'warn', 'phase3.account_discarded', {
+            jobId,
+            actor,
+            email: entry.email,
+            status: 'account_deleted',
+            code: error.code || null,
+          });
+        } catch (dispositionError) {
+          error = phase3DispositionFailure(error, dispositionError);
+          writeLog(logger, 'error', 'phase3.account_disposition_failed', {
+            jobId,
+            actor,
+            email: entry.email,
+            error: redactText(String(dispositionError?.message || dispositionError)),
+            errorCode: error.dispositionErrorCode,
+            dispositionOutcome: error.dispositionOutcome,
+            writeOutcomeUnknown: error.dispositionWriteOutcomeUnknown === true,
+            requiresReconciliation: true,
+            doNotRetry: true,
+          });
+        }
       }
     }
     writeLog(logger, 'error', 'phase3.failed', {
@@ -1364,6 +1507,11 @@ async function runPhase3JobNow({
       durationMs: Date.now() - startedAt,
       error: redactText(String(error?.message || error)),
       code: error?.code || null,
+      dispositionOutcome: error?.dispositionOutcome || null,
+      writeOutcomeUnknown: error?.writeOutcomeUnknown === true,
+      requiresReconciliation: error?.requiresReconciliation === true,
+      doNotRetry: error?.doNotRetry === true,
+      reconciliationReason: error?.reconciliationReason || null,
     });
     throw error;
   } finally {

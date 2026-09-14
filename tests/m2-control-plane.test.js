@@ -38,6 +38,10 @@ const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
+const successfulCheckpointLogger = Object.freeze({
+  checkpoint() { return true; },
+});
+
 function processIsRunning(pid) {
   if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 1) return false;
   try {
@@ -420,6 +424,7 @@ test('phase3 jobs run serially, run the main-gated entrypoint, and reject duplic
     async audit() { throw new Error('simulated audit storage failure'); },
   };
   const logger = {
+    checkpoint() { return true; },
     info(event, fields) { events.push({ event, fields }); },
     warn(event, fields) { events.push({ event, fields }); },
     error(event, fields) { events.push({ event, fields }); },
@@ -575,6 +580,7 @@ test('Phase3 shutdown preserves success when a valid token was already published
         async audit() { order.push('audit'); },
       },
       jobId: 'job-shutdown-token',
+      logger: successfulCheckpointLogger,
       signal: controller.signal,
       async persistSuccess() { order.push('terminal'); },
     });
@@ -636,6 +642,7 @@ test('Phase3 preserves a valid freshest token after a confirmed non-zero process
       email: 'nonzero-token@example.test',
       jobId: 'nonzero-token-job',
       db: { async audit() {}, async updateJob() {} },
+      logger: successfulCheckpointLogger,
     });
     assert.equal(result.tokenFile, 'tokens/freshest.json');
     assert.equal(result.processEndedWithError, true);
@@ -746,6 +753,7 @@ test('phase3 pins one source tree while preserving cwd, __dirname, and relative 
   process.env.PANEL_PHASE3_ENABLED = '1';
   const events = [];
   const logger = {
+    checkpoint() { return true; },
     info(event, fields) { events.push({ event, fields }); },
     warn(event, fields) { events.push({ event, fields }); },
     error(event, fields) { events.push({ event, fields }); },
@@ -839,6 +847,7 @@ test('phase3 executes the validated index inode even when its path is replaced b
       email: 'index-pin@example.test',
       jobId: 'index-pin-job',
       db: { async audit() {}, async updateJob() {} },
+      logger: successfulCheckpointLogger,
     });
     assert.equal(result.tokenFile, 'tokens/original.json');
     assert.equal(fs.existsSync(path.join(root, 'tokens', 'replacement.json')), false);
@@ -1302,6 +1311,7 @@ test('phase3 persists a discard disposition when the account is deactivated', as
   process.env.PANEL_PHASE3_ENABLED = '1';
   const events = [];
   const logger = {
+    checkpoint() { return true; },
     info(event, fields) { events.push({ event, fields }); },
     warn(event, fields) { events.push({ event, fields }); },
     error(event, fields) { events.push({ event, fields }); },

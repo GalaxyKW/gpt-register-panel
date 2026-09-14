@@ -17,6 +17,7 @@ const {
   createServer,
   openVerifiedStaticFile,
   phase3ClaimKeys,
+  phase3FailureMetadata,
   readJsonBody,
   resetAuthFailureBuckets,
   safeStaticPath,
@@ -34,6 +35,52 @@ test('static routing exposes only the three declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
   assert.equal(safeStaticPath('/debug.json'), null);
   assert.equal(safeStaticPath('/nested/asset.js'), null);
+});
+
+test('Phase3 failures persist only bounded reconciliation metadata', () => {
+  const metadata = phase3FailureMetadata({
+    code: 'account_deactivated',
+    accountDisposition: 'discard',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_account_disposition',
+    reconciliationReason: 'account_disposition_write_unknown',
+    dispositionPersisted: null,
+    dispositionOutcome: 'unknown',
+    dispositionWriteOutcomeUnknown: true,
+    dispositionCode: 'account_deactivated',
+    dispositionErrorCode: 'eio',
+    message: 'Bearer must-not-persist',
+    details: { credential: 'must-not-persist' },
+    cause: new Error('must-not-persist'),
+  });
+  assert.deepEqual(metadata, {
+    code: 'ACCOUNT_DEACTIVATED',
+    accountDisposition: 'discard',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_account_disposition',
+    reconciliationReason: 'account_disposition_write_unknown',
+    dispositionPersisted: null,
+    dispositionOutcome: 'unknown',
+    dispositionWriteOutcomeUnknown: true,
+    dispositionCode: 'ACCOUNT_DEACTIVATED',
+    dispositionErrorCode: 'EIO',
+  });
+  assert.equal(JSON.stringify(metadata).includes('must-not-persist'), false);
+
+  assert.deepEqual(phase3FailureMetadata({
+    code: 'invalid-code!',
+    accountDisposition: 'delete_everything',
+    reconciliationScope: 'untrusted',
+    reconciliationReason: 'untrusted',
+    dispositionOutcome: 'untrusted',
+    dispositionErrorCode: 'x'.repeat(97),
+  }), { code: null, accountDisposition: null });
 });
 
 test('HTTP server applies bounded slow-request and connection limits', () => {

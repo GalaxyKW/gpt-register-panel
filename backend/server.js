@@ -64,6 +64,22 @@ const JSON_BODY_ENDPOINTS = new Set([
   '/api/tokens/expired/delete',
   '/api/account-tests',
 ]);
+const PHASE3_RECONCILIATION_SCOPES = new Set([
+  'phase3_account_disposition',
+  'phase3_process_tree',
+]);
+const PHASE3_RECONCILIATION_REASONS = new Set([
+  'account_disposition_write_unknown',
+  'account_disposition_checkpoint_unavailable',
+  'account_disposition_not_persisted',
+  'phase3_process_tree_unconfirmed',
+]);
+const PHASE3_DISPOSITION_OUTCOMES = new Set([
+  'persisted',
+  'not_persisted',
+  'unknown',
+  'not_attempted',
+]);
 
 const authFailureBuckets = new Map();
 const MAX_AUTH_FAILURE_BUCKETS = 10_000;
@@ -637,6 +653,46 @@ function terminalUpdateOptions({ logger, event, requestId, jobId, actor }) {
   };
 }
 
+function safePhase3FailureCode(value) {
+  const code = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  return /^[A-Z0-9_]{1,96}$/.test(code) ? code : null;
+}
+
+function phase3FailureMetadata(error) {
+  const output = {
+    code: safePhase3FailureCode(error?.code),
+    accountDisposition: error?.accountDisposition === 'discard' ? 'discard' : null,
+  };
+  if (error?.requiresReconciliation === true) output.requiresReconciliation = true;
+  if (error?.writeOutcomeUnknown === true) output.writeOutcomeUnknown = true;
+  if (error?.doNotRetry === true) output.doNotRetry = true;
+  if (error?.retryAllowed === false) output.retryAllowed = false;
+  if (PHASE3_RECONCILIATION_SCOPES.has(error?.reconciliationScope)) {
+    output.reconciliationScope = error.reconciliationScope;
+  }
+  if (PHASE3_RECONCILIATION_REASONS.has(error?.reconciliationReason)) {
+    output.reconciliationReason = error.reconciliationReason;
+  }
+  if (error?.dispositionPersisted === true
+      || error?.dispositionPersisted === false
+      || error?.dispositionPersisted === null) {
+    output.dispositionPersisted = error.dispositionPersisted;
+  }
+  if (PHASE3_DISPOSITION_OUTCOMES.has(error?.dispositionOutcome)) {
+    output.dispositionOutcome = error.dispositionOutcome;
+  }
+  if (error?.dispositionWriteOutcomeUnknown === true) {
+    output.dispositionWriteOutcomeUnknown = true;
+  } else if (error?.dispositionWriteOutcomeUnknown === false) {
+    output.dispositionWriteOutcomeUnknown = false;
+  }
+  const dispositionCode = safePhase3FailureCode(error?.dispositionCode);
+  if (dispositionCode) output.dispositionCode = dispositionCode;
+  const dispositionErrorCode = safePhase3FailureCode(error?.dispositionErrorCode);
+  if (dispositionErrorCode) output.dispositionErrorCode = dispositionErrorCode;
+  return output;
+}
+
 function observePhase3Job({
   job,
   email,
@@ -698,6 +754,7 @@ function observePhase3Job({
     })
     .catch(async (error) => {
       const message = safeErrorMessage(error);
+      const failureMetadata = phase3FailureMetadata(error);
       const interrupted = error?.code === 'JOB_INTERRUPTED'
         || tracked?.controller.signal.aborted === true;
       try {
@@ -708,8 +765,7 @@ function observePhase3Job({
           result: interrupted ? 'interrupted' : 'failed',
           details: {
             error: message,
-            code: error?.code || null,
-            accountDisposition: error?.accountDisposition || null,
+            ...failureMetadata,
           },
         });
       } catch (auditError) {
@@ -724,10 +780,7 @@ function observePhase3Job({
         await updateTerminalJob(db, job.id, {
           status: interrupted ? 'interrupted' : 'failed',
           error: message,
-          result: {
-            code: error?.code || null,
-            accountDisposition: error?.accountDisposition || null,
-          },
+          result: failureMetadata,
           finishedAt: new Date().toISOString(),
         }, terminalUpdateOptions({
           logger,
@@ -751,6 +804,7 @@ function observePhase3Job({
         jobId: job.id,
         actor,
         error: message,
+        ...failureMetadata,
       });
     });
   return tracked && jobManager ? jobManager.track(tracked, observation) : observation;
@@ -2108,5 +2162,6 @@ module.exports = {
   safeStaticPath,
   tokenImportJobStatus,
   normalizePhase3Requests,
+  phase3FailureMetadata,
   phase3ClaimKeys,
 };
