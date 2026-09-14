@@ -132,10 +132,7 @@ test('free-text redaction covers compound headers, structured values, and opaque
   ]) assert.equal(spaceSeparated.includes(secret), false, secret + ' leaked');
   assert.match(spaceSeparated, /completed/);
   assert.match(spaceSeparated, /retried/);
-  assert.match(spaceSeparated, /handled/);
-  assert.match(spaceSeparated, /retained/);
   assert.match(spaceSeparated, /rotated/);
-  assert.match(spaceSeparated, /handled-again/);
   assert.match(spaceSeparated, /rotated-again/);
   assert.match(spaceSeparated, /rejected/);
 
@@ -161,6 +158,52 @@ test('free-text redaction covers compound headers, structured values, and opaque
   );
   assert.equal(longUrl.includes(longUserinfoSecret), false);
   assert.equal(longUrl, 'https://[redacted]@host.example/path');
+});
+
+test('redaction covers localized, composite, and URL-encoded credential forms', () => {
+  const marker = 'fake-localized-credential-marker';
+  const secondPart = 'fake-localized-secret-second-part';
+  const cases = [
+    [`密码：${marker} ${secondPart}；状态=失败`, '状态=失败'],
+    [`password ${marker} ${secondPart}; status=failed`, 'status=failed'],
+    [`credential payload ${marker} ${secondPart}; status=failed`, 'status=failed'],
+    [`Bearer "${marker} ${secondPart}" rejected`, 'rejected'],
+    [`token => ${marker}`, 'token =>'],
+    [`API key -> ${marker}`, 'API key ->'],
+    [`client.credentials.raw.value=${marker}&status=failed`, 'status=failed'],
+    [`https%3A%2F%2Fhost.test%2Fcb%3Faccess%5Ftoken%3D${marker}%26status%3Dfailed`,
+      'status%3Dfailed'],
+    [`rt_${marker}`, '[redacted]'],
+  ];
+  for (const [input, retained] of cases) {
+    const output = redactText(input);
+    assert.equal(output.includes(marker), false, input + ' leaked its first secret segment');
+    assert.equal(output.includes(secondPart), false, input + ' leaked its remaining secret segment');
+    assert.ok(output.includes(retained), input + ' lost its non-secret diagnostic context');
+  }
+
+  const structured = redactValue({
+    credentialBody: marker,
+    credentialPayloadRawValue: marker,
+    cookieJar: marker,
+    OAuthCode: marker,
+    OAuth凭据响应: marker,
+    访问令牌: marker,
+    API密钥: marker,
+    tokenCount: 3,
+    tokenFingerprint: 'safe-fingerprint',
+  });
+  for (const key of [
+    'credentialBody',
+    'credentialPayloadRawValue',
+    'cookieJar',
+    'OAuthCode',
+    'OAuth凭据响应',
+    '访问令牌',
+    'API密钥',
+  ]) assert.equal(structured[key], '[redacted]', key + ' was not redacted');
+  assert.equal(structured.tokenCount, 3);
+  assert.equal(structured.tokenFingerprint, 'safe-fingerprint');
 });
 
 test('redaction covers private-key material and common cloud signing credentials', () => {
@@ -541,6 +584,33 @@ test('logger treats rotation failure as a failed write until rotation recovers',
   assert.equal(logger.health().healthy, true);
   assert.equal(logger.health().consecutiveWriteFailures, 0);
   assert.equal(logger.tail(1)[0].event, 'test.rotation.recovered');
+});
+
+test('logger write failure fallback never invokes hostile error accessors', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false });
+  const originalWriteFileSync = fs.writeFileSync;
+  let getterCalls = 0;
+  const hostileError = {};
+  Object.defineProperty(hostileError, 'message', {
+    get() {
+      getterCalls += 1;
+      throw new Error('fake-hostile-error-getter-secret');
+    },
+  });
+  fs.writeFileSync = function failingLogWrite() {
+    throw hostileError;
+  };
+  try {
+    assert.doesNotThrow(() => logger.info('test.hostile_write_failure'));
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+  }
+  assert.equal(getterCalls, 0);
+  assert.equal(logger.health().healthy, false);
+  assert.equal(logger.health().consecutiveWriteFailures, 1);
+  assert.equal(fs.readFileSync(filePath, 'utf8').includes('fake-hostile-error-getter-secret'), false);
 });
 
 test('logger fails closed when its destination cannot be initialized', () => {

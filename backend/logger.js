@@ -29,7 +29,7 @@ const MAX_LOG_NAMESPACE_FILES = 1000;
 // directory full of unrelated names must not make startup materialize an
 // unbounded readdir result before the namespace limit can be enforced.
 const MAX_LOG_DIRECTORY_ENTRIES = 20_000;
-const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
+const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|(?:用户|登录)?密码|口令|(?:管理员|访问|刷新|身份|认证|授权|bearer|jwt)?令牌|(?:api|客户端|签名|加密|私有|服务账号|访问)?密钥|私钥|(?:oauth|身份|登录|认证|授权)?凭据|认证信息|授权信息|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bod(?:y|ies)|texts?|json|lists?|maps?|objects?|arrays?|blobs?|responses?|previews?|plaintexts?|jars?))*(?:值|内容|原文|头|正文|数据|列表|映射|对象|数组|载荷|响应|预览|明文)*$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
   'state', 'states', 'expiry', 'expiries', 'expiration', 'expirations',
@@ -37,12 +37,12 @@ const NON_SECRET_METADATA_WORDS = new Set([
 ]);
 const SECRET_TEXT = [
   /-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY(?: BLOCK)?-----|$)/gi,
-  /Bearer\s+[^\s,;]+/gi,
-  /Basic\s+[^\s,;]+/gi,
+  /Bearer\s+(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)/gi,
+  /Basic\s+(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)/gi,
   /admin-[A-Za-z0-9._~-]{16,}/gi,
   /sk-[A-Za-z0-9_-]{16,}/gi,
   /eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){2,4}/g,
-  /\brt(?:\.[A-Za-z0-9_-]+){1,5}\b/gi,
+  /\brt(?:[._-][A-Za-z0-9_-]+){1,5}\b/gi,
 ];
 
 function asLevel(value) {
@@ -56,7 +56,10 @@ function normalizeSecretKey(key) {
     .replace(/([A-Z]+)([A-Z][a-z])/g, '$1_$2')
     .replace(/[^A-Za-z0-9\u4e00-\u9fff]+/g, '_')
     .replace(/^_+|_+$/g, '')
-    .toLowerCase();
+    .toLowerCase()
+    // The generic acronym splitter turns OAuth into `o_auth`. Restore this
+    // credential-domain acronym before matching normalized field names.
+    .replace(/(^|_)o_auth(?=_|[\u4e00-\u9fff]|$)/g, '$1oauth');
 }
 
 function jsonRedaction(value) {
@@ -72,9 +75,9 @@ function jsonRedaction(value) {
 }
 
 function secretMayContainSpaces(normalizedKey) {
-  return /(^|_)(?:passwords?|passwds?|pwds?|passphrases?|recovery_codes?|credentials?|secrets?|private_keys?)$/.test(
+  return /(^|_)(?:passwords?|passwds?|pwds?|passphrases?|recovery_codes?|credentials?|secrets?|private_keys?)(?:_(?:values?|payloads?|data|raw|headers?|bod(?:y|ies)|texts?|json|lists?|maps?|objects?|arrays?|blobs?|responses?|previews?|plaintexts?|jars?))*$/.test(
     normalizedKey,
-  );
+  ) || /(?:密码|口令|凭据|私钥)(?:值|内容|原文|正文|数据|载荷|响应|预览|明文)*$/.test(normalizedKey);
 }
 
 function assignedValueSpan(text, start, options = {}) {
@@ -129,7 +132,7 @@ function assignedValueSpan(text, start, options = {}) {
 
   // Passwords and passphrases commonly contain whitespace. For those labels,
   // fail closed and hide the complete diagnostic segment up to punctuation.
-  const delimiters = options.allowSpaces ? /[,;}&\r\n]/ : /[\s,;}&]/;
+  const delimiters = options.allowSpaces ? /[,;，；＆}&\r\n]/ : /[\s,;，；＆}&]/;
   const delimiterOffset = text.slice(start).search(delimiters);
   const end = delimiterOffset < 0 ? text.length : start + delimiterOffset;
   return { end, replacement: '[redacted]' };
@@ -141,7 +144,7 @@ function redactMultiwordAssignments(value) {
   // "API key". Match a bounded label (at most four words), then use the same
   // normalized allowlist as structured fields rather than accepting arbitrary
   // prose before a colon.
-  const pattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]*(?:[ \t]+[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]*){1,3})(["']?[ \t]*[:=][ \t]*)/gi;
+  const pattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\[\]\-\u4e00-\u9fff]*(?:[ \t]+[A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\[\]\-\u4e00-\u9fff]*){1,3})(["']?[ \t]*(?:=>|->|:=|[:=：＝→])[ \t]*)/gi;
   let output = '';
   let cursor = 0;
   let match;
@@ -162,7 +165,7 @@ function redactMultiwordAssignments(value) {
 
 function redactAssignments(value) {
   const text = String(value || '');
-  const pattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]*)(["']?[ \t]*[:=][ \t]*)/gi;
+  const pattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\[\]\-\u4e00-\u9fff]{0,255})(["']?[ \t]*(?:=>|->|:=|[:=：＝→])[ \t]*)/gi;
   let output = '';
   let cursor = 0;
   let match;
@@ -183,7 +186,7 @@ function redactAssignments(value) {
 
 function redactEncodedAssignments(value) {
   const text = String(value || '');
-  const pattern = /(^|[^A-Za-z0-9_%])([A-Za-z_\u4e00-\u9fff%][A-Za-z0-9_\-\u4e00-\u9fff%]{0,255})([ \t]*=[ \t]*)/gi;
+  const pattern = /(^|[^A-Za-z0-9_%])([A-Za-z_\u4e00-\u9fff%][A-Za-z0-9_.\[\]\-\u4e00-\u9fff%]{0,255})([ \t]*=[ \t]*)/gi;
   let output = '';
   let cursor = 0;
   let match;
@@ -204,6 +207,34 @@ function redactEncodedAssignments(value) {
   return output + text.slice(cursor);
 }
 
+function redactPercentEncodedAssignments(value) {
+  const text = String(value || '');
+  // Error messages often contain a redirect URL nested inside another query
+  // string. In that form both the key separator and the value delimiter are
+  // percent encoded, so the ordinary assignment pass cannot see them.
+  const pattern = /(^|%(?:2[36]|3f)|[^A-Za-z0-9_%])((?:[A-Za-z0-9_.\[\]\-\u4e00-\u9fff]|%[0-9a-f]{2}){1,256}?)(%3[da]|%ef%bc%9[ad])/gi;
+  let output = '';
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    let decoded;
+    try { decoded = decodeURIComponent(match[2]); } catch { continue; }
+    const normalizedKey = normalizeSecretKey(decoded);
+    if (!SECRET_KEY.test(normalizedKey) || match.index < cursor) continue;
+    output += text.slice(cursor, match.index) + match[1] + match[2] + match[3];
+    const tail = text.slice(pattern.lastIndex);
+    const delimiter = secretMayContainSpaces(normalizedKey)
+      ? /(?:%(?:26|3b|23|0a|0d|2c)|[&,;#\r\n])/i
+      : /(?:%(?:26|3b|23|0a|0d|2c|20|09)|[\s&,;#])/i;
+    const delimiterOffset = tail.search(delimiter);
+    const end = delimiterOffset < 0 ? text.length : pattern.lastIndex + delimiterOffset;
+    output += '[redacted]';
+    cursor = end;
+    pattern.lastIndex = Math.max(end, pattern.lastIndex);
+  }
+  return output + text.slice(cursor);
+}
+
 function startsWithNonSecretMetadata(text, start) {
   const match = /^[A-Za-z_][A-Za-z0-9_-]{0,63}/.exec(text.slice(start));
   return Boolean(match && NON_SECRET_METADATA_WORDS.has(normalizeSecretKey(match[0])));
@@ -218,12 +249,16 @@ function redactSpaceSeparatedPattern(value, pattern) {
     if (match.index < cursor) continue;
     if (match[3].length > 128 || !SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
     let valueStart = pattern.lastIndex;
-    const connector = /^(?:is|was|are|were)\b[ \t]+/i.exec(text.slice(valueStart));
+    const connector = /^(?:(?:(?:is|was|are|were)\b|是|为)[ \t]+|(?:=>|->|:=|[:=：＝→])[ \t]*)/i
+      .exec(text.slice(valueStart));
     if (connector) valueStart += connector[0].length;
     if (valueStart >= text.length || startsWithNonSecretMetadata(text, valueStart)) continue;
+    if (text.startsWith('[redacted]', valueStart)) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
     output += text.slice(pattern.lastIndex, valueStart);
-    const span = assignedValueSpan(text, valueStart);
+    const span = assignedValueSpan(text, valueStart, {
+      allowSpaces: secretMayContainSpaces(normalizeSecretKey(match[3])),
+    });
     output += span.replacement;
     cursor = span.end;
     pattern.lastIndex = Math.max(span.end, pattern.lastIndex);
@@ -237,7 +272,7 @@ function redactSpaceSeparatedSecrets(value) {
   // turning ordinary "token count/status/fingerprint" diagnostics into
   // secrets. Labels and single-key forms are both length bounded.
   const naturalPattern = /(^|[^A-Za-z0-9_])(["']?)((?:(?:access|refresh|id)[ \t]+tokens?|api[ \t]+keys?|private[ \t]+keys?|signing[ \t]+keys?|encryption[ \t]+keys?|secret[ \t]+access[ \t]+keys?|access[ \t]+key[ \t]+ids?|service[ \t]+account[ \t]+keys?|key[ \t]+materials?|mfa[ \t]+secrets?|totp[ \t]+secrets?|recovery[ \t]+codes?|authorization(?:[ \t]+codes?)?|oauth[ \t]+codes?|verification[ \t]+codes?|code[ \t]+verifiers?|client[ \t]+secrets?|secret[ \t]+keys?|passwords?|passwds?|passphrases?|secrets?|cookies?|tokens?|credentials?|nonces?|jwts?|authentication|auth|sessions?)(?:[ \t]+(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?)(["']?[ \t]+)/gi;
-  const singleKeyPattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]{0,127})(["']?[ \t]+)/gi;
+  const singleKeyPattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\[\]\-\u4e00-\u9fff]{0,127})(["']?[ \t]+)/gi;
   return redactSpaceSeparatedPattern(
     redactSpaceSeparatedPattern(value, naturalPattern),
     singleKeyPattern,
@@ -259,13 +294,13 @@ function redactText(value) {
   // Authorization and cookie header values may contain spaces or multiple
   // semicolon-delimited credentials. Treat the entire header value as secret.
   text = redactUrlUserinfo(text);
-  text = text.replace(/\b((?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)\s*:\s*[^\r\n]*/gi, '$1: [redacted]');
+  text = text.replace(/\b((?:proxy[_-]?)?authorization|(?:set[_-]?)?cookie)\s*[:：]\s*[^\r\n]*/gi, '$1: [redacted]');
   for (const pattern of SECRET_TEXT) text = text.replace(pattern, '[redacted]');
   // Assignment forms must run first: otherwise the whitespace-only matcher
   // could consume the container word in `credential payload: {...}` as if it
   // were the secret value and leave the actual payload behind.
-  return redactSpaceSeparatedSecrets(redactEncodedAssignments(
-    redactAssignments(redactMultiwordAssignments(text)),
+  return redactSpaceSeparatedSecrets(redactPercentEncodedAssignments(
+    redactEncodedAssignments(redactAssignments(redactMultiwordAssignments(text))),
   ));
 }
 
@@ -510,6 +545,15 @@ function safeErrorText(error, limit = 8192) {
   return redactText(combined).slice(0, safeLimit);
 }
 
+function safeFailureMessage(error, fallback = 'unknown error') {
+  let value = ownPrimitive(error, 'message');
+  if (value === undefined && ['string', 'number', 'boolean', 'bigint'].includes(typeof error)) {
+    value = error;
+  }
+  const text = redactLogText(value === undefined ? fallback : value).slice(0, 1000);
+  return text || fallback;
+}
+
 function numberFromEnv(value, fallback, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= minimum ? Math.min(parsed, maximum) : fallback;
@@ -607,7 +651,7 @@ class PanelLogger {
       }
       this.directoryIdentity = null;
       this.fileHealthy = false;
-      this.fallback('error', 'logger.initialize_failed', { error: error.message });
+      this.fallback('error', 'logger.initialize_failed', { error: safeFailureMessage(error) });
       const wrapped = new Error('审计日志初始化失败，拒绝启动');
       wrapped.code = 'PANEL_LOG_INITIALIZATION_FAILED';
       wrapped.cause = error;
@@ -812,7 +856,7 @@ class PanelLogger {
       this.failedWrites += 1;
       this.consecutiveWriteFailures += 1;
       this.lastWriteFailureAt = new Date().toISOString();
-      this.fallback('error', 'logger.probe_failed', { error: error.message });
+      this.fallback('error', 'logger.probe_failed', { error: safeFailureMessage(error) });
       return false;
     } finally {
       if (descriptor !== undefined) {
@@ -859,7 +903,7 @@ class PanelLogger {
       this.lastWriteFailureAt = new Date().toISOString();
       this.fallback('error', 'logger.checkpoint_failed', {
         checkpointEvent,
-        error: error.message,
+        error: safeFailureMessage(error),
       });
       return false;
     } finally {
@@ -955,7 +999,7 @@ class PanelLogger {
           error = syncError;
         }
       }
-      this.fallback('error', 'logger.rotate_failed', { error: error.message });
+      this.fallback('error', 'logger.rotate_failed', { error: safeFailureMessage(error) });
       const wrapped = new Error('日志轮转失败');
       wrapped.code = 'PANEL_LOG_ROTATION_FAILED';
       wrapped.cause = error;
@@ -993,7 +1037,10 @@ class PanelLogger {
       };
       ({ entry, line } = serializeLogEntry(entry, this.maxBytes));
     } catch (error) {
-      this.fallback('error', 'logger.serialize_failed', { error: error.message, originalEvent: event });
+      this.fallback('error', 'logger.serialize_failed', {
+        error: safeFailureMessage(error),
+        originalEvent: event,
+      });
       return null;
     }
     let pinnedDirectory;
@@ -1021,7 +1068,10 @@ class PanelLogger {
       this.failedWrites += 1;
       this.consecutiveWriteFailures += 1;
       this.lastWriteFailureAt = new Date().toISOString();
-      this.fallback('error', 'logger.write_failed', { error: error.message, originalEvent: event });
+      this.fallback('error', 'logger.write_failed', {
+        error: safeFailureMessage(error),
+        originalEvent: event,
+      });
     } finally {
       if (pinnedDirectory?.descriptor !== undefined) {
         try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
