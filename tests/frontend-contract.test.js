@@ -179,6 +179,10 @@ test('frontend locks the initial UI when active-job recovery cannot be confirmed
   assert.match(failureBranch, /renderJob\(state\.job\);\s*updateActionState\(\)/);
   assert.match(failureBranch, /window\.setTimeout\(\(\) => resumeActiveJob\(\), 15000\)/);
   assert.match(resumeContract, /if \(state\.job\?\.resumeProbe\)[\s\S]*recentReconciliation[\s\S]*state\.job = recentReconciliation \|\| null;[\s\S]*updateActionState\(\)/);
+  assert.match(resumeContract, /activeListingInvalid \|\| activeListing\.truncated === true \|\| activeTotal > activeReturned/);
+  assert.match(resumeContract, /activeReturned !== activeJobs\.length/);
+  assert.match(resumeContract, /id:\s*'active-list-truncated'[\s\S]*status:\s*'unknown'/);
+  assert.match(resumeContract, /活跃任务列表不完整，无法安全解除操作锁/);
 });
 
 test('frontend restores the newest terminal reconciliation warning when no job is active', async () => {

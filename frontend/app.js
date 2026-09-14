@@ -1884,6 +1884,11 @@ async function resumeActiveJob() {
     const body = await response.json();
     if (!response.ok) throw new Error(body.message || body.error || '任务列表读取失败');
     const listedJobs = Array.isArray(body.jobs) ? body.jobs : [];
+    const activeListing = body.activeJobs && typeof body.activeJobs === 'object'
+      ? body.activeJobs
+      : { total: listedJobs.filter((job) => ['queued', 'running'].includes(job?.status)).length,
+          returned: listedJobs.filter((job) => ['queued', 'running'].includes(job?.status)).length,
+          truncated: false };
     const holdListing = body.reconciliationHolds && typeof body.reconciliationHolds === 'object'
       ? body.reconciliationHolds
       : { total: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
@@ -1895,6 +1900,30 @@ async function resumeActiveJob() {
       truncated: holdListing.truncated === true,
     };
     const activeJobs = listedJobs.filter((job) => ['queued', 'running'].includes(job.status));
+    const activeTotal = Number(activeListing.total);
+    const activeReturned = Number(activeListing.returned);
+    const activeListingInvalid = !Number.isSafeInteger(activeTotal) || activeTotal < 0
+      || !Number.isSafeInteger(activeReturned) || activeReturned < 0
+      || activeReturned > activeTotal || activeReturned !== activeJobs.length
+      || typeof activeListing.truncated !== 'boolean';
+    if (activeListingInvalid || activeListing.truncated === true || activeTotal > activeReturned) {
+      state.jobs = activeJobs;
+      state.job = {
+        id: 'active-list-truncated',
+        type: 'batch',
+        status: 'unknown',
+        jobs: activeJobs,
+        error: '活跃任务列表不完整，无法安全解除操作锁',
+      };
+      renderJob(state.job);
+      updateActionState();
+      showNotice('活跃任务超过单次响应上限，当前显示 '
+        + (Number.isSafeInteger(activeReturned) ? activeReturned : '?') + '/'
+        + (Number.isSafeInteger(activeTotal) ? activeTotal : '?')
+        + ' 个；已保持操作锁定并将在后台重试。', 'notice-warning');
+      state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
+      return;
+    }
     if (!activeJobs.length) {
       if (state.job?.resumeProbe) {
         const recentReconciliation = listedJobs.find((job) => (

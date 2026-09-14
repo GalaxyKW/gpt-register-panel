@@ -28,6 +28,7 @@ const MAX_RECONCILIATION_LIST_JOBS = 100;
 // old jobs monopolize the event loop. Full (still bounded/redacted) results
 // remain available through getJob().
 const MAX_JOB_LIST_RESULT_BYTES = 16 * 1024;
+const MAX_ACTIVE_JOB_LIST_JOBS = 200;
 const LEGACY_GLOBAL_CLAIM_PREFIX = 'reconciliation:legacy-global:';
 const RECONCILIATION_ACK_CONFIRMATION = '我已按强身份完成人工核对';
 const RECONCILIATION_ACK_RESOLUTIONS = Object.freeze([
@@ -2172,6 +2173,8 @@ class PanelDb {
     const rows = await this.read((database) => {
       const heldTotal = Number(resultRows(database.exec(`SELECT COUNT(*) AS count
         FROM sync_jobs WHERE reconciliation_hold = 1`))[0]?.count) || 0;
+      const activeTotal = Number(resultRows(database.exec(`SELECT COUNT(*) AS count
+        FROM sync_jobs WHERE status IN ('queued', 'running')`))[0]?.count) || 0;
       // A normal history limit must never hide a durable hold. Bound the
       // exceptional set separately and report truncation rather than silently
       // implying that the returned list is complete. Global upgrade barriers
@@ -2190,6 +2193,23 @@ class PanelDb {
         ORDER BY CASE WHEN reconciliation_scope = 'global' THEN 0 ELSE 1 END,
           created_at ASC, id ASC
         LIMIT ${MAX_RECONCILIATION_LIST_JOBS}`));
+      // Active work is operational state, not history. Query it independently
+      // so a burst of newer terminal rows can never make the UI conclude that
+      // an older queued/running mutation disappeared. Oldest work comes first;
+      // if the defensive cap is ever reached the response says so explicitly.
+      const active = resultRows(database.exec(`SELECT id, type, status, requested_by,
+          CASE WHEN length(CAST(result_json AS BLOB)) <= ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN result_json ELSE NULL END AS result_json,
+          CASE WHEN result_json IS NOT NULL
+              AND length(CAST(result_json AS BLOB)) > ${MAX_JOB_LIST_RESULT_BYTES}
+            THEN 1 ELSE 0 END AS result_summary_omitted,
+          length(CAST(result_json AS BLOB)) AS result_bytes,
+          reconciliation_hold, reconciliation_scope, reconciliation_claim_digest,
+          error, created_at, started_at, finished_at
+        FROM sync_jobs
+        WHERE status IN ('queued', 'running')
+        ORDER BY created_at ASC, id ASC
+        LIMIT ${MAX_ACTIVE_JOB_LIST_JOBS}`));
       const ordinary = resultRows(database.exec(`SELECT id, type, status, requested_by,
           CASE WHEN length(CAST(result_json AS BLOB)) <= ${MAX_JOB_LIST_RESULT_BYTES}
             THEN result_json ELSE NULL END AS result_json,
@@ -2201,19 +2221,30 @@ class PanelDb {
           error, created_at, started_at, finished_at
         FROM sync_jobs
         WHERE reconciliation_hold = 0
+          AND status NOT IN ('queued', 'running')
         ORDER BY created_at DESC LIMIT ${safeLimit}`));
-      return { held, heldTotal, ordinary };
+      return { held, heldTotal, active, activeTotal, ordinary };
     });
+    const seen = new Set();
+    const jobs = [];
+    for (const row of [...rows.held, ...rows.active, ...rows.ordinary]) {
+      if (seen.has(row.id)) continue;
+      seen.add(row.id);
+      jobs.push(this.decodeJob(row, { listSummary: true }));
+    }
     return {
-      jobs: [
-        ...rows.held.map((row) => this.decodeJob(row, { listSummary: true })),
-        ...rows.ordinary.map((row) => this.decodeJob(row, { listSummary: true })),
-      ],
+      jobs,
       reconciliationHolds: {
         total: rows.heldTotal,
         returned: rows.held.length,
         truncated: rows.heldTotal > rows.held.length,
         maximumReturned: MAX_RECONCILIATION_LIST_JOBS,
+      },
+      activeJobs: {
+        total: rows.activeTotal,
+        returned: rows.active.length,
+        truncated: rows.activeTotal > rows.active.length,
+        maximumReturned: MAX_ACTIVE_JOB_LIST_JOBS,
       },
       history: {
         limit: safeLimit,

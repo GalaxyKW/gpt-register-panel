@@ -985,6 +985,38 @@ test('job listing returns holds older than the normal history limit and normaliz
   assert.equal((await db.listJobsPage('-10')).history.limit, 1);
 });
 
+test('job listing returns old active work independently from newer terminal history', async () => {
+  const db = new PanelDb(databasePath('active-listing'));
+  const active = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:old-active'],
+  });
+  await db.write((database) => {
+    const statement = database.prepare(`INSERT INTO sync_jobs
+      (id, type, status, requested_by, payload_json, result_json, created_at,
+        finished_at, claim_keys_json, reconciliation_hold)
+      VALUES (?, 'history', 'succeeded', 'tester', '{}', '{}', ?, ?, '[]', 0)`);
+    try {
+      for (let index = 0; index < 205; index += 1) {
+        const timestamp = new Date(Date.UTC(2027, 1, 1, 0, 0, index)).toISOString();
+        statement.run(['job_newer_' + String(index).padStart(4, '0'), timestamp, timestamp]);
+      }
+    } finally {
+      statement.free();
+    }
+  });
+
+  const page = await db.listJobsPage(200);
+  assert.deepEqual(page.activeJobs, {
+    total: 1,
+    returned: 1,
+    truncated: false,
+    maximumReturned: 200,
+  });
+  assert.equal(page.jobs.some((job) => job.id === active.id && job.status === 'queued'), true);
+  assert.equal(page.history.returned, 200);
+  assert.equal(page.jobs.length, 201);
+});
+
 test('job listing reports rather than hides reconciliation-hold response truncation', async () => {
   const file = databasePath('held-list-cap');
   const db = new PanelDb(file);
