@@ -770,6 +770,89 @@ test('cleanup never quarantines a claim path replaced after its verified snapsho
   });
 });
 
+test('cleanup fails closed when an open writer changes the claimed inode around hard-link creation', () => {
+  for (const mutationPoint of ['before_link', 'after_link']) {
+    const root = makeRoot();
+    const tokensDirectory = path.join(root, 'tokens');
+    const sourcePath = path.join(tokensDirectory, mutationPoint + '.json');
+    const expiredContent = JSON.stringify({
+      access_token: jwt('open-writer@example.test', { suffix: '-old' }),
+      email: 'open-writer@example.test',
+      expired: '2020-01-01T00:00:00.000Z',
+    });
+    const validContent = JSON.stringify({
+      access_token: jwt('open-writer@example.test', { suffix: '-new' }),
+      email: 'open-writer@example.test',
+      expired: '2099-01-01T00:00:00.000Z',
+    });
+    assert.equal(Buffer.byteLength(expiredContent), Buffer.byteLength(validContent));
+    fs.writeFileSync(sourcePath, expiredContent, { mode: 0o600 });
+    const options = {
+      rootDirectory: root,
+      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+    };
+    const listing = listExpiredTokens(options);
+    assert.equal(listing.count, 1);
+
+    const writer = fs.openSync(sourcePath, fs.constants.O_RDWR);
+    const originalLinkSync = fs.linkSync;
+    let injected = false;
+    const replaceThroughOpenDescriptor = () => {
+      fs.ftruncateSync(writer, 0);
+      fs.writeSync(writer, validContent, 0, 'utf8');
+      fs.fsyncSync(writer);
+      injected = true;
+    };
+    fs.linkSync = function mutateClaimAroundLink(from, to) {
+      const isClaimMove = !injected
+        && path.basename(String(from)).startsWith('.panel-token-cleanup-claim-');
+      if (isClaimMove && mutationPoint === 'before_link') replaceThroughOpenDescriptor();
+      const result = originalLinkSync.call(fs, from, to);
+      if (isClaimMove && mutationPoint === 'after_link') replaceThroughOpenDescriptor();
+      return result;
+    };
+
+    let failure;
+    try {
+      assert.throws(
+        () => deleteExpiredTokens({
+          ...options,
+          expectedVersion: listing.version,
+          confirmation: CONFIRMATION,
+        }),
+        (error) => {
+          failure = error;
+          return error.code === 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN'
+            && error.requiresReconciliation === true
+            && error.doNotRetry === true;
+        },
+      );
+    } finally {
+      fs.linkSync = originalLinkSync;
+      fs.closeSync(writer);
+    }
+
+    assert.equal(injected, true, mutationPoint);
+    assert.equal(fs.existsSync(sourcePath), false, mutationPoint);
+    const remainingClaims = fs.readdirSync(tokensDirectory).filter(
+      (name) => name.startsWith('.panel-token-cleanup-claim-'),
+    );
+    assert.equal(remainingClaims.length, 1, mutationPoint);
+    assert.equal(
+      fs.readFileSync(path.join(tokensDirectory, remainingClaims[0]), 'utf8'),
+      validContent,
+      mutationPoint,
+    );
+    const quarantineRoot = path.join(root, '.panel-quarantine', 'expired-tokens');
+    const [batchName] = fs.readdirSync(quarantineRoot);
+    assert.deepEqual(fs.readdirSync(path.join(quarantineRoot, batchName, 'tokens')), []);
+    assert.deepEqual(failure.currentItem, {
+      source: 'tokens',
+      relativePath: 'tokens/' + mutationPoint + '.json',
+    });
+  }
+});
+
 test('a dead cleanup process requires an explicit pinned recovery before a later delete', async () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
@@ -1018,6 +1101,80 @@ test('claim restore removes only its own mismatched hard link', () => {
   assert.equal(fs.readFileSync(replacementSource, 'utf8'), 'unrelated-replacement');
   assert.equal(fs.readFileSync(displacedLink, 'utf8'), 'original-claim');
   assert.equal(fs.existsSync(replacementClaim), true);
+});
+
+test('claim restore does not publish bytes changed through an already-open descriptor', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const claimPath = path.join(directory, 'open-writer-claim.json');
+  const sourcePath = path.join(directory, 'open-writer-source.json');
+  const originalContent = 'expired-claim-content';
+  const replacementContent = 'updated-valid-content';
+  assert.equal(Buffer.byteLength(originalContent), Buffer.byteLength(replacementContent));
+  fs.writeFileSync(claimPath, originalContent, { mode: 0o600 });
+  const stat = fs.lstatSync(claimPath);
+  const expectedSnapshot = {
+    dev: stat.dev,
+    ino: stat.ino,
+    size: stat.size,
+    mtimeMs: stat.mtimeMs,
+    ctimeMs: stat.ctimeMs,
+    nlink: stat.nlink,
+    uid: stat.uid,
+    mode: stat.mode,
+    contentHash: crypto.createHash('sha256').update(originalContent).digest('hex'),
+  };
+  const writer = fs.openSync(claimPath, fs.constants.O_RDWR);
+  const originalLinkSync = fs.linkSync;
+  let injected = false;
+  fs.linkSync = function mutateRestoredInode(from, to) {
+    const result = originalLinkSync.call(fs, from, to);
+    if (!injected && from === claimPath && to === sourcePath) {
+      fs.ftruncateSync(writer, 0);
+      fs.writeSync(writer, replacementContent, 0, 'utf8');
+      fs.fsyncSync(writer);
+      injected = true;
+    }
+    return result;
+  };
+  try {
+    assert.equal(restoreClaimedPath(claimPath, sourcePath, expectedSnapshot), false);
+  } finally {
+    fs.linkSync = originalLinkSync;
+    fs.closeSync(writer);
+  }
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(claimPath, 'utf8'), replacementContent);
+});
+
+test('claim restore rejects an unexpected third hard link before removing the claim', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const claimPath = path.join(directory, 'extra-link-claim.json');
+  const sourcePath = path.join(directory, 'extra-link-source.json');
+  const externalPath = path.join(directory, 'extra-link-external.json');
+  fs.writeFileSync(claimPath, 'recoverable-content', { mode: 0o600 });
+  const originalLinkSync = fs.linkSync;
+  let injected = false;
+  fs.linkSync = function addUnexpectedHardLink(from, to) {
+    const result = originalLinkSync.call(fs, from, to);
+    if (!injected && from === claimPath && to === sourcePath) {
+      originalLinkSync.call(fs, claimPath, externalPath);
+      injected = true;
+    }
+    return result;
+  };
+  try {
+    assert.equal(restoreClaimedPath(claimPath, sourcePath), false);
+  } finally {
+    fs.linkSync = originalLinkSync;
+  }
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(claimPath), true);
+  assert.equal(fs.existsSync(externalPath), true);
+  assert.equal(fs.lstatSync(claimPath).nlink, 2);
 });
 
 test('claim restore cleans its created source link after a transient claim lstat error', () => {
@@ -1534,12 +1691,12 @@ test('cross-filesystem quarantine refuses oversized files without leaving a part
   const targetPath = path.join(targetDirectory, 'oversized.json');
   fs.mkdirSync(targetDirectory);
   fs.writeFileSync(sourcePath, 'x');
-  fs.truncateSync(sourcePath, 16 * 1024 * 1024 + 1);
   const originalLinkSync = fs.linkSync;
   let forcedCrossDevice = false;
   fs.linkSync = function forceCrossDevice(from, to) {
     if (!forcedCrossDevice && from === sourcePath && to === targetPath) {
       forcedCrossDevice = true;
+      fs.truncateSync(sourcePath, 16 * 1024 * 1024 + 1);
       const error = new Error('simulated cross-device link');
       error.code = 'EXDEV';
       throw error;

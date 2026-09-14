@@ -562,18 +562,32 @@ function assertCleanupMoveSource(stat, expectedSnapshot = null) {
   }
 }
 
+function sameCleanupContentSnapshot(left, right) {
+  return Boolean(left && right
+    && Number.isSafeInteger(left.size) && left.size === right.size
+    && /^[a-f0-9]{64}$/.test(String(left.contentHash || ''))
+    && left.contentHash === right.contentHash);
+}
+
 function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let targetLinked = false;
   let linkedTargetDescriptor;
   let targetIdentity = null;
   let sourceRemoved = false;
   let sourceIdentityBeforeLink = null;
+  let sourceContentBeforeLink = null;
   try {
     // Hard-link + unlink is a no-overwrite move on one filesystem. If the
     // process crashes between the two operations, both names still reference
     // the same recoverable inode instead of losing the only copy.
     const sourceBeforeLink = fs.lstatSync(sourcePath);
     assertCleanupMoveSource(sourceBeforeLink, options.expectedSourceSnapshot);
+    sourceContentBeforeLink = regularFileSnapshot(sourcePath);
+    if (!sameClaimSnapshot(sourceContentBeforeLink, sourceBeforeLink)
+        || (options.expectedSourceSnapshot
+          && !sameCleanupContentSnapshot(sourceContentBeforeLink, options.expectedSourceSnapshot))) {
+      throw new Error('隔离来源内容与已验证快照不一致');
+    }
     sourceIdentityBeforeLink = sourceBeforeLink;
     targetIdentity = sourceBeforeLink;
     fs.linkSync(sourcePath, targetPath);
@@ -589,8 +603,9 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
       throw new Error('隔离目标不是来源文件的预期硬链接');
     }
     linkedTargetDescriptor = fs.openSync(targetPath, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
-    const openedTarget = fs.fstatSync(linkedTargetDescriptor);
-    if (!openedTarget.isFile() || !sameInode(openedTarget, targetStat)) {
+    const openedTarget = regularFileDescriptorSnapshot(linkedTargetDescriptor, 2);
+    if (!sameInode(openedTarget, targetStat)
+        || !sameCleanupContentSnapshot(openedTarget, sourceContentBeforeLink)) {
       throw new Error('隔离目标在权限收紧前发生变化');
     }
     fs.fchmodSync(linkedTargetDescriptor, 0o600);
@@ -611,6 +626,11 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
       throw new Error('隔离来源或目标在发布后发生变化');
     }
     if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
+    const contentBeforeUnlink = regularFileDescriptorSnapshot(linkedTargetDescriptor, 2);
+    if (!sameInode(contentBeforeUnlink, targetStat)
+        || !sameCleanupContentSnapshot(contentBeforeUnlink, sourceContentBeforeLink)) {
+      throw new Error('隔离来源内容在移除前发生变化');
+    }
     fs.unlinkSync(sourcePath);
     sourceRemoved = true;
     syncCleanupDirectory(path.dirname(sourcePath));
@@ -618,6 +638,11 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     assertPublishedCleanupTarget(targetPath, linkedTargetDescriptor, targetStat);
     if (typeof options.afterSourceUnlink === 'function') options.afterSourceUnlink();
     assertPublishedCleanupTarget(targetPath, linkedTargetDescriptor, targetStat);
+    const publishedContent = regularFileDescriptorSnapshot(linkedTargetDescriptor, 1);
+    if (!sameInode(publishedContent, targetStat)
+        || !sameCleanupContentSnapshot(publishedContent, sourceContentBeforeLink)) {
+      throw new Error('隔离目标内容在来源移除后发生变化');
+    }
     fs.closeSync(linkedTargetDescriptor);
     linkedTargetDescriptor = undefined;
     return;
@@ -662,14 +687,16 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
         | (fs.constants.O_NOFOLLOW || 0)
         | (fs.constants.O_NONBLOCK || 0),
     );
-    const before = fs.fstatSync(sourceDescriptor);
-    assertCleanupMoveSource(before, options.expectedSourceSnapshot);
-    if (!sourceIdentityBeforeLink || !sameClaimSnapshot(before, sourceIdentityBeforeLink)) {
+    const before = regularFileDescriptorSnapshot(sourceDescriptor, 1);
+    if (!sourceIdentityBeforeLink || !sameClaimSnapshot(before, sourceIdentityBeforeLink)
+        || !sameCleanupContentSnapshot(before, sourceContentBeforeLink)
+        || (options.expectedSourceSnapshot
+          && !sameCleanupContentSnapshot(before, options.expectedSourceSnapshot))) {
       throw new Error('隔离来源在跨文件系统回退前发生变化');
     }
     targetDescriptor = fs.openSync(
       temporaryPath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
+      fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | (fs.constants.O_NOFOLLOW || 0),
       0o600,
     );
     temporaryIdentity = fs.fstatSync(targetDescriptor);
@@ -714,6 +741,14 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     }
     assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
     if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
+    const finalSourceContent = regularFileDescriptorSnapshot(sourceDescriptor, 1);
+    const finalTargetContent = regularFileDescriptorSnapshot(targetDescriptor, 1);
+    if (!sameInode(finalSourceContent, after)
+        || !sameInode(finalTargetContent, publishedIdentity)
+        || !sameCleanupContentSnapshot(finalSourceContent, sourceContentBeforeLink)
+        || !sameCleanupContentSnapshot(finalTargetContent, sourceContentBeforeLink)) {
+      throw new Error('跨文件系统隔离内容在来源移除前发生变化');
+    }
     fs.unlinkSync(sourcePath);
     copiedSourceRemoved = true;
     syncCleanupDirectory(path.dirname(sourcePath));
@@ -721,6 +756,11 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
     if (typeof options.afterSourceUnlink === 'function') options.afterSourceUnlink();
     assertPublishedCleanupTarget(targetPath, targetDescriptor, publishedIdentity);
+    const publishedContent = regularFileDescriptorSnapshot(targetDescriptor, 1);
+    if (!sameInode(publishedContent, publishedIdentity)
+        || !sameCleanupContentSnapshot(publishedContent, sourceContentBeforeLink)) {
+      throw new Error('跨文件系统隔离目标内容在来源移除后发生变化');
+    }
   } catch (error) {
     let rollbackUnconfirmed = temporaryIdentity
       ? !rollbackOwnedPath(temporaryPath, temporaryIdentity)
@@ -918,14 +958,30 @@ function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
   try {
     // linkSync refuses to overwrite a fresh token recreated at the original
     // path while cleanup was validating the claimed inode.
-    claimStat = fs.lstatSync(claimPath);
-    if (claimStat.isSymbolicLink() || !claimStat.isFile()
-        || !sameClaimSnapshot(claimStat, expectedSnapshot)) return false;
+    const claimPathStat = fs.lstatSync(claimPath);
+    assertCleanupMoveSource(claimPathStat, expectedSnapshot);
+    claimStat = regularFileSnapshot(claimPath);
+    if (!sameClaimSnapshot(claimStat, claimPathStat)
+        || (expectedSnapshot
+          && !sameCleanupContentSnapshot(claimStat, expectedSnapshot))) return false;
     fs.linkSync(claimPath, sourcePath);
     sourceLinkCreated = true;
     const restoredStat = fs.lstatSync(sourcePath);
+    const linkedClaimStat = fs.lstatSync(claimPath);
     if (restoredStat.isSymbolicLink() || !restoredStat.isFile()
-        || !sameInode(restoredStat, claimStat)) {
+        || linkedClaimStat.isSymbolicLink() || !linkedClaimStat.isFile()
+        || !sameInode(restoredStat, claimStat)
+        || !sameInode(linkedClaimStat, claimStat)
+        || restoredStat.nlink !== 2 || linkedClaimStat.nlink !== 2) {
+      if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+        sourceLinkCreated = false;
+        return false;
+      }
+      throw restoreOutcomeUnknown();
+    }
+    const restoredSnapshot = regularFileSnapshot(sourcePath, 2);
+    if (!sameInode(restoredSnapshot, claimStat)
+        || !sameCleanupContentSnapshot(restoredSnapshot, claimStat)) {
       if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
         sourceLinkCreated = false;
         return false;
@@ -934,8 +990,21 @@ function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
     }
     syncCleanupDirectory(path.dirname(sourcePath));
     const latestSource = fs.lstatSync(sourcePath);
+    const latestClaim = fs.lstatSync(claimPath);
     if (latestSource.isSymbolicLink() || !latestSource.isFile()
-        || !sameInode(latestSource, claimStat)) {
+        || latestClaim.isSymbolicLink() || !latestClaim.isFile()
+        || !sameInode(latestSource, claimStat)
+        || !sameInode(latestClaim, claimStat)
+        || latestSource.nlink !== 2 || latestClaim.nlink !== 2) {
+      if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+        sourceLinkCreated = false;
+        return false;
+      }
+      throw restoreOutcomeUnknown();
+    }
+    const latestSnapshot = regularFileSnapshot(sourcePath, 2);
+    if (!sameInode(latestSnapshot, claimStat)
+        || !sameCleanupContentSnapshot(latestSnapshot, claimStat)) {
       if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
         sourceLinkCreated = false;
         return false;
@@ -964,6 +1033,11 @@ function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
       claimRemoved = true;
     }
     syncCleanupDirectory(path.dirname(claimPath));
+    const finalSnapshot = regularFileSnapshot(sourcePath);
+    if (!sameInode(finalSnapshot, claimStat)
+        || !sameCleanupContentSnapshot(finalSnapshot, claimStat)) {
+      throw restoreOutcomeUnknown();
+    }
     sourceLinkCreated = false;
     return true;
   } catch (error) {
@@ -987,7 +1061,60 @@ function safeAbsolutePath(directory, fileName) {
   return absolutePath;
 }
 
-function regularFileSnapshot(filePath) {
+function regularFileDescriptorSnapshot(descriptor, expectedNlink = 1) {
+  const before = fs.fstatSync(descriptor);
+  const currentUid = cleanupProcessUid();
+  if (!before.isFile() || before.nlink !== expectedNlink
+      || (currentUid !== null && before.uid !== currentUid)
+      || (before.mode & 0o022) !== 0) {
+    throw new Error('token 来源必须是当前用户持有、不可被其他用户修改的普通文件');
+  }
+  const maximumBytes = cleanupTokenMaximumBytes();
+  if (before.size < 0 || before.size > maximumBytes) {
+    const error = new Error('token 文件超过清理安全上限');
+    error.code = 'TOKEN_CLEANUP_FILE_TOO_LARGE';
+    throw error;
+  }
+  const hash = crypto.createHash('sha256');
+  const buffer = Buffer.allocUnsafe(64 * 1024);
+  let total = 0;
+  while (total <= maximumBytes) {
+    // Positional reads leave the descriptor offset unchanged so the same
+    // already-open inode can be revalidated at every namespace transition.
+    const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, total);
+    if (bytesRead === 0) break;
+    hash.update(buffer.subarray(0, bytesRead));
+    total += bytesRead;
+    if (total > maximumBytes) {
+      const error = new Error('token 文件超过清理安全上限');
+      error.code = 'TOKEN_CLEANUP_FILE_TOO_LARGE';
+      throw error;
+    }
+  }
+  const after = fs.fstatSync(descriptor);
+  if (before.dev !== after.dev || before.ino !== after.ino
+      || before.size !== after.size || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs || total !== after.size
+      || after.nlink !== expectedNlink
+      || before.uid !== after.uid || before.mode !== after.mode
+      || (currentUid !== null && after.uid !== currentUid)
+      || (after.mode & 0o022) !== 0) {
+    throw new Error('token 文件在读取期间发生变化');
+  }
+  return {
+    dev: after.dev,
+    ino: after.ino,
+    size: after.size,
+    mtimeMs: after.mtimeMs,
+    ctimeMs: after.ctimeMs,
+    nlink: after.nlink,
+    uid: after.uid,
+    mode: after.mode,
+    contentHash: hash.digest('hex'),
+  };
+}
+
+function regularFileSnapshot(filePath, expectedNlink = 1) {
   let descriptor;
   try {
     descriptor = fs.openSync(
@@ -996,53 +1123,7 @@ function regularFileSnapshot(filePath) {
         | (fs.constants.O_NOFOLLOW || 0)
         | (fs.constants.O_NONBLOCK || 0),
     );
-    const before = fs.fstatSync(descriptor);
-    const currentUid = cleanupProcessUid();
-    if (!before.isFile() || before.nlink !== 1
-        || (currentUid !== null && before.uid !== currentUid)
-        || (before.mode & 0o022) !== 0) {
-      throw new Error('token 来源必须是当前用户持有、不可被其他用户修改的非硬链接普通文件');
-    }
-    const maximumBytes = cleanupTokenMaximumBytes();
-    if (before.size < 0 || before.size > maximumBytes) {
-      const error = new Error('token 文件超过清理安全上限');
-      error.code = 'TOKEN_CLEANUP_FILE_TOO_LARGE';
-      throw error;
-    }
-    const hash = crypto.createHash('sha256');
-    const buffer = Buffer.allocUnsafe(64 * 1024);
-    let total = 0;
-    while (total <= maximumBytes) {
-      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
-      if (bytesRead === 0) break;
-      hash.update(buffer.subarray(0, bytesRead));
-      total += bytesRead;
-      if (total > maximumBytes) {
-        const error = new Error('token 文件超过清理安全上限');
-        error.code = 'TOKEN_CLEANUP_FILE_TOO_LARGE';
-        throw error;
-      }
-    }
-    const after = fs.fstatSync(descriptor);
-    if (before.dev !== after.dev || before.ino !== after.ino
-        || before.size !== after.size || before.mtimeMs !== after.mtimeMs
-        || before.ctimeMs !== after.ctimeMs || total !== after.size
-        || after.nlink !== 1
-        || (currentUid !== null && after.uid !== currentUid)
-        || (after.mode & 0o022) !== 0) {
-      throw new Error('token 文件在读取期间发生变化');
-    }
-    return {
-      dev: after.dev,
-      ino: after.ino,
-      size: after.size,
-      mtimeMs: after.mtimeMs,
-      ctimeMs: after.ctimeMs,
-      nlink: after.nlink,
-      uid: after.uid,
-      mode: after.mode,
-      contentHash: hash.digest('hex'),
-    };
+    return regularFileDescriptorSnapshot(descriptor, expectedNlink);
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
