@@ -2313,6 +2313,93 @@ test('frontend labels the remote-only source filter unambiguously', () => {
   assert.match(htmlSource, /<option value="sub2api">仅 Sub2API（无本地 token）<\/option>/);
 });
 
+test('historical visibility changes reverify active jobs before loading a new snapshot', async () => {
+  const historicalHandler = sourceSection(
+    'if (elements.historicalToggle) {',
+    'function updateActionState',
+  );
+  let changeHandler;
+  let loadOptions = null;
+  const context = {
+    elements: {
+      historicalToggle: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'change');
+          changeHandler = handler;
+        },
+      },
+    },
+    loadSnapshot: async (options) => { loadOptions = options; return true; },
+  };
+  vm.runInNewContext(historicalHandler, context);
+  assert.equal(await changeHandler(), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(loadOptions)), { resumeJobs: true });
+});
+
+test('zero-selection difference preview explicitly covers all active tokens regardless of filters', async () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
+  const previewContract = sourceSection(
+    'async function previewSelection',
+    "elements.previewButton.addEventListener('click', previewSelection);",
+  );
+  const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  const notices = [];
+  const renderedPlans = [];
+  let requestBody = null;
+  const context = {
+    state: {
+      snapshot: {
+        rows: [],
+        sub2api: { readStatus: 'ok' },
+        diff: { comparisonStatus: 'complete' },
+      },
+      selected: new Set(),
+      selectionRevision: 0,
+      previewRequestPending: false,
+    },
+    hiddenSelectionProblem: () => '',
+    selectionStillCurrent: () => true,
+    renderPlan: (plan) => renderedPlans.push(plan),
+    updateActionState() {},
+    apiFetch: async (pathname, options) => {
+      assert.equal(pathname, '/api/sync/preview');
+      requestBody = JSON.parse(options.body);
+      return {
+        ok: true,
+        async json() {
+          return {
+            version: 'a'.repeat(64),
+            planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
+            items: [],
+          };
+        },
+      };
+    },
+    showNotice: (...args) => notices.push(args),
+  };
+  vm.runInNewContext(comparisonContract + '\n' + previewContract
+    + '\npreviewPromise = previewSelection();', context);
+  assert.equal(await context.previewPromise, true);
+  assert.deepEqual(requestBody, { selectedKeys: [] });
+  assert.equal(renderedPlans.length, 2);
+  assert.equal(renderedPlans[0], null);
+  assert.match(notices.at(-1)[0], /全部活动 token/);
+  assert.match(notices.at(-1)[0], /不受当前筛选条件影响/);
+  assert.match(updateContract, /previewScopeTitle = state\.selected\.size > 0[\s\S]*检查所选账号[\s\S]*检查全部活动 token/);
+  assert.match(htmlSource, /未选择时检查全部活动 token，不受当前筛选条件影响/);
+});
+
+test('frontend names remote status and model support semantics without promising prevalidation', () => {
+  const modelContract = sourceSection('async function loadAccountTestModels', 'function actionRequestPending');
+  assert.match(htmlSource, /<span>Sub2API 状态<\/span>/);
+  assert.match(htmlSource, /<option value="">全部 Sub2API 状态<\/option>/);
+  assert.match(htmlSource, /<th>Sub2API 状态<\/th>/);
+  assert.match(source, /renderSelectOptions\(elements\.statusFilter, snapshot\.filters\.statuses, \{\}, '全部 Sub2API 状态'\)/);
+  assert.doesNotMatch(modelContract, /逐项验证/);
+  assert.match(modelContract, /最终支持性由账号测试请求结果确认/);
+  assert.match(modelContract, /最终支持性由各账号的测试请求结果确认/);
+});
+
 test('frontend discards a preview when the selected keys or revision changes in flight', async () => {
   const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
   const freshnessContract = sourceSection('function selectionStillCurrent', 'function renderRows');

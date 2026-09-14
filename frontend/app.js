@@ -856,8 +856,8 @@ async function loadAccountTestModels(snapshot, selectedRows = []) {
   state.accountTestModelsPending = Boolean(candidate && sub2ApiReadStatus(snapshot) === 'ok');
   if (elements.accountTestModelSelect) {
     elements.accountTestModelSelect.title = candidate
-      ? '正在读取这个账号实际报告的模型；提交时仍会重新逐项验证'
-      : '候选模型列表；多选账号会在测试时逐项验证是否支持';
+      ? '正在读取这个账号实际报告的候选模型；最终支持性由账号测试请求结果确认'
+      : '模型列表仅作为候选；最终支持性由各账号的测试请求结果确认';
   }
   updateActionState();
   if (!state.accountTestModelsPending) return;
@@ -877,7 +877,7 @@ async function loadAccountTestModels(snapshot, selectedRows = []) {
         && state.accountTestModelRequestSequence === requestSequence) {
       state.accountTestModelsPending = false;
       if (elements.accountTestModelSelect) {
-        elements.accountTestModelSelect.title = '模型列表仅作为候选；提交时会重新逐项验证';
+        elements.accountTestModelSelect.title = '模型列表仅作为候选；最终支持性由账号测试请求结果确认';
       }
       updateActionState();
     }
@@ -2707,7 +2707,7 @@ async function loadSnapshot(options = {}) {
     state.selectionRevision += 1;
     renderPlan(null);
     renderMetrics(snapshot);
-    renderSelectOptions(elements.statusFilter, snapshot.filters.statuses, {}, '全部状态');
+    renderSelectOptions(elements.statusFilter, snapshot.filters.statuses, {}, '全部 Sub2API 状态');
     renderSelectOptions(elements.availabilityFilter, snapshot.filters.availabilities, {
       available: '可用',
       unavailable: '不可用',
@@ -2810,7 +2810,7 @@ async function previewSelection() {
       ? '差异预览已生成：有 ' + supersededSelectionCount + ' 个所选旧副本将按有效性与新鲜度规则改用首选版本，请核对“实际文件”后再确认。'
       : selectedKeys.length
         ? '差异预览已生成，确认前仍会重新检查来源版本。'
-        : '已生成全部差异预览；如需导入，请先选择账号后重新检查。',
+        : '已生成全部活动 token 的差异预览（不受当前筛选条件影响）；如需导入，请先选择账号后重新检查。',
     supersededSelectionCount ? 'notice-warning' : 'notice-info');
     return true;
   } catch (error) {
@@ -3069,7 +3069,7 @@ elements.selectAll.addEventListener('change', () => {
   .forEach((element) => element.addEventListener(element.tagName === 'SELECT' ? 'change' : 'input', applyFilters));
 
 if (elements.historicalToggle) {
-  elements.historicalToggle.addEventListener('change', () => loadSnapshot());
+  elements.historicalToggle.addEventListener('change', () => loadSnapshot({ resumeJobs: true }));
 }
 
 function updateActionState() {
@@ -3169,10 +3169,13 @@ function updateActionState() {
   } else {
     elements.phase3Button.title = '按顺序为已选本地 gpt_register 账号运行 Phase 3';
   }
+  const previewScopeTitle = state.selected.size > 0
+    ? '检查所选账号与 Sub2API 的同步差异'
+    : '检查全部活动 token 与 Sub2API 的同步差异；不受当前筛选条件影响';
   elements.previewButton.title = state.jobInventoryVerified !== true
     ? '正在确认后台任务和待对账项，暂不可操作'
     : selectionVisibilityProblem || syncProblem || (comparisonAvailable()
-      ? '检查所选账号与 Sub2API 的同步差异'
+      ? previewScopeTitle
       : 'Sub2API 账号尚未成功读取，无法比较或同步');
 }
 

@@ -49,8 +49,8 @@
         <input id="searchInput" type="search" placeholder="例如 free00001、邮箱或手机号">
       </label>
       <label>
-        <span>状态</span>
-        <select id="statusFilter"><option value="">全部状态</option></select>
+        <span>Sub2API 状态</span>
+        <select id="statusFilter"><option value="">全部 Sub2API 状态</option></select>
       </label>
       <label>
         <span>Sub2API 可用性</span>
@@ -88,7 +88,7 @@
           <label><input type="checkbox" data-column-toggle="current" checked> 本周期</label>
         </details>
         <button id="clearSelectionButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">×</span><span>清除选择</span></button>
-        <button id="previewButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">⌁</span><span>检查差异</span></button>
+        <button id="previewButton" class="button button-secondary" type="button" title="选择账号时检查所选项；未选择时检查全部活动 token，不受当前筛选条件影响"><span class="button-icon" aria-hidden="true">⌁</span><span>检查差异</span></button>
         <button id="importButton" class="button button-primary" type="button" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
         <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="正在确认 Phase 3 是否启用"><span class="button-icon" aria-hidden="true">↗</span><span id="phase3ButtonLabel">本地 Phase 3</span></button>
         <button id="accountTestButton" class="button button-secondary account-test-button" type="button" disabled title="测试所选行关联的 Sub2API 上游账号"><span class="button-icon" aria-hidden="true">✓</span><span>测试 Sub2API 账号</span></button>
@@ -126,7 +126,7 @@
               <th>账号 / 文件</th>
               <th>邮箱对比</th>
               <th>强身份对比</th>
-              <th>状态</th>
+              <th>Sub2API 状态</th>
               <th>来源</th>
               <th>差异 / 同步决策</th>
               <th>过期时间对比</th>
