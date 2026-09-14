@@ -112,6 +112,52 @@ test('view rows use null for the side that does not exist', () => {
   assert.equal(sourceOnly.sourceDetails.relativePath, 'tokens/source-only.json');
   assert.equal(remoteOnly.sourceDetails, null);
   assert.equal(remoteOnly.remoteDetails.id, 27);
+  assert.equal(remoteOnly.schedulable, null);
+  assert.equal(remoteOnly.schedulableKnown, false);
+});
+
+test('view rows preserve the three-state Sub2API scheduler contract', () => {
+  const enabled = rowFromDiffItem({
+    kind: 'sub2api_only',
+    issues: [],
+    token: null,
+    account: { id: 31, schedulable: true, schedulableKnown: true },
+  });
+  const disabled = rowFromDiffItem({
+    kind: 'sub2api_only',
+    issues: [],
+    token: null,
+    account: { id: 32, schedulable: false, schedulableKnown: true },
+  });
+  const unknown = rowFromDiffItem({
+    kind: 'sub2api_only',
+    issues: [],
+    token: null,
+    account: { id: 33, schedulable: true, schedulableKnown: false },
+  });
+  const malformedKnownFlag = rowFromDiffItem({
+    kind: 'sub2api_only',
+    issues: [],
+    token: null,
+    account: { id: 34, schedulable: true, schedulableKnown: 'true' },
+  });
+
+  assert.deepEqual(
+    [enabled.schedulable, enabled.schedulableKnown],
+    [true, true],
+  );
+  assert.deepEqual(
+    [disabled.schedulable, disabled.schedulableKnown],
+    [false, true],
+  );
+  assert.deepEqual(
+    [unknown.schedulable, unknown.schedulableKnown],
+    [null, false],
+  );
+  assert.deepEqual(
+    [malformedKnownFlag.schedulable, malformedKnownFlag.schedulableKnown],
+    [null, false],
+  );
 });
 
 test('frontend renders both sides, full-value differences, and the numeric remote id', () => {
@@ -192,4 +238,52 @@ test('frontend labels an old matched snapshot as merged instead of inventing two
   assert.match(context.result.email, /后端尚未提供分侧字段/);
   assert.doesNotMatch(context.result.email, /comparison-marker/);
   assert.match(context.result.account, /Sub2API ID #19/);
+});
+
+test('frontend renders scheduler state as enabled, disabled, or unknown with safe availability reasons', () => {
+  const primitives = sourceSection('function escapeHtml', 'function finiteNumber');
+  const sideRenderers = sourceSection('function rowSideData', 'function renderRows');
+  const context = {};
+  vm.runInNewContext(primitives + '\n' + sideRenderers + `
+    const sides = { remote: { id: 41 } };
+    result = {
+      enabled: renderRemoteState({
+        accountId: 41,
+        schedulable: true,
+        schedulableKnown: true,
+        availability: 'available',
+        availabilityReason: 'sub2api_available',
+      }, sides),
+      disabled: renderRemoteState({
+        accountId: 41,
+        schedulable: false,
+        schedulableKnown: true,
+        availability: 'unavailable',
+        availabilityReason: 'sub2api_unschedulable',
+      }, sides),
+      unknown: renderRemoteState({
+        accountId: 41,
+        schedulable: true,
+        schedulableKnown: false,
+        availability: 'unknown',
+        availabilityReason: 'credential=must-not-be-rendered',
+      }, sides),
+      invalidAutoPause: renderRemoteState({
+        accountId: 41,
+        schedulable: true,
+        schedulableKnown: true,
+        availability: 'unknown',
+        availabilityReason: 'sub2api_auto_pause_invalid',
+      }, sides),
+    };
+  `, context);
+
+  assert.match(context.result.enabled, /调度：开启/);
+  assert.match(context.result.enabled, />可用</);
+  assert.match(context.result.disabled, /调度：关闭/);
+  assert.match(context.result.disabled, /不可用：调度已关闭/);
+  assert.match(context.result.unknown, /调度：未知/);
+  assert.match(context.result.unknown, /可用性未知：原因无法安全识别/);
+  assert.doesNotMatch(context.result.unknown, /must-not-be-rendered/);
+  assert.match(context.result.invalidAutoPause, /可用性未知：过期自动停调配置无效/);
 });

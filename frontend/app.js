@@ -757,6 +757,52 @@ function renderAccountSummary(row, sides, displayName) {
     + details.map((detail) => '<small>' + escapeHtml(detail) + '</small>').join('');
 }
 
+function availabilityReasonLabel(reason) {
+  return {
+    sub2api_available: '可用',
+    sub2api_status_active: '账号状态正常',
+    sub2api_status_disabled: '账号已禁用',
+    sub2api_status_error: '账号处于 error',
+    sub2api_status_unknown: '账号状态无法识别',
+    sub2api_status_missing: '缺少账号状态',
+    sub2api_schema_invalid: '账号字段不完整或冲突',
+    sub2api_schedulable_missing: '缺少调度状态',
+    sub2api_unschedulable: '调度已关闭',
+    sub2api_auto_pause_invalid: '过期自动停调配置无效',
+    sub2api_expired: '账号已过期',
+    sub2api_expiry_invalid: '账号过期时间无效',
+    sub2api_temp_unschedulable: '账号临时停调',
+    sub2api_temp_unschedulable_invalid: '临时停调时间无效',
+    sub2api_rate_limited: '账号限流中',
+    sub2api_rate_limit_invalid: '限流恢复时间无效',
+    sub2api_overloaded: '账号过载停调中',
+    sub2api_overload_invalid: '过载恢复时间无效',
+    sub2api_read_failed: 'Sub2API 读取失败',
+    sub2api_not_read: '本次未读取 Sub2API',
+    not_in_sub2api: '未导入 Sub2API',
+  }[String(reason || '').trim().toLowerCase()] || '原因无法安全识别';
+}
+
+function renderRemoteState(row, sides) {
+  const remoteId = Number(sides.remote?.id ?? row?.accountId);
+  if (!Number.isSafeInteger(remoteId) || remoteId <= 0) return '';
+  const hasKnownFlag = Object.prototype.hasOwnProperty.call(row || {}, 'schedulableKnown');
+  const schedulableKnown = hasKnownFlag
+    ? row.schedulableKnown === true && typeof row.schedulable === 'boolean'
+    : typeof row?.schedulable === 'boolean';
+  const scheduler = schedulableKnown
+    ? (row.schedulable ? '调度：开启' : '调度：关闭')
+    : '调度：未知';
+  const availability = String(row?.availability || 'unknown');
+  const availabilityText = availability === 'available'
+    ? '可用'
+    : availability === 'unavailable'
+      ? '不可用：' + availabilityReasonLabel(row?.availabilityReason)
+      : '可用性未知：' + availabilityReasonLabel(row?.availabilityReason);
+  return '<small class="availability-note">' + escapeHtml(scheduler) + '</small>'
+    + '<small class="availability-note">' + escapeHtml(availabilityText) + '</small>';
+}
+
 function renderRows() {
   const rows = state.rows;
   const checkboxDisabled = actionsLocked() ? ' disabled' : '';
@@ -775,8 +821,7 @@ function renderRows() {
       + '<td class="comparison-cell">' + renderEmailComparison(row, sides, phase3Note) + '</td>'
       + '<td class="comparison-cell">' + renderIdentityComparison(row, sides) + '</td>'
       + '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(statusLabel(row.status)) + '</span>'
-      + (row.availability === 'unavailable' ? '<small class="availability-note">不可用</small>'
-        : row.availability === 'unknown' ? '<small class="availability-note">可用性未知</small>' : '') + '</td>'
+      + renderRemoteState(row, sides) + '</td>'
       + '<td><span class="source-text ' + sourceClass(row.source) + '">' + escapeHtml(row.source || '-') + '</span></td>'
       + '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span></td>'
       + '<td class="comparison-cell">' + renderExpiryComparison(row, sides) + '</td>'
@@ -1012,14 +1057,198 @@ function tokenImportResultDetail(result) {
   return parts.join(' · ');
 }
 
+function accountTestItemNeedsReconciliation(item) {
+  return item?.requiresReconciliation === true
+    || item?.code === 'account_test_reconciliation_required'
+    || item?.code === 'account_scheduler_reconciliation_required';
+}
+
+function accountTestItemNotAttempted(item) {
+  return item?.outcome === 'not_attempted'
+    || item?.code === 'account_test_not_attempted_reconciliation';
+}
+
+function accountTestResultCounts(result) {
+  const items = Array.isArray(result?.results) ? result.results : null;
+  if (items) {
+    const counts = {
+      succeeded: 0,
+      failed: 0,
+      skipped: 0,
+      reconciliation: 0,
+      notAttempted: 0,
+    };
+    for (const item of items) {
+      if (accountTestItemNeedsReconciliation(item)) counts.reconciliation += 1;
+      else if (accountTestItemNotAttempted(item)) counts.notAttempted += 1;
+      else if (item?.status === 'succeeded') counts.succeeded += 1;
+      else if (item?.status === 'failed') counts.failed += 1;
+      else if (item?.status === 'skipped') counts.skipped += 1;
+    }
+    return counts;
+  }
+  const reconciliation = Math.max(
+    0,
+    Math.trunc(finiteNumber(result?.reconciliationCount)),
+    result?.requiresReconciliation === true ? 1 : 0,
+  );
+  const notAttempted = Math.max(0, Math.trunc(finiteNumber(result?.notAttemptedCount)));
+  return {
+    succeeded: Math.max(0, Math.trunc(finiteNumber(result?.succeeded))),
+    failed: Math.max(0, Math.trunc(finiteNumber(result?.failed)) - reconciliation),
+    skipped: Math.max(0, Math.trunc(finiteNumber(result?.skipped)) - notAttempted),
+    reconciliation,
+    notAttempted,
+  };
+}
+
+function accountTestNeedsReconciliation(result) {
+  return result?.requiresReconciliation === true
+    || accountTestResultCounts(result).reconciliation > 0;
+}
+
+function accountTestScopeLabel(scope) {
+  return {
+    test: '账号测试与状态恢复',
+    scheduler: '调度写入与回滚',
+  }[String(scope || '').trim().toLowerCase()] || '账号状态核验';
+}
+
+function accountTestReasonLabel(reason) {
+  return {
+    external_abort: '停机中断后结果无法确认',
+    timeout: '请求超时，结果无法确认',
+    transport: '连接中断，结果无法确认',
+    response_too_large: '响应过大，无法确认结果',
+    empty_response: '响应为空，无法确认结果',
+    invalid_json: '响应格式无效，无法确认结果',
+    request_validation: '请求校验失败，结果无法确认',
+    response_rejected: '远端拒绝响应，结果仍需核对',
+    invalid_terminal: '远端返回了矛盾的终态',
+    missing_terminal: '远端未返回可确认的终态',
+    model_mismatch: '返回模型与请求模型不一致',
+    post_test_interrupted: '测试后状态恢复流程被中断',
+    post_test_target_changed: '测试后账号强身份发生变化',
+    account_test_state_unknown: '测试后账号状态无法确认',
+    scheduler_write_unknown: '调度写入结果无法确认',
+    enable_response_mismatch: '启用调度响应与目标不一致',
+    rollback_state_unavailable: '回滚前账号状态无法读取',
+    rollback_state_changed: '回滚前账号状态已被修改',
+    rollback_response_mismatch: '回滚响应与目标不一致',
+    rollback_verification_mismatch: '回滚后的状态核验不一致',
+    rollback_failed: '调度回滚结果无法确认',
+    response_schema: '调度响应结构无效',
+    response_mismatch: '调度响应与请求不一致',
+    post_write_verification: '调度写后核验失败',
+  }[String(reason || '').trim().toLowerCase()] || '结果无法安全确认';
+}
+
+function accountTestReconciliationFacts(results) {
+  const items = (results || []).flatMap((result) => (
+    Array.isArray(result?.results)
+      ? result.results.filter(accountTestItemNeedsReconciliation)
+      : []
+  ));
+  const ids = [...new Set(items.map((item) => Number(item?.accountId)).filter((id) => (
+    Number.isSafeInteger(id) && id > 0
+  )))];
+  const scopes = [...new Set(items.map((item) => accountTestScopeLabel(item?.reconciliationScope)))];
+  const reasons = [...new Set(items.map((item) => accountTestReasonLabel(item?.reconciliationReason)))];
+  return {
+    ids,
+    scopes,
+    reasons,
+    schedulerUnknown: items.length === 0 || items.some((item) => (
+      item?.enabledKnown !== true || typeof item?.enabled !== 'boolean'
+    )),
+  };
+}
+
+function accountTestIdsLabel(ids) {
+  if (!ids?.length) return '';
+  const visible = ids.slice(0, 5).map((id) => '#' + id).join('、');
+  return '账号 ID ' + visible + (ids.length > 5 ? ' 等 ' + ids.length + ' 个' : '');
+}
+
+function accountTestResultsDetail(results) {
+  const counts = (results || []).map(accountTestResultCounts).reduce((total, current) => {
+    for (const key of Object.keys(total)) total[key] += current[key] || 0;
+    return total;
+  }, { succeeded: 0, failed: 0, skipped: 0, reconciliation: 0, notAttempted: 0 });
+  const parts = [
+    '成功 ' + counts.succeeded,
+    '失败 ' + counts.failed,
+    '跳过 ' + counts.skipped,
+  ];
+  if (counts.reconciliation > 0) parts.push('待人工核对 ' + counts.reconciliation);
+  if (counts.notAttempted > 0) parts.push('未执行 ' + counts.notAttempted);
+  if (counts.reconciliation > 0) {
+    const facts = accountTestReconciliationFacts(results);
+    const ids = accountTestIdsLabel(facts.ids);
+    if (ids) parts.push(ids);
+    if (facts.scopes.length) parts.push('范围：' + facts.scopes.join('、'));
+    if (facts.schedulerUnknown) parts.push('调度状态未知');
+    if (facts.reasons.length) parts.push('原因：' + facts.reasons.join('、'));
+    parts.push('已停止后续测试，确认前勿重试');
+  }
+  return parts.join(' · ');
+}
+
+function accountTestReconciliationNotice(results) {
+  const counts = (results || []).map(accountTestResultCounts).reduce((total, current) => ({
+    reconciliation: total.reconciliation + current.reconciliation,
+    notAttempted: total.notAttempted + current.notAttempted,
+  }), { reconciliation: 0, notAttempted: 0 });
+  const facts = accountTestReconciliationFacts(results);
+  const ids = accountTestIdsLabel(facts.ids);
+  const scope = facts.scopes.length ? '，核对范围：' + facts.scopes.join('、') : '';
+  const reason = facts.reasons.length ? '，原因：' + facts.reasons.join('、') : '';
+  const halted = counts.notAttempted > 0 ? '，另有 ' + counts.notAttempted + ' 个账号未执行' : '';
+  return '账号测试有 ' + Math.max(1, counts.reconciliation) + ' 个账号待人工核对'
+    + halted + (ids ? '，涉及' + ids : '') + scope + reason
+    + '。调度状态未知；请先按账号 ID 和强身份字段核对 Sub2API，确认前不要重复测试。';
+}
+
+function jobNeedsReconciliation(job) {
+  if (Array.isArray(job?.jobs)) return job.jobs.some(jobNeedsReconciliation);
+  if (job?.type === 'token_import') return tokenImportNeedsReconciliation(job.result);
+  if (job?.type === 'account_test') return accountTestNeedsReconciliation(job.result);
+  return job?.result?.requiresReconciliation === true;
+}
+
+function reconciliationNoticeForJobs(jobs) {
+  const list = Array.isArray(jobs) ? jobs : [];
+  const notices = [];
+  const accountResults = list.filter((job) => (
+    job?.type === 'account_test' && accountTestNeedsReconciliation(job.result)
+  )).map((job) => job.result);
+  if (accountResults.length) notices.push(accountTestReconciliationNotice(accountResults));
+  const tokenJobs = list.filter((job) => (
+    job?.type === 'token_import' && tokenImportNeedsReconciliation(job.result)
+  ));
+  if (tokenJobs.length === 1) notices.push(tokenImportReconciliationNotice(tokenJobs[0].result));
+  else if (tokenJobs.length > 1) {
+    const totals = tokenJobs.map((job) => tokenImportResultCounts(job.result)).reduce((total, current) => ({
+      reconciliation: total.reconciliation + current.reconciliation,
+      notAttempted: total.notAttempted + current.notAttempted,
+    }), { reconciliation: 0, notAttempted: 0 });
+    notices.push('Token 导入有 ' + Math.max(1, totals.reconciliation) + ' 个写入结果待人工核对'
+      + (totals.notAttempted ? '，另有 ' + totals.notAttempted + ' 个账号未执行' : '')
+      + '。请先按账号 ID 和强身份字段核对 Sub2API，确认前不要重复提交。');
+  }
+  return notices.join(' ');
+}
+
 function renderJob(job) {
   if (!job) {
     elements.jobPanel.hidden = true;
     return;
   }
   elements.jobPanel.hidden = false;
-  elements.jobPanel.dataset.status = job.status || '';
   const jobs = Array.isArray(job.jobs) ? job.jobs : [job];
+  const reconciliationJobs = jobs.filter(jobNeedsReconciliation);
+  const needsReconciliation = reconciliationJobs.length > 0;
+  elements.jobPanel.dataset.status = needsReconciliation ? 'partial' : (job.status || '');
   const isPhase3 = jobs.every((item) => item.type === 'phase3');
   const isAccountTest = jobs.every((item) => item.type === 'account_test');
   elements.jobTitle.textContent = isAccountTest
@@ -1027,25 +1256,29 @@ function renderJob(job) {
     : isPhase3
     ? (jobs.length > 1 ? 'Phase 3 批量任务' : 'Phase 3 任务')
     : (jobs.length > 1 ? '批量任务' : 'Token 导入任务');
-  const importNeedsReconciliation = jobs.length === 1
-    && job.type === 'token_import'
-    && tokenImportNeedsReconciliation(job.result);
   elements.jobStatus.className = 'badge '
-    + (importNeedsReconciliation ? 'badge-warning' : jobStatusClass(job.status));
-  elements.jobStatus.textContent = importNeedsReconciliation
+    + (needsReconciliation ? 'badge-warning' : jobStatusClass(job.status));
+  elements.jobStatus.textContent = needsReconciliation
     ? '待人工核对'
     : jobStatusLabel(job.status);
   if (jobs.length > 1) {
     const terminalCount = jobs.filter((item) => ['succeeded', 'partial', 'failed', 'interrupted'].includes(item.status)).length;
     const failedCount = jobs.filter((item) => ['failed', 'interrupted', 'partial'].includes(item.status)).length;
     const activeCount = jobs.length - terminalCount;
-    elements.jobMeta.textContent = '完成 ' + terminalCount + '/' + jobs.length
+    const baseDetail = '完成 ' + terminalCount + '/' + jobs.length
       + ' · 失败/部分 ' + failedCount
       + (activeCount ? ' · 进行中 ' + activeCount : '')
       + ' · 最近任务 ' + String(jobs[jobs.length - 1].id || '').slice(0, 16);
+    const accountResults = reconciliationJobs.filter((item) => item.type === 'account_test')
+      .map((item) => item.result);
+    elements.jobMeta.textContent = isAccountTest && accountResults.length
+      ? accountTestResultsDetail(jobs.map((item) => item.result)) + ' · ' + baseDetail
+      : baseDetail + (needsReconciliation ? ' · 存在待人工核对结果，确认前勿重试' : '');
     return;
   }
-  let detail = job.error;
+  let detail = needsReconciliation && job.type === 'account_test'
+    ? accountTestResultsDetail([job.result])
+    : job.error;
   if (!detail && job.result) {
     if (job.type === 'account_test') {
       detail = '测试成功 ' + (job.result.succeeded || 0)
@@ -1128,10 +1361,9 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         stopJobPolling();
         let terminalNotice;
         let terminalNoticeKind;
-        const reconciliationJob = loaded.find((job) => job.type === 'token_import'
-          && tokenImportNeedsReconciliation(job.result));
-        if (reconciliationJob) {
-          terminalNotice = tokenImportReconciliationNotice(reconciliationJob.result);
+        const reconciliationJobs = loaded.filter(jobNeedsReconciliation);
+        if (reconciliationJobs.length) {
+          terminalNotice = reconciliationNoticeForJobs(reconciliationJobs);
           terminalNoticeKind = 'notice-warning';
         } else if (loaded.every((job) => job.status === 'succeeded')) {
           terminalNotice = '任务已完成，账号状态已刷新。';
@@ -1215,12 +1447,19 @@ async function resumeActiveJob() {
     const response = await apiFetch('/api/jobs?limit=200');
     const body = await response.json();
     if (!response.ok) throw new Error(body.message || body.error || '任务列表读取失败');
-    const activeJobs = (body.jobs || []).filter((job) => ['queued', 'running'].includes(job.status));
+    const listedJobs = Array.isArray(body.jobs) ? body.jobs : [];
+    const activeJobs = listedJobs.filter((job) => ['queued', 'running'].includes(job.status));
     if (!activeJobs.length) {
       if (state.job?.resumeProbe) {
-        state.jobs = [];
-        state.job = null;
-        renderJob(null);
+        const recentReconciliation = listedJobs.find((job) => (
+          terminalJob(job?.status) && jobNeedsReconciliation(job)
+        ));
+        state.jobs = recentReconciliation ? [recentReconciliation] : [];
+        state.job = recentReconciliation || null;
+        renderJob(state.job);
+        if (recentReconciliation) {
+          showNotice(reconciliationNoticeForJobs([recentReconciliation]), 'notice-warning');
+        }
         updateActionState();
       }
       return;
@@ -1302,6 +1541,9 @@ async function loadSnapshot(options = {}) {
       showNotice('本次未读取 Sub2API；当前仅显示 gpt_register 文件事实，无法比较或同步。', 'notice-warning');
     } else if (snapshot.sub2api.statsError) {
       showNotice('账号已读取，但统计接口暂不可用：' + snapshot.sub2api.statsError, 'notice-warning');
+    } else if (state.job && jobNeedsReconciliation(state.job)) {
+      const jobs = Array.isArray(state.job.jobs) ? state.job.jobs : [state.job];
+      showNotice(reconciliationNoticeForJobs(jobs.filter(jobNeedsReconciliation)), 'notice-warning');
     } else if (!state.job || ['succeeded', 'partial', 'failed', 'interrupted'].includes(state.job.status)) {
       showNotice('', '');
     }

@@ -174,7 +174,71 @@ test('frontend locks the initial UI when active-job recovery cannot be confirmed
   assert.match(failureBranch, /resumeProbe:\s*true/);
   assert.match(failureBranch, /renderJob\(state\.job\);\s*updateActionState\(\)/);
   assert.match(failureBranch, /window\.setTimeout\(\(\) => resumeActiveJob\(\), 15000\)/);
-  assert.match(resumeContract, /if \(state\.job\?\.resumeProbe\)[\s\S]*state\.job = null;[\s\S]*updateActionState\(\)/);
+  assert.match(resumeContract, /if \(state\.job\?\.resumeProbe\)[\s\S]*recentReconciliation[\s\S]*state\.job = recentReconciliation \|\| null;[\s\S]*updateActionState\(\)/);
+});
+
+test('frontend restores the newest terminal reconciliation warning when no job is active', async () => {
+  const resultContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const resumeContract = sourceSection('async function resumeActiveJob', 'async function loadSnapshot');
+  let listedJobs = [];
+  const rendered = [];
+  const notices = [];
+  const stateForTest = { jobs: [], job: null };
+  const context = {
+    state: stateForTest,
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+    apiFetch: async () => ({ ok: true, json: async () => ({ jobs: listedJobs }) }),
+    renderJob: (job) => rendered.push(job),
+    updateActionState() {},
+    showNotice: (...args) => notices.push(args),
+    aggregateJobs: (jobs) => jobs[0] || null,
+    watchJobs: async () => {},
+    terminalJob: (status) => ['succeeded', 'partial', 'failed', 'interrupted'].includes(status),
+    window: { setTimeout() {} },
+  };
+  vm.runInNewContext(resultContract + '\n' + resumeContract, context);
+
+  listedJobs = [
+    { id: 'newer-ordinary', type: 'account_test', status: 'failed', result: { failed: 1 } },
+    {
+      id: 'account-reconciliation',
+      type: 'account_test',
+      status: 'failed',
+      result: {
+        requiresReconciliation: true,
+        results: [{
+          accountId: 25,
+          status: 'failed',
+          code: 'account_scheduler_reconciliation_required',
+          requiresReconciliation: true,
+          reconciliationScope: 'scheduler',
+          reconciliationReason: 'timeout',
+          enabled: null,
+          enabledKnown: false,
+        }],
+      },
+    },
+  ];
+  await vm.runInNewContext('resumeActiveJob()', context);
+  assert.equal(stateForTest.job.id, 'account-reconciliation');
+  assert.equal(rendered.at(-1).id, 'account-reconciliation');
+  assert.equal(notices.at(-1)[1], 'notice-warning');
+  assert.match(notices.at(-1)[0], /账号 ID #25/);
+  assert.match(notices.at(-1)[0], /不要重复测试/);
+
+  listedJobs = [{
+    id: 'token-reconciliation',
+    type: 'token_import',
+    status: 'partial',
+    result: {
+      requiresReconciliation: true,
+      imported: [{ requiresReconciliation: true, outcome: 'requires_reconciliation' }],
+    },
+  }];
+  await vm.runInNewContext('resumeActiveJob()', context);
+  assert.equal(stateForTest.job.id, 'token-reconciliation');
+  assert.match(notices.at(-1)[0], /Token 导入/);
+  assert.match(notices.at(-1)[0], /不要重复提交/);
 });
 
 test('frontend usage formatting never turns missing statistics into zero', () => {
@@ -293,8 +357,112 @@ test('frontend separates unknown write outcomes from failures and shows halted i
     'if (loaded.every((job) => terminalJob(job.status)))',
     '// Even a failed/interrupted operation',
   );
-  assert.match(terminalBranch, /tokenImportNeedsReconciliation\(job\.result\)/);
+  assert.match(terminalBranch, /loaded\.filter\(jobNeedsReconciliation\)/);
+  assert.match(terminalBranch, /reconciliationNoticeForJobs\(reconciliationJobs\)/);
   assert.match(terminalBranch, /terminalNoticeKind = 'notice-warning'/);
+});
+
+test('frontend renders account-test reconciliation as a separate yellow outcome for single and batch jobs', () => {
+  const resultContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const renderContract = sourceSection('function renderJob', 'function stopJobPolling');
+  const context = {
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+    elements: {
+      jobPanel: { dataset: {} },
+      jobTitle: {},
+      jobStatus: {},
+      jobMeta: {},
+    },
+    jobStatusClass: () => 'badge-danger',
+    jobStatusLabel: () => '失败',
+    formatDate: () => '现在',
+  };
+  vm.runInNewContext(resultContract + '\n' + renderContract + `
+    const accountResult = {
+      requested: 5,
+      succeeded: 1,
+      failed: 2,
+      skipped: 2,
+      requiresReconciliation: true,
+      reconciliationCount: 1,
+      notAttemptedCount: 1,
+      results: [
+        { accountId: 21, status: 'succeeded', code: 'account_test_succeeded' },
+        { accountId: 22, status: 'failed', code: 'upstream_test_failed' },
+        { accountId: 23, status: 'skipped', code: 'account_not_found' },
+        {
+          accountId: 25,
+          status: 'failed',
+          code: 'account_scheduler_reconciliation_required',
+          requiresReconciliation: true,
+          reconciliationScope: 'scheduler',
+          reconciliationReason: 'rollback_state_changed',
+          enabled: null,
+          enabledKnown: false,
+        },
+        { accountId: 26, status: 'skipped', code: 'account_test_not_attempted_reconciliation' },
+      ],
+    };
+    counts = accountTestResultCounts(accountResult);
+    notice = accountTestReconciliationNotice([accountResult]);
+    renderJob({
+      id: 'account-job',
+      type: 'account_test',
+      status: 'failed',
+      result: accountResult,
+      finishedAt: 'now',
+    });
+    single = {
+      status: elements.jobStatus.textContent,
+      statusClass: elements.jobStatus.className,
+      panelStatus: elements.jobPanel.dataset.status,
+      detail: elements.jobMeta.textContent,
+    };
+    renderJob({
+      id: 'account-job,account-job-two',
+      type: 'batch',
+      status: 'partial',
+      jobs: [
+        { id: 'account-job', type: 'account_test', status: 'failed', result: accountResult },
+        {
+          id: 'account-job-two',
+          type: 'account_test',
+          status: 'succeeded',
+          result: { results: [{ accountId: 27, status: 'succeeded' }] },
+        },
+      ],
+    });
+    batch = {
+      title: elements.jobTitle.textContent,
+      status: elements.jobStatus.textContent,
+      statusClass: elements.jobStatus.className,
+      detail: elements.jobMeta.textContent,
+    };
+  `, context);
+
+  assert.deepEqual({ ...context.counts }, {
+    succeeded: 1,
+    failed: 1,
+    skipped: 1,
+    reconciliation: 1,
+    notAttempted: 1,
+  });
+  assert.equal(context.single.status, '待人工核对');
+  assert.equal(context.single.statusClass, 'badge badge-warning');
+  assert.equal(context.single.panelStatus, 'partial');
+  assert.match(context.single.detail, /成功 1 · 失败 1 · 跳过 1 · 待人工核对 1 · 未执行 1/);
+  assert.match(context.single.detail, /账号 ID #25/);
+  assert.match(context.single.detail, /范围：调度写入与回滚/);
+  assert.match(context.single.detail, /调度状态未知/);
+  assert.match(context.single.detail, /原因：回滚前账号状态已被修改/);
+  assert.match(context.single.detail, /确认前勿重试/);
+  assert.match(context.notice, /另有 1 个账号未执行/);
+  assert.match(context.notice, /按账号 ID 和强身份字段核对 Sub2API/);
+  assert.equal(context.batch.title, '上游账号批量测试');
+  assert.equal(context.batch.status, '待人工核对');
+  assert.equal(context.batch.statusClass, 'badge badge-warning');
+  assert.match(context.batch.detail, /成功 2 · 失败 1 · 跳过 1 · 待人工核对 1 · 未执行 1/);
+  assert.match(context.batch.detail, /完成 2\/2/);
 });
 
 test('frontend renders a completed Phase3 result without bogus zero counters', () => {
@@ -308,6 +476,7 @@ test('frontend renders a completed Phase3 result without bogus zero counters', (
     },
     jobStatusClass: () => 'badge-success',
     jobStatusLabel: () => '已完成',
+    jobNeedsReconciliation: () => false,
     formatDate: () => '现在',
   };
   vm.runInNewContext(renderJob + `

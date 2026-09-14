@@ -139,6 +139,10 @@ function rowFromDiffItem(item, options = {}) {
   const tokenKey = 'token:' + source + ':' + String(token?.relativePath || token?.fileName || token?.identityKeys?.join('|') || 'unknown');
   const key = token ? tokenKey : 'account:' + String(account?.id ?? 'unknown');
   const fingerprints = account?.tokenFingerprints || token?.fingerprints || {};
+  const hasSchedulableKnown = Object.prototype.hasOwnProperty.call(account || {}, 'schedulableKnown');
+  const schedulableKnown = hasSchedulableKnown
+    ? account.schedulableKnown === true && typeof account?.schedulable === 'boolean'
+    : typeof account?.schedulable === 'boolean';
   return {
     key,
     // Keep the legacy flattened fields below during the rolling upgrade. New
@@ -164,7 +168,8 @@ function rowFromDiffItem(item, options = {}) {
       : (['token_only', 'expired', 'expiry_invalid'].includes(item.kind) ? '未导入' : '未知')),
     availability: availability.key,
     availabilityReason: availability.reason,
-    schedulable: typeof account?.schedulable === 'boolean' ? account.schedulable : null,
+    schedulable: schedulableKnown ? account.schedulable : null,
+    schedulableKnown,
     source,
     diffKind: item.kind,
     issues: Array.isArray(item.issues) ? item.issues : [],
