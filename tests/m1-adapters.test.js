@@ -2872,6 +2872,91 @@ test('Sub2API timeouts are hard-bounded and request serialization clears its tim
   }
 });
 
+test('Sub2API endpoint collections reject cross-endpoint aliases and account-shaped groups', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  const group = {
+    id: 7,
+    name: 'share',
+    description: '',
+    platform: 'openai',
+    status: 'active',
+  };
+  client.request = async () => [group];
+  assert.deepEqual(await client.listGroups(), [group]);
+
+  for (const response of [
+    { accounts: [group] },
+    { items: [group] },
+    [{ id: 7, name: 'free00007', platform: 'openai', status: 'active' }],
+    [group, { ...group }],
+  ]) {
+    client.request = async () => response;
+    await assert.rejects(
+      client.listGroups(),
+      (error) => error.code === 'SUB2API_GROUPS_SCHEMA_INVALID',
+    );
+  }
+
+  client.request = async () => ({ models: ['gpt-5.6-luna'] });
+  assert.deepEqual(await client.getAvailableModels(7), ['gpt-5.6-luna']);
+  for (const response of [
+    { accounts: ['gpt-5.6-luna'] },
+    { items: ['gpt-5.6-luna'] },
+    { models: ['gpt-5.6-luna'], accounts: [] },
+  ]) {
+    client.request = async () => response;
+    await assert.rejects(
+      client.getAvailableModels(7),
+      (error) => error.code === 'SUB2API_MODELS_SCHEMA_INVALID',
+    );
+  }
+});
+
+test('Sub2API account-test options reject invalid models before dispatch', async () => {
+  const originalFetch = global.fetch;
+  const records = [];
+  let fetchCalls = 0;
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger: Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+      level,
+      (event, fields) => records.push({ level, event, fields }),
+    ])),
+  });
+  global.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('fetch must not run');
+  };
+  try {
+    const secretMarker = 'opaque-model-secret-marker';
+    for (const options of [
+      { modelId: 'Bearer ' + secretMarker },
+      { modelId: 'model\nwith-control' },
+      { modelId: ' gpt-5.6-luna ' },
+      { modelId: { value: secretMarker } },
+      { modelId: 'gpt-5.6-luna', model_id: 'gpt-5.6-sol' },
+    ]) {
+      await assert.rejects(
+        client.testAccount(1, options),
+        (error) => error.code === 'SUB2API_TEST_MODEL_INVALID'
+          && !error.message.includes(secretMarker),
+      );
+    }
+    for (const options of [{ prompt: { value: secretMarker } }, { prompt: 'x'.repeat(2001) }]) {
+      await assert.rejects(
+        client.testAccount(1, options),
+        (error) => error.code === 'SUB2API_TEST_PROMPT_INVALID'
+          && !error.message.includes(secretMarker),
+      );
+    }
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(records, []);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API model values are bounded and cannot carry credential text', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
   client.request = async () => ({
@@ -2886,8 +2971,8 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
   });
   const models = await client.getAvailableModels(1);
   assert.equal(models.includes('gpt-5.6-luna'), true);
-  assert.equal(models.includes('model with-control'), true);
-  assert.equal(models.length, 2);
+  assert.equal(models.includes('model with-control'), false);
+  assert.equal(models.length, 1);
   assert.equal(JSON.stringify(models).includes('model.header.value'), false);
   assert.equal(JSON.stringify(models).includes('model-credential-value'), false);
   assert.equal(JSON.stringify(models).includes('nested-model-value'), false);
@@ -2920,10 +3005,28 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
       status: 200,
       headers: { 'content-type': 'text/event-stream' },
     });
+    await assert.rejects(
+      client.testAccount(1),
+      (error) => error.code === 'SUB2API_TEST_RESPONSE_INVALID'
+        && error.requiresReconciliation === true
+        && error.reconciliationScope === 'test'
+        && error.reconciliationReason === 'invalid_model'
+        && error.testOutcomeUnknown !== true
+        && error.testSuccess === true
+        && error.testSuccessKnown === true
+        && !error.message.includes('sse-model-value'),
+    );
+
+    global.fetch = async () => new Response('data: ' + JSON.stringify({
+      type: 'test_complete',
+      success: true,
+    }) + '\n\n', {
+      status: 200,
+      headers: { 'content-type': 'text/event-stream' },
+    });
     const tested = await client.testAccount(1);
     assert.equal(tested.success, true);
     assert.equal(tested.model, null);
-    assert.equal(JSON.stringify(tested).includes('sse-model-value'), false);
   } finally {
     global.fetch = originalFetch;
   }

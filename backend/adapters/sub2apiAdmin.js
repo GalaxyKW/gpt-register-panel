@@ -53,13 +53,38 @@ function isValidExportPayload(value) {
   return true;
 }
 
-function asList(value) {
-  if (Array.isArray(value)) return value;
-  if (!value || typeof value !== 'object') return null;
-  for (const key of ['items', 'records', 'list', 'accounts']) {
-    if (Array.isArray(value[key])) return value[key];
+function groupListRows(value) {
+  // The current Sub2API /groups/all contract returns data as a bare array.
+  // Do not reuse account-list aliases here: accepting `{ accounts: [...] }`
+  // can turn a response from the wrong endpoint into group bindings.
+  if (!Array.isArray(value)) return null;
+  const ids = new Set();
+  for (const row of value) {
+    const id = isPlainObject(row) ? positiveAccountId(row.id) : null;
+    if (!id
+        || !hasOwn(row, 'name')
+        || typeof row.name !== 'string'
+        || !hasOwn(row, 'description')
+        || typeof row.description !== 'string'
+        || !hasOwn(row, 'platform')
+        || typeof row.platform !== 'string'
+        || !hasOwn(row, 'status')
+        || typeof row.status !== 'string'
+        || ids.has(id)) return null;
+    ids.add(id);
   }
-  return null;
+  return value;
+}
+
+function modelListRows(value) {
+  if (Array.isArray(value)) return value;
+  if (!isPlainObject(value)
+      || !hasOwn(value, 'models')
+      || !Array.isArray(value.models)) return null;
+  // Retain the legacy `{ models: [...] }` envelope, but reject an ambiguous
+  // object that also carries a collection name belonging to another endpoint.
+  if (ACCOUNT_LIST_ALIASES.some((key) => hasOwn(value, key))) return null;
+  return value.models;
 }
 
 const ACCOUNT_LIST_ALIASES = Object.freeze(['items', 'records', 'list', 'accounts']);
@@ -775,10 +800,43 @@ function safeRemoteText(value, limit = 1000) {
 
 function safeModelId(value) {
   if (typeof value !== 'string') return '';
-  const cleaned = value.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
-  if (!cleaned || cleaned.length > 256) return '';
+  const cleaned = value.trim();
+  if (!cleaned
+      || cleaned !== value
+      || cleaned.length > 256
+      || IDENTITY_CONTROL_OR_BIDI.test(cleaned)) return '';
   const redacted = safeRemoteText(cleaned, 256);
   return redacted.includes('[redacted]') ? '' : redacted;
+}
+
+function testOptionError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function requestedTestModelId(options) {
+  const aliases = ['modelId', 'model_id']
+    .filter((key) => hasOwn(options, key) && options[key] !== undefined && options[key] !== null);
+  if (aliases.length === 0) return '';
+  const values = aliases.map((key) => options[key]);
+  if (values.some((value) => typeof value !== 'string' || value.length > 256)) {
+    throw testOptionError('SUB2API_TEST_MODEL_INVALID', 'Sub2API 账号测试模型无效');
+  }
+  const normalized = values.map((value) => (value ? safeModelId(value) : ''));
+  if (values.some((value, index) => value && !normalized[index])
+      || new Set(normalized).size !== 1) {
+    throw testOptionError('SUB2API_TEST_MODEL_INVALID', 'Sub2API 账号测试模型无效');
+  }
+  return normalized[0];
+}
+
+function requestedTestPrompt(options) {
+  if (!hasOwn(options, 'prompt') || options.prompt === undefined || options.prompt === null) return '';
+  if (typeof options.prompt !== 'string' || options.prompt.length > 2000) {
+    throw testOptionError('SUB2API_TEST_PROMPT_INVALID', 'Sub2API 账号测试提示词无效');
+  }
+  return options.prompt.trim();
 }
 
 function decodeResponseBytes(bytes, fatalUtf8) {
@@ -1618,7 +1676,7 @@ class Sub2ApiAdminClient {
       undefined,
       { signal: options.signal },
     );
-    const rows = asList(value);
+    const rows = groupListRows(value);
     if (!rows) {
       const error = new Error('Sub2API 分组列表响应结构无效');
       error.code = 'SUB2API_GROUPS_SCHEMA_INVALID';
@@ -1663,9 +1721,7 @@ class Sub2ApiAdminClient {
       'GET',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/models',
     );
-    const rows = Array.isArray(value)
-      ? value
-      : (Array.isArray(value?.models) ? value.models : asList(value));
+    const rows = modelListRows(value);
     if (!rows) {
       const error = new Error('Sub2API 模型列表响应结构无效');
       error.code = 'SUB2API_MODELS_SCHEMA_INVALID';
@@ -1685,8 +1741,8 @@ class Sub2ApiAdminClient {
     );
     const startedAt = Date.now();
     const pathname = '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/test';
-    const modelId = safeModelId(options.modelId || options.model_id);
-    const prompt = asString(options.prompt).trim();
+    const modelId = requestedTestModelId(options);
+    const prompt = requestedTestPrompt(options);
     const body = {};
     if (modelId) body.model_id = modelId;
     if (prompt) body.prompt = prompt;
@@ -1827,6 +1883,20 @@ class Sub2ApiAdminClient {
     // only for mismatch detection; never reflect arbitrary upstream text in a
     // result or log record.
     const completedModel = modelId || null;
+    if (parsedSse.terminal.kind === 'success' && hasOwn(completed, 'model') && !eventModel) {
+      const detail = 'Sub2API 返回的测试模型字段无效';
+      writeLog(this.logger, 'warn', 'sub2api.account_test_model_invalid', {
+        ...this.logContext,
+        accountId,
+        model: modelId || null,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        error: detail,
+      });
+      const error = new Error(detail);
+      error.code = 'SUB2API_TEST_RESPONSE_INVALID';
+      throw markAccountTestReconciliation(error, 'invalid_model', { testSuccess: true });
+    }
     if (parsedSse.terminal.kind === 'success' && modelId && eventModel && eventModel !== modelId) {
       const detail = 'Sub2API 返回的测试模型与请求不一致';
       writeLog(this.logger, 'warn', 'sub2api.account_test_model_mismatch', {
