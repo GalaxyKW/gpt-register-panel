@@ -15,7 +15,8 @@ const {
   normalizeTableUsageStats,
 } = require('../backend/adapters/sub2apiAdmin');
 const { buildDiff } = require('../backend/diff');
-const { rowFromDiffItem } = require('../backend/view');
+const { buildRows, rowFromDiffItem } = require('../backend/view');
+const { buildImportPlan } = require('../backend/sync');
 
 function makeJwt(payload) {
   return [
@@ -339,6 +340,67 @@ test('shared workspace or user IDs with a contradictory second dimension are not
   ], []);
   assert.equal(sameUser.counts.duplicate_identity || 0, 0);
   assert.equal(sameUser.counts.token_only, 2);
+});
+
+test('partial remote identities cannot collapse distinct source rows onto one selection key', () => {
+  const tokens = [
+    {
+      source: 'tokens',
+      relativePath: 'tokens/u1.json',
+      fileName: 'u1.json',
+      parseStatus: 'ok',
+      expiryStatus: 'missing',
+      identityKeys: ['account:workspace', 'user:u1', 'email:shared@example.test'],
+      fingerprints: { access: tokenFingerprint('u1') },
+    },
+    {
+      source: 'tokens',
+      relativePath: 'tokens/u2.json',
+      fileName: 'u2.json',
+      parseStatus: 'ok',
+      expiryStatus: 'missing',
+      identityKeys: ['account:workspace', 'user:u2', 'email:shared@example.test'],
+      fingerprints: { access: tokenFingerprint('u2') },
+    },
+  ];
+  const account = {
+    id: 266,
+    name: 'free00006',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    identityKeys: ['account:workspace', 'email:shared@example.test'],
+    tokenFingerprints: { access: tokenFingerprint('remote') },
+  };
+  const diff = buildDiff(tokens, [account]);
+  const rows = buildRows(diff);
+
+  assert.equal(diff.counts.mapping_conflict, 2);
+  assert.equal(diff.counts.token_changed || 0, 0);
+  assert.deepEqual(rows.map((row) => row.key).sort(), [
+    'token:tokens:tokens/u1.json',
+    'token:tokens:tokens/u2.json',
+  ]);
+  assert.equal(new Set(rows.map((row) => row.key)).size, 2);
+  assert.equal(rows.every((row) => row.accountId === null), true);
+  assert.equal(rows.every((row) => row.issues.includes('ambiguous_sub2api_identity')), true);
+
+  const plan = buildImportPlan({
+    tokens: tokens.map((token) => ({
+      ...token,
+      raw: {},
+    })),
+    usernames: [],
+  }, [account], ['token:tokens:tokens/u1.json']);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].relativePath, 'tokens/u1.json');
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'ambiguous_sub2api_identity');
+
+  const remoteOnlyRows = buildRows(buildDiff([], [account]));
+  assert.equal(remoteOnlyRows.length, 1);
+  assert.equal(remoteOnlyRows[0].key, 'account:266');
+  assert.equal(remoteOnlyRows[0].accountId, 266);
 });
 
 test('classifies old_codex files as hidden historical backups', () => {

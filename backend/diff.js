@@ -71,6 +71,18 @@ function identitiesCompatible(leftKeys = [], rightKeys = []) {
   return false;
 }
 
+function strongIdentityContradiction(leftKeys = [], rightKeys = []) {
+  const left = identityParts(leftKeys);
+  const right = identityParts(rightKeys);
+  for (const kind of ['account', 'user']) {
+    if (left[kind].size > 0 && right[kind].size > 0
+        && ![...left[kind]].some((value) => right[kind].has(value))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isExpired(record, nowMs) {
   if (!record?.expiresAt) return false;
   const timestamp = Date.parse(record.expiresAt);
@@ -284,6 +296,40 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     });
   }
 
+  // A remote account can omit one strong-identity dimension. In that case,
+  // two distinct source users in the same workspace (or one user in two
+  // workspaces) can each look compatible with that partial remote identity.
+  // Surface the ambiguity before the row is allowed to authorize an
+  // ID-scoped operation. The import planner performs the same fail-closed
+  // check; the diff must not present these rows as ordinary token changes.
+  const matchedItemsByAccount = new Map();
+  for (const item of items) {
+    if (!item.token || item.token.historical === true || !item.account) continue;
+    const key = String(item.account.id);
+    const bucket = matchedItemsByAccount.get(key) || [];
+    bucket.push(item);
+    matchedItemsByAccount.set(key, bucket);
+  }
+  for (const bucket of matchedItemsByAccount.values()) {
+    const contradictory = bucket.some((left, leftIndex) => bucket.some((right, rightIndex) => (
+      rightIndex > leftIndex
+        && strongIdentityContradiction(
+          left.token.identityKeys || [],
+          right.token.identityKeys || [],
+        )
+    )));
+    if (!contradictory) continue;
+    for (const item of bucket) {
+      item.kind = 'mapping_conflict';
+      item.issues = [...new Set([...(item.issues || []), 'ambiguous_sub2api_identity'])];
+      // Keep the conflicting account ID only as an issue hint. Removing the
+      // operational account object prevents account testing from treating a
+      // partial identity match as authorization for that numeric ID.
+      item.issues.push(item.account.id);
+      item.account = null;
+    }
+  }
+
   for (const account of accountRecords) {
     if (!matchedAccountIds.has(String(account.id))) {
       const keys = accountKeys(account);
@@ -363,6 +409,7 @@ function toSafeDiff(diff) {
 module.exports = {
   accountKeys,
   hasStrongIdentity,
+  strongIdentityContradiction,
   identitiesStronglyCompatible,
   identitiesCompatible,
   isExpired,

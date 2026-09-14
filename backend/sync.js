@@ -9,6 +9,7 @@ const {
   toSafeDiff,
   isExpired,
   isExpiryInvalid,
+  strongIdentityContradiction,
   identitiesCompatible,
   identitiesStronglyCompatible,
   hasStrongIdentity,
@@ -630,15 +631,6 @@ function dateMilliseconds(value) {
 // the older copy win. Pick one deterministic winner before writing anything.
 function compareCandidateFreshness(left, right, nowMs) {
   return compareTokenRecordFreshness(left?.record, right?.record, nowMs);
-}
-
-function strongIdentityContradiction(leftKeys = [], rightKeys = []) {
-  for (const prefix of ['account:', 'user:']) {
-    const left = identityValues(leftKeys, prefix);
-    const right = identityValues(rightKeys, prefix);
-    if (left.size > 0 && right.size > 0 && !sharedValues(left, right)) return true;
-  }
-  return false;
 }
 
 function buildImportPlan(sources, accounts, selectedKeys = []) {

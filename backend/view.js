@@ -5,12 +5,11 @@ function rowFromDiffItem(item) {
   const account = item.account;
   const source = token ? token.source : 'sub2api';
   const availability = getAccountAvailability(account);
-  // Duplicate source rows can share one Sub2API account. Keep their keys
-  // file-specific so each checkbox remains stable and selectable.
+  // A partial remote identity can match more than one distinct source row.
+  // Every source-backed row therefore needs a file-specific selection key;
+  // only a pure Sub2API row may use its numeric account ID as the row key.
   const tokenKey = 'token:' + source + ':' + String(token?.relativePath || token?.fileName || token?.identityKeys?.join('|') || 'unknown');
-  const key = account && !['duplicate_identity', 'historical_backup'].includes(item.kind)
-    ? 'account:' + String(account.id)
-    : tokenKey;
+  const key = token ? tokenKey : 'account:' + String(account?.id ?? 'unknown');
   const fingerprints = account?.tokenFingerprints || token?.fingerprints || {};
   return {
     key,
