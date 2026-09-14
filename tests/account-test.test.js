@@ -1987,6 +1987,59 @@ test('account-test total deadline covers a dispatched scheduler restore and keep
   assert.equal(outcome.results[0].reconciliationReason, 'job_timeout');
 });
 
+test('account-test deadline is rechecked after a blocking checkpoint before scheduler dispatch', async () => {
+  let account = oauthTestAccount(68, 'error', false);
+  let schedulerWrites = 0;
+  const checkpointEvents = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [68],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-scheduler-checkpoint-deadline',
+    jobTimeoutMs: 100,
+    logger: {
+      checkpoint(event) {
+        checkpointEvents.push(event);
+        if (event === 'account_test.scheduler_enable_checkpoint') {
+          const unblockAt = Date.now() + 150;
+          while (Date.now() < unblockAt) {
+            // Deliberately keep the event loop from running the timeout timer.
+          }
+        }
+        return true;
+      },
+      info() {},
+      warn() {},
+      error() {},
+    },
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = { ...account, status: 'active' };
+        return { success: true };
+      },
+      async setSchedulable() {
+        schedulerWrites += 1;
+        account = { ...account, schedulable: true };
+        return { ...account };
+      },
+    },
+  });
+
+  assert.deepEqual(checkpointEvents, [
+    'account_test.test_mutation_checkpoint',
+    'account_test.scheduler_enable_checkpoint',
+  ]);
+  assert.equal(schedulerWrites, 0);
+  assert.equal(account.schedulable, false);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.requiresReconciliation, false);
+  assert.equal(outcome.results[0].code, 'account_scheduler_enable_not_attempted_timeout');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].enabled, false);
+});
+
 test('pre-dispatch scheduler-enable interruption records the known test without a hold', async () => {
   const controller = new AbortController();
   let first = oauthTestAccount(63, 'error', false);

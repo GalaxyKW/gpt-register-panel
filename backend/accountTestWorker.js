@@ -146,6 +146,15 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = Date.
   };
 }
 
+function throwIfAccountTestStopped(signal, stopReason) {
+  const reason = typeof stopReason === 'function' ? stopReason() : null;
+  // A synchronous checkpoint can cross the absolute deadline before the
+  // timeout callback gets an event-loop turn. Consult the clock-backed reason
+  // at every dispatch boundary instead of relying on AbortSignal alone.
+  if (reason) throw accountTestStopError(reason);
+  throwIfJobInterrupted(signal);
+}
+
 function accountTestJobStatus(result = {}) {
   const requested = Number.isSafeInteger(result.requested) && result.requested >= 0
     ? result.requested
@@ -607,7 +616,7 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
     accountId: id,
     expectedSchedulable: mutation.original,
   });
-  throwIfJobInterrupted(options.signal);
+  throwIfAccountTestStopped(options.signal, options.stopReason);
   let writeResponse;
   try {
     writeResponse = await client.setSchedulable(
@@ -834,7 +843,7 @@ async function runAccountTestJobNow({
         accountId: id,
         model: normalizedModelId || null,
       });
-      throwIfJobInterrupted(signal);
+      throwIfAccountTestStopped(signal, () => jobSignal.reason());
       const test = await client.testAccount(id, {
         modelId: normalizedModelId,
         prompt,
@@ -864,14 +873,15 @@ async function runAccountTestJobNow({
       // test whose terminal result is a known failure. If shutdown wins before
       // postflight verification, persist the unfinished chain rather than
       // silently relabelling it as an ordinary interrupted job.
-      if (signal?.aborted && testSuccessKnown) {
+      const postTestStopReason = jobSignal.reason();
+      if (postTestStopReason && testSuccessKnown) {
         throw accountTestReconciliationError(
-          accountTestStopError(jobSignal.reason()),
-          jobSignal.reason() === 'timeout' ? 'post_test_timeout' : 'post_test_interrupted',
+          accountTestStopError(postTestStopReason),
+          postTestStopReason === 'timeout' ? 'post_test_timeout' : 'post_test_interrupted',
           { testSuccess: testSucceeded },
         );
       }
-      throwIfJobInterrupted(signal);
+      throwIfAccountTestStopped(signal, () => postTestStopReason);
       if (!returnedTestSuccess) {
         let afterFailure = null;
         let afterFailureReadError = null;
@@ -1129,7 +1139,7 @@ async function runAccountTestJobNow({
         accountId: id,
         expectedSchedulable: true,
       });
-      throwIfJobInterrupted(signal);
+      throwIfAccountTestStopped(signal, () => jobSignal.reason());
       recoveryAttempted = true;
       recoveryMutation = {
         original: schedulableBefore,
