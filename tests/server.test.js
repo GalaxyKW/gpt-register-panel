@@ -449,6 +449,25 @@ test('Phase3 failures persist only bounded reconciliation metadata', () => {
     reconciliationScope: 'phase3_token_output',
     reconciliationReason: 'phase3_postflight_source_unavailable',
   });
+
+  assert.deepEqual(phase3FailureMetadata({
+    code: 'PHASE3_TOKEN_IDENTITY_MISMATCH',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_token_output',
+    reconciliationReason: 'phase3_token_identity_mismatch',
+  }), {
+    code: 'PHASE3_TOKEN_IDENTITY_MISMATCH',
+    accountDisposition: null,
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_token_output',
+    reconciliationReason: 'phase3_token_identity_mismatch',
+  });
 });
 
 test('generic worker failures preserve only bounded reconciliation signals', () => {

@@ -115,6 +115,7 @@ const PHASE3_RECONCILIATION_REASONS = new Set([
   'account_disposition_not_persisted',
   'phase3_process_tree_unconfirmed',
   'phase3_postflight_source_unavailable',
+  'phase3_token_identity_mismatch',
 ]);
 const PHASE3_DISPOSITION_OUTCOMES = new Set([
   'persisted',

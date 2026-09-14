@@ -9,7 +9,12 @@ const {
   readGptRegisterSources,
   usernameRecordLimit,
 } = require('./adapters/gptRegisterFs');
-const { isExpired, isExpiryInvalid } = require('./diff');
+const {
+  hasStrongIdentity,
+  identitiesStronglyCompatible,
+  isExpired,
+  isExpiryInvalid,
+} = require('./diff');
 const { normalizeEmail } = require('./lib/token');
 const {
   PHASE3_PHONE_USERNAME_MAX_BYTES,
@@ -1150,6 +1155,28 @@ function phase3TokenPostflightError(cause) {
   return error;
 }
 
+function phase3TokenIdentityMismatchError() {
+  const error = new Error('Phase 3 已生成与所选账号强身份不兼容的 token；必须人工对账，禁止直接重试');
+  error.code = 'PHASE3_TOKEN_IDENTITY_MISMATCH';
+  error.writeOutcomeUnknown = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'phase3_token_output';
+  error.reconciliationReason = 'phase3_token_identity_mismatch';
+  return error;
+}
+
+function phase3TokenMatchesBoundIdentity(token, selectedToken) {
+  if (!selectedToken) return true;
+  const selectedKeys = Array.isArray(selectedToken.identityKeys)
+    ? selectedToken.identityKeys
+    : [];
+  if (!hasStrongIdentity(selectedKeys)) return true;
+  const tokenKeys = Array.isArray(token?.identityKeys) ? token.identityKeys : [];
+  return identitiesStronglyCompatible(selectedKeys, tokenKeys);
+}
+
 function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
   const details = error?.details || {};
   const hasProcessDetails = details && typeof details === 'object'
@@ -1768,9 +1795,9 @@ async function runPhase3JobNow({
       phone,
       expectedExecutionBinding: executionBinding?.username || null,
     }, rootHandle);
-    if (executionBinding) {
-      assertTokenExecutionBinding(executionBinding.token, beforeSources, entry, { email, phone });
-    }
+    const selectedToken = executionBinding
+      ? assertTokenExecutionBinding(executionBinding.token, beforeSources, entry, { email, phone })
+      : null;
     const beforeTokens = beforeSources.tokens
       .filter((item) => item.historical !== true && item.parseStatus === 'ok' && item.email === entry.email)
       .map((item) => ({
@@ -1877,7 +1904,10 @@ async function runPhase3JobNow({
     }
     const tokenObservedAt = Date.now();
     const beforeByPath = new Map(beforeTokens.map((item) => [item.relativePath, item]));
-    const changedTokens = sources.tokens
+    const beforeCredentialVersions = new Set(beforeTokens
+      .filter((item) => item.access)
+      .map((item) => item.access + ':' + (item.refresh || '')));
+    const observedChangedTokens = sources.tokens
       .filter((item) => isUsablePhase3Token(item, tokenObservedAt) && item.email === entry.email)
       .filter((item) => {
         const before = beforeByPath.get(item.relativePath);
@@ -1888,8 +1918,21 @@ async function runPhase3JobNow({
           && Number(item.mtimeMs) > Number(before.mtimeMs || 0)
           && Number(item.mtimeMs) >= startedAt;
         return fingerprintChanged || mtimeChangedWithoutFingerprint;
-      })
-      .sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
+      });
+    if (observedChangedTokens.some(
+      (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken),
+    )) {
+      throw phase3TokenIdentityMismatchError();
+    }
+    // A second path containing credentials that were already present before
+    // the child started is only a copy, not proof that OAuth refreshed them.
+    const changedTokens = observedChangedTokens.filter((item) => {
+      if (beforeByPath.has(item.relativePath)) return true;
+      const access = item.fingerprints?.access || null;
+      const refresh = item.fingerprints?.refresh || null;
+      return !access || !beforeCredentialVersions.has(access + ':' + (refresh || ''));
+    });
+    changedTokens.sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
     const token = changedTokens[0];
     if (!token) {
       if (processError) throw processError;

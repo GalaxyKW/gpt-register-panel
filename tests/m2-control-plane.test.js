@@ -1130,6 +1130,159 @@ test('Phase3 preserves a valid freshest token after a confirmed non-zero process
   }
 });
 
+test('Phase3 refuses a changed token that contradicts the selected strong identity', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-output-identity-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const email = 'phase3-output-identity@example.test';
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email,
+    password: 'hidden',
+  }]));
+  const selectedKey = 'token:tokens:tokens/selected.json';
+  fs.writeFileSync(path.join(root, 'tokens', 'selected.json'), JSON.stringify({
+    access_token: 'selected-access-value',
+    refresh_token: 'selected-refresh-value',
+    email,
+    chatgpt_account_id: 'selected-workspace',
+    chatgpt_user_id: 'selected-user',
+  }));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    `fs.writeFileSync(path.join(process.cwd(), 'tokens', 'wrong-account.json'), JSON.stringify({`,
+    "  access_token: 'replacement-access-value',",
+    "  refresh_token: 'replacement-refresh-value',",
+    `  email: ${JSON.stringify(email)},`,
+    "  chatgpt_account_id: 'different-workspace',",
+    "  chatgpt_user_id: 'different-user',",
+    '}));',
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  let successPersisted = false;
+  try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const phase3TargetRevision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
+    const resolved = resolvePhase3Requests([{
+      originalIndex: 0,
+      email,
+      phone: '',
+      selectedKey,
+      phase3TargetRevision,
+    }]);
+    assert.equal(resolved.eligible.length, 1);
+    const target = resolved.eligible[0];
+    await assert.rejects(
+      runPhase3Job({
+        ...target,
+        executionBinding: target.executionBinding,
+        jobId: 'phase3-output-identity-job',
+        db: { async audit() {}, async startMutationJob() {} },
+        logger: successfulCheckpointLogger,
+        async persistSuccess() { successPersisted = true; },
+      }),
+      (error) => error.code === 'PHASE3_TOKEN_IDENTITY_MISMATCH'
+        && error.requiresReconciliation === true
+        && error.retryAllowed === false
+        && error.doNotRetry === true
+        && error.reconciliationScope === 'phase3_token_output'
+        && error.reconciliationReason === 'phase3_token_identity_mismatch',
+    );
+    assert.equal(successPersisted, false);
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'wrong-account.json')), true);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('Phase3 does not treat a same-credential copy at a new path as a refreshed token', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-output-copy-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const email = 'phase3-output-copy@example.test';
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email,
+    password: 'hidden',
+  }]));
+  const selectedKey = 'token:tokens:tokens/selected.json';
+  const selectedDocument = {
+    access_token: 'unchanged-access-value',
+    refresh_token: 'unchanged-refresh-value',
+    email,
+    chatgpt_account_id: 'copy-workspace',
+    chatgpt_user_id: 'copy-user',
+  };
+  fs.writeFileSync(
+    path.join(root, 'tokens', 'selected.json'),
+    JSON.stringify(selectedDocument),
+  );
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const original = fs.readFileSync(path.join(process.cwd(), 'tokens', 'selected.json'));",
+    "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'copied.json'), original);",
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const phase3TargetRevision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
+    const resolved = resolvePhase3Requests([{
+      originalIndex: 0,
+      email,
+      phone: '',
+      selectedKey,
+      phase3TargetRevision,
+    }]);
+    assert.equal(resolved.eligible.length, 1);
+    const target = resolved.eligible[0];
+    await assert.rejects(
+      runPhase3Job({
+        ...target,
+        executionBinding: target.executionBinding,
+        jobId: 'phase3-output-copy-job',
+        db: { async audit() {}, async startMutationJob() {} },
+        logger: successfulCheckpointLogger,
+      }),
+      (error) => error.code === 'PHASE3_TOKEN_UNCHANGED',
+    );
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'copied.json')), true);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
 test('Phase3 requires reconciliation when postflight token sources become unavailable', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-postflight-'));
   fs.mkdirSync(path.join(root, 'tokens'));
