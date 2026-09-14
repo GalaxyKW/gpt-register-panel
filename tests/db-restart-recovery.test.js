@@ -1179,7 +1179,7 @@ test('createJob persists a migrated legacy global hold before returning its conf
   assert.equal(held.result.reconciliationHold, true);
   assert.equal(held.result.reconciliationHoldScope, 'all_future_jobs');
   await assert.rejects(
-    restarted.createJob('still-unrelated', {}, 'tester', { claimKeys: ['different:key'] }),
+    restarted.createJob('still_unrelated', {}, 'tester', { claimKeys: ['different:key'] }),
     (error) => error.code === 'JOB_RECONCILIATION_REQUIRED'
       && error.existingJobId === legacy.id,
   );

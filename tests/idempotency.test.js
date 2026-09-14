@@ -224,6 +224,37 @@ test('receipt construction failure rolls back every job and claim', async () => 
   assert.match(replacement.id, /^job_[a-f0-9]{24}$/);
 });
 
+test('response formatting cannot rewrite the durable receipt job graph', async () => {
+  const db = new PanelDb(databasePath('response-factory-isolation'));
+  let originalIds;
+  const options = submissionOptions({
+    idempotencyKey: 'idem_v1_response_factory_isolation_1234567890',
+    jobs: [
+      { type: 'phase3', payload: { ordinal: 1 }, claimKeys: ['phase3:factory:1'] },
+      { type: 'phase3', payload: { ordinal: 2 }, claimKeys: ['phase3:factory:2'] },
+    ],
+    responseFactory: ({ createdJobs }) => {
+      originalIds = createdJobs.map((item) => item.job.id);
+      createdJobs[0].job.id = 'job_' + 'f'.repeat(24);
+      createdJobs.splice(0, 1);
+      return { status: 'queued', jobIds: originalIds };
+    },
+  });
+
+  const created = await db.createMutationSubmission(options);
+  assert.deepEqual(created.receipt.jobIds, originalIds);
+  assert.deepEqual(
+    created.createdJobs.map((item) => item.job.id),
+    originalIds,
+  );
+  for (const id of originalIds) {
+    await db.updateJob(id, { status: 'failed', error: 'test cleanup' });
+  }
+  const replay = await db.createMutationSubmission(options);
+  assert.equal(replay.replayed, true);
+  assert.deepEqual(replay.receipt.jobIds, originalIds);
+});
+
 test('receipt capacity fails closed and does not evict an unexpired receipt', async () => {
   const previous = process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS;
   process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS = '1';

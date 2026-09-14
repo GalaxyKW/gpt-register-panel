@@ -1334,7 +1334,7 @@ test('active account-test admission lookup reads only requested claims and minim
     statement.run([
       JSON.stringify({ marker, filler: 'p'.repeat(64 * 1024) }),
       JSON.stringify({ marker, filler: 'r'.repeat(64 * 1024) }),
-      marker + '-'.repeat(64 * 1024),
+      marker + '-'.repeat((64 * 1024) - Buffer.byteLength(marker, 'utf8')),
       requested.id,
       historical.id,
     ]);
