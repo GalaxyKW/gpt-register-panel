@@ -1,10 +1,15 @@
 const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
-const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
+const CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/u;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const EMAIL_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+// OpenAI's OIDC subject currently uses an Auth0-style `provider|subject`
+// value. It is an issuer subject, not a ChatGPT business user ID, so validate
+// it separately instead of rejecting an otherwise usable token merely because
+// the business-ID alphabet intentionally excludes `|`.
+const CANONICAL_ISSUER_SUBJECT = /^[A-Za-z0-9][A-Za-z0-9._:@/+~|-]{0,511}$/;
 const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_IDENTITY_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
 const CREDENTIAL_IDENTITY_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
@@ -125,10 +130,15 @@ function stringAliases(object, keys, maximumLength, options = {}) {
       continue;
     }
     const normalized = raw.trim();
+    // Treat an alias containing only whitespace like an omitted/empty alias.
+    // It carries no credential or identity value and must not invalidate a
+    // second canonical alias that is present and valid.
+    if (!normalized) continue;
     if (normalized.length > maximumLength
+        || (options.rejectOuterWhitespace && raw !== normalized)
         || (options.rejectControls && options.rejectControls.test(raw))
         || (value && value !== normalized)) invalid = true;
-    else if (normalized) value = normalized;
+    else value = normalized;
   }
   return { value, invalid };
 }
@@ -143,7 +153,11 @@ function tokenCredentialField(document, kind) {
   const definition = TOKEN_CREDENTIAL_FIELDS[kind];
   if (!definition) return { value: '', invalid: true };
   return stringAliases(document, definition.keys, definition.maximumLength, {
-    rejectControls: CREDENTIAL_LINE_CONTROL,
+    // OAuth bearer/refresh/JWT values cannot safely contain whitespace,
+    // controls or bidi formatting. Treating such a newer file as usable can
+    // make it win freshness ordering and displace an older valid credential.
+    rejectControls: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+    rejectOuterWhitespace: true,
   });
 }
 
@@ -161,7 +175,7 @@ function claimScalar(object, key, maximumLength, allowNumber = true) {
   const rawText = String(raw);
   const value = rawText.trim();
   return value.length <= maximumLength && !C0_OR_DEL.test(rawText)
-    ? { value, invalid: false }
+    ? { value, invalid: false, outerWhitespace: rawText !== value }
     : { value: '', invalid: true };
 }
 
@@ -178,10 +192,26 @@ function strongIdentityField(field, prefix, maximumLength = 512) {
   if (!field.value) return { value: '', invalid: false };
   const raw = String(field.value);
   const normalized = normalizeIdentityValue(prefix, raw);
-  if (!normalized || raw !== raw.trim() || normalized.length > maximumLength
+  if (!normalized || field.outerWhitespace === true
+      || raw !== raw.trim() || normalized.length > maximumLength
       || IDENTITY_CONTROL_OR_BIDI.test(raw)
       || !CANONICAL_STRONG_IDENTITY.test(normalized)
       || looksLikeCredentialIdentity(normalized)) {
+    return { value: '', invalid: true };
+  }
+  return { value: normalized, invalid: false };
+}
+
+function issuerSubjectField(field) {
+  if (!field || field.invalid) return { value: '', invalid: true };
+  if (!field.value) return { value: '', invalid: false };
+  const raw = String(field.value);
+  const normalized = normalizeIdentityValue('user:', raw);
+  if (!normalized || field.outerWhitespace === true
+      || raw !== raw.trim()
+      || IDENTITY_CONTROL_OR_BIDI.test(raw)
+      || !CANONICAL_ISSUER_SUBJECT.test(normalized)
+      || looksLikeCredentialIdentity(normalized.replace(/\|/g, ':'))) {
     return { value: '', invalid: true };
   }
   return { value: normalized, invalid: false };
@@ -258,13 +288,13 @@ function normalizeTokenDocument({
     document,
     ['chatgpt_account_id', 'account_id', 'accountId'],
     512,
-    { rejectControls: C0_OR_DEL },
+    { rejectControls: C0_OR_DEL, rejectOuterWhitespace: true },
   ), 'account:');
   const explicitUser = strongIdentityField(stringAliases(
     document,
     ['chatgpt_user_id', 'user_id', 'userId'],
     512,
-    { rejectControls: C0_OR_DEL },
+    { rejectControls: C0_OR_DEL, rejectOuterWhitespace: true },
   ), 'user:');
   const explicitEmail = emailIdentityField(stringAliases(
     document,
@@ -283,11 +313,11 @@ function normalizeTokenDocument({
   const claimAccount = strongIdentityField(claimScalar(auth, 'chatgpt_account_id', 512), 'account:');
   const claimChatGptUser = strongIdentityField(claimScalar(auth, 'chatgpt_user_id', 512), 'user:');
   const claimUser = strongIdentityField(claimScalar(auth, 'user_id', 512), 'user:');
-  const claimSubject = strongIdentityField(claimScalar(accessPayload, 'sub', 512), 'user:');
+  const claimSubject = issuerSubjectField(claimScalar(accessPayload, 'sub', 512));
   const idClaimAccount = strongIdentityField(claimScalar(idAuth, 'chatgpt_account_id', 512), 'account:');
   const idClaimChatGptUser = strongIdentityField(claimScalar(idAuth, 'chatgpt_user_id', 512), 'user:');
   const idClaimUser = strongIdentityField(claimScalar(idAuth, 'user_id', 512), 'user:');
-  const idClaimSubject = strongIdentityField(claimScalar(idPayload, 'sub', 512), 'user:');
+  const idClaimSubject = issuerSubjectField(claimScalar(idPayload, 'sub', 512));
   const claimAuthEmail = emailIdentityField(claimScalar(auth, 'email', 320, false));
   const claimEmail = emailIdentityField(claimScalar(accessPayload, 'email', 320, false));
   const idClaimAuthEmail = emailIdentityField(claimScalar(idAuth, 'email', 320, false));

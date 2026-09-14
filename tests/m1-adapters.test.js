@@ -205,6 +205,128 @@ test('token parsing rejects secret-like or confusing strong identities without e
   assert.equal(valid.userId, 'valid-user_123');
 });
 
+test('token parsing rejects trimmed strong identities and ambiguous credential characters', () => {
+  const identityMarker = 'outer-space-identity-marker';
+  for (const data of [
+    { access_token: 'ordinary-access', account_id: ' ' + identityMarker + ' ' },
+    {
+      access_token: makeJwt({
+        'https://api.openai.com/auth': { chatgpt_account_id: ' ' + identityMarker + ' ' },
+      }),
+    },
+  ]) {
+    const record = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/ambiguous-identity.json',
+      fileName: 'ambiguous-identity.json',
+      mtimeMs: 1,
+      data,
+    });
+    assert.equal(record.parseStatus, 'invalid');
+    assert.equal(record.accountId, '');
+    assert.equal(JSON.stringify(record).includes(identityMarker), false);
+  }
+
+  const credentialMarker = 'ambiguous-credential-marker';
+  for (const credential of [
+    'access\t' + credentialMarker,
+    'access ' + credentialMarker,
+    'access\u0085' + credentialMarker,
+    'access\u202e' + credentialMarker,
+    ' access-' + credentialMarker + ' ',
+  ]) {
+    const record = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/ambiguous-credential.json',
+      fileName: 'ambiguous-credential.json',
+      mtimeMs: 1,
+      data: {
+        access_token: credential,
+        account_id: 'safe-account-id',
+      },
+    });
+    assert.equal(record.parseStatus, 'invalid');
+    assert.equal(record.parseError, 'token 字段类型或长度无效');
+    assert.equal(JSON.stringify(record).includes(credentialMarker), false);
+  }
+});
+
+test('OIDC issuer subjects allow the bounded Auth0 separator without weakening business IDs', () => {
+  const subject = 'auth0|safe-issuer-subject';
+  const data = {
+    access_token: makeJwt({
+      sub: subject,
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'safe-account',
+        chatgpt_user_id: 'safe-business-user',
+      },
+    }),
+    id_token: makeJwt({ sub: subject }),
+  };
+  const record = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/auth0-subject.json',
+    fileName: 'auth0-subject.json',
+    mtimeMs: 1,
+    data,
+  });
+  assert.equal(record.parseStatus, 'ok');
+  assert.equal(record.accountId, 'safe-account');
+  assert.equal(record.userId, 'safe-business-user');
+  assert.deepEqual(record.identityKeys, ['account:safe-account', 'user:safe-business-user']);
+
+  const mismatched = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/auth0-subject-mismatch.json',
+    fileName: 'auth0-subject-mismatch.json',
+    mtimeMs: 1,
+    data: {
+      ...data,
+      id_token: makeJwt({ sub: 'auth0|different-issuer-subject' }),
+    },
+  });
+  assert.equal(mismatched.parseStatus, 'invalid');
+  assert.equal(mismatched.parseError, 'token 强身份字段互相矛盾');
+
+  const businessIdWithPipe = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/business-id-pipe.json',
+    fileName: 'business-id-pipe.json',
+    mtimeMs: 1,
+    data: {
+      access_token: 'ordinary-access',
+      user_id: 'business|user',
+    },
+  });
+  assert.equal(businessIdWithPipe.parseStatus, 'invalid');
+  assert.equal(businessIdWithPipe.userId, '');
+});
+
+test('an unusable newer credential cannot displace an older valid token', () => {
+  const fixture = fixtureRoot();
+  const invalidPath = path.join(fixture.root, 'use_token', 'newer-invalid.json');
+  fs.writeFileSync(invalidPath, JSON.stringify({
+    access_token: 'newer\tbut-unusable',
+    refresh_token: 'newer-refresh',
+    account_id: 'account-1',
+    user_id: 'user-1',
+    email: 'example@email.test',
+    expired: '2099-12-31T00:00:00.000Z',
+    last_refresh: '2099-12-01T00:00:00.000Z',
+  }));
+  const future = new Date('2099-12-15T00:00:00.000Z');
+  fs.utimesSync(invalidPath, future, future);
+
+  const sources = readGptRegisterSources({ rootDirectory: fixture.root, includeRaw: true });
+  const invalid = sources.tokens.find((item) => item.relativePath === 'use_token/newer-invalid.json');
+  assert.equal(invalid.parseStatus, 'invalid');
+  const plan = buildImportPlan(sources, []);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].relativePath, 'tokens/b.json');
+  assert.equal(plan[0].fingerprints.access, tokenFingerprint(sources.tokens
+    .find((item) => item.relativePath === 'tokens/b.json').raw.access_token));
+});
+
 test('case-insensitive filename ties have a stable total order', () => {
   const fixture = fixtureRoot();
   fs.writeFileSync(path.join(fixture.root, 'tokens', 'A.json'), JSON.stringify({
