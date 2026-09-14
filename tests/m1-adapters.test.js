@@ -116,6 +116,51 @@ test('token parsing rejects contradictory email evidence across files and JWT cl
   assert.equal(equivalent.email, 'first@example.test');
 });
 
+test('token parsing rejects secret-like or confusing strong identities without exposing them', () => {
+  const fixture = fixtureRoot();
+  const tokenPath = path.join(fixture.root, 'tokens', 'b.json');
+  const dangerousValues = [
+    'Bearer local-identity-leak-marker',
+    'eyJhbGciOiJIUzI1NiJ9.identityleakmarker.signaturemarker',
+    'sk-proj-local-identity-leak-marker-1234567890',
+    'credential:local-identity-leak-marker',
+    'account-safe\u202elocal-identity-leak-marker',
+    'opaque1'.repeat(16),
+  ];
+  for (let index = 0; index < dangerousValues.length; index += 1) {
+    const dangerous = dangerousValues[index];
+    const document = index % 2 === 0
+      ? { access_token: 'test-access', account_id: dangerous }
+      : {
+          access_token: makeJwt({
+            'https://api.openai.com/auth': { chatgpt_user_id: dangerous },
+          }),
+        };
+    fs.writeFileSync(tokenPath, JSON.stringify(document));
+    const record = readGptRegisterSources({ rootDirectory: fixture.root }).tokens
+      .find((item) => item.relativePath === 'tokens/b.json');
+    const serialized = JSON.stringify(record);
+    assert.equal(record.parseStatus, 'invalid');
+    assert.equal(record.accountId, '');
+    assert.equal(record.userId, '');
+    assert.equal(serialized.includes('local-identity-leak-marker'), false);
+  }
+
+  fs.writeFileSync(tokenPath, JSON.stringify({
+    access_token: makeJwt({
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: '{123E4567-E89B-12D3-A456-426614174000}',
+        chatgpt_user_id: 'valid-user_123',
+      },
+    }),
+  }));
+  const valid = readGptRegisterSources({ rootDirectory: fixture.root }).tokens
+    .find((item) => item.relativePath === 'tokens/b.json');
+  assert.equal(valid.parseStatus, 'ok');
+  assert.equal(valid.accountId, '123e4567-e89b-12d3-a456-426614174000');
+  assert.equal(valid.userId, 'valid-user_123');
+});
+
 test('case-insensitive filename ties have a stable total order', () => {
   const fixture = fixtureRoot();
   fs.writeFileSync(path.join(fixture.root, 'tokens', 'A.json'), JSON.stringify({

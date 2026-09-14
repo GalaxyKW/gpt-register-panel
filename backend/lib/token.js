@@ -1,6 +1,12 @@
 const crypto = require('node:crypto');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
+const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+const CREDENTIAL_IDENTITY_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
+const CREDENTIAL_IDENTITY_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
+const LONG_OPAQUE_IDENTITY = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
 
 function asString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
@@ -106,7 +112,9 @@ function claimScalar(object, key, maximumLength, allowNumber = true) {
   }
   const raw = object[key];
   if (raw === undefined || raw === null || raw === '') return { value: '', invalid: false };
-  if (typeof raw !== 'string' && !(allowNumber && typeof raw === 'number' && Number.isFinite(raw))) {
+  if (typeof raw !== 'string'
+      && !(allowNumber && typeof raw === 'number'
+        && Number.isSafeInteger(raw) && !Object.is(raw, -0))) {
     return { value: '', invalid: true };
   }
   const rawText = String(raw);
@@ -114,6 +122,28 @@ function claimScalar(object, key, maximumLength, allowNumber = true) {
   return value.length <= maximumLength && !C0_OR_DEL.test(rawText)
     ? { value, invalid: false }
     : { value: '', invalid: true };
+}
+
+function looksLikeCredentialIdentity(value) {
+  return /^(?:bearer|basic)\s+\S+/i.test(value)
+    || COMPACT_JWT.test(value)
+    || CREDENTIAL_IDENTITY_LABEL.test(value)
+    || CREDENTIAL_IDENTITY_PREFIX.test(value)
+    || LONG_OPAQUE_IDENTITY.test(value);
+}
+
+function strongIdentityField(field, prefix, maximumLength = 512) {
+  if (!field || field.invalid) return { value: '', invalid: true };
+  if (!field.value) return { value: '', invalid: false };
+  const raw = String(field.value);
+  const normalized = normalizeIdentityValue(prefix, raw);
+  if (!normalized || raw !== raw.trim() || normalized.length > maximumLength
+      || IDENTITY_CONTROL_OR_BIDI.test(raw)
+      || !CANONICAL_STRONG_IDENTITY.test(normalized)
+      || looksLikeCredentialIdentity(normalized)) {
+    return { value: '', invalid: true };
+  }
+  return { value: normalized, invalid: false };
 }
 
 function expectedDateScalar(value) {
@@ -174,18 +204,18 @@ function normalizeTokenDocument({
   const accessField = tokenCredentialField(document, 'access');
   const refreshField = tokenCredentialField(document, 'refresh');
   const idField = tokenCredentialField(document, 'id');
-  const explicitAccount = stringAliases(
+  const explicitAccount = strongIdentityField(stringAliases(
     document,
     ['chatgpt_account_id', 'account_id', 'accountId'],
     512,
     { rejectControls: C0_OR_DEL },
-  );
-  const explicitUser = stringAliases(
+  ), 'account:');
+  const explicitUser = strongIdentityField(stringAliases(
     document,
     ['chatgpt_user_id', 'user_id', 'userId'],
     512,
     { rejectControls: C0_OR_DEL },
-  );
+  ), 'user:');
   const explicitEmail = stringAliases(document, ['email'], 320, { rejectControls: C0_OR_DEL });
   const explicitTypeField = stringAliases(document, ['type'], 32, { rejectControls: C0_OR_DEL });
   const accessToken = accessField.value;
@@ -195,14 +225,14 @@ function normalizeTokenDocument({
   const idPayload = parseJwtPayload(idToken);
   const auth = openAiAuth(accessPayload);
   const idAuth = openAiAuth(idPayload);
-  const claimAccount = claimScalar(auth, 'chatgpt_account_id', 512);
-  const claimChatGptUser = claimScalar(auth, 'chatgpt_user_id', 512);
-  const claimUser = claimScalar(auth, 'user_id', 512);
-  const claimSubject = claimScalar(accessPayload, 'sub', 512);
-  const idClaimAccount = claimScalar(idAuth, 'chatgpt_account_id', 512);
-  const idClaimChatGptUser = claimScalar(idAuth, 'chatgpt_user_id', 512);
-  const idClaimUser = claimScalar(idAuth, 'user_id', 512);
-  const idClaimSubject = claimScalar(idPayload, 'sub', 512);
+  const claimAccount = strongIdentityField(claimScalar(auth, 'chatgpt_account_id', 512), 'account:');
+  const claimChatGptUser = strongIdentityField(claimScalar(auth, 'chatgpt_user_id', 512), 'user:');
+  const claimUser = strongIdentityField(claimScalar(auth, 'user_id', 512), 'user:');
+  const claimSubject = strongIdentityField(claimScalar(accessPayload, 'sub', 512), 'user:');
+  const idClaimAccount = strongIdentityField(claimScalar(idAuth, 'chatgpt_account_id', 512), 'account:');
+  const idClaimChatGptUser = strongIdentityField(claimScalar(idAuth, 'chatgpt_user_id', 512), 'user:');
+  const idClaimUser = strongIdentityField(claimScalar(idAuth, 'user_id', 512), 'user:');
+  const idClaimSubject = strongIdentityField(claimScalar(idPayload, 'sub', 512), 'user:');
   const claimAuthEmail = claimScalar(auth, 'email', 320, false);
   const claimEmail = claimScalar(accessPayload, 'email', 320, false);
   const idClaimAuthEmail = claimScalar(idAuth, 'email', 320, false);
