@@ -999,32 +999,47 @@ test('successful test reconciles a replaced non-error account without scheduler 
   assert.equal(outcome.results[0].statusAfter, null);
 });
 
-test('ordinary diagnostic read failure never reports the pre-test state as current', async () => {
+test('failed test with an unavailable postflight state requires reconciliation and stops the batch', async () => {
   const account = oauthTestAccount(35, 'active', true);
+  const laterAccount = oauthTestAccount(36, 'active', true);
   let reads = 0;
+  let testCalls = 0;
   const outcome = await runAccountTestJobNow({
-    accountIds: [35],
-    targetBaselines: targetBaselines(account),
+    accountIds: [35, 36],
+    targetBaselines: targetBaselines(account, laterAccount),
     db: fakeWorkerDb(),
     jobId: 'test-failure-diagnostic-unavailable',
     client: {
-      async listAccounts() { return [{ ...account }]; },
+      async listAccounts() { return [{ ...account }, { ...laterAccount }]; },
       async getAccount() {
         reads += 1;
         if (reads === 1) return { ...account };
         throw new Error('diagnostic unavailable');
       },
-      async testAccount() { return { success: false }; },
+      async testAccount() { testCalls += 1; return { success: false }; },
     },
   });
 
   assert.equal(outcome.failed, 1);
-  assert.equal(outcome.results[0].code, 'upstream_test_failed');
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.reconciliationCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(testCalls, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'ACCOUNT_TEST_POSTFLIGHT_UNAVAILABLE');
+  assert.equal(outcome.results[0].testSuccess, false);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_state_unconfirmed');
   assert.equal(outcome.results[0].enabled, null);
   assert.equal(outcome.results[0].enabledKnown, false);
   assert.equal(outcome.results[0].statusAfter, null);
   assert.equal(outcome.results[0].statusAfterKnown, false);
-  assert.doesNotMatch(outcome.results[0].message, /保持当前状态/);
+  assert.equal(outcome.results[1].accountId, 36);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.equal(JSON.stringify(outcome).includes('diagnostic unavailable'), false);
 });
 
 test('shutdown cancels the diagnostic read after an unsuccessful account test', async () => {

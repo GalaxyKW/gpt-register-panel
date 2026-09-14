@@ -603,6 +603,7 @@ async function runAccountTestJobNow({
       throwIfJobInterrupted(signal);
       if (!test.success) {
         let afterFailure = null;
+        let afterFailureReadError = null;
         try {
           afterFailure = await client.getAccount(id, { signal });
         } catch (readError) {
@@ -610,8 +611,24 @@ async function runAccountTestJobNow({
             throwIfJobInterrupted(signal);
             throw readError;
           }
+          afterFailureReadError = readError;
         }
-        if (afterFailure && !sameAccountTarget(account, afterFailure)) {
+        if (!afterFailure) {
+          writeLog(logger, 'error', 'account_test.failed_state_unavailable', {
+            jobId,
+            actor,
+            accountId: id,
+            error: safeErrorMessage(afterFailureReadError || 'account state unavailable'),
+          });
+          const error = new Error('账号测试失败后无法确认账号当前状态');
+          error.code = 'ACCOUNT_TEST_POSTFLIGHT_UNAVAILABLE';
+          throw accountTestReconciliationError(
+            error,
+            'post_test_state_unconfirmed',
+            { testSuccess: false },
+          );
+        }
+        if (!sameAccountTarget(account, afterFailure)) {
           const error = new Error('账号测试后强身份已变化');
           error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
           throw accountTestReconciliationError(
@@ -620,7 +637,6 @@ async function runAccountTestJobNow({
             { testSuccess: false },
           );
         }
-        const stateKnown = sameAccountTarget(account, afterFailure);
         const result = {
           accountId: id,
           accountName: account.name || null,
@@ -629,10 +645,10 @@ async function runAccountTestJobNow({
           message: test.message || '常规请求失败',
           testSuccess: false,
           statusBefore,
-          enabled: stateKnown ? afterFailure.schedulable === true : null,
-          enabledKnown: stateKnown,
-          statusAfter: stateKnown ? afterFailure.status || null : null,
-          statusAfterKnown: stateKnown,
+          enabled: afterFailure.schedulable === true,
+          enabledKnown: true,
+          statusAfter: afterFailure.status || null,
+          statusAfterKnown: true,
           durationMs: Date.now() - itemStartedAt,
         };
         results.push(result);
