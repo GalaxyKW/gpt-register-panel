@@ -487,12 +487,31 @@ function validateRuntimeConfiguration() {
   }
 }
 
+function panelCredential(request) {
+  const authorization = singleRequestHeader(request, 'authorization');
+  const panelToken = singleRequestHeader(request, 'x-panel-token');
+  if (!authorization.valid || !panelToken.valid) return { valid: false, value: '' };
+
+  let bearerValue = null;
+  if (authorization.present) {
+    const match = /^Bearer[ \t]+([^\r\n]+)$/i.exec(authorization.value);
+    if (!match) return { valid: false, value: '' };
+    bearerValue = match[1].trim();
+  }
+  const panelValue = panelToken.present ? panelToken.value.trim() : null;
+  if (bearerValue !== null && panelValue !== null
+      && !tokensEqual(bearerValue, panelValue)) {
+    return { valid: false, value: '' };
+  }
+  const value = bearerValue ?? panelValue ?? '';
+  return value.length > 0 && value.length <= 4096
+    ? { valid: true, value }
+    : { valid: false, value: '' };
+}
+
 function headerToken(request) {
-  const authorization = String(request.headers.authorization || '');
-  const value = authorization.toLowerCase().startsWith('bearer ')
-    ? authorization.slice(7).trim()
-    : String(request.headers['x-panel-token'] || '').trim();
-  return value.length <= 4096 ? value : '';
+  const credential = panelCredential(request);
+  return credential.valid ? credential.value : '';
 }
 
 function authorizationError(request, write = false) {
@@ -790,8 +809,9 @@ function readJsonBody(request, limit = 1024 * 1024) {
 }
 
 function hasJsonContentType(request) {
-  const value = String(request?.headers?.['content-type'] || '');
-  return value.split(';', 1)[0].trim().toLowerCase() === 'application/json';
+  const header = singleRequestHeader(request, 'content-type');
+  if (!header.present || !header.valid) return false;
+  return header.value.split(';', 1)[0].trim().toLowerCase() === 'application/json';
 }
 
 function pathParam(pathname, prefix) {

@@ -16,6 +16,7 @@ const {
   configuredListenHost,
   configuredListenPort,
   createServer,
+  hasJsonContentType,
   openVerifiedStaticFile,
   phase3ClaimKeys,
   phase3FailureMetadata,
@@ -697,6 +698,72 @@ test('authentication defaults to enabled and startup validates before database a
     if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
     else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
   }
+});
+
+test('authentication rejects conflicting, duplicated, and ambiguous credential headers', () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+  };
+  const token = 'credential-source-test-token';
+  process.env.PANEL_ADMIN_TOKEN = token;
+  process.env.PANEL_REQUIRE_AUTH = '1';
+  resetAuthFailureBuckets();
+  const requestWith = (headers, rawHeaders) => ({
+    headers,
+    rawHeaders,
+    socket: { remoteAddress: '198.51.100.42' },
+  });
+  try {
+    assert.equal(authorizationError(requestWith(
+      { authorization: 'Bearer ' + token, 'x-panel-token': token },
+      ['Authorization', 'Bearer ' + token, 'X-Panel-Token', token],
+    )), null);
+
+    for (const requestObject of [
+      requestWith(
+        { authorization: 'Bearer ' + token, 'x-panel-token': 'conflicting-token' },
+        ['Authorization', 'Bearer ' + token, 'X-Panel-Token', 'conflicting-token'],
+      ),
+      requestWith(
+        { authorization: 'Bearer ' + token },
+        ['Authorization', 'Bearer ' + token, 'Authorization', 'Bearer conflicting-token'],
+      ),
+      requestWith(
+        { 'x-panel-token': token },
+        ['X-Panel-Token', token, 'X-Panel-Token', 'conflicting-token'],
+      ),
+      requestWith(
+        { authorization: 'Basic ignored-value', 'x-panel-token': token },
+        ['Authorization', 'Basic ignored-value', 'X-Panel-Token', token],
+      ),
+      requestWith(
+        { authorization: ['Bearer ' + token] },
+        ['Authorization', 'Bearer ' + token],
+      ),
+    ]) assert.equal(authorizationError(requestObject).status, 401);
+  } finally {
+    resetAuthFailureBuckets();
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+  }
+});
+
+test('JSON content type must be represented by exactly one request header', () => {
+  assert.equal(hasJsonContentType({
+    headers: { 'content-type': 'application/json; charset=utf-8' },
+    rawHeaders: ['Content-Type', 'application/json; charset=utf-8'],
+  }), true);
+  assert.equal(hasJsonContentType({
+    headers: { 'content-type': 'application/json' },
+    rawHeaders: ['Content-Type', 'application/json', 'Content-Type', 'text/plain'],
+  }), false);
+  assert.equal(hasJsonContentType({
+    headers: { 'content-type': ['application/json', 'text/plain'] },
+    rawHeaders: ['Content-Type', 'application/json', 'Content-Type', 'text/plain'],
+  }), false);
 });
 
 test('tokenless loopback writes require a literal loopback Host and same-origin Origin', async () => {
