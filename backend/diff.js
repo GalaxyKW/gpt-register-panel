@@ -58,6 +58,24 @@ function identitiesStronglyCompatible(leftKeys = [], rightKeys = []) {
   return strongMatch;
 }
 
+// Mapping a local source identity to a remote account is stricter than
+// grouping local token versions. Every account/user dimension present on
+// either side must be present on the other side with the exact same values.
+// This prevents an account-only record from authorizing an update to an
+// account+user row (and vice versa) while still allowing partial local token
+// versions to be grouped by identitiesStronglyCompatible above.
+function strongIdentitiesFullyMatch(leftKeys = [], rightKeys = []) {
+  const left = identityParts(leftKeys);
+  const right = identityParts(rightKeys);
+  let hasStrong = false;
+  for (const kind of ['account', 'user']) {
+    if (left[kind].size > 0 || right[kind].size > 0) hasStrong = true;
+    if (left[kind].size !== right[kind].size) return false;
+    if ([...left[kind]].some((value) => !right[kind].has(value))) return false;
+  }
+  return hasStrong;
+}
+
 // Strong identifiers must never contradict each other just because an email
 // happens to be shared or stale. Email remains a compatibility fallback only
 // when neither side has a stronger identifier. If either side has an account
@@ -81,17 +99,23 @@ function identitiesCompatible(leftKeys = [], rightKeys = []) {
 function ambiguousAccountHints(candidate, accounts) {
   const candidateKeys = candidate?.sourceIdentityKeys || [];
   const candidateIdentity = identityParts(candidateKeys);
-  if (candidateIdentity.email.size === 0) return [];
   return (accounts || []).filter((account) => {
     const keys = Array.isArray(account?.identityKeys) && account.identityKeys.length > 0
       ? account.identityKeys
       : accountKeys(account);
     const remoteIdentity = identityParts(keys);
+    if (strongIdentitiesFullyMatch(candidateKeys, keys)) return false;
+    const sharesStrong = ['account', 'user'].some((kind) => (
+      [...candidateIdentity[kind]].some((value) => remoteIdentity[kind].has(value))
+    ));
+    // A shared strong value with incomplete or contradictory dimensions is
+    // evidence of a possible existing account, never permission to create a
+    // duplicate or update a partially identified row.
+    if (sharesStrong) return true;
     const sharesEmail = [...candidateIdentity.email].some((value) => (
       remoteIdentity.email.has(value)
     ));
     if (!sharesEmail) return false;
-    if (identitiesStronglyCompatible(candidateKeys, keys)) return false;
     if (remoteIdentity.account.size === 0 && remoteIdentity.user.size === 0) return true;
     const hasComparableDimension = (candidateIdentity.account.size > 0
         && remoteIdentity.account.size > 0)
@@ -291,7 +315,7 @@ function operationalAccountCandidates(token, accountIndex) {
       // can be consumed by ID-scoped UI actions, so require a compatible
       // account/user identity even when both records only expose the same
       // email address.
-      .filter((account) => identitiesStronglyCompatible(
+      .filter((account) => strongIdentitiesFullyMatch(
         token?.identityKeys || [],
         accountKeys(account),
       )),
@@ -401,6 +425,10 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     if (candidates.length === 0) {
       const expiryInvalid = isExpiryInvalid(token);
       const expired = isExpired(token, nowMs);
+      const ambiguousHints = ambiguousAccountHints({
+        sourceIdentityKeys: token.identityKeys || [],
+      }, uniqueRecords((token.identityKeys || [])
+        .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])));
       let decision = null;
       if (comparisonUnavailable) {
         decision = { action: null, reason: comparisonUnavailableReason };
@@ -417,11 +445,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
             decision = { action: 'conflict', reason: 'source_identity_insufficient' };
           } else if (incomparableTokens.has(token)) {
             decision = { action: 'conflict', reason: 'incomparable_strong_identity' };
-          } else if (ambiguousAccountHints({
-            sourceIdentityKeys: token.identityKeys || [],
-          }, uniqueRecords((token.identityKeys || [])
-            .filter((key) => /^email:/i.test(String(key || '')))
-            .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || []))).length > 0) {
+          } else if (ambiguousHints.length > 0) {
             decision = { action: 'conflict', reason: 'ambiguous_sub2api_identity' };
           } else if (token.disabled === true) {
             decision = { action: 'skip', reason: 'source_disabled' };
@@ -430,8 +454,16 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
           }
         }
       }
+      if (decision?.reason === 'ambiguous_sub2api_identity') {
+        for (const hint of ambiguousHints) {
+          if (hint?.id !== undefined && hint?.id !== null) matchedAccountIds.add(String(hint.id));
+        }
+      }
+      const identityAmbiguous = decision?.reason === 'ambiguous_sub2api_identity';
       items.push({
-        kind: expiryInvalid
+        kind: identityAmbiguous
+          ? 'mapping_conflict'
+          : expiryInvalid
           ? 'expiry_invalid'
           : expired
             ? 'expired'
@@ -443,7 +475,14 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
         account: null,
         decisionAction: decision?.action ?? null,
         decisionReason: decision?.reason || null,
-        issues: expiryInvalid ? ['expiry_invalid'] : expired ? ['expired'] : [],
+        issues: identityAmbiguous
+          ? [
+              'ambiguous_sub2api_identity',
+              ...ambiguousHints
+                .map((hint) => hint?.id)
+                .filter((id) => id !== undefined && id !== null),
+            ]
+          : expiryInvalid ? ['expiry_invalid'] : expired ? ['expired'] : [],
       });
       continue;
     }
@@ -635,6 +674,7 @@ module.exports = {
   hasStrongIdentity,
   strongIdentityContradiction,
   identitiesStronglyCompatible,
+  strongIdentitiesFullyMatch,
   identitiesCompatible,
   ambiguousAccountHints,
   isExpired,

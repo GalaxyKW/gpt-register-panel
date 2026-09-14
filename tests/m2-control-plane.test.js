@@ -1424,7 +1424,7 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
         type: 'oauth',
         status: 'active',
         email: 'one@example.test',
-        identityKeys: ['email:one@example.test'],
+        identityKeys: ['account:a-1', 'user:u-1', 'email:one@example.test'],
         tokenFingerprints: {},
       }];
     },
@@ -1708,7 +1708,7 @@ test('no-remote and ambiguous diff decisions match planner blockers when they ar
   ]);
 });
 
-test('import plan writes only the freshest candidate when one account has duplicate sources', () => {
+test('aggregated strong identity refuses a partial remote even when the freshest source matches it', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-duplicate-source-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
@@ -1753,11 +1753,12 @@ test('import plan writes only the freshest candidate when one account has duplic
     tokenFingerprints: { access: 'different-access', refresh: 'different-refresh' },
   }];
   const plan = buildImportPlan(sources, accounts);
-  const updates = plan.filter((item) => item.action === 'update');
-  assert.equal(updates.length, 1);
-  assert.equal(updates[0].source, 'tokens');
-  assert.equal(updates[0].relativePath, 'tokens/fresh.json');
-  assert.equal(updates[0].duplicateSource, true);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'ambiguous_sub2api_identity');
+  assert.equal(plan[0].source, 'tokens');
+  assert.equal(plan[0].relativePath, 'tokens/fresh.json');
+  assert.equal(plan[0].duplicateSource, true);
   assert.equal(plan.some((item) => item.relativePath === 'use_token/old.json'), false);
 
   const oldKey = 'token:use_token:use_token/old.json';
@@ -2634,8 +2635,8 @@ test('update preflight does not treat matching access with an unverified refresh
   assert.equal(raced.reason, 'already_in_sync');
 });
 
-test('update preflight binds every strong identity dimension from the planned remote row', async () => {
-  const source = syntheticToken(
+test('import plan rejects incomplete strong identity coverage in either direction', () => {
+  const accountOnlySource = syntheticToken(
     'tokens/account-only.json',
     ['account:shared-account'],
     { accountId: 'shared-account', accessFingerprint: 'new-fingerprint' },
@@ -2650,35 +2651,41 @@ test('update preflight binds every strong identity dimension from the planned re
     identityKeys: ['account:shared-account', 'user:planned-user'],
     tokenFingerprints: { access: 'old-fingerprint' },
   };
-  const planItem = buildImportPlan({ tokens: [source], usernames: [] }, [plannedRemote])[0];
-  assert.equal(planItem.action, 'update');
+  const sourceMissingUser = buildImportPlan(
+    { tokens: [accountOnlySource], usernames: [] },
+    [plannedRemote],
+  )[0];
+  assert.equal(sourceMissingUser.action, 'conflict');
+  assert.equal(sourceMissingUser.reason, 'ambiguous_sub2api_identity');
+  assert.equal(sourceMissingUser.accountId, null);
 
-  let mutations = 0;
-  await assert.rejects(
-    executeImportPlanItem({
-      item: planItem,
-      client: {
-        async getAccount() {
-          return {
-            ...plannedRemote,
-            // This replacement still matches the source's account ID. The
-            // planned remote user ID is what must make the preflight fail.
-            identityKeys: ['account:shared-account', 'user:replacement-user'],
-          };
-        },
-        async applyOAuthCredentials() { mutations += 1; },
-      },
-    }),
-    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+  const completeSource = syntheticToken(
+    'tokens/complete.json',
+    ['account:shared-account', 'user:planned-user'],
+    {
+      accountId: 'shared-account',
+      userId: 'planned-user',
+      accessFingerprint: 'new-complete-fingerprint',
+    },
   );
-  assert.equal(mutations, 0);
+  const remoteMissingUser = buildImportPlan(
+    { tokens: [completeSource], usernames: [] },
+    [{ ...plannedRemote, userId: '', identityKeys: ['account:shared-account'] }],
+  )[0];
+  assert.equal(remoteMissingUser.action, 'conflict');
+  assert.equal(remoteMissingUser.reason, 'ambiguous_sub2api_identity');
+  assert.equal(remoteMissingUser.accountId, null);
 });
 
-test('partial source identities preserve verified remote dimensions and verify them after writing', async () => {
+test('final update preflight rejects a remote that loses a source identity dimension', async () => {
   const source = syntheticToken(
-    'tokens/partial-account.json',
-    ['account:partial-account'],
-    { accountId: 'partial-account', accessFingerprint: 'partial-new-fingerprint' },
+    'tokens/complete-preflight.json',
+    ['account:preflight-account', 'user:preflight-user'],
+    {
+      accountId: 'preflight-account',
+      userId: 'preflight-user',
+      accessFingerprint: 'preflight-new-fingerprint',
+    },
   );
   const before = {
     id: 121,
@@ -2687,57 +2694,31 @@ test('partial source identities preserve verified remote dimensions and verify t
     type: 'oauth',
     status: 'error',
     schedulable: false,
-    accountId: 'partial-account',
-    userId: 'remote-user-to-preserve',
-    identityKeys: ['account:partial-account', 'user:remote-user-to-preserve'],
-    tokenFingerprints: { access: 'partial-old-fingerprint' },
-  };
-  const after = {
-    ...before,
-    tokenFingerprints: { access: source.fingerprints.access },
+    accountId: 'preflight-account',
+    userId: 'preflight-user',
+    identityKeys: ['account:preflight-account', 'user:preflight-user'],
+    tokenFingerprints: { access: 'preflight-old-fingerprint' },
   };
   const item = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
-  let reads = 0;
-  let payload = null;
-  const outcome = await executeImportPlanItem({
-    item,
-    client: {
-      async getAccount() {
-        reads += 1;
-        return reads === 1 ? before : after;
-      },
-      async applyOAuthCredentials(id, value) {
-        assert.equal(id, 121);
-        payload = value;
-      },
-    },
-  });
-  assert.equal(outcome.skipped, false);
-  assert.equal(payload.credentials.chatgpt_account_id, 'partial-account');
-  assert.equal(payload.credentials.chatgpt_user_id, 'remote-user-to-preserve');
-
-  reads = 0;
+  assert.equal(item.action, 'update');
   let mutations = 0;
   await assert.rejects(
     executeImportPlanItem({
       item,
       client: {
         async getAccount() {
-          reads += 1;
-          return reads === 1
-            ? before
-            : {
-                ...after,
-                userId: '',
-                identityKeys: ['account:partial-account'],
-              };
+          return {
+            ...before,
+            userId: '',
+            identityKeys: ['account:preflight-account'],
+          };
         },
         async applyOAuthCredentials() { mutations += 1; },
       },
     }),
-    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+    (error) => error.code === 'SUB2API_TARGET_IDENTITY_MISMATCH',
   );
-  assert.equal(mutations, 1);
+  assert.equal(mutations, 0);
 });
 
 test('update preflight rejects a strong identity dimension added after planning', async () => {
@@ -2776,12 +2757,12 @@ test('update preflight rejects a strong identity dimension added after planning'
         async applyOAuthCredentials() { mutations += 1; },
       },
     }),
-    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+    (error) => error.code === 'SUB2API_TARGET_IDENTITY_MISMATCH',
   );
   assert.equal(mutations, 0);
 });
 
-test('freshest partial token carries a unique identity dimension from its older version', async () => {
+test('aggregated source dimensions do not authorize an update to a partial remote', () => {
   const freshest = syntheticToken(
     'tokens/freshest-partial.json',
     ['account:aggregate-account'],
@@ -2813,12 +2794,6 @@ test('freshest partial token carries a unique identity dimension from its older 
     identityKeys: ['account:aggregate-account'],
     tokenFingerprints: { access: 'remote-old-fingerprint' },
   };
-  const after = {
-    ...before,
-    userId: 'aggregate-user',
-    identityKeys: ['account:aggregate-account', 'user:aggregate-user'],
-    tokenFingerprints: { access: freshest.fingerprints.access },
-  };
   const plan = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [before]);
   assert.equal(plan.length, 1);
   assert.equal(plan[0].relativePath, freshest.relativePath);
@@ -2826,24 +2801,9 @@ test('freshest partial token carries a unique identity dimension from its older 
     'account:aggregate-account',
     'user:aggregate-user',
   ]);
-  let reads = 0;
-  let payload = null;
-  const outcome = await executeImportPlanItem({
-    item: plan[0],
-    client: {
-      async getAccount() {
-        reads += 1;
-        return reads === 1 ? before : after;
-      },
-      async applyOAuthCredentials(id, value) {
-        assert.equal(id, 123);
-        payload = value;
-      },
-    },
-  });
-  assert.equal(outcome.skipped, false);
-  assert.equal(payload.credentials.chatgpt_account_id, 'aggregate-account');
-  assert.equal(payload.credentials.chatgpt_user_id, 'aggregate-user');
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'ambiguous_sub2api_identity');
+  assert.equal(plan[0].accountId, null);
 });
 
 test('source token changes after remote preflight block every mutation', async () => {

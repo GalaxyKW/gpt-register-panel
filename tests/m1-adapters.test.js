@@ -1364,15 +1364,17 @@ test('email overlap never bridges a weak identity to a strong identity in either
     identityKeys: ['account:workspace-271', 'user:user-271', 'email:' + email],
   };
 
-  for (const [source, remote] of [
-    [weakToken, strongAccount],
-    [strongToken, weakAccount],
-  ]) {
-    const diff = buildDiff([source], [remote]);
-    assert.equal(diff.counts.token_only, 1);
-    assert.equal(diff.counts.sub2api_only, 1);
-    assert.equal(diff.items.find((item) => item.token).account, null);
-  }
+  const weakSourceDiff = buildDiff([weakToken], [strongAccount]);
+  assert.equal(weakSourceDiff.counts.token_only, 1);
+  assert.equal(weakSourceDiff.counts.sub2api_only, 1);
+  assert.equal(weakSourceDiff.items.find((item) => item.token).account, null);
+
+  const weakRemoteDiff = buildDiff([strongToken], [weakAccount]);
+  assert.equal(weakRemoteDiff.counts.mapping_conflict, 1);
+  assert.equal(weakRemoteDiff.counts.sub2api_only || 0, 0);
+  const weakRemoteItem = weakRemoteDiff.items.find((item) => item.token);
+  assert.equal(weakRemoteItem.account, null);
+  assert.equal(weakRemoteItem.decisionReason, 'ambiguous_sub2api_identity');
 });
 
 test('historical email-only tokens never acquire a remote account id', () => {

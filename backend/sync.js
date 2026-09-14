@@ -12,6 +12,7 @@ const {
   strongIdentityContradiction,
   identitiesCompatible,
   identitiesStronglyCompatible,
+  strongIdentitiesFullyMatch,
   ambiguousAccountHints,
   hasStrongIdentity,
   accountKeys,
@@ -714,7 +715,7 @@ function accountMatches(candidate, accounts) {
     const keys = Array.isArray(account.identityKeys) && account.identityKeys.length > 0
       ? account.identityKeys
       : accountKeys(account);
-    if (identitiesStronglyCompatible(candidate.sourceIdentityKeys || [], keys)) {
+    if (strongIdentitiesFullyMatch(candidate.sourceIdentityKeys || [], keys)) {
       matches.set(String(account.id), account);
     }
   }
@@ -1144,7 +1145,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
       { signal },
     );
     throwIfJobInterrupted(signal);
-    const matches = accounts.filter((candidate) => identitiesStronglyCompatible(
+    const matches = accounts.filter((candidate) => strongIdentitiesFullyMatch(
       item.sourceIdentityKeys?.length ? item.sourceIdentityKeys : item._account?.identityKeys || [item.identityKey],
       candidate.identityKeys || accountKeys(candidate),
     ));
@@ -1160,7 +1161,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
     ? item.sourceIdentityKeys
     : item._account?.identityKeys || [item.identityKey];
   const actualIdentity = account.identityKeys || accountKeys(account);
-  if (!identitiesStronglyCompatible(expectedIdentity, actualIdentity)) {
+  if (!strongIdentitiesFullyMatch(expectedIdentity, actualIdentity)) {
     const error = new Error('导入后账号身份与来源不一致');
     error.code = 'SUB2API_IMPORT_VERIFY_IDENTITY_MISMATCH';
     throw error;
@@ -1236,7 +1237,7 @@ function verifyTargetIdentity(item, account, expectedId = null) {
   const expectedIdentity = item.sourceIdentityKeys || [];
   const actualIdentity = account.identityKeys || accountKeys(account);
   if (!hasStrongIdentity(expectedIdentity)
-      || !identitiesStronglyCompatible(expectedIdentity, actualIdentity)) {
+      || !strongIdentitiesFullyMatch(expectedIdentity, actualIdentity)) {
     throw targetVerificationError('Sub2API 目标账号强身份与来源不一致', 'SUB2API_TARGET_IDENTITY_MISMATCH');
   }
   return actualId;
