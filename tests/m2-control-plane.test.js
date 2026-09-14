@@ -1312,7 +1312,7 @@ test('import plan writes only the freshest candidate when one account has duplic
   }));
   const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
   const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
-  const plan = buildImportPlan(sources, [{
+  const accounts = [{
     id: 77,
     name: 'free00077',
     platform: 'openai',
@@ -1321,13 +1321,59 @@ test('import plan writes only the freshest candidate when one account has duplic
     schedulable: false,
     identityKeys: ['user:fresh-user', 'email:duplicate@example.test'],
     tokenFingerprints: { access: 'different-access', refresh: 'different-refresh' },
-  }]);
+  }];
+  const plan = buildImportPlan(sources, accounts);
   const updates = plan.filter((item) => item.action === 'update');
   assert.equal(updates.length, 1);
   assert.equal(updates[0].source, 'tokens');
   assert.equal(updates[0].relativePath, 'tokens/fresh.json');
   assert.equal(updates[0].duplicateSource, true);
   assert.equal(plan.some((item) => item.relativePath === 'use_token/old.json'), false);
+
+  const oldKey = 'token:use_token:use_token/old.json';
+  const selectedOld = importPlanSummary(buildImportPlan(sources, accounts, [oldKey]));
+  assert.equal(selectedOld.items.length, 1);
+  assert.equal(selectedOld.items[0].relativePath, 'tokens/fresh.json');
+  assert.equal(selectedOld.items[0].sourceVersionCount, 2);
+  assert.deepEqual(selectedOld.items[0].selectedSourcePaths, ['use_token/old.json']);
+  assert.deepEqual(selectedOld.items[0].selectedSupersededPaths, ['use_token/old.json']);
+  assert.equal(selectedOld.items[0].selectedSourceSuperseded, true);
+  assert.equal(JSON.stringify(selectedOld).includes('refresh-fresh'), false);
+  assert.equal(JSON.stringify(selectedOld).includes('refresh-old'), false);
+
+  const freshKey = 'token:tokens:tokens/fresh.json';
+  const selectedFresh = importPlanSummary(buildImportPlan(sources, accounts, [freshKey]));
+  assert.equal(selectedFresh.items[0].relativePath, 'tokens/fresh.json');
+  assert.deepEqual(selectedFresh.items[0].selectedSupersededPaths, []);
+  assert.equal(selectedFresh.items[0].selectedSourceSuperseded, false);
+});
+
+test('sync selection accepts only explicit token row keys', () => {
+  const token = syntheticToken('tokens/numeric-account.json', ['account:77'], {
+    accountId: '77',
+  });
+  const unrelatedRemote = {
+    id: 77,
+    name: 'free00077',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys: ['account:unrelated-account'],
+    tokenFingerprints: { access: 'unrelated-fingerprint' },
+  };
+  const sources = { tokens: [token], usernames: [] };
+
+  assert.deepEqual(buildImportPlan(sources, [unrelatedRemote], ['account:77']), []);
+  assert.deepEqual(buildImportPlan(sources, [unrelatedRemote], ['user:untrusted-alias']), []);
+  const selected = buildImportPlan(
+    sources,
+    [unrelatedRemote],
+    ['token:tokens:tokens/numeric-account.json'],
+  );
+  assert.equal(selected.length, 1);
+  assert.equal(selected[0].relativePath, 'tokens/numeric-account.json');
+  assert.equal(selected[0].action, 'create');
 });
 
 test('treats expired active Sub2API accounts as unavailable for replacement', () => {

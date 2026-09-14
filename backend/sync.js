@@ -714,12 +714,33 @@ function freeName(number) {
   return 'free' + String(number).padStart(5, '0');
 }
 
-function selectedCandidate(candidate, selectedKeys, account = null) {
-  if (!Array.isArray(selectedKeys) || selectedKeys.length === 0) return true;
+function selectedTokenRecords(candidate, selectedKeys) {
+  if (!Array.isArray(selectedKeys) || selectedKeys.length === 0) return [];
   const keys = new Set(selectedKeys.map((key) => String(key)));
-  if (keys.has(candidate.key) || keys.has(candidate.identityKey)) return true;
-  if (account && keys.has('account:' + String(account.id))) return true;
-  return candidate.records.some((record) => keys.has(candidateKey(record)));
+  return candidate.records.filter((record) => keys.has(candidateKey(record)));
+}
+
+function selectedCandidate(candidate, selectedKeys) {
+  if (!Array.isArray(selectedKeys) || selectedKeys.length === 0) return true;
+  // Selection keys come from source-backed table rows. Do not accept a
+  // candidate identity key or a Sub2API numeric account key here: both use
+  // the `account:` namespace and can otherwise authorize an unrelated local
+  // token whose ChatGPT account ID happens to equal a remote numeric ID.
+  return selectedTokenRecords(candidate, selectedKeys).length > 0;
+}
+
+function sourceSelectionMetadata(candidate, selectedKeys) {
+  const selectedRecords = selectedTokenRecords(candidate, selectedKeys);
+  const selectedSuperseded = selectedRecords.filter((record) => (
+    candidateKey(record) !== candidate.key
+  ));
+  const relativePath = (record) => record.relativePath || record.fileName || '';
+  return {
+    sourceVersionCount: candidate.records.length,
+    selectedSourcePaths: selectedRecords.map(relativePath).filter(Boolean),
+    selectedSupersededPaths: selectedSuperseded.map(relativePath).filter(Boolean),
+    selectedSourceSuperseded: selectedSuperseded.length > 0,
+  };
 }
 
 function dateMilliseconds(value) {
@@ -772,7 +793,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   for (const entry of entries) {
     if (!entry.account || entry.candidate.identityConflict
         || !hasStrongIdentity(entry.candidate.sourceIdentityKeys)
-        || !selectedCandidate(entry.candidate, selectedKeys, entry.account)
+        || !selectedCandidate(entry.candidate, selectedKeys)
         || isExpiryInvalid(entry.candidate.record)
         || sourceTerminalStatus(sources?.usernames, entry.candidate.record)) continue;
     const accountId = entry.account.id;
@@ -787,7 +808,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   let nextNumber = nextFreeNumber(accounts);
   for (const entry of entries) {
     const { candidate, matches, ambiguousHints, account } = entry;
-    if (!selectedCandidate(candidate, selectedKeys, account)) continue;
+    if (!selectedCandidate(candidate, selectedKeys)) continue;
     const terminalStatus = sourceTerminalStatus(sources?.usernames, candidate.record);
     const sourceDecision = sourceStateImportDecision(candidate.record, { terminalStatus });
     let action = 'create';
@@ -861,6 +882,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       sourceDisabled: candidate.record.disabled === true,
       sourceTerminalStatus: terminalStatus,
       supersededBy: superseded ? preferred.candidate.record.relativePath : null,
+      ...sourceSelectionMetadata(candidate, selectedKeys),
       _raw: candidate.record.raw,
       _record: candidate.record,
       _account: account,
@@ -896,6 +918,12 @@ function safeImportItem(item) {
     sourceDisabled: item.sourceDisabled,
     sourceTerminalStatus: item.sourceTerminalStatus || null,
     supersededBy: item.supersededBy || null,
+    sourceVersionCount: Number(item.sourceVersionCount) || 1,
+    selectedSourcePaths: Array.isArray(item.selectedSourcePaths) ? item.selectedSourcePaths : [],
+    selectedSupersededPaths: Array.isArray(item.selectedSupersededPaths)
+      ? item.selectedSupersededPaths
+      : [],
+    selectedSourceSuperseded: item.selectedSourceSuperseded === true,
   };
 }
 

@@ -820,18 +820,37 @@ function renderPlan(plan) {
     result[action] = (result[action] || 0) + 1;
     return result;
   }, {});
+  const supersededSelectionCount = items.filter((item) => (
+    item?.selectedSourceSuperseded === true
+  )).length;
   elements.planSummary.textContent = '新增 ' + (counts.create || 0) + ' · 更新 ' + (counts.update || 0)
-    + ' · 跳过 ' + (counts.skip || 0) + ' · 冲突 ' + (counts.conflict || 0);
+    + ' · 跳过 ' + (counts.skip || 0) + ' · 冲突 ' + (counts.conflict || 0)
+    + (supersededSelectionCount ? ' · 旧副本改用最新 ' + supersededSelectionCount : '');
   elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12)
     + ' · 选择 ' + state.plan.selectedKeys.length;
   elements.planRows.innerHTML = items.map((item) => {
     const action = effectivePlanAction(item);
     const reason = effectivePlanReason(item);
+    const selectedSupersededPaths = Array.isArray(item.selectedSupersededPaths)
+      ? item.selectedSupersededPaths.filter(Boolean)
+      : [];
+    const sourceVersionCount = Math.max(1, finiteNumber(item.sourceVersionCount));
+    const actualPath = item.relativePath || item.fileName || item.source || '-';
+    const duplicateNote = sourceVersionCount > 1
+      ? '<small>同身份 ' + sourceVersionCount + ' 个版本，实际仅使用排序首选版本</small>'
+      : '';
+    const supersededPathText = selectedSupersededPaths.join('、') || '（旧版本路径未提供）';
+    const selectionNote = item.selectedSourceSuperseded === true
+      ? '<small class="availability-note" title="' + escapeHtml(supersededPathText)
+        + '">已选旧副本 ' + escapeHtml(supersededPathText) + ' → 实际使用 '
+        + escapeHtml(actualPath) + '</small>'
+      : '';
     return '<tr>'
     + '<td><span class="badge ' + (action === 'conflict' ? 'badge-danger' : action === 'skip' ? 'badge-neutral' : action === 'update' ? 'badge-warning' : 'badge-success') + '">' + escapeHtml(actionLabel(action)) + '</span></td>'
     + '<td>' + escapeHtml(item.accountName || '-') + '</td>'
     + '<td>' + escapeHtml(item.email || '-') + '</td>'
-    + '<td>' + escapeHtml(item.source || '-') + '</td>'
+    + '<td><strong>' + escapeHtml(item.source || '-') + '</strong><small title="' + escapeHtml(actualPath)
+    + '">实际文件 ' + escapeHtml(actualPath) + '</small>' + duplicateNote + selectionNote + '</td>'
     + '<td><code>' + escapeHtml(formatFingerprint(item.fingerprints?.access)) + '</code></td>'
     + '<td>' + escapeHtml(actionReasonLabel(reason)) + '</td></tr>';
   }).join('');
@@ -1326,7 +1345,15 @@ async function previewSelection() {
     if (!selectionStillCurrent(selectionRevision, selectedKeys)) return false;
     if (!response.ok) throw new Error(body.message || body.error || '差异检查失败');
     renderPlan({ ...body, selectedKeys });
-    showNotice(selectedKeys.length ? '差异预览已生成，确认前仍会重新检查来源版本。' : '已生成全部差异预览；如需导入，请先选择账号后重新检查。', 'notice-info');
+    const supersededSelectionCount = (body.items || []).filter((item) => (
+      item?.selectedSourceSuperseded === true
+    )).length;
+    showNotice(supersededSelectionCount
+      ? '差异预览已生成：有 ' + supersededSelectionCount + ' 个所选旧副本将按有效性与新鲜度规则改用首选版本，请核对“实际文件”后再确认。'
+      : selectedKeys.length
+        ? '差异预览已生成，确认前仍会重新检查来源版本。'
+        : '已生成全部差异预览；如需导入，请先选择账号后重新检查。',
+    supersededSelectionCount ? 'notice-warning' : 'notice-info');
     return true;
   } catch (error) {
     if (selectionStillCurrent(selectionRevision, selectedKeys)) {
@@ -1352,7 +1379,13 @@ elements.importButton.addEventListener('click', async () => {
     showNotice('导入前请先选择账号并重新检查差异。', 'notice-warning');
     return;
   }
-  if (!window.confirm('确认将预览中的新增/更新写入 Sub2API？')) return;
+  const supersededSelectionCount = (state.plan.items || []).filter((item) => (
+    item?.selectedSourceSuperseded === true
+  )).length;
+  const replacementWarning = supersededSelectionCount
+    ? '其中 ' + supersededSelectionCount + ' 个所选旧副本将改用预览所示的排序首选版本。\n'
+    : '';
+  if (!window.confirm(replacementWarning + '确认将预览中的新增/更新写入 Sub2API？')) return;
   state.importRequestPending = true;
   updateActionState();
   try {

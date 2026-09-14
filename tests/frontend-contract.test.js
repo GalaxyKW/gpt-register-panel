@@ -40,6 +40,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
     escapeHtml: (value) => String(value ?? ''),
     actionLabel: (value) => value,
     formatFingerprint: (value) => value || '-',
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
   };
   vm.runInNewContext(actionContracts + '\n' + lockingContracts + '\n' + renderPlan + `
     renderPlan({
@@ -47,7 +48,17 @@ test('frontend treats every blocking plan item as a conflict and explains termin
       selectedKeys: ['token:one'],
       items: [
         { action: 'create', reason: 'token_only', fingerprints: {} },
-        { action: 'update', reason: 'token_changed', conflictingVersions: true, fingerprints: {} },
+        {
+          action: 'update',
+          reason: 'token_changed',
+          conflictingVersions: true,
+          source: 'tokens',
+          relativePath: 'tokens/fresh.json',
+          sourceVersionCount: 2,
+          selectedSourceSuperseded: true,
+          selectedSupersededPaths: ['use_token/old.json'],
+          fingerprints: {},
+        },
       ],
     });
     result = {
@@ -70,13 +81,61 @@ test('frontend treats every blocking plan item as a conflict and explains termin
   `, context);
   assert.equal(context.result.disabled, true);
   assert.match(context.result.summary, /冲突 1/);
+  assert.match(context.result.summary, /旧副本改用最新 1/);
   assert.match(context.result.rows, /来源 token 版本冲突，禁止导入/);
+  assert.match(context.result.rows, /同身份 2 个版本/);
+  assert.match(context.result.rows, /已选旧副本/);
+  assert.match(context.result.rows, /tokens\/fresh\.json/);
+  assert.match(context.result.rows, /use_token\/old\.json/);
   assert.equal(context.result.terminal, '来源账号已处置，跳过');
   assert.equal(context.result.identityReasons.every((label) => label.includes('禁止导入')), true);
   assert.match(context.result.unknownAvailability, /跳过/);
   assert.match(context.result.invalidAutoPause, /跳过/);
   assert.match(source, /unknown:\s*'未知'/);
   assert.match(source, /可用性未知/);
+  assert.match(source, /所选旧副本将按有效性与新鲜度规则改用首选版本/);
+  assert.match(source, /所选旧副本将改用预览所示的排序首选版本/);
+});
+
+test('frontend import confirmation calls out selected superseded token files', async () => {
+  const importHandler = sourceSection(
+    "elements.importButton.addEventListener('click'",
+    "elements.phase3Button.addEventListener('click'",
+  );
+  let clickHandler;
+  let confirmation = '';
+  const context = {
+    elements: {
+      importButton: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          clickHandler = handler;
+        },
+      },
+    },
+    state: {
+      plan: {
+        version: 'a'.repeat(64),
+        selectedKeys: ['token:use_token:use_token/old.json'],
+        items: [{ selectedSourceSuperseded: true }],
+      },
+      importRequestPending: false,
+      snapshot: { sub2api: { readStatus: 'ok' } },
+    },
+    comparisonAvailable: () => true,
+    showNotice() {},
+    window: {
+      confirm(message) {
+        confirmation = message;
+        return false;
+      },
+    },
+  };
+  vm.runInNewContext(importHandler, context);
+  await clickHandler();
+  assert.match(confirmation, /1 个所选旧副本/);
+  assert.match(confirmation, /排序首选版本/);
+  assert.match(confirmation, /确认将预览中的新增\/更新写入 Sub2API/);
 });
 
 test('frontend polling helper keeps an unknown task locked and schedules a slower retry', () => {
@@ -662,6 +721,19 @@ test('frontend discards a preview when the selected keys or revision changes in 
   assert.equal(await context.changedRevisionPromise, false);
   assert.deepEqual(plans, [null, null]);
   assert.equal(notices.length, 0);
+
+  vm.runInNewContext('supersededPromise = previewSelection();', context);
+  requests[2]({
+    ok: true,
+    json: async () => ({
+      version: 'current',
+      items: [{ selectedSourceSuperseded: true }],
+    }),
+  });
+  assert.equal(await context.supersededPromise, true);
+  assert.equal(notices.length, 1);
+  assert.match(notices[0][0], /所选旧副本/);
+  assert.equal(notices[0][1], 'notice-warning');
 });
 
 test('frontend refuses sync preview when remote comparison is unavailable', async () => {
