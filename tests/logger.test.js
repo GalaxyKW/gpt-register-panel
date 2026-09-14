@@ -498,7 +498,8 @@ test('structured logger rotates files, supports tail, and uses restrictive permi
     rotations: 1_000_000,
   });
   assert.equal(bounded.maxBytes, 128 * 1024 * 1024);
-  assert.equal(bounded.rotations, 100);
+  assert.equal(bounded.rotations, 3);
+  assert.ok(bounded.maxBytes * (bounded.rotations + 1) <= 512 * 1024 * 1024);
 });
 
 test('logger treats rotation failure as a failed write until rotation recovers', () => {
@@ -747,6 +748,41 @@ test('logger refuses unsafe directories and multiply linked log files', () => {
     { code: 'PANEL_LOG_INITIALIZATION_FAILED' },
   );
   assert.equal(fs.readFileSync(linkedPath, 'utf8'), 'original\n');
+});
+
+test('logger secures the full rotated namespace and refuses unsafe rotation targets', () => {
+  const normalizedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-old-'));
+  const normalizedPath = path.join(normalizedDirectory, 'panel.log');
+  fs.writeFileSync(normalizedPath, 'current\n', { mode: 0o600 });
+  fs.writeFileSync(normalizedPath + '.999', 'legacy\n', { mode: 0o644 });
+  new PanelLogger({ filePath: normalizedPath, console: false, rotations: 2 });
+  assert.equal(fs.statSync(normalizedPath + '.999').mode & 0o077, 0);
+
+  for (const kind of ['hardlink', 'symlink']) {
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-unsafe-old-'));
+    const filePath = path.join(directory, 'panel.log');
+    const outsidePath = path.join(directory, 'outside');
+    fs.writeFileSync(filePath, 'current\n', { mode: 0o600 });
+    fs.writeFileSync(outsidePath, 'outside\n', { mode: 0o600 });
+    if (kind === 'hardlink') fs.linkSync(outsidePath, filePath + '.1');
+    else fs.symlinkSync(outsidePath, filePath + '.1');
+    assert.throws(
+      () => new PanelLogger({ filePath, console: false }),
+      { code: 'PANEL_LOG_INITIALIZATION_FAILED' },
+    );
+    assert.equal(fs.readFileSync(outsidePath, 'utf8'), 'outside\n');
+  }
+
+  const runtimeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-target-'));
+  const runtimePath = path.join(runtimeDirectory, 'panel.log');
+  const runtimeOutside = path.join(runtimeDirectory, 'outside');
+  const logger = new PanelLogger({ filePath: runtimePath, console: false, maxBytes: 1024, rotations: 2 });
+  fs.appendFileSync(runtimePath, 'x'.repeat(1100));
+  fs.writeFileSync(runtimeOutside, 'outside-original\n', { mode: 0o600 });
+  fs.linkSync(runtimeOutside, runtimePath + '.1');
+  logger.info('test.unsafe.rotation.target');
+  assert.equal(logger.health().healthy, false);
+  assert.equal(fs.readFileSync(runtimeOutside, 'utf8'), 'outside-original\n');
 });
 
 test('fatal stderr formatting preserves a bounded stack without exposing credentials', () => {

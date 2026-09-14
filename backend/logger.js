@@ -6,6 +6,7 @@ const { ensureDirectoryTree, assertDirectoryTree } = require('./lib/safeFs');
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const MAX_LOG_BYTES = 128 * 1024 * 1024;
 const MAX_LOG_ROTATIONS = 100;
+const MAX_LOG_TOTAL_BYTES = 512 * 1024 * 1024;
 const LOG_TAIL_BLOCK_BYTES = 64 * 1024;
 const LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024;
 const MAX_REDACTION_DEPTH = 20;
@@ -14,6 +15,7 @@ const MAX_REDACTION_ENTRIES = 512;
 const MAX_REDACTION_TEXT_CHARS = 128 * 1024;
 const MAX_REDACTION_TOTAL_CHARS = 256 * 1024;
 const MAX_LOG_ENTRY_BYTES = 256 * 1024;
+const MAX_LOG_NAMESPACE_FILES = 1000;
 const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
@@ -488,12 +490,14 @@ class PanelLogger {
       1024,
       MAX_LOG_BYTES,
     ));
-    this.rotations = Math.floor(numberFromEnv(
+    const requestedRotations = Math.floor(numberFromEnv(
       options.rotations || process.env.PANEL_LOG_ROTATIONS,
       5,
       1,
       MAX_LOG_ROTATIONS,
     ));
+    const retainedRotationLimit = Math.max(1, Math.floor(MAX_LOG_TOTAL_BYTES / this.maxBytes) - 1);
+    this.rotations = Math.min(requestedRotations, retainedRotationLimit);
     const consoleValue = options.console === undefined
       ? process.env.PANEL_LOG_CONSOLE ?? '1'
       : options.console;
@@ -529,16 +533,8 @@ class PanelLogger {
         ino: directoryStat.ino,
       };
       pinnedDirectory = this.openPinnedDirectory();
-      const pinnedFilePath = this.filePathIn(pinnedDirectory);
-      let fileStat;
-      try { fileStat = fs.lstatSync(pinnedFilePath); } catch (error) {
-        if (error?.code === 'ENOENT') fileStat = null;
-        else throw error;
-      }
-      if (fileStat && (fileStat.isSymbolicLink() || !fileStat.isFile() || fileStat.nlink !== 1
-          || (currentUid !== null && fileStat.uid !== currentUid)
-          || (fileStat.mode & 0o022) !== 0)) {
-        throw new Error('日志文件必须是当前用户持有且不可被其他用户修改的普通文件');
+      if (this.validateLogNamespace(pinnedDirectory, currentUid)) {
+        this.syncPinnedDirectory(pinnedDirectory);
       }
 
       // Probe the actual destination during startup. Merely validating the
@@ -584,6 +580,67 @@ class PanelLogger {
 
   filePathIn(pinnedDirectory) {
     return path.join(pinnedDirectory.accessDirectory, path.basename(this.filePath));
+  }
+
+  validateExistingLogFile(pinnedDirectory, candidatePath, currentUid, normalizePermissions) {
+    this.assertPinnedDirectory(pinnedDirectory);
+    const pathStat = fs.lstatSync(candidatePath);
+    if (pathStat.isSymbolicLink() || !pathStat.isFile() || pathStat.nlink !== 1
+        || (currentUid !== null && pathStat.uid !== currentUid)
+        || (pathStat.mode & 0o022) !== 0) {
+      throw new Error('日志文件必须是当前用户持有且不可被其他用户修改的单链接普通文件');
+    }
+    let descriptor;
+    try {
+      const needsNormalization = normalizePermissions && (pathStat.mode & 0o077) !== 0;
+      descriptor = fs.openSync(
+        candidatePath,
+        (needsNormalization ? fs.constants.O_RDWR : fs.constants.O_RDONLY)
+          | (fs.constants.O_NOFOLLOW || 0)
+          | (fs.constants.O_NONBLOCK || 0),
+      );
+      let descriptorStat = fs.fstatSync(descriptor);
+      if (!descriptorStat.isFile() || descriptorStat.nlink !== 1
+          || descriptorStat.dev !== pathStat.dev || descriptorStat.ino !== pathStat.ino
+          || (currentUid !== null && descriptorStat.uid !== currentUid)
+          || (descriptorStat.mode & 0o022) !== 0) {
+        throw new Error('日志文件在安全校验期间发生变化');
+      }
+      if (needsNormalization) {
+        fs.fchmodSync(descriptor, 0o600);
+        fs.fsyncSync(descriptor);
+        descriptorStat = fs.fstatSync(descriptor);
+      }
+      if ((descriptorStat.mode & 0o077) !== 0) {
+        throw new Error('日志文件权限必须不宽于 0600');
+      }
+      return needsNormalization;
+    } finally {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+    }
+  }
+
+  validateLogNamespace(pinnedDirectory, currentUid) {
+    this.assertPinnedDirectory(pinnedDirectory);
+    const baseName = path.basename(this.filePath);
+    const names = fs.readdirSync(pinnedDirectory.accessDirectory)
+      .filter((name) => name === baseName
+        || (name.startsWith(baseName + '.') && /^\d+$/.test(name.slice(baseName.length + 1))));
+    if (names.length > MAX_LOG_NAMESPACE_FILES) {
+      throw new Error('日志轮转文件数量超过安全上限');
+    }
+    let permissionsChanged = false;
+    for (const name of names) {
+      permissionsChanged = this.validateExistingLogFile(
+        pinnedDirectory,
+        path.join(pinnedDirectory.accessDirectory, name),
+        currentUid,
+        true,
+      ) || permissionsChanged;
+    }
+    return permissionsChanged;
   }
 
   assertPinnedDirectory(pinnedDirectory) {
@@ -659,7 +716,7 @@ class PanelLogger {
       const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
       if (!stat.isFile() || stat.nlink !== 1
           || (currentUid !== null && stat.uid !== currentUid)
-          || (stat.mode & 0o022) !== 0) {
+          || (stat.mode & 0o077) !== 0) {
         throw new Error('日志文件必须是当前用户持有且不可被其他用户修改的普通文件');
       }
       return descriptor;
@@ -796,6 +853,8 @@ class PanelLogger {
     if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
       throw new Error('日志轮转源必须是普通文件');
     }
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    this.validateExistingLogFile(pinnedDirectory, currentPath, currentUid, false);
     if (fileStat.size + nextBytes <= this.maxBytes) return false;
     let directoryChanged = false;
     try {
@@ -808,17 +867,13 @@ class PanelLogger {
           else throw error;
         }
         if (!fromStat) continue;
-        if (fromStat.isSymbolicLink() || !fromStat.isFile()) {
-          throw new Error('日志轮转源必须是普通文件');
-        }
+        this.validateExistingLogFile(pinnedDirectory, from, currentUid, false);
         let toStat;
         try { toStat = fs.lstatSync(to); } catch (error) {
           if (error?.code === 'ENOENT') toStat = null;
           else throw error;
         }
-        if (toStat && (toStat.isSymbolicLink() || !toStat.isFile())) {
-          throw new Error('日志轮转目标必须是普通文件');
-        }
+        if (toStat) this.validateExistingLogFile(pinnedDirectory, to, currentUid, false);
         fs.renameSync(from, to);
         directoryChanged = true;
       }
@@ -828,9 +883,7 @@ class PanelLogger {
         if (error?.code === 'ENOENT') targetStat = null;
         else throw error;
       }
-      if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
-        throw new Error('日志轮转目标必须是普通文件');
-      }
+      if (targetStat) this.validateExistingLogFile(pinnedDirectory, target, currentUid, false);
       fs.renameSync(currentPath, target);
       directoryChanged = true;
       return true;
@@ -952,7 +1005,7 @@ class PanelLogger {
       const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
       if (!descriptorStat.isFile() || descriptorStat.nlink !== 1
           || (currentUid !== null && descriptorStat.uid !== currentUid)
-          || (descriptorStat.mode & 0o022) !== 0) return [];
+          || (descriptorStat.mode & 0o077) !== 0) return [];
       try {
         if (fs.realpathSync('/proc/self/fd/' + descriptor) !== expectedPath) return [];
       } catch {
