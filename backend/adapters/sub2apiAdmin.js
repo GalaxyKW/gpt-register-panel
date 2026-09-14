@@ -577,7 +577,7 @@ function firstOwnValue(object, keys) {
 }
 
 function normalizeUsageStats(stats) {
-  if (!stats || typeof stats !== 'object') return null;
+  if (!isPlainObject(stats)) return null;
   const knownKeys = [
     'requests', 'total_requests', 'tokens', 'total_tokens', 'input_tokens',
     'total_input_tokens', 'output_tokens', 'total_output_tokens', 'cost',
@@ -604,7 +604,7 @@ function normalizeUsageStats(stats) {
 }
 
 function normalizeTableUsageStats(value) {
-  if (!value || typeof value !== 'object') return null;
+  if (!isPlainObject(value)) return null;
   const historical = normalizeUsageStats(value.historical || value.history || value.historical_usage);
   const current = normalizeUsageStats(value.current || value.today || value.current_usage);
   if (!historical && !current) return null;
@@ -836,6 +836,12 @@ function isEventStreamResponse(response) {
   return contentType === 'text/event-stream';
 }
 
+function isJsonResponse(response) {
+  const contentType = responseContentType(response).split(';', 1)[0].trim().toLowerCase();
+  return contentType === 'application/json'
+    || /^application\/[a-z0-9!#$&^_.+-]+\+json$/.test(contentType);
+}
+
 function isSuccessfulHttpResponse(response) {
   const status = Number(response?.status);
   return response?.ok === true
@@ -923,15 +929,62 @@ function requiredIdempotencyKey(value) {
   return value;
 }
 
+function configuredCredential(value) {
+  let text;
+  try {
+    text = String(value ?? '');
+  } catch {
+    text = '';
+  }
+  if (!text) return '';
+  // Sub2API API keys and compact JWTs are visible ASCII. Reject whitespace,
+  // controls, obs-text, and Unicode before they reach Headers/fetch, whose
+  // conversion errors are implementation-defined and may reflect input.
+  if (text.length > 16 * 1024 || !/^[\x21-\x7e]+$/.test(text)) {
+    const error = new Error('Sub2API 管理凭据格式无效');
+    error.code = 'SUB2API_CREDENTIAL_INVALID';
+    throw error;
+  }
+  return text;
+}
+
+function safeTransportErrorDetail(value, credentials = []) {
+  let text;
+  try {
+    text = String(value?.message || value || '');
+  } catch {
+    text = '';
+  }
+  // Keep exact credential replacement bounded even when a transport shim
+  // constructs an unusually large exception string.
+  text = text.slice(0, 8192);
+  for (const credential of credentials) {
+    if (credential) text = text.split(credential).join('[redacted]');
+  }
+  return safeRemoteText(text);
+}
+
+function statsSchemaError(message = 'Sub2API 账号统计响应结构无效') {
+  const error = new Error(message);
+  error.code = 'SUB2API_STATS_SCHEMA_INVALID';
+  return error;
+}
+
+function canonicalBatchAccountId(rawId, allowed) {
+  if (!/^[1-9]\d*$/.test(rawId)) return null;
+  const id = Number(rawId);
+  return Number.isSafeInteger(id) && allowed.has(id) ? id : null;
+}
+
 class Sub2ApiAdminClient {
   constructor(options = {}) {
     this.baseUrl = String(
       options.baseUrl || process.env.SUB2API_BASE_URL || '',
     ).replace(/\/$/, '');
-    this.apiKey = String(
+    this.apiKey = configuredCredential(
       options.apiKey || process.env.SUB2API_ADMIN_API_KEY || '',
     );
-    this.jwt = String(
+    this.jwt = configuredCredential(
       options.jwt || process.env.SUB2API_JWT || '',
     );
     this.timeoutMs = boundedTimeout(
@@ -1032,11 +1085,18 @@ class Sub2ApiAdminClient {
         // Admin calls must never silently follow a redirect to another host.
         redirect: 'error',
       });
+      if (!isJsonResponse(response)) {
+        throw requestFailure(
+          'SUB2API_RESPONSE_CONTENT_TYPE_INVALID',
+          'Sub2API 返回的响应类型不是 JSON：' + method + ' ' + pathname,
+        );
+      }
       // Keep the timeout active while consuming the response body too. A
       // server can accept the request and then stall before sending JSON.
       text = await readResponseTextWithLimit(
         response,
         requestOptions.maxResponseBytes || this.maxResponseBytes,
+        { fatalUtf8: true },
       );
     } catch (error) {
       let failure;
@@ -1053,11 +1113,17 @@ class Sub2ApiAdminClient {
       } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
         failure = error;
         reason = 'response_too_large';
+      } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
+        failure = error;
+        reason = 'invalid_utf8';
+      } else if (error?.code === 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID') {
+        failure = error;
+        reason = 'invalid_content_type';
       } else if (error?.code === 'SUB2API_REQUEST_SERIALIZATION_FAILED') {
         failure = error;
         reason = 'request_validation';
       } else {
-        const safeDetail = safeRemoteText(error?.message || error);
+        const safeDetail = safeTransportErrorDetail(error, [this.apiKey, this.jwt]);
         failure = requestFailure(
           'SUB2API_TRANSPORT_ERROR',
           'Sub2API request failed: ' + method + ' ' + pathname + ': ' + safeDetail,
@@ -1615,17 +1681,19 @@ class Sub2ApiAdminClient {
     const value = await this.request('POST', '/api/v1/admin/accounts/today-stats/batch', {
       account_ids: requestedIds,
     });
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      const error = new Error('Sub2API 当期统计响应结构无效');
-      error.code = 'SUB2API_STATS_SCHEMA_INVALID';
-      throw error;
+    if (!isPlainObject(value) || !hasOwn(value, 'stats') || !isPlainObject(value.stats)) {
+      throw statsSchemaError('Sub2API 当期统计响应结构无效');
     }
     const allowed = new Set(requestedIds);
     const normalized = Object.create(null);
-    for (const [rawId, item] of Object.entries(value)) {
-      const id = Number(rawId);
-      if (!Number.isSafeInteger(id) || id <= 0 || !allowed.has(id)) continue;
-      normalized[String(id)] = normalizeUsageStats(item);
+    for (const [rawId, item] of Object.entries(value.stats)) {
+      const id = canonicalBatchAccountId(rawId, allowed);
+      const stats = normalizeUsageStats(item);
+      if (!id || !stats) throw statsSchemaError('Sub2API 当期统计响应结构无效');
+      normalized[String(id)] = stats;
+    }
+    if (Object.keys(normalized).length !== requestedIds.length) {
+      throw statsSchemaError('Sub2API 当期统计响应不完整');
     }
     return normalized;
   }
@@ -1638,26 +1706,34 @@ class Sub2ApiAdminClient {
       { account_ids: requestedIds },
       { signal: options.signal },
     );
-    if (!value || typeof value !== 'object' || Array.isArray(value)) {
-      const error = new Error('Sub2API 账号统计响应结构无效');
-      error.code = 'SUB2API_STATS_SCHEMA_INVALID';
-      throw error;
+    if (!isPlainObject(value)
+        || !hasOwn(value, 'stats')
+        || !isPlainObject(value.stats)
+        || !hasOwn(value, 'errors')
+        || !isPlainObject(value.errors)) {
+      throw statsSchemaError();
     }
-    const stats = value?.stats && typeof value.stats === 'object' ? value.stats : value;
     const allowed = new Set(requestedIds);
     const normalized = Object.create(null);
-    for (const [rawId, item] of Object.entries(stats || {})) {
-      const id = Number(rawId);
-      if (!Number.isSafeInteger(id) || id <= 0 || !allowed.has(id)) continue;
-      normalized[String(id)] = normalizeTableUsageStats(item);
+    for (const [rawId, item] of Object.entries(value.stats)) {
+      const id = canonicalBatchAccountId(rawId, allowed);
+      const stats = normalizeTableUsageStats(item);
+      if (!id || !stats) throw statsSchemaError();
+      normalized[String(id)] = stats;
     }
     const errors = Object.create(null);
-    if (value?.errors && typeof value.errors === 'object' && !Array.isArray(value.errors)) {
-      for (const [rawId, error] of Object.entries(value.errors)) {
-        const id = Number(rawId);
-        if (!Number.isSafeInteger(id) || id <= 0 || !allowed.has(id)) continue;
-        errors[String(id)] = safeRemoteText(error);
+    for (const [rawId, remoteError] of Object.entries(value.errors)) {
+      const id = canonicalBatchAccountId(rawId, allowed);
+      if (!id
+          || hasOwn(normalized, String(id))
+          || typeof remoteError !== 'string'
+          || !remoteError.trim()) {
+        throw statsSchemaError();
       }
+      errors[String(id)] = safeRemoteText(remoteError);
+    }
+    if (Object.keys(normalized).length + Object.keys(errors).length !== requestedIds.length) {
+      throw statsSchemaError('Sub2API 账号统计响应不完整');
     }
     return {
       stats: normalized,

@@ -1858,6 +1858,7 @@ test('Sub2API request errors are redacted before leaving the adapter', async () 
       ok: false,
       status: 400,
       statusText: 'Bad Request',
+      headers: new Headers({ 'content-type': 'application/json' }),
       body: null,
       async text() {
         return JSON.stringify({
@@ -1885,6 +1886,88 @@ test('Sub2API request errors are redacted before leaving the adapter', async () 
   }
 });
 
+test('Sub2API credentials reject control characters before fetch and never echo configured values', async () => {
+  const originalFetch = global.fetch;
+  let fetchCalls = 0;
+  global.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('fetch must not run');
+  };
+  try {
+    for (const credentials of [
+      { apiKey: 'prefix\r\ncredential-control-marker' },
+      { apiKey: '', jwt: 'prefix\u0000credential-control-marker' },
+      { apiKey: 'prefix credential-control-marker' },
+      { apiKey: '', jwt: 'prefix\u0085credential-control-marker' },
+    ]) {
+      assert.throws(
+        () => new Sub2ApiAdminClient({
+          baseUrl: 'http://127.0.0.1:8080',
+          ...credentials,
+        }),
+        (error) => error.code === 'SUB2API_CREDENTIAL_INVALID'
+          && !error.message.includes('credential-control-marker'),
+      );
+    }
+    assert.equal(fetchCalls, 0);
+
+    const opaqueCredential = 'plainOpaqueValue123456789';
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: opaqueCredential,
+    });
+    global.fetch = async () => {
+      throw new Error('transport reflected ' + opaqueCredential);
+    };
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts/1'),
+      (error) => error.code === 'SUB2API_TRANSPORT_ERROR'
+        && !error.message.includes(opaqueCredential),
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API JSON requests require a JSON media type and fatal UTF-8 decoding', async () => {
+  const originalFetch = global.fetch;
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+  });
+  try {
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      statusText: 'OK',
+      headers: new Headers({ 'content-type': 'text/html' }),
+      body: null,
+      async text() { return '{"code":0,"data":{}}'; },
+    });
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID',
+    );
+
+    global.fetch = async () => new Response(
+      Uint8Array.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]),
+      { status: 200, headers: { 'content-type': 'application/json' } },
+    );
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_RESPONSE_UTF8_INVALID',
+    );
+
+    global.fetch = async () => new Response(
+      JSON.stringify({ code: 0, data: { accepted: true } }),
+      { status: 200, headers: { 'content-type': 'application/problem+json; charset=utf-8' } },
+    );
+    assert.deepEqual(await client.request('GET', '/api/v1/admin/accounts'), { accepted: true });
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API Codex imports require a bounded printable idempotency key only', async () => {
   const originalFetch = global.fetch;
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
@@ -1899,6 +1982,7 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
         ok: true,
         status: 200,
         statusText: 'OK',
+        headers: new Headers({ 'content-type': 'application/json; charset=utf-8' }),
         body: null,
         async text() {
           return JSON.stringify({
@@ -1958,6 +2042,7 @@ test('Sub2API write requests distinguish pre-dispatch failures from unknown remo
     ok: true,
     status: 200,
     statusText: 'OK',
+    headers: new Headers({ 'content-type': 'application/json' }),
     body: null,
     async text() { return text; },
     ...overrides,
@@ -1988,6 +2073,22 @@ test('Sub2API write requests distinguish pre-dispatch failures from unknown remo
         code: 'SUB2API_RESPONSE_TOO_LARGE',
         reason: 'response_too_large',
         fetch: async () => response('x'.repeat(1025)),
+      },
+      {
+        code: 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID',
+        reason: 'invalid_content_type',
+        fetch: async () => response(
+          JSON.stringify({ code: 0, data: {} }),
+          { headers: new Headers({ 'content-type': 'text/plain' }) },
+        ),
+      },
+      {
+        code: 'SUB2API_RESPONSE_UTF8_INVALID',
+        reason: 'invalid_utf8',
+        fetch: async () => new Response(
+          Uint8Array.from([0x7b, 0x22, 0x78, 0x22, 0x3a, 0x22, 0xc3, 0x28, 0x22, 0x7d]),
+          { status: 200, headers: { 'content-type': 'application/json' } },
+        ),
       },
       {
         code: 'SUB2API_REQUEST_REJECTED',
@@ -2140,23 +2241,79 @@ test('Sub2API strict postflight listings require a total on every page', async (
   }), []);
 });
 
-test('Sub2API batch-stat errors leave the adapter only after redaction', async () => {
+test('Sub2API batch-stat envelopes are complete and errors leave only after redaction', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
-  client.request = async () => JSON.parse(
-    '{"stats":{"1":{"historical":{"requests":1}},"2":{"historical":{"requests":99}},'
-      + '"__proto__":{"historical":{"requests":100}}},'
-      + '"errors":{"1":{"message":"Bearer stats.header.value access_token=stats-access-value"},'
-      + '"2":"unexpected-account-error","__proto__":"prototype-error"}}',
-  );
-  const result = await client.getBatchTableUsageStats([1]);
-  assert.equal(result.errors['1'].includes('stats.header.value'), false);
-  assert.equal(result.errors['1'].includes('stats-access-value'), false);
+  client.request = async () => ({
+    stats: { 1: { historical: { requests: 1 } } },
+    errors: { 2: 'Bearer stats.header.value access_token=stats-access-value' },
+  });
+  const result = await client.getBatchTableUsageStats([1, 2]);
+  assert.equal(result.errors['2'].includes('stats.header.value'), false);
+  assert.equal(result.errors['2'].includes('stats-access-value'), false);
   assert.deepEqual(Object.keys(result.stats), ['1']);
-  assert.deepEqual(Object.keys(result.errors), ['1']);
+  assert.deepEqual(Object.keys(result.errors), ['2']);
   assert.equal(Object.getPrototypeOf(result.stats), null);
   assert.equal(Object.getPrototypeOf(result.errors), null);
   assert.equal(result.stats.__proto__, undefined);
   assert.equal(result.errors.__proto__, undefined);
+});
+
+test('Sub2API today-stat batches require the canonical complete stats envelope', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  client.request = async () => ({
+    stats: {
+      1: { requests: 0, tokens: 0, cost: 0 },
+      2: { requests: 2, tokens: 3, cost: 0.1 },
+    },
+  });
+  const result = await client.getBatchTodayStats([1, 2]);
+  assert.deepEqual(Object.keys(result), ['1', '2']);
+  assert.equal(result['1'].requests, 0);
+  assert.equal(result['2'].totalTokens, 3);
+
+  for (const malformed of [
+    {},
+    { stats: [] },
+    { stats: { 1: { requests: 1 } } },
+    { stats: { 1: { requests: 1 }, 2: [] } },
+    { stats: { 1: { requests: 1 }, 2: { requests: 2 }, 3: { requests: 3 } } },
+    { 1: { requests: 1 }, 2: { requests: 2 } },
+  ]) {
+    client.request = async () => malformed;
+    await assert.rejects(
+      client.getBatchTodayStats([1, 2]),
+      (error) => error.code === 'SUB2API_STATS_SCHEMA_INVALID',
+    );
+  }
+});
+
+test('Sub2API table-stat batches reject malformed, overlapping, and incomplete results', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  for (const malformed of [
+    {},
+    { stats: {}, errors: [] },
+    { stats: [], errors: {} },
+    { stats: { 1: { historical: { requests: 1 } } }, errors: {} },
+    {
+      stats: { 1: { historical: { requests: 1 } } },
+      errors: { 1: 'overlap', 2: 'failed' },
+    },
+    {
+      stats: { 1: { historical: { requests: 1 } }, 3: { historical: { requests: 3 } } },
+      errors: { 2: 'failed' },
+    },
+    {
+      stats: { 1: { historical: { requests: 1 } } },
+      errors: { 2: { message: 'not the server string contract' } },
+    },
+    { stats: { 1: [] }, errors: { 2: 'failed' } },
+  ]) {
+    client.request = async () => malformed;
+    await assert.rejects(
+      client.getBatchTableUsageStats([1, 2]),
+      (error) => error.code === 'SUB2API_STATS_SCHEMA_INVALID',
+    );
+  }
 });
 
 test('Sub2API timeouts are hard-bounded and request serialization clears its timer', async () => {
