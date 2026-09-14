@@ -10,6 +10,8 @@ const { PanelDb } = require('../backend/db');
 const {
   buildImportPlan,
   buildOAuthUpdatePayload,
+  buildCodexSessionDocument,
+  buildCodexImportIdempotencyKey,
   collectCandidates,
   executeImportPlanItem,
   importPlanSummary,
@@ -1089,6 +1091,68 @@ function syntheticToken(relativePath, identityKeys, options = {}) {
   };
 }
 
+test('Codex create documents use the current expiry field and deterministic secret-free keys', () => {
+  const accessSecret = 'access-secret-must-not-enter-header';
+  const refreshSecret = 'refresh-secret-must-not-enter-header';
+  const source = syntheticToken(
+    'tokens/idempotent.json',
+    ['user:idempotent-user', 'account:idempotent-account', 'email:hidden@example.test'],
+    {
+      accountId: 'idempotent-account',
+      userId: 'idempotent-user',
+      email: 'hidden@example.test',
+      accessToken: accessSecret,
+      refreshToken: refreshSecret,
+      accessFingerprint: 'access-fingerprint-a',
+      refreshFingerprint: 'refresh-fingerprint-a',
+      expiresAt: '2099-02-03T04:05:06.000Z',
+    },
+  );
+  source.contentHash = '1'.repeat(64);
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const document = buildCodexSessionDocument(item);
+  assert.equal(document.expires_at, '2099-02-03T04:05:06.000Z');
+  assert.equal(Object.hasOwn(document, 'expired'), false);
+
+  const context = { jobId: 'durable-job-123' };
+  const first = buildCodexImportIdempotencyKey(item, context);
+  const retry = buildCodexImportIdempotencyKey(item, { ...context });
+  assert.equal(first, retry);
+  assert.equal(buildCodexImportIdempotencyKey({
+    ...item,
+    sourceIdentityKeys: [
+      'email:changed-but-not-authoritative@example.test',
+      'account:idempotent-account',
+      'user:idempotent-user',
+    ],
+  }, context), first);
+  assert.match(first, /^gptreg-create-v1-[a-f0-9]{64}$/);
+  assert.equal(first.length <= 128, true);
+  assert.match(first, /^[\x21-\x7e]+$/);
+  for (const secret of [accessSecret, refreshSecret, source.email, source.accountId, source.userId]) {
+    assert.equal(first.includes(secret), false);
+  }
+
+  const changedCredential = {
+    ...item,
+    _record: { ...item._record, contentHash: '2'.repeat(64) },
+  };
+  assert.notEqual(buildCodexImportIdempotencyKey(changedCredential, context), first);
+  assert.notEqual(buildCodexImportIdempotencyKey(
+    { ...item, accountName: 'free09999' },
+    context,
+  ), first);
+  assert.notEqual(buildCodexImportIdempotencyKey(
+    { ...item, relativePath: 'tokens/another.json' },
+    context,
+  ), first);
+  assert.notEqual(buildCodexImportIdempotencyKey({
+    ...item,
+    sourceIdentityKeys: ['account:another-account', 'user:idempotent-user'],
+  }, context), first);
+  assert.notEqual(buildCodexImportIdempotencyKey(item, { jobId: 'another-job' }), first);
+});
+
 test('candidate grouping merges partial versions but keeps different workspace users separate', () => {
   const complete = syntheticToken(
     'tokens/complete.json',
@@ -1810,11 +1874,34 @@ test('create verification consumes the nested Codex import account ID', async ()
   source.raw.unknown = { credential: 'nested-unknown-value' };
   let genericCalls = 0;
   let importPayload = null;
+  let importOptions = null;
+  let listCalls = 0;
+  const createdAccount = {
+    id: 42,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  };
   const client = {
-    async listAccounts() { return []; },
-    async importCodexSession(payload) {
+    async listAccounts(options) {
+      listCalls += 1;
+      if (listCalls > 1) {
+        assert.equal(options.sortBy, 'id');
+        assert.equal(options.sortOrder, 'asc');
+        assert.equal(Object.hasOwn(options, 'platform'), false);
+        assert.equal(Object.hasOwn(options, 'type'), false);
+      }
+      return listCalls === 1 ? [] : [createdAccount];
+    },
+    async importCodexSession(payload, options) {
       genericCalls += 1;
       importPayload = payload;
+      importOptions = options;
       return {
         total: 1,
         created: 1,
@@ -1826,26 +1913,28 @@ test('create verification consumes the nested Codex import account ID', async ()
     },
     async getAccount(id) {
       assert.equal(id, 42);
-      return {
-        id,
-        name: item.accountName,
-        platform: 'openai',
-        type: 'oauth',
-        status: 'active',
-        schedulable: true,
-        identityKeys,
-        tokenFingerprints: { ...source.fingerprints },
-        credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
-      };
+      return createdAccount;
     },
     async applyOAuthCredentials() { throw new Error('create must not use ID-scoped update'); },
   };
-  const outcome = await executeImportPlanItem({ client, item, groups: [3] });
+  const outcome = await executeImportPlanItem({
+    client,
+    item,
+    groups: [3],
+    context: { jobId: 'create-verification-job' },
+  });
   assert.equal(genericCalls, 1);
+  assert.equal(listCalls, 2);
   assert.equal(importPayload.update_existing, false);
   assert.equal(importPayload.content.includes('nested-import-value'), false);
   assert.equal(importPayload.content.includes('nested-unknown-value'), false);
+  const importDocument = JSON.parse(importPayload.content);
+  assert.equal(importDocument.expires_at, source.expiresAt);
+  assert.equal(Object.hasOwn(importDocument, 'expired'), false);
   assert.match(importPayload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
+  assert.match(importOptions.idempotencyKey, /^gptreg-create-v1-[a-f0-9]{64}$/);
+  assert.equal(importOptions.idempotencyKey.includes(source.raw.access_token), false);
+  assert.equal(importOptions.idempotencyKey.includes(source.raw.refresh_token), false);
   assert.equal(outcome.result.accountId, 42);
   assert.equal(outcome.verification.accountId, 42);
 
@@ -1923,6 +2012,182 @@ test('create verification consumes the nested Codex import account ID', async ()
     }),
     (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH',
   );
+});
+
+test('create postflight fails closed on a concurrent duplicate strong identity', async () => {
+  const identityKeys = ['account:race-account', 'user:race-user'];
+  const source = syntheticToken('tokens/race-identity.json', identityKeys, {
+    accountId: 'race-account',
+    userId: 'race-user',
+    accessFingerprint: 'race-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const created = {
+    id: 51,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  let listCalls = 0;
+  let importCalls = 0;
+  let deletionCalls = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      context: { jobId: 'identity-race-job' },
+      client: {
+        async listAccounts() {
+          listCalls += 1;
+          return listCalls === 1
+            ? []
+            : [created, { ...created, id: 52, name: 'free00052' }];
+        },
+        async importCodexSession(payload, options) {
+          importCalls += 1;
+          assert.equal(payload.update_existing, false);
+          assert.match(options.idempotencyKey, /^gptreg-create-v1-/);
+          return {
+            total: 1,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 51 }],
+          };
+        },
+        async getAccount() { return created; },
+        async deleteAccount() { deletionCalls += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_CREATE_RACE_IDENTITY_CONFLICT',
+  );
+  assert.equal(listCalls, 2);
+  assert.equal(importCalls, 1);
+  assert.equal(deletionCalls, 0);
+});
+
+test('create postflight fails closed when the allocated free name is no longer unique', async () => {
+  const identityKeys = ['account:name-race-account', 'user:name-race-user'];
+  const source = syntheticToken('tokens/race-name.json', identityKeys, {
+    accountId: 'name-race-account',
+    userId: 'name-race-user',
+    accessFingerprint: 'name-race-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const created = {
+    id: 61,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  let listCalls = 0;
+  let importCalls = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      context: { jobId: 'name-race-job' },
+      client: {
+        async listAccounts() {
+          listCalls += 1;
+          return listCalls === 1
+            ? []
+            : [
+                created,
+                {
+                  ...created,
+                  id: 62,
+                  platform: 'anthropic',
+                  type: 'apikey',
+                  identityKeys: ['account:unrelated-account', 'user:unrelated-user'],
+                },
+              ];
+        },
+        async importCodexSession() {
+          importCalls += 1;
+          return {
+            total: 1,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 61 }],
+          };
+        },
+        async getAccount() { return created; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_CREATE_RACE_NAME_CONFLICT',
+  );
+  assert.equal(listCalls, 2);
+  assert.equal(importCalls, 1);
+});
+
+test('create verification rejects malformed or non-OpenAI OAuth target rows', async () => {
+  const identityKeys = ['account:kind-account', 'user:kind-user'];
+  const source = syntheticToken('tokens/create-kind.json', identityKeys, {
+    accountId: 'kind-account',
+    userId: 'kind-user',
+    accessFingerprint: 'kind-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const baseAccount = {
+    id: 71,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  for (const { replacement, expectedCode } of [
+    {
+      replacement: { ...baseAccount, type: 'apikey' },
+      expectedCode: 'SUB2API_TARGET_KIND_MISMATCH',
+    },
+    {
+      replacement: { ...baseAccount, schemaValid: false },
+      expectedCode: 'SUB2API_TARGET_SCHEMA_INVALID',
+    },
+  ]) {
+    let listCalls = 0;
+    let importCalls = 0;
+    await assert.rejects(
+      executeImportPlanItem({
+        item,
+        context: { jobId: 'create-target-schema-job-' + expectedCode },
+        client: {
+          async listAccounts() {
+            listCalls += 1;
+            return [];
+          },
+          async importCodexSession() {
+            importCalls += 1;
+            return {
+              total: 1,
+              created: 1,
+              updated: 0,
+              skipped: 0,
+              failed: 0,
+              items: [{ index: 0, action: 'created', account_id: 71 }],
+            };
+          },
+          async getAccount() { return replacement; },
+        },
+      }),
+      (error) => error.code === expectedCode,
+    );
+    assert.equal(listCalls, 1);
+    assert.equal(importCalls, 1);
+  }
 });
 
 test('credential backups require a private directory and enforce file retention', () => {

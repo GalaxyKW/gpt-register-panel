@@ -887,6 +887,72 @@ test('Sub2API request errors are redacted before leaving the adapter', async () 
   }
 });
 
+test('Sub2API Codex imports require a bounded printable idempotency key only', async () => {
+  const originalFetch = global.fetch;
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  let fetchCalls = 0;
+  let capturedHeaders = null;
+  try {
+    global.fetch = async (url, options) => {
+      fetchCalls += 1;
+      assert.equal(url, 'http://127.0.0.1:8080/api/v1/admin/accounts/import/codex-session');
+      capturedHeaders = options.headers;
+      return {
+        ok: true,
+        status: 200,
+        statusText: 'OK',
+        body: null,
+        async text() {
+          return JSON.stringify({
+            success: true,
+            data: {
+              total: 1,
+              created: 1,
+              updated: 0,
+              skipped: 0,
+              failed: 0,
+              items: [{ action: 'created', account_id: 41 }],
+            },
+          });
+        },
+      };
+    };
+
+    await assert.rejects(
+      client.importCodexSession({ content: '{}' }),
+      (error) => error.code === 'SUB2API_IDEMPOTENCY_KEY_INVALID',
+    );
+    for (const idempotencyKey of [
+      '',
+      'contains space',
+      'contains\nnewline',
+      '不是-ascii',
+      'x'.repeat(129),
+    ]) {
+      await assert.rejects(
+        client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+        (error) => error.code === 'SUB2API_IDEMPOTENCY_KEY_INVALID',
+      );
+    }
+    assert.equal(fetchCalls, 0);
+
+    const idempotencyKey = 'gptreg-create-v1-' + 'a'.repeat(64);
+    const result = await client.importCodexSession(
+      { content: '{}' },
+      {
+        idempotencyKey,
+        headers: { 'x-untrusted-header': 'must-not-cross-boundary' },
+      },
+    );
+    assert.equal(result.created, 1);
+    assert.equal(fetchCalls, 1);
+    assert.equal(capturedHeaders['Idempotency-Key'], idempotencyKey);
+    assert.equal(Object.hasOwn(capturedHeaders, 'x-untrusted-header'), false);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API batch-stat errors leave the adapter only after redaction', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
   client.request = async () => JSON.parse(

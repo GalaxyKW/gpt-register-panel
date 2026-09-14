@@ -949,7 +949,9 @@ async function verifyImportedAccount(client, item, result, logger, context = {})
     ? await client.getAccount(reportedId)
     : null;
   if (!account) {
-    const accounts = await client.listAccounts({ platform: 'openai', type: 'oauth', pageSize: 200 });
+    const accounts = await client.listAccounts({
+      platform: 'openai', type: 'oauth', pageSize: 200, sortBy: 'id', sortOrder: 'asc',
+    });
     const matches = accounts.filter((candidate) => identitiesStronglyCompatible(
       item.sourceIdentityKeys?.length ? item.sourceIdentityKeys : item._account?.identityKeys || [item.identityKey],
       candidate.identityKeys || accountKeys(candidate),
@@ -961,6 +963,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {})
     }
     account = matches[0];
   }
+  verifyTargetIdentity(item, account, reportedId);
   const expectedIdentity = item.sourceIdentityKeys?.length
     ? item.sourceIdentityKeys
     : item._account?.identityKeys || [item.identityKey];
@@ -971,6 +974,28 @@ async function verifyImportedAccount(client, item, result, logger, context = {})
     throw error;
   }
   const actualFingerprint = verifyTargetFingerprint(item, account);
+  // update_existing=false is not a create-only compare-and-swap in Sub2API:
+  // a matching account that appears after its initial list can still race with
+  // CreateAccount. Re-list every account type after the write and fail closed
+  // unless both the strong identity and allocated free name resolve uniquely
+  // to the reported row. Do not attempt an unsafe automatic rollback or
+  // deletion here.
+  const accounts = await client.listAccounts({ pageSize: 200, sortBy: 'id', sortOrder: 'asc' });
+  const identityMatches = accountMatches({ sourceIdentityKeys: expectedIdentity }, accounts);
+  if (identityMatches.length !== 1 || Number(identityMatches[0]?.id) !== Number(account.id)) {
+    throw targetVerificationError(
+      '导入后发现来源强身份对应多个 Sub2API 账号',
+      'SUB2API_CREATE_RACE_IDENTITY_CONFLICT',
+    );
+  }
+  const expectedName = String(item?.accountName || '');
+  const nameMatches = accounts.filter((candidate) => String(candidate?.name || '') === expectedName);
+  if (!expectedName || nameMatches.length !== 1 || Number(nameMatches[0]?.id) !== Number(account.id)) {
+    throw targetVerificationError(
+      '导入后发现 Sub2API 账号名称发生竞态或冲突',
+      'SUB2API_CREATE_RACE_NAME_CONFLICT',
+    );
+  }
   writeLog(logger, 'info', 'import.account_verified', {
     ...context,
     accountId: account.id,
@@ -1207,10 +1232,45 @@ function buildCodexSessionDocument(item) {
     ...(credentials.email ? { email: credentials.email } : {}),
     ...(credentials.chatgpt_account_id ? { account_id: credentials.chatgpt_account_id } : {}),
     ...(credentials.chatgpt_user_id ? { user_id: credentials.chatgpt_user_id } : {}),
-    ...(credentials.expires_at ? { expired: credentials.expires_at } : {}),
+    // Current Sub2API Codex imports read expires_at. `expired` is a legacy
+    // gpt_register source field and is ignored by the import parser.
+    ...(credentials.expires_at ? { expires_at: credentials.expires_at } : {}),
     ...(credentials.last_refresh ? { last_refresh: credentials.last_refresh } : {}),
     type: 'codex',
   };
+}
+
+function buildCodexImportIdempotencyKey(item, context = {}) {
+  const contentHash = String(item?._record?.contentHash || '').toLowerCase();
+  const strongIdentity = [];
+  for (const prefix of ['account:', 'user:']) {
+    for (const value of identityValues(item?.sourceIdentityKeys || [], prefix)) {
+      strongIdentity.push(prefix + value);
+    }
+  }
+  strongIdentity.sort((left, right) => left.localeCompare(right, 'en'));
+  const material = {
+    jobId: String(context?.jobId || ''),
+    action: 'create',
+    sourceIdentityKeys: strongIdentity,
+    sourceContentHash: /^[a-f0-9]{64}$/.test(contentHash) ? contentHash : '',
+    // Real filesystem records always carry contentHash. The fingerprint-only
+    // fallback keeps direct/test callers deterministic without ever placing a
+    // credential in the seed or header.
+    fallbackFingerprints: /^[a-f0-9]{64}$/.test(contentHash)
+      ? []
+      : [item?.fingerprints?.access || '', item?.fingerprints?.refresh || ''],
+    relativePath: String(item?.relativePath || ''),
+    targetName: String(item?.accountName || ''),
+  };
+  const digest = crypto.createHash('sha256')
+    .update('gpt-register-panel/create/v1\n')
+    .update(JSON.stringify(material))
+    .digest('hex');
+  // Printable ASCII, 81 bytes. The key contains only a domain label and a
+  // one-way digest; raw tokens, identities and account names never cross the
+  // HTTP header or logs through this value.
+  return 'gptreg-create-v1-' + digest;
 }
 
 function canonicalIdentitySet(keys = []) {
@@ -1425,7 +1485,9 @@ async function executeImportPlanItem({
     skip_default_group_bind: false,
     confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
   };
-  const rawResult = await client.importCodexSession(payload);
+  const rawResult = await client.importCodexSession(payload, {
+    idempotencyKey: buildCodexImportIdempotencyKey(writeItem, context),
+  });
   assertCreatedImportResult(rawResult, knownAccountIds);
   const verification = await verifyImportedAccount(client, item, rawResult, logger, context);
   return {
@@ -1909,6 +1971,7 @@ module.exports = {
   compareTokenRecordFreshness,
   buildOAuthUpdatePayload,
   buildCodexSessionDocument,
+  buildCodexImportIdempotencyKey,
   revalidateSourceToken,
   executeImportPlanItem,
   importResultAccountId,

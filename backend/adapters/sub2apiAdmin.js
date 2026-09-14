@@ -519,6 +519,18 @@ function interruptedRequestError(message) {
   return error;
 }
 
+function requiredIdempotencyKey(value) {
+  if (typeof value !== 'string'
+      || value.length === 0
+      || value.length > 128
+      || !/^[\x21-\x7e]+$/.test(value)) {
+    const error = new Error('Sub2API 幂等键必须是 1-128 个可打印 ASCII 字符');
+    error.code = 'SUB2API_IDEMPOTENCY_KEY_INVALID';
+    throw error;
+  }
+  return value;
+}
+
 class Sub2ApiAdminClient {
   constructor(options = {}) {
     this.baseUrl = String(
@@ -583,6 +595,12 @@ class Sub2ApiAdminClient {
     const headers = { Accept: 'application/json' };
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     else headers.Authorization = 'Bearer ' + this.jwt;
+    if (requestOptions.idempotencyKey !== undefined) {
+      // This is the only caller-controlled header supported by the generic
+      // admin request path. Do not accept a headers object here: doing so
+      // would allow credentials or hop-by-hop headers to cross this boundary.
+      headers['Idempotency-Key'] = requiredIdempotencyKey(requestOptions.idempotencyKey);
+    }
     const controller = new AbortController();
     const externalSignal = requestOptions.signal;
     let abortSource = null;
@@ -1087,8 +1105,14 @@ class Sub2ApiAdminClient {
     return value;
   }
 
-  async importCodexSession(payload) {
-    const value = await this.request('POST', '/api/v1/admin/accounts/import/codex-session', payload);
+  async importCodexSession(payload, options = {}) {
+    const idempotencyKey = requiredIdempotencyKey(options?.idempotencyKey);
+    const value = await this.request(
+      'POST',
+      '/api/v1/admin/accounts/import/codex-session',
+      payload,
+      { idempotencyKey },
+    );
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       const error = new Error('Sub2API 导入响应结构无效');
       error.code = 'SUB2API_IMPORT_SCHEMA_INVALID';
