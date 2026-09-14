@@ -541,6 +541,14 @@ function safeAccount(account) {
   const status = /^[a-z0-9_-]{1,64}$/.test(rawStatus) ? rawStatus : '';
   const statusKnown = ['active', 'disabled', 'error'].includes(status);
   const schedulableKnown = typeof account.schedulable === 'boolean';
+  const tempUnschedulableReasonPresent = Boolean(firstScalar(
+    [account.temp_unschedulable_reason, account.tempUnschedulableReason],
+    4000,
+  ));
+  const errorMessagePresent = Boolean(firstScalar(
+    [account.error_message, account.errorMessage],
+    4000,
+  ));
   return {
     id,
     name,
@@ -552,11 +560,15 @@ function safeAccount(account) {
     schedulableKnown,
     tempUnschedulableUntil: tempUnschedulable.value,
     tempUnschedulableUntilStatus: tempUnschedulable.status,
-    tempUnschedulableReason: safeRemoteText(
-      firstScalar([account.temp_unschedulable_reason, account.tempUnschedulableReason], 4000),
-      1000,
-    ),
-    errorMessage: safeRemoteText(firstScalar([account.error_message, account.errorMessage], 4000), 1000),
+    // These are arbitrary administrator-API strings, not trusted display
+    // data. Regex redaction cannot prove that an opaque value is not a
+    // credential, so preserve only the fact that a reason/error was present.
+    tempUnschedulableReason: tempUnschedulableReasonPresent
+      ? 'Sub2API 已报告暂停调度原因（详情已隐藏）'
+      : '',
+    errorMessage: errorMessagePresent
+      ? 'Sub2API 已报告账号错误（详情已隐藏）'
+      : '',
     email,
     accountId,
     userId,
@@ -993,22 +1005,6 @@ function configuredCredential(value) {
   return text;
 }
 
-function safeTransportErrorDetail(value, credentials = []) {
-  let text;
-  try {
-    text = String(value?.message || value || '');
-  } catch {
-    text = '';
-  }
-  // Keep exact credential replacement bounded even when a transport shim
-  // constructs an unusually large exception string.
-  text = text.slice(0, 8192);
-  for (const credential of credentials) {
-    if (credential) text = text.split(credential).join('[redacted]');
-  }
-  return safeRemoteText(text);
-}
-
 function statsSchemaError(message = 'Sub2API 账号统计响应结构无效') {
   const error = new Error(message);
   error.code = 'SUB2API_STATS_SCHEMA_INVALID';
@@ -1168,10 +1164,9 @@ class Sub2ApiAdminClient {
         failure = error;
         reason = 'request_validation';
       } else {
-        const safeDetail = safeTransportErrorDetail(error, [this.apiKey, this.jwt]);
         failure = requestFailure(
           'SUB2API_TRANSPORT_ERROR',
-          'Sub2API request failed: ' + method + ' ' + pathname + ': ' + safeDetail,
+          'Sub2API 管理请求传输失败：' + method + ' ' + pathname,
         );
       }
       failure = writeAwareFailure(failure, requestOptions, requestDispatched, reason);
@@ -1232,24 +1227,32 @@ class Sub2ApiAdminClient {
     const payloadCode = payload?.code ?? payload?.data?.code;
     if (!response.ok || payloadFailure
         || (payloadCode !== undefined && payloadCode !== 0 && payloadCode !== '0')) {
-      const detail = payload?.message || payload?.data?.message || payloadCode || response.statusText || 'request failed';
-      const safeDetail = safeRemoteText(detail);
+      const upstreamDetailPresent = Boolean(
+        payload?.message !== undefined
+        || payload?.data?.message !== undefined
+        || payloadCode !== undefined,
+      );
+      const upstreamStatus = Number.isSafeInteger(response.status) ? response.status : null;
       const error = writeAwareFailure(
         requestFailure(
           'SUB2API_REQUEST_REJECTED',
-          'Sub2API ' + method + ' ' + pathname + ' failed: ' + safeDetail,
+          'Sub2API ' + method + ' ' + pathname + ' 请求被上游拒绝'
+            + (upstreamStatus === null ? '' : '（HTTP ' + upstreamStatus + '）'),
         ),
         requestOptions,
         requestDispatched,
         'response_rejected',
       );
+      error.upstreamStatus = upstreamStatus;
+      error.upstreamDetailPresent = upstreamDetailPresent;
       writeLog(this.logger, 'warn', 'sub2api.request_rejected', {
         ...this.logContext,
         method,
         path: pathname,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
-        error: safeDetail,
+        error: error.message,
+        upstreamDetailPresent,
         writeOutcomeUnknown: error.writeOutcomeUnknown === true,
       });
       throw error;
@@ -1775,7 +1778,9 @@ class Sub2ApiAdminClient {
           || !remoteError.trim()) {
         throw statsSchemaError();
       }
-      errors[String(id)] = safeRemoteText(remoteError);
+      // Batch errors are arbitrary upstream strings. A fixed marker keeps the
+      // per-account failure signal without persisting or returning its body.
+      errors[String(id)] = 'Sub2API 账号统计读取失败（详情已隐藏）';
     }
     if (Object.keys(normalized).length + Object.keys(errors).length !== requestedIds.length) {
       throw statsSchemaError('Sub2API 账号统计响应不完整');

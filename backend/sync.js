@@ -51,21 +51,12 @@ function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
 }
 
-function safeRemoteError(value) {
+function safeRemoteError(value, message = 'Sub2API 已报告远程错误（详情已隐藏）') {
   if (value === undefined || value === null || value === '') return null;
-  let detail = value;
-  if (value && typeof value === 'object') {
-    const code = value.code ?? value.status ?? value.error_code ?? value.errorCode;
-    const message = value.message ?? value.error_message ?? value.errorMessage ?? value.error;
-    if (code !== undefined || message !== undefined) {
-      detail = [code === undefined ? '' : String(code), message === undefined ? '' : String(message)]
-        .filter(Boolean)
-        .join(': ');
-    } else {
-      try { detail = JSON.stringify(value); } catch { detail = '[unavailable remote error]'; }
-    }
-  }
-  return redactText(String(detail)).slice(0, 1000);
+  // Values supplied by the configured Sub2API are outside the panel trust
+  // boundary. An unlabelled opaque credential cannot be recognized reliably,
+  // so never copy the value into snapshots, task results, audit rows or logs.
+  return message;
 }
 
 function writeLog(logger, level, event, fields = {}) {
@@ -316,7 +307,10 @@ function safeAccountForSnapshot(account) {
     autoPauseOnExpired: account.autoPauseOnExpired === undefined
       ? true
       : account.autoPauseOnExpired,
-    errorMessage: safeRemoteError(account.errorMessage),
+    errorMessage: safeRemoteError(
+      account.errorMessage,
+      'Sub2API 已报告账号错误（详情已隐藏）',
+    ),
     email: account.email,
     accountId: account.accountId,
     userId: account.userId,
@@ -328,7 +322,10 @@ function safeAccountForSnapshot(account) {
     credentialPresence: account.credentialPresence,
     groupIds: account.groupIds,
     usage: account.usage || null,
-    usageError: safeRemoteError(account.usageError),
+    usageError: safeRemoteError(
+      account.usageError,
+      'Sub2API 账号统计读取失败（详情已隐藏）',
+    ),
   };
 }
 
@@ -353,14 +350,17 @@ async function readSub2ApiAccounts(client, options = {}) {
       for (const account of accounts) {
         account.usage = tableStats.stats[String(account.id)] || normalizeAccountUsage(account);
         if (tableStats.errors?.[String(account.id)]) {
-          account.usageError = safeRemoteError(tableStats.errors[String(account.id)]);
+          account.usageError = safeRemoteError(
+            tableStats.errors[String(account.id)],
+            'Sub2API 账号统计读取失败（详情已隐藏）',
+          );
         }
       }
       const failedCount = Object.keys(tableStats.errors || {}).length;
       if (failedCount > 0) statsError = failedCount + ' 个账号统计读取失败';
     } catch (error) {
       rethrowIfJobInterrupted(error, signal);
-      statsError = safeErrorMessage(error);
+      statsError = 'Sub2API 账号统计读取失败';
       for (const account of accounts) account.usage = normalizeAccountUsage(account);
     }
   }
@@ -406,7 +406,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       } catch (error) {
         rethrowIfJobInterrupted(error, signal);
         readStatus = 'failed';
-        apiError = safeErrorMessage(error);
+        apiError = 'Sub2API 管理 API 账号读取失败';
         writeLog(logger, 'warn', 'snapshot.sub2api_failed', { ...logContext, error: apiError });
       }
     }
@@ -1065,7 +1065,9 @@ async function resolveGroupIds(client, options = {}) {
   } catch (error) {
     rethrowIfJobInterrupted(error, signal);
     if (['SUB2API_GROUP_NOT_FOUND', 'SUB2API_GROUP_AMBIGUOUS'].includes(error?.code)) throw error;
-    const wrapped = new Error('读取 Sub2API 分组失败：' + safeErrorMessage(error));
+    // A client/transport exception is outside the panel trust boundary. Do
+    // not reflect its arbitrary message into a later job error or HTTP body.
+    const wrapped = new Error('读取 Sub2API 分组失败');
     wrapped.code = 'SUB2API_GROUP_RESOLVE_FAILED';
     throw wrapped;
   }
@@ -1088,7 +1090,11 @@ function safeImportResult(result) {
     ...counters,
     errorCount: Array.isArray(result.errors) ? result.errors.length : 0,
     warningCount: Array.isArray(result.warnings) ? result.warnings.length : 0,
-    message: result.message ? redactText(String(result.message)).slice(0, 500) : null,
+    // A successful response message is still arbitrary upstream free text and
+    // may contain an opaque credential. Preserve only its presence.
+    message: result.message === undefined || result.message === null || result.message === ''
+      ? null
+      : 'Sub2API 已返回导入状态（详情已隐藏）',
   };
 }
 

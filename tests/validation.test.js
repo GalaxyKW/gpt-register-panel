@@ -1209,13 +1209,14 @@ test('snapshot version changes when token or username contents change', async ()
 });
 
 test('import job result keeps only non-sensitive remote fields', () => {
+  const opaqueMessage = 'opaque-import-message-d4912e';
   const safe = safeImportResult({
     success: true,
     account_id: 12,
     created: 1,
     access_token: 'secret-access-token',
     credentials: { refresh_token: 'secret-refresh-token' },
-    message: 'done',
+    message: opaqueMessage,
   });
   assert.deepEqual(safe, {
     success: true,
@@ -1228,9 +1229,10 @@ test('import job result keeps only non-sensitive remote fields', () => {
     failed: null,
     errorCount: 0,
     warningCount: 0,
-    message: 'done',
+    message: 'Sub2API 已返回导入状态（详情已隐藏）',
   });
   assert.equal(JSON.stringify(safe).includes('secret-'), false);
+  assert.equal(JSON.stringify(safe).includes(opaqueMessage), false);
 
   const nested = safeImportResult({
     total: 1,

@@ -1640,6 +1640,8 @@ test('phase3 persists a discard disposition when the account is deactivated', as
 
 test('snapshot maps Sub2API historical and current-window stats to rows', async () => {
   const { root } = fixture();
+  const opaqueAccountError = 'opaque-snapshot-account-error-a82f41';
+  const opaqueStatsError = 'opaque-snapshot-stats-error-c3905e';
   const fakeClient = {
     async listAccounts() {
       return [{
@@ -1648,6 +1650,7 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
         platform: 'openai',
         type: 'oauth',
         status: 'active',
+        errorMessage: opaqueAccountError,
         email: 'one@example.test',
         identityKeys: ['account:a-1', 'user:u-1', 'email:one@example.test'],
         tokenFingerprints: {},
@@ -1658,7 +1661,7 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
         historical: { totalTokens: 1234, requests: 12 },
         current: { totalTokens: 55, requests: 2 },
       } }, errors: {
-        '42': { code: 'UPSTREAM', message: 'Bearer secret.header.value access_token=hidden-value' },
+        '42': { code: 'UPSTREAM', message: opaqueStatsError },
       } };
     },
   };
@@ -1671,8 +1674,35 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
   assert.equal(row.usage.historical.totalTokens, 1234);
   assert.equal(row.usage.current.totalTokens, 55);
   const account = snapshot.sub2api.accounts.find((item) => item.id === 42);
-  assert.equal(account.usageError.includes('secret.header.value'), false);
-  assert.equal(account.usageError.includes('hidden-value'), false);
+  assert.equal(account.errorMessage, 'Sub2API 已报告账号错误（详情已隐藏）');
+  assert.equal(account.usageError, 'Sub2API 账号统计读取失败（详情已隐藏）');
+  assert.equal(JSON.stringify(snapshot).includes(opaqueAccountError), false);
+  assert.equal(JSON.stringify(snapshot).includes(opaqueStatsError), false);
+});
+
+test('snapshot replaces an opaque Sub2API read failure before returning or logging it', async () => {
+  const { root } = fixture();
+  const opaqueFailure = 'opaque-snapshot-read-failure-18f7d3';
+  const records = [];
+  const logger = Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+    level,
+    (event, fields) => records.push({ level, event, fields }),
+  ]));
+  const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+    rootDirectory: root,
+    readSub2Api: true,
+    logger,
+    client: {
+      async listAccounts() {
+        throw new Error(opaqueFailure);
+      },
+    },
+  });
+
+  assert.equal(snapshot.sub2api.readStatus, 'failed');
+  assert.equal(snapshot.sub2api.apiError, 'Sub2API 管理 API 账号读取失败');
+  assert.equal(JSON.stringify(snapshot).includes(opaqueFailure), false);
+  assert.equal(JSON.stringify(records).includes(opaqueFailure), false);
 });
 
 test('import plan never updates an available Sub2API account', () => {
@@ -2533,6 +2563,13 @@ test('group resolution accepts only one exact safe match', async () => {
     await assert.rejects(
       resolveGroupIds({ async listGroups() { return [{ id: true, name: 'share' }]; } }),
       (error) => error.code === 'SUB2API_GROUP_NOT_FOUND',
+    );
+    const opaqueGroupFailure = 'opaque-group-read-failure-87c2d4';
+    await assert.rejects(
+      resolveGroupIds({ async listGroups() { throw new Error(opaqueGroupFailure); } }),
+      (error) => error.code === 'SUB2API_GROUP_RESOLVE_FAILED'
+        && error.message === '读取 Sub2API 分组失败'
+        && !error.message.includes(opaqueGroupFailure),
     );
 
     process.env.SUB2API_GROUP_IDS = '7, 7,9';

@@ -1815,18 +1815,21 @@ test('duplicate remote strong identities are conflicts, not ordinary remote-only
 });
 
 test('Sub2API account errors are redacted and OAuth update responses stay credential-free', async () => {
+  const opaqueAccountError = 'opaque-account-error-4b92f3';
+  const opaquePauseReason = 'opaque-pause-reason-73a1c8';
   const safe = safeAccount({
     id: 40,
     name: 'free00040',
     status: 'error',
-    error_message: 'Bearer abc.def.ghi access_token=do-not-return',
-    temp_unschedulable_reason: 'credential=temp-reason-value',
+    error_message: opaqueAccountError,
+    temp_unschedulable_reason: opaquePauseReason,
     platform: { access_token: 'nested-platform-value' },
     type: { access_token: 'nested-type-value' },
   });
-  assert.equal(safe.errorMessage.includes('abc.def.ghi'), false);
-  assert.equal(safe.errorMessage.includes('do-not-return'), false);
-  assert.equal(safe.tempUnschedulableReason.includes('temp-reason-value'), false);
+  assert.equal(safe.errorMessage, 'Sub2API 已报告账号错误（详情已隐藏）');
+  assert.equal(safe.tempUnschedulableReason, 'Sub2API 已报告暂停调度原因（详情已隐藏）');
+  assert.equal(JSON.stringify(safe).includes(opaqueAccountError), false);
+  assert.equal(JSON.stringify(safe).includes(opaquePauseReason), false);
   assert.equal(safe.platform, '');
   assert.equal(safe.type, '');
   assert.equal(JSON.stringify(safe).includes('nested-platform-value'), false);
@@ -1972,7 +1975,18 @@ test('Sub2API permits plaintext HTTP only for loopback unless explicitly overrid
 
 test('Sub2API request errors are redacted before leaving the adapter', async () => {
   const originalFetch = global.fetch;
-  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  const records = [];
+  const logger = Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+    level,
+    (event, fields) => records.push({ level, event, fields }),
+  ]));
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger,
+  });
+  const opaqueRejectedDetail = 'opaque-rejected-detail-85c214';
+  const opaqueTransportDetail = 'opaque-transport-detail-a619d0';
   try {
     global.fetch = async () => ({
       ok: false,
@@ -1983,24 +1997,30 @@ test('Sub2API request errors are redacted before leaving the adapter', async () 
       async text() {
         return JSON.stringify({
           success: false,
-          message: 'error_message=Bearer remote.header.value; access_token=remote-access-value',
+          message: opaqueRejectedDetail,
         });
       },
     });
     await assert.rejects(
       client.request('GET', '/api/v1/admin/accounts/1'),
-      (error) => !error.message.includes('remote.header.value')
-        && !error.message.includes('remote-access-value'),
+      (error) => error.code === 'SUB2API_REQUEST_REJECTED'
+        && error.upstreamStatus === 400
+        && error.upstreamDetailPresent === true
+        && error.message === 'Sub2API GET /api/v1/admin/accounts/1 请求被上游拒绝（HTTP 400）'
+        && !JSON.stringify(error).includes(opaqueRejectedDetail),
     );
 
     global.fetch = async () => {
-      throw new Error('credential=network-credential-value Bearer network.header.value');
+      throw new Error(opaqueTransportDetail);
     };
     await assert.rejects(
       client.request('GET', '/api/v1/admin/accounts/1'),
-      (error) => !error.message.includes('network-credential-value')
-        && !error.message.includes('network.header.value'),
+      (error) => error.code === 'SUB2API_TRANSPORT_ERROR'
+        && error.message === 'Sub2API 管理请求传输失败：GET /api/v1/admin/accounts/1'
+        && !error.message.includes(opaqueTransportDetail),
     );
+    assert.equal(JSON.stringify(records).includes(opaqueRejectedDetail), false);
+    assert.equal(JSON.stringify(records).includes(opaqueTransportDetail), false);
   } finally {
     global.fetch = originalFetch;
   }
@@ -2362,14 +2382,15 @@ test('Sub2API strict postflight listings require a total on every page', async (
 });
 
 test('Sub2API batch-stat envelopes are complete and errors leave only after redaction', async () => {
+  const opaqueStatsError = 'opaque-stats-error-346b19';
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
   client.request = async () => ({
     stats: { 1: { historical: { requests: 1 } } },
-    errors: { 2: 'Bearer stats.header.value access_token=stats-access-value' },
+    errors: { 2: opaqueStatsError },
   });
   const result = await client.getBatchTableUsageStats([1, 2]);
-  assert.equal(result.errors['2'].includes('stats.header.value'), false);
-  assert.equal(result.errors['2'].includes('stats-access-value'), false);
+  assert.equal(result.errors['2'], 'Sub2API 账号统计读取失败（详情已隐藏）');
+  assert.equal(JSON.stringify(result).includes(opaqueStatsError), false);
   assert.deepEqual(Object.keys(result.stats), ['1']);
   assert.deepEqual(Object.keys(result.errors), ['2']);
   assert.equal(Object.getPrototypeOf(result.stats), null);
