@@ -145,6 +145,22 @@ function uniqueRecords(list) {
   });
 }
 
+function operationalAccountCandidates(token, accountIndex) {
+  return uniqueRecords(
+    (token?.identityKeys || [])
+      .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
+      // Email is useful for a human-facing hint, but it must never attach a
+      // remote numeric ID to a source row.  Every account object returned here
+      // can be consumed by ID-scoped UI actions, so require a compatible
+      // account/user identity even when both records only expose the same
+      // email address.
+      .filter((account) => identitiesStronglyCompatible(
+        token?.identityKeys || [],
+        accountKeys(account),
+      )),
+  );
+}
+
 function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
   const nowMs = Number(options.nowMs || Date.now());
   // Files prefixed with old_codex are retained as backups, but are not part
@@ -188,11 +204,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
         });
         continue;
       }
-      const historicalCandidates = uniqueRecords(
-        (token.identityKeys || [])
-          .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
-          .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
-      );
+      const historicalCandidates = operationalAccountCandidates(token, accountIndex);
       items.push({
         kind: 'historical_backup',
         source: token.source,
@@ -232,11 +244,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       // not make a uniquely matching Sub2API account look untracked. The
       // import planner applies the same identity matching rule and chooses a
       // single freshest source before writing.
-      const duplicateCandidates = uniqueRecords(
-        (token.identityKeys || [])
-          .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
-          .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
-      );
+      const duplicateCandidates = operationalAccountCandidates(token, accountIndex);
       const duplicateAccount = duplicateCandidates.length === 1 ? duplicateCandidates[0] : null;
       if (duplicateAccount) matchedAccountIds.add(String(duplicateAccount.id));
       items.push({
@@ -251,11 +259,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       continue;
     }
 
-    const candidates = uniqueRecords(
-      (token.identityKeys || [])
-        .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
-        .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
-    );
+    const candidates = operationalAccountCandidates(token, accountIndex);
     if (candidates.length === 0) {
       const expiryInvalid = isExpiryInvalid(token);
       const expired = isExpired(token, nowMs);

@@ -889,6 +889,117 @@ test('a strong token never maps to an email-only legacy account', () => {
   assert.equal(legacyRow.kind, 'sub2api_only');
 });
 
+test('email-only source and remote identities remain separate non-operational rows', () => {
+  const email = 'shared-weak@example.test';
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/weak.json',
+    fileName: 'weak.json',
+    parseStatus: 'ok',
+    expiryStatus: 'missing',
+    email,
+    identityKeys: ['email:' + email],
+    fingerprints: { access: tokenFingerprint('same-synthetic-access') },
+  };
+  const account = {
+    id: 270,
+    name: 'free00270',
+    email,
+    identityKeys: ['email:' + email],
+    tokenFingerprints: { access: token.fingerprints.access },
+  };
+
+  const diff = buildDiff([token], [account]);
+  assert.equal(diff.counts.token_only, 1);
+  assert.equal(diff.counts.sub2api_only, 1);
+  assert.equal(diff.counts.in_sync || 0, 0);
+  const tokenItem = diff.items.find((item) => item.token);
+  const remoteItem = diff.items.find((item) => !item.token);
+  assert.equal(tokenItem.account, null);
+  assert.equal(remoteItem.account.id, 270);
+
+  const rows = buildRows(diff);
+  const tokenRow = rows.find((row) => row.relativePath === token.relativePath);
+  const remoteRow = rows.find((row) => row.key === 'account:270');
+  assert.equal(tokenRow.key, 'token:tokens:tokens/weak.json');
+  assert.equal(tokenRow.accountId, null);
+  assert.equal(remoteRow.accountId, 270);
+});
+
+test('email overlap never bridges a weak identity to a strong identity in either direction', () => {
+  const email = 'shared-strength@example.test';
+  const baseToken = {
+    source: 'tokens',
+    relativePath: 'tokens/identity-strength.json',
+    fileName: 'identity-strength.json',
+    parseStatus: 'ok',
+    expiryStatus: 'missing',
+    email,
+    fingerprints: { access: tokenFingerprint('synthetic-access') },
+  };
+  const baseAccount = {
+    id: 271,
+    name: 'free00271',
+    email,
+    tokenFingerprints: { access: baseToken.fingerprints.access },
+  };
+  const weakToken = { ...baseToken, identityKeys: ['email:' + email] };
+  const strongToken = {
+    ...baseToken,
+    accountId: 'workspace-271',
+    userId: 'user-271',
+    identityKeys: ['account:workspace-271', 'user:user-271', 'email:' + email],
+  };
+  const weakAccount = { ...baseAccount, identityKeys: ['email:' + email] };
+  const strongAccount = {
+    ...baseAccount,
+    accountId: 'workspace-271',
+    userId: 'user-271',
+    identityKeys: ['account:workspace-271', 'user:user-271', 'email:' + email],
+  };
+
+  for (const [source, remote] of [
+    [weakToken, strongAccount],
+    [strongToken, weakAccount],
+  ]) {
+    const diff = buildDiff([source], [remote]);
+    assert.equal(diff.counts.token_only, 1);
+    assert.equal(diff.counts.sub2api_only, 1);
+    assert.equal(diff.items.find((item) => item.token).account, null);
+  }
+});
+
+test('historical email-only tokens never acquire a remote account id', () => {
+  const email = 'historical-weak@example.test';
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/old_codex-weak.json',
+    fileName: 'old_codex-weak.json',
+    historical: true,
+    parseStatus: 'ok',
+    expiryStatus: 'missing',
+    email,
+    identityKeys: ['email:' + email],
+    fingerprints: { access: tokenFingerprint('historical-synthetic-access') },
+  };
+  const account = {
+    id: 272,
+    name: 'free00272',
+    email,
+    identityKeys: ['email:' + email],
+    tokenFingerprints: { access: token.fingerprints.access },
+  };
+
+  const diff = buildDiff([token], [account], { includeHistorical: true });
+  assert.equal(diff.counts.historical_backup, 1);
+  assert.equal(diff.counts.sub2api_only, 1);
+  const historical = diff.items.find((item) => item.kind === 'historical_backup');
+  assert.equal(historical.account, null);
+  const row = buildRows(diff).find((item) => item.relativePath === token.relativePath);
+  assert.equal(row.accountId, null);
+  assert.equal(row.key, 'token:tokens:tokens/old_codex-weak.json');
+});
+
 test('duplicate remote strong identities are conflicts, not ordinary remote-only rows', () => {
   const identityKeys = ['account:duplicate-account', 'user:duplicate-user'];
   const diff = buildDiff([], [
