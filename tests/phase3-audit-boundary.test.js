@@ -128,6 +128,51 @@ test('Phase3 requires a durable checkpoint immediately before spawning', async (
     logger.events.filter((item) => item.level === 'checkpoint').map((item) => item.event),
     ['phase3.process_spawn_checkpoint'],
   );
+  const startingIndex = logger.events.findIndex(
+    (item) => item.event === 'phase3.process_starting',
+  );
+  const checkpointIndex = logger.events.findIndex(
+    (item) => item.event === 'phase3.process_spawn_checkpoint',
+  );
+  assert.ok(startingIndex >= 0);
+  assert.ok(checkpointIndex > startingIndex);
+  assert.equal(
+    logger.events.some((item) => item.event === 'phase3.process_started'),
+    false,
+  );
+});
+
+test('Phase3 logs process_started only after a successful spawn checkpoint', async () => {
+  const email = 'spawn-success@example.test';
+  const root = phase3Fixture(email, [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    `const email = ${JSON.stringify(email)};`,
+    "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'spawn-success.json'), JSON.stringify({",
+    "  email,",
+    "  access_token: 'test-only-access-token',",
+    "  refresh_token: 'test-only-refresh-token',",
+    "  expires_at: '2099-01-01T00:00:00.000Z',",
+    "  last_refresh: '2098-01-01T00:00:00.000Z',",
+    '}));',
+  ].join('\n'));
+  const logger = recordingLogger(() => true);
+
+  await withPhase3Environment(root, async () => {
+    const result = await runPhase3Job({
+      email,
+      db: phase3Db(),
+      jobId: 'spawn-success',
+      logger,
+    });
+    assert.equal(result.tokenFile, 'tokens/spawn-success.json');
+  });
+
+  const eventIndex = (event) => logger.events.findIndex((item) => item.event === event);
+  assert.ok(eventIndex('phase3.process_starting') >= 0);
+  assert.ok(eventIndex('phase3.process_spawn_checkpoint') > eventIndex('phase3.process_starting'));
+  assert.ok(eventIndex('phase3.process_started') > eventIndex('phase3.process_spawn_checkpoint'));
+  assert.ok(eventIndex('phase3.process_completed') > eventIndex('phase3.process_started'));
 });
 
 test('Phase3 disposition checkpoint failure leaves the child disposition untouched', async () => {

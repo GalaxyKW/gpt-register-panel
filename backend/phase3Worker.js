@@ -1265,6 +1265,13 @@ function runCommand(command, args, options = {}) {
       reject(error);
       return;
     }
+    child.once('spawn', () => {
+      try {
+        if (typeof options.onSpawn === 'function') options.onSpawn();
+      } catch {
+        // Spawn observers are diagnostic only and must not affect the child.
+      }
+    });
     supervisionRecord = { terminate: () => signalProcessTree('SIGKILL') };
     activePhase3Children.add(supervisionRecord);
     if (process.platform === 'linux') {
@@ -1459,6 +1466,13 @@ async function runPhase3JobNow({
         '--phase3',
         phase3Argument,
       ];
+      const processLogFields = {
+        jobId,
+        actor,
+        email: entry.email,
+        command: path.basename(nodePath),
+        script: 'index.js',
+      };
       const commandOptions = {
         cwd: pinnedRootPath,
         env: phase3Environment(),
@@ -1471,21 +1485,10 @@ async function runPhase3JobNow({
           rootHandle.descriptor,
         ],
         signal,
+        onSpawn: () => writeLog(logger, 'info', 'phase3.process_started', processLogFields),
       };
-      writeLog(logger, 'info', 'phase3.process_started', {
-        jobId,
-        actor,
-        email: entry.email,
-        command: path.basename(nodePath),
-        script: 'index.js',
-      });
-      assertAuditLogCheckpoint(logger, 'phase3.process_spawn_checkpoint', {
-        jobId,
-        actor,
-        email: entry.email,
-        command: path.basename(nodePath),
-        script: 'index.js',
-      });
+      writeLog(logger, 'info', 'phase3.process_starting', processLogFields);
+      assertAuditLogCheckpoint(logger, 'phase3.process_spawn_checkpoint', processLogFields);
       result = await runCommand(command, commandArguments, commandOptions);
     } catch (error) {
       const shutdownInterruption = error?.code === 'JOB_INTERRUPTED';
