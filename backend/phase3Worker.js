@@ -48,6 +48,7 @@ const PHASE3_USERNAME_DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
 const PHASE3_USERNAME_HARD_MAX_BYTES = 32 * 1024 * 1024;
 const PHASE3_FINAL_KILL_WAIT_MS = 5000;
 const PHASE3_DESCENDANT_LIMIT = 4096;
+const PHASE3_SCRIPT_CHILD_FD = 3;
 const READ_ONLY_NOFOLLOW = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
@@ -246,16 +247,39 @@ function sharedDescriptorPath(descriptor) {
   return '/proc/' + process.pid + '/fd/' + descriptor;
 }
 
-function phase3LauncherSource(rootPath) {
-  return [
-    `'use strict';`,
-    `const root = ${JSON.stringify(rootPath)};`,
-    'const forwarded = process.argv.slice(1);',
-    'process.cwd = () => root;',
-    "const script = root + '/index.js';",
-    'process.argv = [process.execPath, script, ...forwarded];',
-    'require(script);',
-  ].join('\n');
+// This launcher is deliberately constant. The verified index.js is inherited
+// as a descriptor instead of putting its source in argv/environment. Compile
+// that descriptor-backed source as the real main module so gpt_register's
+// `require.main === module` entrypoint runs normally.
+const PHASE3_LAUNCHER_SOURCE = [
+  `'use strict';`,
+  "const fs = require('node:fs');",
+  "const Module = require('node:module');",
+  'const [root, ...forwarded] = process.argv.slice(1);',
+  "if (!/^\\/proc\\/[1-9][0-9]*\\/fd\\/[0-9]+$/.test(root || '')) {",
+  "  throw new Error('invalid pinned Phase3 root');",
+  '}',
+  `const source = fs.readFileSync(${PHASE3_SCRIPT_CHILD_FD}, 'utf8');`,
+  "const script = root + '/index.js';",
+  'process.cwd = () => root;',
+  'process.argv = [process.execPath, script, ...forwarded];',
+  "const main = new Module('.', null);",
+  'main.filename = script;',
+  'main.path = root;',
+  'main.paths = Module._nodeModulePaths(root);',
+  'process.mainModule = main;',
+  'Module._cache[script] = main;',
+  'try {',
+  '  main._compile(source, script);',
+  '  main.loaded = true;',
+  '} catch (error) {',
+  '  delete Module._cache[script];',
+  '  throw error;',
+  '}',
+].join('\n');
+
+function phase3LauncherSource() {
+  return PHASE3_LAUNCHER_SOURCE;
 }
 
 function phase3Environment() {
@@ -715,13 +739,24 @@ function runCommand(command, args, options = {}) {
       reject(interruptedJobError());
       return;
     }
+    const extraFileDescriptors = Array.isArray(options.extraFileDescriptors)
+      ? options.extraFileDescriptors
+      : [];
+    if (extraFileDescriptors.length > 8 || extraFileDescriptors.some(
+      (descriptor) => !Number.isSafeInteger(descriptor) || descriptor < 0,
+    )) {
+      const error = new Error('phase3 继承文件描述符无效');
+      error.code = 'PHASE3_DESCRIPTOR_INVALID';
+      reject(error);
+      return;
+    }
     try {
       child = spawn(command, args, {
         cwd: options.cwd,
         env: options.env,
         shell: false,
         detached: process.platform !== 'win32',
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['ignore', 'pipe', 'pipe', ...extraFileDescriptors],
       });
     } catch (error) {
       cleanup();
@@ -904,8 +939,9 @@ async function runPhase3JobNow({
         '--preserve-symlinks',
         '--preserve-symlinks-main',
         '-e',
-        phase3LauncherSource(pinnedRootPath),
+        phase3LauncherSource(),
         '--',
+        pinnedRootPath,
         '--phase3',
         phase3Argument,
       ], {
@@ -914,6 +950,7 @@ async function runPhase3JobNow({
         timeoutMs: process.env.PANEL_PHASE3_TIMEOUT_MS,
         maxOutputBytes: process.env.PANEL_PHASE3_MAX_OUTPUT_BYTES,
         terminationGraceMs: process.env.PANEL_PHASE3_KILL_GRACE_MS,
+        extraFileDescriptors: [scriptHandle.descriptor],
         signal,
       });
     } catch (error) {

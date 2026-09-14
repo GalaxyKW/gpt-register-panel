@@ -213,7 +213,7 @@ test('username record limits are shared by snapshots and Phase3 and remain hard-
   }
 });
 
-test('phase3 jobs run serially and reject duplicate account submissions', async () => {
+test('phase3 jobs run serially, run the main-gated entrypoint, and reject duplicates', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
@@ -225,7 +225,9 @@ test('phase3 jobs run serially and reject duplicate account submissions', async 
     "const fs = require('node:fs');",
     "const path = require('node:path');",
     "const email = (process.argv.find((arg) => arg.startsWith('--email=')) || '').slice(8);",
-    "setTimeout(() => fs.writeFileSync(path.join(process.cwd(), 'tokens', 'codex-' + email + '.json'), JSON.stringify({ access_token: 'access-' + email, email })), 80);",
+    'if (require.main === module) {',
+    "  setTimeout(() => fs.writeFileSync(path.join(process.cwd(), 'tokens', 'codex-' + email + '.json'), JSON.stringify({ access_token: 'access-' + email, email })), 80);",
+    '}',
   ].join('\n'));
   const previous = {
     root: process.env.GPT_REGISTER_ROOT,
@@ -450,6 +452,82 @@ test('phase3 pins one source tree while preserving cwd, __dirname, and relative 
     assert.equal(Object.hasOwn(result.process, 'stdout'), false);
     assert.equal(Object.hasOwn(result.process, 'stderr'), false);
     assert.equal(result.process.stdoutBytes > 0, true);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('phase3 executes the validated index inode even when its path is replaced before launch', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-index-pin-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'index-pin@example.test', password: 'hidden' },
+  ]), { mode: 0o600 });
+  const originalSource = [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    'if (require.main === module) {',
+    "  fs.writeFileSync(path.join(process.cwd(), 'entrypoint.json'), JSON.stringify({ isMain: true, filename: __filename, dirname: __dirname }));",
+    "  fs.writeFileSync(path.join(process.cwd(), 'tokens', 'original.json'), JSON.stringify({ access_token: 'descriptor-bound-token', email: 'index-pin@example.test' }));",
+    '}',
+  ].join('\n');
+  const replacementSource = [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'replacement.json'), JSON.stringify({ access_token: 'replacement-token', email: 'index-pin@example.test' }));",
+  ].join('\n');
+  fs.writeFileSync(path.join(root, 'index.js'), originalSource, { mode: 0o600 });
+
+  // The wrapper runs only after phase3Worker has opened and validated index.js.
+  // It replaces that path, then forwards the already inherited script fd to
+  // the real Node launcher to make the check-to-exec race deterministic.
+  const nodeWrapper = path.join(root, 'node-wrapper');
+  fs.writeFileSync(nodeWrapper, [
+    '#!' + process.execPath,
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const { spawnSync } = require('node:child_process');",
+    "const script = path.join(process.cwd(), 'index.js');",
+    "fs.renameSync(script, script + '.validated');",
+    `fs.writeFileSync(script, ${JSON.stringify(replacementSource)}, { mode: 0o600 });`,
+    'const result = spawnSync(process.execPath, process.argv.slice(2), {',
+    '  cwd: process.cwd(),',
+    '  env: process.env,',
+    "  stdio: ['ignore', 'inherit', 'inherit', 3],",
+    '});',
+    'if (result.error) throw result.error;',
+    'process.exit(result.status === null ? 1 : result.status);',
+  ].join('\n'), { mode: 0o700 });
+  fs.chmodSync(nodeWrapper, 0o700);
+
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = nodeWrapper;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const result = await runPhase3Job({
+      email: 'index-pin@example.test',
+      jobId: 'index-pin-job',
+      db: { async audit() {}, async updateJob() {} },
+    });
+    assert.equal(result.tokenFile, 'tokens/original.json');
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'replacement.json')), false);
+    assert.equal(fs.readFileSync(path.join(root, 'index.js'), 'utf8'), replacementSource);
+    assert.equal(fs.readFileSync(path.join(root, 'index.js.validated'), 'utf8'), originalSource);
+    const entrypoint = JSON.parse(fs.readFileSync(path.join(root, 'entrypoint.json'), 'utf8'));
+    assert.equal(entrypoint.isMain, true);
+    assert.match(entrypoint.filename, /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+\/index\.js$/);
+    assert.equal(entrypoint.dirname, path.dirname(entrypoint.filename));
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous.root;
