@@ -283,8 +283,14 @@ function claimIntegrityError(message) {
   return error;
 }
 
-function validateJobClaimSchema(database) {
-  const requireSingleColumnUniqueIdentity = (tableName, columnName) => {
+function validateDurableIdentitySchema(database) {
+  const requireSingleColumnUniqueIdentity = (
+    tableName,
+    columnName,
+    invalid = () => claimIntegrityError(
+      '任务保护键数据库结构缺少必需的主键或唯一性保证',
+    ),
+  ) => {
     const columns = resultRows(database.exec(
       'PRAGMA table_info(' + sqlString(tableName) + ')',
     ));
@@ -306,12 +312,19 @@ function validateJobClaimSchema(database) {
         if (indexColumns.length === 1 && indexColumns[0]?.name === columnName) return;
       }
     }
-    throw claimIntegrityError(
-      '任务保护键数据库结构缺少必需的主键或唯一性保证',
-    );
+    throw invalid();
   };
   requireSingleColumnUniqueIdentity('sync_jobs', 'id');
   requireSingleColumnUniqueIdentity('job_claims', 'claim_key');
+  // Idempotency lookups deliberately select one row by key hash. Without a
+  // single-column unique identity, a damaged or downgraded schema could retain
+  // conflicting receipts and make that LIMIT 1 selection ambiguous.
+  requireSingleColumnUniqueIdentity('mutation_receipts', 'key_hash', () => (
+    mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执数据库结构缺少必需的主键或唯一性保证',
+    )
+  ));
 }
 
 function reconciliationError(code, message, fields = {}) {
@@ -846,7 +859,7 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
   // Validate every compact claim row before any legacy repair. Claims are
   // scanned again per job below, but at no point is the complete claim graph
   // retained as JavaScript objects. Single-column uniqueness is guaranteed by
-  // validateJobClaimSchema(), so a rowid scan needs no memory-heavy sort/set.
+  // validateDurableIdentitySchema(), so a rowid scan needs no memory-heavy sort/set.
   prevalidateBoundedStoredClaims(database, claimCount);
 
   const metadataStatement = database.prepare(`SELECT
@@ -2512,7 +2525,7 @@ class PanelDb {
     // CREATE TABLE IF NOT EXISTS does not verify an existing legacy or damaged
     // schema. Without these unique identities, two queued jobs could appear to
     // own the same claim while the in-memory maps silently overwrite one owner.
-    validateJobClaimSchema(this.database);
+    validateDurableIdentitySchema(this.database);
   }
 
   pruneRows({ pruneMutationReceipts = true } = {}) {

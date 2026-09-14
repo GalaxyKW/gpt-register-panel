@@ -118,6 +118,44 @@ test('a receipt replays the exact response across terminal state and database re
   );
 });
 
+test('receipt schema without a single-column unique key hash fails closed on restart', async () => {
+  const file = databasePath('duplicate-receipt-schema');
+  const db = new PanelDb(file);
+  const options = submissionOptions({
+    idempotencyKey: 'idem_v1_duplicate_receipt_schema_1234567890',
+  });
+  await db.createMutationSubmission(options);
+
+  await db.write((database) => database.run(`
+    ALTER TABLE mutation_receipts RENAME TO mutation_receipts_with_identity;
+    CREATE TABLE mutation_receipts (
+      key_hash TEXT NOT NULL,
+      workflow TEXT NOT NULL,
+      request_digest TEXT NOT NULL,
+      http_status INTEGER NOT NULL,
+      response_json TEXT NOT NULL,
+      job_ids_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL
+    );
+    INSERT INTO mutation_receipts SELECT * FROM mutation_receipts_with_identity;
+    INSERT INTO mutation_receipts SELECT * FROM mutation_receipts_with_identity;
+    DROP TABLE mutation_receipts_with_identity;
+  `));
+
+  assert.equal(await db.read((database) => Number(
+    database.exec('SELECT COUNT(*) FROM mutation_receipts')[0].values[0][0],
+  )), 2);
+  await assert.rejects(
+    new PanelDb(file).ready,
+    (error) => error.code === 'IDEMPOTENCY_RECEIPT_INVALID'
+      && /主键或唯一性/.test(error.message),
+  );
+  assert.equal(await db.read((database) => Number(
+    database.exec('SELECT COUNT(*) FROM mutation_receipts')[0].values[0][0],
+  )), 2);
+});
+
 test('the durable database stores neither the raw key nor an account-test prompt', async () => {
   const file = databasePath('secret-boundary');
   const db = new PanelDb(file);
