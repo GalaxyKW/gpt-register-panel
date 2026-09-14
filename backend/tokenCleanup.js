@@ -14,8 +14,58 @@ const CLAIM_PREFIX = '.panel-token-cleanup-claim-';
 const CLAIM_PREFIX_V1 = '.panel-token-cleanup-claim-v1-';
 const CLAIM_PREFIX_V2 = '.panel-token-cleanup-claim-v2-';
 const MAX_REPORTED_CLEANUP_CLAIMS = 1000;
+const MAX_RECOVERABLE_CLEANUP_CLAIMS = 1000;
+const DEFAULT_CLEANUP_DIRECTORY_ENTRIES = 20_000;
+const HARD_CLEANUP_DIRECTORY_ENTRIES = 200_000;
 const DEFAULT_TOKEN_MAX_BYTES = 4 * 1024 * 1024;
 const HARD_TOKEN_MAX_BYTES = 16 * 1024 * 1024;
+
+function cleanupDirectoryEntryLimit() {
+  const value = Number(process.env.GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES);
+  if (!Number.isSafeInteger(value) || value < 1) return DEFAULT_CLEANUP_DIRECTORY_ENTRIES;
+  return Math.min(value, HARD_CLEANUP_DIRECTORY_ENTRIES);
+}
+
+function cleanupClaimScanLimitExceeded(reason) {
+  const error = new Error('token 清理 claim 扫描超过安全上限；无法证明目录中不存在未完成操作，请人工核验');
+  error.code = 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT';
+  error.recoveryRequired = true;
+  error.requiresReconciliation = true;
+  error.reconciliationScope = 'expired_token_cleanup';
+  error.reconciliationReason = reason;
+  error.blockedBeforeStart = true;
+  error.executionOutcome = 'not_started';
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  return error;
+}
+
+function forEachBoundedCleanupDirectoryEntry(directoryPath, visitor) {
+  const maximumEntries = cleanupDirectoryEntryLimit();
+  let directory;
+  let failure = null;
+  try {
+    directory = fs.opendirSync(directoryPath);
+    let entryCount = 0;
+    while (true) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      entryCount += 1;
+      if (entryCount > maximumEntries) {
+        throw cleanupClaimScanLimitExceeded('directory_entry_limit_exceeded');
+      }
+      visitor(String(entry.name));
+    }
+  } catch (error) {
+    failure = error;
+  }
+  if (directory) {
+    try { directory.closeSync(); } catch (error) {
+      if (!failure) failure = error;
+    }
+  }
+  if (failure) throw failure;
+}
 
 function cleanupTokenMaximumBytes() {
   const value = Number(process.env.GPT_REGISTER_TOKEN_MAX_BYTES);
@@ -162,9 +212,12 @@ function cleanupRecoveryInvalid(reason) {
   const error = new Error('检测到无法安全验证的过期 token 清理 claim；请人工核验，禁止自动重试');
   error.code = 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM';
   error.recoveryReason = reason;
+  error.recoveryRequired = true;
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
+  error.blockedBeforeStart = true;
+  error.executionOutcome = 'not_started';
   error.reconciliationScope = 'expired_token_cleanup';
   error.reconciliationReason = reason;
   return error;
@@ -384,19 +437,18 @@ function inspectTokenCleanupClaims(preparedSources) {
   for (const source of SOURCES) {
     const pin = preparedSources.sourcePins.get(source);
     if (!pin) throw cleanupDirectoryError(null, source + ' 目录');
-    let names;
     try {
-      names = fs.readdirSync(cleanupFdPath(pin));
+      forEachBoundedCleanupDirectoryEntry(cleanupFdPath(pin), (name) => {
+        // Unknown or malformed claim generations are deliberately included.
+        // Treating an unparseable staging name as ordinary input could strand or
+        // overwrite the only recoverable copy of a token.
+        if (!name.startsWith(CLAIM_PREFIX)) return;
+        if (claimCount < MAX_REPORTED_CLEANUP_CLAIMS) claimCount += 1;
+        else claimCountTruncated = true;
+      });
     } catch (error) {
+      if (error?.code === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT') throw error;
       throw cleanupDirectoryError(error, source + ' 目录');
-    }
-    for (const name of names) {
-      // Unknown or malformed claim generations are deliberately included.
-      // Treating an unparseable staging name as ordinary input could strand or
-      // overwrite the only recoverable copy of a token.
-      if (!String(name).startsWith(CLAIM_PREFIX)) continue;
-      if (claimCount < MAX_REPORTED_CLEANUP_CLAIMS) claimCount += 1;
-      else claimCountTruncated = true;
     }
     assertCleanupDirectoryPin(pin);
   }
@@ -704,19 +756,22 @@ function parseClaimName(fileName) {
   const value = String(fileName);
   if (value.startsWith(CLAIM_PREFIX_V2)) {
     const body = value.slice(CLAIM_PREFIX_V2.length);
-    const match = body.match(/^(\d+)\.(\d+)\.([A-Za-z0-9_-]{22}|0)\.([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{11})$/);
+    const match = body.match(/^([1-9]\d*)\.(0|[1-9]\d*)\.([A-Za-z0-9_-]{22}|0)\.([A-Za-z0-9_-]{43})\.([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{11})$/);
     if (!match) return null;
     let bootBytes;
     let hashBytes;
     let originalFileName;
+    let nonceBytes;
     try {
       bootBytes = match[3] === '0' ? null : Buffer.from(match[3], 'base64url');
       hashBytes = Buffer.from(match[4], 'base64url');
       originalFileName = Buffer.from(match[5], 'base64url').toString('utf8');
+      nonceBytes = Buffer.from(match[6], 'base64url');
     } catch { return null; }
     if ((bootBytes && (bootBytes.length !== 16 || bootBytes.toString('base64url') !== match[3]))
         || hashBytes.length !== 32 || hashBytes.toString('base64url') !== match[4]
-        || Buffer.from(originalFileName, 'utf8').toString('base64url') !== match[5]) return null;
+        || Buffer.from(originalFileName, 'utf8').toString('base64url') !== match[5]
+        || nonceBytes.length !== 8 || nonceBytes.toString('base64url') !== match[6]) return null;
     if (!originalFileName
         || path.basename(originalFileName) !== originalFileName
         || !originalFileName.toLowerCase().endsWith('.json')) return null;
@@ -737,13 +792,14 @@ function parseClaimName(fileName) {
 
   if (!value.startsWith(CLAIM_PREFIX_V1)) return null;
   const body = value.slice(CLAIM_PREFIX_V1.length);
-  const match = body.match(/^(\d+)-([0-9]+)-([a-f0-9]{64})-([A-Za-z0-9_-]+)-([a-f0-9]{16})$/i);
+  const match = body.match(/^([1-9]\d*)-(0|[1-9]\d*)-([a-f0-9]{64})-([A-Za-z0-9_-]+)-([a-f0-9]{16})$/);
   if (!match) return null;
   let originalFileName = '';
   try { originalFileName = Buffer.from(match[4], 'base64url').toString('utf8'); } catch { return null; }
   if (!originalFileName
       || path.basename(originalFileName) !== originalFileName
-      || !originalFileName.toLowerCase().endsWith('.json')) return null;
+      || !originalFileName.toLowerCase().endsWith('.json')
+      || Buffer.from(originalFileName, 'utf8').toString('base64url') !== match[4]) return null;
   const pid = Number(match[1]);
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
   return {
@@ -962,27 +1018,31 @@ function recoverTokenCleanupClaimsFromDirectories(rootDirectory, options = {}) {
     const pinnedDirectory = options.sourceDirectories?.get?.(source);
     const directory = pinnedDirectory || path.join(rootDirectory, source);
     if (!pinnedDirectory) ensureDirectory(directory, source + ' 目录');
-    let names;
     try {
-      names = fs.readdirSync(directory).sort(compareCleanupPaths);
-    } catch {
+      forEachBoundedCleanupDirectoryEntry(directory, (fileName) => {
+        if (!fileName.startsWith(CLAIM_PREFIX)) return;
+        const claim = parseClaimName(fileName);
+        if (!claim) throw cleanupRecoveryInvalid('claim_name_invalid');
+        const claimPath = safeAbsolutePath(directory, fileName);
+        const sourcePath = safeAbsolutePath(directory, claim.originalFileName);
+        if (!claimPath || !sourcePath) throw cleanupRecoveryInvalid('claim_path_invalid');
+        if (discovered.length >= MAX_RECOVERABLE_CLEANUP_CLAIMS) {
+          throw cleanupClaimScanLimitExceeded('recoverable_claim_limit_exceeded');
+        }
+        discovered.push({
+          source,
+          claim,
+          claimPath,
+          sourcePath,
+          relativePath: path.join(source, claim.originalFileName),
+        });
+      });
+    } catch (cause) {
+      if (cause?.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+          || cause?.code === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT') throw cause;
       const error = new Error('无法完整预检 token 清理 claim');
       error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
       throw error;
-    }
-    for (const fileName of names) {
-      const claim = parseClaimName(fileName);
-      if (!claim) continue;
-      const claimPath = safeAbsolutePath(directory, fileName);
-      const sourcePath = safeAbsolutePath(directory, claim.originalFileName);
-      if (!claimPath || !sourcePath) continue;
-      discovered.push({
-        source,
-        claim,
-        claimPath,
-        sourcePath,
-        relativePath: path.join(source, claim.originalFileName),
-      });
     }
   }
   discovered.sort((left, right) => compareCleanupPaths(left.relativePath, right.relativePath)

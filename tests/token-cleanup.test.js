@@ -374,6 +374,131 @@ test('cleanup scan fail-closes on malformed claims and bounds public claim metad
   assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
 });
 
+test('cleanup claim inspection and recovery stream directory entries without unbounded reads', () => {
+  const root = makeRoot();
+  const tokenDirectories = new Set([
+    path.join(root, 'tokens'),
+    path.join(root, 'use_token'),
+  ]);
+  const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
+  let boundedPasses = 0;
+  fs.readdirSync = function rejectUnboundedCleanupRead(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (tokenDirectories.has(realTarget)) throw new Error('unbounded cleanup directory read');
+    return originalReaddirSync.call(fs, target, ...args);
+  };
+  fs.opendirSync = function countBoundedCleanupRead(target, ...args) {
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (tokenDirectories.has(realTarget)) boundedPasses += 1;
+    return originalOpendirSync.call(fs, target, ...args);
+  };
+  try {
+    const listing = listExpiredTokens({
+      rootDirectory: root,
+      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+    });
+    assert.equal(listing.recoveryRequired, false);
+    assert.deepEqual(recoverTokenCleanupClaims(root), []);
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+    fs.opendirSync = originalOpendirSync;
+  }
+  assert.equal(boundedPasses >= 6, true);
+});
+
+test('cleanup claim scans fail closed when a directory exceeds the bounded entry limit', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  fs.writeFileSync(path.join(directory, 'ordinary-a.txt'), 'a', { mode: 0o600 });
+  fs.writeFileSync(path.join(directory, 'ordinary-b.txt'), 'b', { mode: 0o600 });
+  const previousLimit = process.env.GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES;
+  process.env.GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES = '1';
+  try {
+    for (const operation of [
+      () => listExpiredTokens({ rootDirectory: root }),
+      () => recoverTokenCleanupClaims(root),
+    ]) {
+      assert.throws(
+        operation,
+        (error) => error.code === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT'
+          && error.recoveryRequired === true
+          && error.requiresReconciliation === true
+          && error.reconciliationReason === 'directory_entry_limit_exceeded'
+          && error.blockedBeforeStart === true
+          && error.executionOutcome === 'not_started'
+          && error.retryAllowed === false
+          && error.doNotRetry === true,
+      );
+    }
+  } finally {
+    if (previousLimit === undefined) {
+      delete process.env.GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES;
+    } else {
+      process.env.GPT_REGISTER_TOKEN_MAX_DIRECTORY_ENTRIES = previousLimit;
+    }
+  }
+  assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+});
+
+test('claim recovery rejects malformed prefixed entries before restoring valid claims', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const validClaim = deadClaimPath(
+    directory,
+    'valid-before-malformed.json',
+    JSON.stringify({ marker: 'valid-before-malformed' }),
+  );
+  const malformedContent = JSON.stringify({ marker: 'noncanonical-name-encoding' });
+  const malformedHash = crypto.createHash('sha256').update(malformedContent).digest('hex');
+  const canonicalName = Buffer.from('ab.json', 'utf8').toString('base64url');
+  const noncanonicalName = canonicalName.slice(0, -1) + 'h';
+  assert.equal(Buffer.from(noncanonicalName, 'base64url').toString('utf8'), 'ab.json');
+  assert.notEqual(noncanonicalName, canonicalName);
+  const malformedClaim = path.join(
+    directory,
+    '.panel-token-cleanup-claim-v1-999999-0-' + malformedHash
+      + '-' + noncanonicalName + '-0123456789abcdef',
+  );
+  fs.writeFileSync(malformedClaim, malformedContent, { mode: 0o600 });
+
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+      && error.recoveryReason === 'claim_name_invalid'
+      && error.recoveryRequired === true
+      && error.requiresReconciliation === true
+      && error.blockedBeforeStart === true
+      && error.executionOutcome === 'not_started'
+      && error.retryAllowed === false
+      && error.doNotRetry === true,
+  );
+  assert.equal(fs.existsSync(path.join(directory, 'valid-before-malformed.json')), false);
+  assert.equal(fs.existsSync(validClaim), true);
+  assert.equal(fs.existsSync(malformedClaim), true);
+});
+
+test('claim recovery bounds the number of staged claims before any restoration', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  let firstClaim;
+  for (let index = 0; index < 1001; index += 1) {
+    const fileName = 'bounded-' + String(index).padStart(4, '0') + '.json';
+    const claimPath = deadClaimPath(directory, fileName, JSON.stringify({ index }));
+    if (index === 0) firstClaim = claimPath;
+  }
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => error.code === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT'
+      && error.reconciliationReason === 'recoverable_claim_limit_exceeded'
+      && error.blockedBeforeStart === true,
+  );
+  assert.equal(fs.existsSync(path.join(directory, 'bounded-0000.json')), false);
+  assert.equal(fs.existsSync(firstClaim), true);
+});
+
 test('cleanup refuses a source that becomes writable by other users after listing', () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired-permissions.json');

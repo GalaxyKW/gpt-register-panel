@@ -304,6 +304,7 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS',
   'TOKEN_CLEANUP_STALE',
   'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+  'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT',
   'JOB_RECONCILIATION_NOT_HELD',
   'JOB_RECONCILIATION_ACK_CONFLICT',
   'JOB_RECONCILIATION_DIGEST_MISMATCH',
@@ -358,6 +359,7 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   SUB2API_READ_FAILED: '无法确认 Sub2API 当前账号列表',
   TOKEN_CLEANUP_STALE: '过期 token 清单已变化，请重新扫描',
   TOKEN_CLEANUP_RECOVERY_REQUIRED: '过期 token 清理存在待恢复状态，已阻止继续删除',
+  TOKEN_CLEANUP_CLAIM_SCAN_LIMIT: 'token 清理声明扫描超过安全上限，已阻止继续操作',
   JOB_RECONCILIATION_NOT_FOUND: '待对账任务不存在',
   JOB_RECONCILIATION_ADMIN_REQUIRED: '只允许经过认证的面板管理员执行该操作',
   AUDIT_LOG_UNAVAILABLE: '审计日志不可用，已拒绝写操作',
@@ -1416,7 +1418,8 @@ function publicTokenCleanupErrorFields(publicCode, error) {
     } catch {}
     return currentVersion ? { currentVersion } : {};
   }
-  if (publicCode === 'TOKEN_CLEANUP_RECOVERY_REQUIRED') {
+  if (publicCode === 'TOKEN_CLEANUP_RECOVERY_REQUIRED'
+      || publicCode === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT') {
     let recoveryRequired = false;
     let claimCount = 0;
     let claimCountTruncated = false;

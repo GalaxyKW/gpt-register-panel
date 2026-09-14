@@ -117,6 +117,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS',
       'TOKEN_CLEANUP_STALE',
       'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+      'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT',
       'JOB_RECONCILIATION_NOT_HELD',
       'JOB_RECONCILIATION_ACK_CONFLICT',
       'JOB_RECONCILIATION_DIGEST_MISMATCH',
@@ -233,6 +234,13 @@ test('cleanup public fields expose only a strict current version and bounded rec
     recoveryRequired: true,
     claimCount: 7,
     claimCountTruncated: true,
+  });
+  assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_CLAIM_SCAN_LIMIT', {
+    recoveryRequired: true,
+  }), {
+    recoveryRequired: true,
+    claimCount: 0,
+    claimCountTruncated: false,
   });
 });
 
