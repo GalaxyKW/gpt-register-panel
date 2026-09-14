@@ -20,7 +20,11 @@ const {
   safeErrorMessage,
 } = require('./sync');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
-const { PanelDb } = require('./db');
+const {
+  PanelDb,
+  RECONCILIATION_ACK_CONFIRMATION,
+  RECONCILIATION_ACK_RESOLUTIONS,
+} = require('./db');
 const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   runPhase3Job,
@@ -64,15 +68,18 @@ const JSON_BODY_ENDPOINTS = new Set([
   '/api/tokens/expired/delete',
   '/api/account-tests',
 ]);
+const RECONCILIATION_ACK_RESOLUTION_SET = new Set(RECONCILIATION_ACK_RESOLUTIONS);
 const PHASE3_RECONCILIATION_SCOPES = new Set([
   'phase3_account_disposition',
   'phase3_process_tree',
+  'phase3_token_output',
 ]);
 const PHASE3_RECONCILIATION_REASONS = new Set([
   'account_disposition_write_unknown',
   'account_disposition_checkpoint_unavailable',
   'account_disposition_not_persisted',
   'phase3_process_tree_unconfirmed',
+  'phase3_postflight_source_unavailable',
 ]);
 const PHASE3_DISPOSITION_OUTCOMES = new Set([
   'persisted',
@@ -446,6 +453,63 @@ function pathParam(pathname, prefix) {
   try { return decodeURIComponent(value); } catch { return null; }
 }
 
+function reconciliationAcknowledgePath(pathname) {
+  const prefix = '/api/jobs/';
+  const suffix = '/reconciliation/acknowledge';
+  if (!pathname.startsWith(prefix) || !pathname.endsWith(suffix)) {
+    return { matched: false, jobId: null };
+  }
+  const encoded = pathname.slice(prefix.length, -suffix.length);
+  let jobId = null;
+  try { jobId = decodeURIComponent(encoded); } catch {}
+  if (!/^job_[a-f0-9]{24}$/.test(String(jobId || ''))) jobId = null;
+  return { matched: true, jobId };
+}
+
+function reconciliationAcknowledgeRequestError(body, jobId) {
+  if (!jobId) {
+    const error = new Error('待对账任务标识无效');
+    error.code = 'JOB_RECONCILIATION_JOB_ID_INVALID';
+    return error;
+  }
+  if (!body || typeof body !== 'object' || Array.isArray(body)
+      || Object.getPrototypeOf(body) !== Object.prototype) {
+    const error = new Error('请求体必须是 JSON 对象');
+    error.code = 'INVALID_REQUEST_BODY';
+    return error;
+  }
+  const allowed = new Set(['jobId', 'confirmation', 'resolution', 'claimDigest']);
+  if (Object.keys(body).some((key) => !allowed.has(key))) {
+    const error = new Error('人工对账请求包含未允许的字段');
+    error.code = 'JOB_RECONCILIATION_REQUEST_INVALID';
+    return error;
+  }
+  if (typeof body.jobId !== 'string' || body.jobId !== jobId) {
+    const error = new Error('请求体中的任务标识与路径不一致');
+    error.code = 'JOB_RECONCILIATION_JOB_ID_MISMATCH';
+    return error;
+  }
+  if (body.confirmation !== RECONCILIATION_ACK_CONFIRMATION) {
+    const error = new Error('人工对账确认语不正确');
+    error.code = 'JOB_RECONCILIATION_CONFIRMATION_INVALID';
+    return error;
+  }
+  if (typeof body.resolution !== 'string'
+      || body.resolution.length > 32
+      || !RECONCILIATION_ACK_RESOLUTION_SET.has(body.resolution)) {
+    const error = new Error('人工对账结论无效');
+    error.code = 'JOB_RECONCILIATION_RESOLUTION_INVALID';
+    return error;
+  }
+  if (typeof body.claimDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(body.claimDigest)) {
+    const error = new Error('任务保护键摘要无效');
+    error.code = 'JOB_RECONCILIATION_DIGEST_INVALID';
+    return error;
+  }
+  return null;
+}
+
 function safeStaticPath(urlPath) {
   let decoded;
   try { decoded = decodeURIComponent(urlPath === '/' ? '/index.html' : urlPath); } catch { return null; }
@@ -693,6 +757,29 @@ function phase3FailureMetadata(error) {
   return output;
 }
 
+function mutationFailureMetadata(error) {
+  const output = { code: safePhase3FailureCode(error?.code) };
+  if (error?.requiresReconciliation === true) output.requiresReconciliation = true;
+  if (error?.writeOutcomeUnknown === true) output.writeOutcomeUnknown = true;
+  if (error?.doNotRetry === true) output.doNotRetry = true;
+  if (error?.retryAllowed === false) output.retryAllowed = false;
+  if (error?.blockedBeforeStart === true) output.blockedBeforeStart = true;
+  if (['not_started', 'unknown'].includes(error?.executionOutcome)) {
+    output.executionOutcome = error.executionOutcome;
+  }
+  const reconciliationReason = typeof error?.reconciliationReason === 'string'
+    ? error.reconciliationReason.trim().toLowerCase()
+    : '';
+  if (/^[a-z0-9_]{1,64}$/.test(reconciliationReason)) {
+    output.reconciliationReason = reconciliationReason;
+  }
+  if (error?.criticalSectionCompleted === true) output.criticalSectionCompleted = true;
+  if (error?.controlPlaneLeaseReleaseFailed === true) {
+    output.controlPlaneLeaseReleaseFailed = true;
+  }
+  return output;
+}
+
 function observePhase3Job({
   job,
   email,
@@ -707,6 +794,7 @@ function observePhase3Job({
 }) {
   const tracked = taskRecord || jobManager?.begin(job, 'phase3', actor) || null;
   let successPersisted = false;
+  let failurePersisted = false;
   const persistSuccess = async (result) => {
     await updateTerminalJob(db, job.id, {
       status: 'succeeded',
@@ -721,6 +809,23 @@ function observePhase3Job({
     }));
     successPersisted = true;
   };
+  const persistFailure = async (error) => {
+    const interrupted = error?.code === 'JOB_INTERRUPTED'
+      || tracked?.controller.signal.aborted === true;
+    await updateTerminalJob(db, job.id, {
+      status: interrupted ? 'interrupted' : 'failed',
+      error: safeErrorMessage(error),
+      result: phase3FailureMetadata(error),
+      finishedAt: new Date().toISOString(),
+    }, terminalUpdateOptions({
+      logger,
+      event: 'phase3.job_update_retry',
+      requestId,
+      jobId: job.id,
+      actor,
+    }));
+    failurePersisted = true;
+  };
   const observation = runPhase3Job({
     email,
     phone,
@@ -731,6 +836,7 @@ function observePhase3Job({
     logger,
     signal: tracked?.controller.signal || null,
     persistSuccess,
+    persistFailure,
   })
     .then(async (result) => {
       if (!successPersisted) try {
@@ -757,6 +863,16 @@ function observePhase3Job({
       const failureMetadata = phase3FailureMetadata(error);
       const interrupted = error?.code === 'JOB_INTERRUPTED'
         || tracked?.controller.signal.aborted === true;
+      if (!successPersisted && !failurePersisted) try {
+        await persistFailure(error);
+      } catch (jobError) {
+        writeLog(logger, 'error', 'phase3.job_update_failed', {
+          requestId,
+          jobId: job.id,
+          actor,
+          error: safeErrorMessage(jobError),
+        });
+      }
       try {
         await db.audit({
           jobId: job.id,
@@ -774,27 +890,6 @@ function observePhase3Job({
           jobId: job.id,
           actor,
           error: safeErrorMessage(auditError),
-        });
-      }
-      try {
-        await updateTerminalJob(db, job.id, {
-          status: interrupted ? 'interrupted' : 'failed',
-          error: message,
-          result: failureMetadata,
-          finishedAt: new Date().toISOString(),
-        }, terminalUpdateOptions({
-          logger,
-          event: 'phase3.job_update_retry',
-          requestId,
-          jobId: job.id,
-          actor,
-        }));
-      } catch (jobError) {
-        writeLog(logger, 'error', 'phase3.job_update_failed', {
-          requestId,
-          jobId: job.id,
-          actor,
-          error: safeErrorMessage(jobError),
         });
       }
       writeLog(logger, interrupted ? 'warn' : 'error', interrupted
@@ -825,6 +920,7 @@ function observeAccountTestJob({
 }) {
   const tracked = taskRecord || jobManager?.begin(job, 'account_test', actor) || null;
   let resultPersisted = false;
+  let failurePersisted = false;
   const persistResult = async (result) => {
     const status = result.failed > 0
       ? (result.succeeded > 0 ? 'partial' : 'failed')
@@ -842,6 +938,23 @@ function observeAccountTestJob({
     }));
     resultPersisted = true;
   };
+  const persistFailure = async (error) => {
+    const interrupted = error?.code === 'JOB_INTERRUPTED'
+      || tracked?.controller.signal.aborted === true;
+    await updateTerminalJob(db, job.id, {
+      status: interrupted ? 'interrupted' : 'failed',
+      error: safeAccountTestErrorMessage(error),
+      result: mutationFailureMetadata(error),
+      finishedAt: new Date().toISOString(),
+    }, terminalUpdateOptions({
+      logger,
+      event: 'account_test.job_update_retry',
+      requestId,
+      jobId: job.id,
+      actor,
+    }));
+    failurePersisted = true;
+  };
   const observation = runAccountTestJob({
     accountIds,
     targetBaselines,
@@ -853,6 +966,7 @@ function observeAccountTestJob({
     logger,
     signal: tracked?.controller.signal || null,
     persistResult,
+    persistFailure,
   }).then(async (result) => {
     const status = result.failed > 0
       ? (result.succeeded > 0 ? 'partial' : 'failed')
@@ -883,6 +997,16 @@ function observeAccountTestJob({
     const message = safeAccountTestErrorMessage(error);
     const interrupted = error?.code === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
+    if (!resultPersisted && !failurePersisted) try {
+      await persistFailure(error);
+    } catch (jobError) {
+      writeLog(logger, 'error', 'account_test.job_update_failed', {
+        requestId,
+        jobId: job.id,
+        actor,
+        error: safeErrorMessage(jobError),
+      });
+    }
     try {
       await db.audit({
         jobId: job.id,
@@ -897,27 +1021,6 @@ function observeAccountTestJob({
         jobId: job.id,
         actor,
         error: safeErrorMessage(auditError),
-      });
-    }
-    try {
-      await updateTerminalJob(db, job.id, {
-        status: interrupted ? 'interrupted' : 'failed',
-        error: message,
-        result: { code: error?.code || null },
-        finishedAt: new Date().toISOString(),
-      }, terminalUpdateOptions({
-        logger,
-        event: 'account_test.job_update_retry',
-        requestId,
-        jobId: job.id,
-        actor,
-      }));
-    } catch (jobError) {
-      writeLog(logger, 'error', 'account_test.job_update_failed', {
-        requestId,
-        jobId: job.id,
-        actor,
-        error: safeErrorMessage(jobError),
       });
     }
     writeLog(logger, interrupted ? 'warn' : 'error', interrupted
@@ -1048,6 +1151,7 @@ function createServer(options = {}) {
     try {
       const requestUrl = new URL(request.url || '/', 'http://localhost');
       requestPath = requestUrl.pathname;
+      const reconciliationAckPath = reconciliationAcknowledgePath(requestUrl.pathname);
       if (jobManager.shuttingDown) {
         response.setHeader('connection', 'close');
         jsonResponse(response, 503, {
@@ -1058,7 +1162,8 @@ function createServer(options = {}) {
       }
       const isReadOnlyGet = request.method === 'GET';
       const requiresWrite = request.method === 'POST'
-        && ['/api/sync/import', '/api/phase3', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname);
+        && (reconciliationAckPath.matched
+          || ['/api/sync/import', '/api/phase3', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
       const authError = requestUrl.pathname.startsWith('/api/')
         ? authorizationError(request, requiresWrite)
         : null;
@@ -1076,7 +1181,7 @@ function createServer(options = {}) {
         return;
       }
       if (request.method === 'POST'
-          && JSON_BODY_ENDPOINTS.has(requestUrl.pathname)
+          && (JSON_BODY_ENDPOINTS.has(requestUrl.pathname) || reconciliationAckPath.matched)
           && !hasJsonContentType(request)) {
         writeLog(logger, 'warn', 'http.unsupported_media_type', {
           requestId,
@@ -1204,6 +1309,7 @@ function createServer(options = {}) {
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
           includeInternal: true,
+          requireCompleteSources: true,
           logger,
           requestId,
           actor,
@@ -1276,6 +1382,40 @@ function createServer(options = {}) {
           selectedCount: selectedKeys.length,
           durationMs: Date.now() - importRequestStartedAt,
         });
+        let resultPersisted = false;
+        let failurePersisted = false;
+        const persistImportResult = async (result) => {
+          const status = tokenImportJobStatus(result);
+          await updateTerminalJob(db, job.id, {
+            status,
+            result,
+            finishedAt: new Date().toISOString(),
+          }, terminalUpdateOptions({
+            logger,
+            event: 'import.job_update_retry',
+            requestId,
+            jobId: job.id,
+            actor,
+          }));
+          resultPersisted = true;
+        };
+        const persistImportFailure = async (error) => {
+          const interrupted = error?.code === 'JOB_INTERRUPTED'
+            || trackedImport.controller.signal.aborted;
+          await updateTerminalJob(db, job.id, {
+            status: interrupted ? 'interrupted' : 'failed',
+            error: safeErrorMessage(error),
+            result: mutationFailureMetadata(error),
+            finishedAt: new Date().toISOString(),
+          }, terminalUpdateOptions({
+            logger,
+            event: 'import.job_update_retry',
+            requestId,
+            jobId: job.id,
+            actor,
+          }));
+          failurePersisted = true;
+        };
         const importObservation = Promise.resolve().then(() => {
           throwIfJobInterrupted(trackedImport.controller.signal);
           return executeImport({
@@ -1286,21 +1426,13 @@ function createServer(options = {}) {
             jobId: job.id,
             logger,
             signal: trackedImport.controller.signal,
+            persistResult: persistImportResult,
+            persistFailure: persistImportFailure,
           });
         }).then(async (result) => {
           const status = tokenImportJobStatus(result);
-          try {
-            await updateTerminalJob(db, job.id, {
-              status,
-              result,
-              finishedAt: new Date().toISOString(),
-            }, terminalUpdateOptions({
-              logger,
-              event: 'import.job_update_retry',
-              requestId,
-              jobId: job.id,
-              actor,
-            }));
+          if (!resultPersisted && !failurePersisted) try {
+            await persistImportResult(result);
           } catch (jobError) {
             // The remote operation has already completed. Keep that outcome
             // in logs rather than relabeling a successful remote write as a
@@ -1325,6 +1457,16 @@ function createServer(options = {}) {
           const message = safeErrorMessage(error);
           const interrupted = error?.code === 'JOB_INTERRUPTED'
             || trackedImport.controller.signal.aborted;
+          if (!resultPersisted && !failurePersisted) try {
+            await persistImportFailure(error);
+          } catch (jobError) {
+            writeLog(logger, 'error', 'import.job_update_failed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              error: safeErrorMessage(jobError),
+            });
+          }
           try {
             await db.audit({
               jobId: job.id,
@@ -1339,27 +1481,6 @@ function createServer(options = {}) {
               jobId: job.id,
               actor,
               error: safeErrorMessage(auditError),
-            });
-          }
-          try {
-            await updateTerminalJob(db, job.id, {
-              status: interrupted ? 'interrupted' : 'failed',
-              error: message,
-              result: { code: error?.code || null },
-              finishedAt: new Date().toISOString(),
-            }, terminalUpdateOptions({
-              logger,
-              event: 'import.job_update_retry',
-              requestId,
-              jobId: job.id,
-              actor,
-            }));
-          } catch (jobError) {
-            writeLog(logger, 'error', 'import.job_update_failed', {
-              requestId,
-              jobId: job.id,
-              actor,
-              error: safeErrorMessage(jobError),
             });
           }
           writeLog(logger, 'error', 'import.job_failed', {
@@ -1380,7 +1501,7 @@ function createServer(options = {}) {
         });
         const status = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-          : error?.code === 'JOB_ALREADY_CLAIMED' ? 409 : 400;
+          : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409 : 400;
         jsonResponse(response, status, { error: error?.code || 'import_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -1465,6 +1586,18 @@ function createServer(options = {}) {
               });
               throwIfJobInterrupted(signal);
             } catch (error) {
+              if (error?.code === 'JOB_RECONCILIATION_REQUIRED') {
+                enqueueFailure = error;
+                rejected.push({
+                  index: requestItem.originalIndex,
+                  email: requestItem.email || null,
+                  phone: requestItem.phone || null,
+                  error: 'phase3_reconciliation_required',
+                  message: '上一个任务结果未知，已保留持久阻挡；请先人工核对',
+                  jobId: error.existingJobId || null,
+                });
+                break;
+              }
               if (error?.code !== 'JOB_ALREADY_CLAIMED') {
                 enqueueFailure = error;
                 rejected.push({
@@ -1573,7 +1706,8 @@ function createServer(options = {}) {
           error: safeErrorMessage(error),
         });
         const status = error?.code === 'JOB_INTERRUPTED' ? 503
-          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413 : 400;
+          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
+            : error?.code === 'JOB_RECONCILIATION_REQUIRED' ? 409 : 400;
         jsonResponse(response, status, { error: error?.code || 'phase3_failed', message: safeErrorMessage(error) });
       }
       return;
@@ -1720,7 +1854,7 @@ function createServer(options = {}) {
         const status = error?.code === 'JOB_INTERRUPTED' ? 503
           : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
           : error?.code === 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS' ? 409
-            : error?.code === 'JOB_ALREADY_CLAIMED' ? 409
+            : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
             : error?.message?.includes('required') ? 503 : 400;
         jsonResponse(response, status, {
           error: error?.code || 'account_test_failed',
@@ -1770,6 +1904,13 @@ function createServer(options = {}) {
           throw error;
         }
         const cleanup = await jobManager.withAdmission((signal) => withControlPlaneLock(async () => {
+          throwIfJobInterrupted(signal);
+          if (!db || typeof db.assertNoReconciliationHold !== 'function') {
+            const error = new Error('任务对账安全检查不可用，未修改任何 token 文件');
+            error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+            throw error;
+          }
+          await db.assertNoReconciliationHold();
           throwIfJobInterrupted(signal);
           try {
             await db.audit({
@@ -1910,8 +2051,9 @@ function createServer(options = {}) {
           error: safeErrorMessage(error),
           durationMs: Date.now() - cleanupStartedAt,
         });
-        const status = ['TOKEN_CLEANUP_STALE', 'JOB_ALREADY_CLAIMED'].includes(error?.code) ? 409
-          : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED'].includes(error?.code)
+        const status = ['TOKEN_CLEANUP_STALE', 'JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
+          : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
+            'JOB_RECONCILIATION_GUARD_UNAVAILABLE'].includes(error?.code)
             ? 503
             : 400;
         jsonResponse(response, status, {
@@ -1923,8 +2065,111 @@ function createServer(options = {}) {
       return;
     }
 
+    if (request.method === 'POST' && reconciliationAckPath.matched) {
+      const acknowledgeStartedAt = Date.now();
+      if (actor !== 'panel-admin') {
+        writeLog(logger, 'warn', 'job.reconciliation_acknowledge_admin_required', {
+          requestId,
+          actor,
+          jobId: reconciliationAckPath.jobId,
+        });
+        jsonResponse(response, 403, {
+          error: 'JOB_RECONCILIATION_ADMIN_REQUIRED',
+          message: '只允许经过认证的面板管理员解除待对账阻挡',
+        });
+        return;
+      }
+      try {
+        const body = await readJsonBody(request, 4096);
+        const requestError = reconciliationAcknowledgeRequestError(
+          body,
+          reconciliationAckPath.jobId,
+        );
+        if (requestError) throw requestError;
+        writeLog(logger, 'warn', 'job.reconciliation_acknowledge_started', {
+          requestId,
+          actor,
+          jobId: reconciliationAckPath.jobId,
+          resolution: body.resolution,
+        });
+        const acknowledgement = await jobManager.withAdmission(async (signal) => {
+          throwIfJobInterrupted(signal);
+          return db.acknowledgeJobReconciliation(reconciliationAckPath.jobId, {
+            actor,
+            confirmation: body.confirmation,
+            resolution: body.resolution,
+            claimDigest: body.claimDigest,
+            beforeRelease: (fields) => {
+              throwIfJobInterrupted(signal);
+              assertAuditLogCheckpoint(logger, 'job.reconciliation_acknowledge_checkpoint', {
+                requestId,
+                actor,
+                jobId: fields.jobId,
+                resolution: fields.resolution,
+                claimDigest: fields.claimDigest,
+                holdScope: fields.holdScope,
+                releasedClaimCount: fields.releasedClaimCount,
+              });
+            },
+          });
+        });
+        writeLog(logger, 'warn', 'job.reconciliation_acknowledge_completed', {
+          requestId,
+          actor,
+          jobId: acknowledgement.jobId,
+          resolution: acknowledgement.resolution,
+          releasedClaimCount: acknowledgement.releasedClaimCount,
+          idempotent: acknowledgement.idempotent,
+          durationMs: Date.now() - acknowledgeStartedAt,
+        });
+        jsonResponse(response, 200, {
+          ...acknowledgement,
+          message: '已记录管理员的人工核对结论并解除该任务对未来操作的阻挡；原任务仍不可重试',
+        });
+      } catch (error) {
+        writeLog(logger, 'error', 'job.reconciliation_acknowledge_failed', {
+          requestId,
+          actor,
+          jobId: reconciliationAckPath.jobId,
+          code: error?.code || null,
+          error: safeErrorMessage(error),
+          durationMs: Date.now() - acknowledgeStartedAt,
+        });
+        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
+          : error?.code === 'JOB_RECONCILIATION_NOT_FOUND' ? 404
+            : error?.code === 'JOB_RECONCILIATION_ADMIN_REQUIRED' ? 403
+              : [
+                  'JOB_RECONCILIATION_NOT_HELD',
+                  'JOB_RECONCILIATION_ACK_CONFLICT',
+                  'JOB_RECONCILIATION_DIGEST_MISMATCH',
+                ].includes(error?.code) ? 409
+                : [
+                    'INVALID_JSON_BODY',
+                    'INVALID_REQUEST_BODY',
+                    'JOB_RECONCILIATION_JOB_ID_INVALID',
+                    'JOB_RECONCILIATION_REQUEST_INVALID',
+                    'JOB_RECONCILIATION_JOB_ID_MISMATCH',
+                    'JOB_RECONCILIATION_CONFIRMATION_INVALID',
+                    'JOB_RECONCILIATION_RESOLUTION_INVALID',
+                    'JOB_RECONCILIATION_DIGEST_INVALID',
+                  ].includes(error?.code) ? 400
+                  // Persistence, integrity, audit and interruption failures
+                  // are service failures. Do not mislabel an unknown internal
+                  // failure as a request the administrator can fix by retrying.
+                  : 503;
+        jsonResponse(response, status, {
+          error: error?.code || 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED',
+          message: safeErrorMessage(error),
+        });
+      }
+      return;
+    }
+
     if (request.method === 'GET' && requestUrl.pathname === '/api/jobs') {
-      jsonResponse(response, 200, { jobs: await db.listJobs(requestUrl.searchParams.get('limit')) });
+      const page = typeof db.listJobsPage === 'function'
+        ? await db.listJobsPage(requestUrl.searchParams.get('limit'))
+        : { jobs: await db.listJobs(requestUrl.searchParams.get('limit')) };
+      jsonResponse(response, 200, page);
       return;
     }
 
@@ -2163,5 +2408,8 @@ module.exports = {
   tokenImportJobStatus,
   normalizePhase3Requests,
   phase3FailureMetadata,
+  mutationFailureMetadata,
   phase3ClaimKeys,
+  reconciliationAcknowledgePath,
+  reconciliationAcknowledgeRequestError,
 };

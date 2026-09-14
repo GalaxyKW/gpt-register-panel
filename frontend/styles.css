@@ -71,9 +71,10 @@ h2 { margin-bottom: 5px; font-size: 18px; letter-spacing: .01em; }
 .job-panel[data-status="partial"] { border-left-color: var(--warning); background: #fffdf8; }
 .job-panel[data-status="failed"], .job-panel[data-status="interrupted"] { border-left-color: var(--danger); background: #fffafa; }
 .job-mark { display: grid; width: 30px; height: 30px; flex: 0 0 30px; place-items: center; border-radius: 7px; background: #e4eef1; color: #496d79; font-size: 17px; font-weight: 800; }
-.job-copy { min-width: 0; }
+.job-copy { min-width: 0; flex: 1 1 auto; }
 .job-heading { display: flex; align-items: center; gap: 8px; color: var(--ink); font-size: 13px; }
 .job-copy p { margin: 4px 0 0; overflow: hidden; color: var(--muted); font-size: 12px; text-overflow: ellipsis; white-space: nowrap; }
+.reconciliation-ack-button { flex: 0 0 auto; margin-left: auto; }
 
 .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 13px; margin-bottom: 18px; }
 .metric { position: relative; min-height: 108px; overflow: hidden; padding: 18px 19px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: 0 3px 12px rgba(29, 62, 68, .045); transition: border-color .15s ease, box-shadow .15s ease, transform .15s ease; }
@@ -185,6 +186,12 @@ code { color: #355e69; font-size: 11px; }
 .auth-dialog-mark::after { position: absolute; top: 8px; left: 13px; width: 8px; height: 9px; border: 2px solid var(--accent-strong); border-bottom: 0; border-radius: 6px 6px 0 0; content: ''; }
 .auth-dialog-field { display: grid; gap: 7px; color: var(--ink-soft); font-size: 12px; font-weight: 700; }
 .auth-dialog-actions { display: flex; justify-content: flex-end; gap: 9px; }
+.reconciliation-dialog { width: min(620px, calc(100vw - 32px)); }
+.reconciliation-dialog-mark { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; border-radius: 8px; background: var(--warning-soft); color: var(--warning); font-weight: 900; }
+.reconciliation-target { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 7px 12px; padding: 11px 12px; border: 1px solid var(--line); border-radius: 7px; background: #f8faf9; color: var(--muted); font-size: 12px; }
+.reconciliation-target code { overflow-wrap: anywhere; color: var(--ink-soft); }
+.reconciliation-target strong { color: var(--ink-soft); font-weight: 700; }
+.dialog-error { margin: 0; color: var(--danger); font-size: 12px; line-height: 1.5; }
 
 @media (max-width: 980px) {
   .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -202,8 +209,9 @@ code { color: #355e69; font-size: 11px; }
   .toolbar-actions .button { flex: 1 1 auto; }
   .selection-count { margin-right: auto; }
   .section-heading { align-items: flex-start; flex-direction: column; gap: 7px; }
-  .job-panel { align-items: flex-start; }
+  .job-panel { align-items: flex-start; flex-wrap: wrap; }
   .job-copy p { white-space: normal; }
+  .reconciliation-ack-button { width: calc(100% - 43px); margin-left: 43px; }
   .auth-dialog-form { padding: 18px; }
   .auth-dialog-actions .button { flex: 1 1 0; }
 }

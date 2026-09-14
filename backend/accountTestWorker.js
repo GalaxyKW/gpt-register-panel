@@ -502,7 +502,14 @@ async function runAccountTestJobNow({
   const deadline = startedAt + jobTimeoutMs;
   const normalizedModelId = normalizeAccountTestModelId(modelId);
   const baselineByAccountId = accountTestBaselineMap(targetBaselines, accountIds);
-  await db?.updateJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+  if (db && jobId) {
+    if (typeof db.startMutationJob !== 'function') {
+      const error = new Error('任务执行安全检查不可用，尚未开始账号测试');
+      error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+      throw error;
+    }
+    await db.startMutationJob(jobId);
+  }
   writeLog(logger, 'info', 'account_test.started', {
     jobId,
     actor,
@@ -1171,7 +1178,28 @@ async function runAccountTestJobNow({
 
 function runAccountTestJob(args = {}) {
   return withControlPlaneLock(
-    () => runAccountTestJobNow(args),
+    async () => {
+      try {
+        return await runAccountTestJobNow(args);
+      } catch (error) {
+        if (typeof args.persistFailure === 'function') {
+          try {
+            // As with normal result persistence, settle the durable job row
+            // while the control-plane lease is still held. The observer is an
+            // idempotent fallback for temporary persistence failures only.
+            await args.persistFailure(error);
+          } catch (jobError) {
+            writeLog(args.logger, 'error', 'account_test.job_update_deferred', {
+              jobId: args.jobId || null,
+              actor: args.actor || 'local',
+              terminalOutcome: 'failed',
+              error: safeErrorMessage(jobError),
+            });
+          }
+        }
+        throw error;
+      }
+    },
     { signal: args.signal },
   );
 }

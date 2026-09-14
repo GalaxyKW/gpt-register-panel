@@ -13,6 +13,9 @@ const state = {
   watchIds: [],
   jobPollTimer: null,
   cleanupRequestPending: false,
+  reconciliationAckPending: false,
+  reconciliationAckTarget: null,
+  reconciliationHolds: { total: 0, returned: 0, truncated: false },
   snapshotRequestSequence: 0,
   snapshotRequestsPending: 0,
   selectionRevision: 0,
@@ -57,10 +60,28 @@ const elements = {
   jobTitle: document.querySelector('#jobTitle'),
   jobStatus: document.querySelector('#jobStatus'),
   jobMeta: document.querySelector('#jobMeta'),
+  reconciliationAckButton: document.querySelector('#reconciliationAckButton'),
+  reconciliationAckDialog: document.querySelector('#reconciliationAckDialog'),
+  reconciliationAckForm: document.querySelector('#reconciliationAckForm'),
+  reconciliationAckJobId: document.querySelector('#reconciliationAckJobId'),
+  reconciliationAckScope: document.querySelector('#reconciliationAckScope'),
+  reconciliationAckDigest: document.querySelector('#reconciliationAckDigest'),
+  reconciliationAckResolution: document.querySelector('#reconciliationAckResolution'),
+  reconciliationAckConfirmation: document.querySelector('#reconciliationAckConfirmation'),
+  reconciliationAckError: document.querySelector('#reconciliationAckError'),
+  reconciliationAckCancel: document.querySelector('#reconciliationAckCancel'),
+  reconciliationAckConfirm: document.querySelector('#reconciliationAckConfirm'),
   adminTokenDialog: document.querySelector('#adminTokenDialog'),
   adminTokenInput: document.querySelector('#adminTokenInput'),
   adminTokenOrigin: document.querySelector('#adminTokenOrigin'),
 };
+
+const RECONCILIATION_ACK_CONFIRMATION = '我已按强身份完成人工核对';
+const RECONCILIATION_ACK_RESOLUTIONS = new Set([
+  'operation_applied',
+  'operation_not_applied',
+  'state_manually_reconciled',
+]);
 
 function escapeHtml(value) {
   return String(value === undefined || value === null ? '' : value)
@@ -451,7 +472,8 @@ function actionRequestPending() {
     || state.importRequestPending
     || state.phase3RequestPending
     || state.accountTestRequestPending
-    || state.cleanupRequestPending;
+    || state.cleanupRequestPending
+    || state.reconciliationAckPending;
 }
 
 function activeJobPending() {
@@ -463,6 +485,12 @@ function actionsLocked() {
     || activeJobPending()
     || state.snapshotRefreshPending
     || state.snapshotRequestsPending > 0;
+}
+
+function reconciliationWriteBlocked() {
+  const reportedTotal = Number(state.reconciliationHolds?.total);
+  return (Number.isSafeInteger(reportedTotal) && reportedTotal > 0)
+    || reconciliationHoldJobs(state.job).length > 0;
 }
 
 function sub2ApiReadStatus(snapshot = state.snapshot) {
@@ -488,6 +516,7 @@ function updateImportButtonState() {
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
   elements.importButton.disabled = !state.plan
     || actionsLocked()
+    || reconciliationWriteBlocked()
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || state.plan.selectedKeys.length === 0
@@ -1233,6 +1262,8 @@ function accountTestReconciliationNotice(results) {
 
 function jobNeedsReconciliation(job) {
   if (Array.isArray(job?.jobs)) return job.jobs.some(jobNeedsReconciliation);
+  if (job?.result?.reconciliationResolved === true
+      && job?.result?.reconciliationHold === false) return false;
   if (job?.type === 'token_import') return tokenImportNeedsReconciliation(job.result);
   if (job?.type === 'account_test') return accountTestNeedsReconciliation(job.result);
   return job?.result?.requiresReconciliation === true;
@@ -1258,18 +1289,63 @@ function reconciliationNoticeForJobs(jobs) {
       + (totals.notAttempted ? '，另有 ' + totals.notAttempted + ' 个账号未执行' : '')
       + '。请先按账号 ID 和强身份字段核对 Sub2API，确认前不要重复提交。');
   }
+  const genericJobs = list.filter((job) => (
+    jobNeedsReconciliation(job)
+      && job?.type !== 'token_import'
+      && job?.type !== 'account_test'
+  ));
+  if (genericJobs.length) {
+    notices.push('有 ' + genericJobs.length + ' 个任务的执行结果待人工核对。'
+      + '面板不会自动确认实际状态，核对完成前请勿重试。');
+  }
+  const hasHold = list.some((job) => job?.result?.reconciliationHold === true);
+  if (hasHold) notices.push('当前安全策略会保守阻止全部新写操作，直到所有持久 hold 均完成人工核对。');
   return notices.join(' ');
+}
+
+function reconciliationHoldJobs(job) {
+  const jobs = Array.isArray(job?.jobs) ? job.jobs : (job ? [job] : []);
+  return jobs.filter((item) => (
+    terminalJob(item?.status)
+      && item?.result?.requiresReconciliation === true
+      && item?.result?.reconciliationHold === true
+      && item?.result?.reconciliationResolved !== true
+      && /^job_[a-f0-9]{24}$/.test(String(item?.id || ''))
+      && /^[a-f0-9]{64}$/.test(String(item?.result?.reconciliationClaimDigest || ''))
+  ));
+}
+
+function reconciliationHoldTarget(job = state.job) {
+  return reconciliationHoldJobs(job)[0] || null;
+}
+
+function renderReconciliationAction(job) {
+  const button = elements.reconciliationAckButton;
+  if (!button) return;
+  const heldJobs = reconciliationHoldJobs(job);
+  const target = heldJobs[0] || null;
+  button.hidden = !target;
+  button.disabled = !target || state.reconciliationAckPending || Boolean(state.snapshot?.readOnly);
+  const knownHeldCount = Math.max(heldJobs.length, Number(state.reconciliationHolds?.total) || 0);
+  button.textContent = knownHeldCount > 1
+    ? '逐项人工核对（待处理 ' + knownHeldCount + '）'
+    : '人工核对并解除阻挡';
+  button.title = state.snapshot?.readOnly
+    ? '当前面板为只读模式，无法解除持久阻挡'
+    : '仅在外部人工核对完成后使用；面板不会自动核对';
 }
 
 function renderJob(job) {
   if (!job) {
     elements.jobPanel.hidden = true;
+    if (typeof renderReconciliationAction === 'function') renderReconciliationAction(null);
     return;
   }
   elements.jobPanel.hidden = false;
   const jobs = Array.isArray(job.jobs) ? job.jobs : [job];
   const reconciliationJobs = jobs.filter(jobNeedsReconciliation);
   const needsReconciliation = reconciliationJobs.length > 0;
+  if (typeof renderReconciliationAction === 'function') renderReconciliationAction(job);
   elements.jobPanel.dataset.status = needsReconciliation ? 'partial' : (job.status || '');
   const isPhase3 = jobs.every((item) => item.type === 'phase3');
   const isAccountTest = jobs.every((item) => item.type === 'account_test');
@@ -1309,13 +1385,133 @@ function renderJob(job) {
     } else if (job.type === 'token_import') {
       detail = tokenImportResultDetail(job.result);
     } else if (job.type === 'phase3') {
-      detail = 'Phase 3 已完成并检测到 token 更新';
+      detail = needsReconciliation
+        ? 'Phase 3 执行结果未知；请按账号 ID 和强身份字段人工核对，确认前勿重试'
+        : 'Phase 3 已完成并检测到 token 更新';
     } else {
       detail = '成功 ' + (job.result.imported?.length || 0) + ' · 失败 ' + (job.result.failed || 0);
     }
   }
   if (!detail) detail = '任务编号 ' + job.id;
   elements.jobMeta.textContent = detail + ' · ' + formatDate(job.finishedAt || job.startedAt || job.createdAt);
+}
+
+function setReconciliationDialogError(message) {
+  if (!elements.reconciliationAckError) return;
+  elements.reconciliationAckError.hidden = !message;
+  elements.reconciliationAckError.textContent = message || '';
+}
+
+function setReconciliationDialogPending(pending) {
+  for (const element of [
+    elements.reconciliationAckResolution,
+    elements.reconciliationAckConfirmation,
+    elements.reconciliationAckCancel,
+    elements.reconciliationAckConfirm,
+  ]) {
+    if (element) element.disabled = Boolean(pending);
+  }
+}
+
+function openReconciliationDialog() {
+  const target = reconciliationHoldTarget();
+  const dialog = elements.reconciliationAckDialog;
+  if (!target || !dialog || typeof dialog.showModal !== 'function') {
+    showNotice('无法打开人工核对确认框，持久阻挡未变更。', 'notice-danger');
+    return;
+  }
+  state.reconciliationAckTarget = {
+    id: target.id,
+    digest: target.result.reconciliationClaimDigest,
+  };
+  if (elements.reconciliationAckJobId) elements.reconciliationAckJobId.textContent = target.id;
+  if (elements.reconciliationAckScope) {
+    elements.reconciliationAckScope.textContent = target.result.reconciliationHoldScope === 'all_future_jobs'
+      ? '全部新写操作（旧版任务无法还原原保护键）'
+      : '当前键已保留；安全策略阻止全部新写操作';
+  }
+  if (elements.reconciliationAckDigest) {
+    elements.reconciliationAckDigest.textContent = target.result.reconciliationClaimDigest;
+  }
+  if (elements.reconciliationAckResolution) elements.reconciliationAckResolution.value = '';
+  if (elements.reconciliationAckConfirmation) elements.reconciliationAckConfirmation.value = '';
+  setReconciliationDialogError('');
+  setReconciliationDialogPending(false);
+  try {
+    dialog.returnValue = '';
+    dialog.showModal();
+    elements.reconciliationAckResolution?.focus();
+  } catch {
+    state.reconciliationAckTarget = null;
+    showNotice('无法打开人工核对确认框，持久阻挡未变更。', 'notice-danger');
+  }
+}
+
+async function submitReconciliationAcknowledgement(event) {
+  event.preventDefault();
+  const submitterValue = String(event.submitter?.value || '');
+  if (submitterValue !== 'confirm') {
+    if (!state.reconciliationAckPending) elements.reconciliationAckDialog?.close('cancel');
+    return;
+  }
+  if (state.reconciliationAckPending) return;
+  const target = state.reconciliationAckTarget;
+  const current = reconciliationHoldJobs(state.job).find((job) => (
+    job.id === target?.id && job.result.reconciliationClaimDigest === target?.digest
+  ));
+  if (!current) {
+    setReconciliationDialogError('任务或保护键摘要已变化，请关闭后刷新。');
+    return;
+  }
+  const resolution = String(elements.reconciliationAckResolution?.value || '');
+  const confirmation = String(elements.reconciliationAckConfirmation?.value || '');
+  if (!RECONCILIATION_ACK_RESOLUTIONS.has(resolution)) {
+    setReconciliationDialogError('请选择与人工核对结果完全一致的结论。');
+    return;
+  }
+  if (confirmation !== RECONCILIATION_ACK_CONFIRMATION) {
+    setReconciliationDialogError('二次确认语不正确，持久阻挡未变更。');
+    return;
+  }
+  if (!window.confirm('最后确认：你已在对应系统中人工核对实际状态。面板不会自动验证此结论，是否解除该任务对未来操作的阻挡？')) return;
+
+  state.reconciliationAckPending = true;
+  setReconciliationDialogError('');
+  setReconciliationDialogPending(true);
+  updateActionState();
+  try {
+    const response = await apiFetch(
+      '/api/jobs/' + encodeURIComponent(target.id) + '/reconciliation/acknowledge',
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          jobId: target.id,
+          confirmation,
+          resolution,
+          claimDigest: target.digest,
+        }),
+      },
+    );
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.message || body.error || '人工对账确认失败');
+    elements.reconciliationAckDialog?.close('acknowledged');
+    state.reconciliationAckTarget = null;
+    await resumeActiveJob();
+    if (state.job && jobNeedsReconciliation(state.job)) {
+      showNotice('已解除任务 ' + target.id + ' 的未来操作阻挡；原任务仍不可重试。'
+        + reconciliationNoticeForJobs(Array.isArray(state.job.jobs) ? state.job.jobs : [state.job]), 'notice-warning');
+    } else {
+      showNotice('已记录人工核对结论并解除该任务对未来操作的阻挡；原任务仍不可重试。', 'notice-info');
+    }
+  } catch (error) {
+    setReconciliationDialogError(error.message || '人工对账确认失败；持久阻挡未变更。');
+    showNotice(error.message || '人工对账确认失败。', 'notice-danger');
+  } finally {
+    state.reconciliationAckPending = false;
+    setReconciliationDialogPending(false);
+    renderReconciliationAction(state.job);
+    updateActionState();
+  }
 }
 
 function stopJobPolling() {
@@ -1470,6 +1666,16 @@ async function resumeActiveJob() {
     const body = await response.json();
     if (!response.ok) throw new Error(body.message || body.error || '任务列表读取失败');
     const listedJobs = Array.isArray(body.jobs) ? body.jobs : [];
+    const holdListing = body.reconciliationHolds && typeof body.reconciliationHolds === 'object'
+      ? body.reconciliationHolds
+      : { total: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
+          returned: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
+          truncated: false };
+    state.reconciliationHolds = {
+      total: Math.max(0, Number(holdListing.total) || 0),
+      returned: Math.max(0, Number(holdListing.returned) || 0),
+      truncated: holdListing.truncated === true,
+    };
     const activeJobs = listedJobs.filter((job) => ['queued', 'running'].includes(job.status));
     if (!activeJobs.length) {
       if (state.job?.resumeProbe) {
@@ -1480,7 +1686,12 @@ async function resumeActiveJob() {
         state.job = recentReconciliation || null;
         renderJob(state.job);
         if (recentReconciliation) {
-          showNotice(reconciliationNoticeForJobs([recentReconciliation]), 'notice-warning');
+          showNotice(reconciliationNoticeForJobs([recentReconciliation])
+            + (state.reconciliationHolds.truncated
+              ? '待核对任务超过单次响应上限，当前显示 '
+                + state.reconciliationHolds.returned + '/' + state.reconciliationHolds.total
+                + ' 个；请逐项处理并刷新，不得将未显示项视为已解除。'
+              : ''), 'notice-warning');
         }
         updateActionState();
       }
@@ -1494,6 +1705,7 @@ async function resumeActiveJob() {
     renderJob(state.job);
     updateActionState();
     await watchJobs(activeJobs.map((job) => job.id), activeJobs.length === 1 ? activeJobs[0].type : 'batch');
+    if (state.reconciliationHolds.total > 0 && !activeJobPending()) await resumeActiveJob();
   } catch (error) {
     // A task can still run even when the optional resume request is not
     // available. Treat the initial state as unknown and keep all mutations
@@ -1820,10 +2032,14 @@ function updateActionState() {
     && !phase3Problem
     && !state.snapshot?.readOnly;
   const locked = actionsLocked();
-  elements.phase3Button.disabled = locked || !canRunPhase3;
+  const writeBlocked = reconciliationWriteBlocked();
+  const mutationLocked = locked || writeBlocked;
+  elements.phase3Button.disabled = mutationLocked || !canRunPhase3;
   if (elements.accountTestButton) {
-    elements.accountTestButton.disabled = locked || !canRunAccountTest;
-    if (locked) {
+    elements.accountTestButton.disabled = mutationLocked || !canRunAccountTest;
+    if (writeBlocked) {
+      elements.accountTestButton.title = '存在待人工对账任务，当前全部写操作已阻止';
+    } else if (locked) {
       elements.accountTestButton.title = '另一个任务或请求执行中';
     } else if (!canRunAccountTest) {
       elements.accountTestButton.title = '请选择已导入 Sub2API 的上游账号';
@@ -1836,10 +2052,24 @@ function updateActionState() {
   document.querySelectorAll('.row-check').forEach((input) => { input.disabled = locked; });
   elements.previewButton.disabled = locked || !comparisonAvailable();
   updateImportButtonState();
+  elements.importButton.title = writeBlocked
+    ? '存在待人工对账任务，当前全部写操作已阻止'
+    : '';
   if (elements.cleanupButton) {
-    elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || locked;
+    elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || mutationLocked;
+    elements.cleanupButton.title = writeBlocked
+      ? '存在待人工对账任务，当前全部写操作已阻止'
+      : '';
   }
-  if (locked) {
+  if (elements.reconciliationAckButton) {
+    const target = reconciliationHoldTarget();
+    elements.reconciliationAckButton.disabled = !target
+      || state.reconciliationAckPending
+      || Boolean(state.snapshot?.readOnly);
+  }
+  if (writeBlocked) {
+    elements.phase3Button.title = '存在待人工对账任务，当前全部写操作已阻止';
+  } else if (locked) {
     elements.phase3Button.title = '另一个任务或请求执行中';
   } else if (!canRunPhase3) {
     elements.phase3Button.title = phase3Problem || '请选择至少一个符合条件的账号';
@@ -1868,6 +2098,22 @@ document.querySelectorAll('[data-column-toggle]').forEach((input) => {
   } catch {}
   input.addEventListener('change', applyColumnVisibility);
 });
+
+if (elements.reconciliationAckButton) {
+  elements.reconciliationAckButton.addEventListener('click', openReconciliationDialog);
+}
+if (elements.reconciliationAckForm) {
+  elements.reconciliationAckForm.addEventListener('submit', submitReconciliationAcknowledgement);
+}
+if (elements.reconciliationAckDialog) {
+  elements.reconciliationAckDialog.addEventListener('cancel', (event) => {
+    if (state.reconciliationAckPending) event.preventDefault();
+  });
+  elements.reconciliationAckDialog.addEventListener('close', () => {
+    if (!state.reconciliationAckPending) state.reconciliationAckTarget = null;
+    setReconciliationDialogError('');
+  });
+}
 
 loadSnapshot({ resumeJobs: true });
 applyColumnVisibility();

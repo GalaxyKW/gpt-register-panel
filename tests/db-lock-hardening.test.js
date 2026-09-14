@@ -130,12 +130,16 @@ test('PanelDb persists boot identity and rejects a live PID from another boot', 
     statement.free();
   });
   const afterLegacyMigration = new PanelDb(file);
-  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'interrupted');
-  const afterLegacyReplacement = await afterLegacyMigration.createJob('phase3', {}, 'tester', {
-    claimKeys: [legacyClaimKey],
-  });
-  assert.equal(afterLegacyReplacement.status, 'queued');
-  await afterLegacyMigration.updateJob(afterLegacyReplacement.id, {
+  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'queued');
+  await assert.rejects(
+    afterLegacyMigration.createJob('phase3', {}, 'tester', {
+      claimKeys: [legacyClaimKey],
+    }),
+    (error) => error.code === 'JOB_ALREADY_CLAIMED'
+      && error.existingJobId === legacyOwned.id,
+  );
+  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'queued');
+  await afterLegacyMigration.updateJob(legacyOwned.id, {
     status: 'failed',
     error: 'test cleanup',
   });

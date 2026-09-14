@@ -5,6 +5,7 @@ const {
   asString,
   normalizeIdentityValue,
 } = require('../lib/token');
+const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
@@ -474,12 +475,47 @@ function safeModelId(value) {
   return redacted.includes('[redacted]') ? '' : redacted;
 }
 
-async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024) {
+function hasInvalidUnicodeText(value) {
+  if (value.includes('\ufffd')) return true;
+  for (let index = 0; index < value.length; index += 1) {
+    const code = value.charCodeAt(index);
+    if (code >= 0xd800 && code <= 0xdbff) {
+      const next = value.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true;
+      index += 1;
+    } else if (code >= 0xdc00 && code <= 0xdfff) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function decodeResponseBytes(bytes, fatalUtf8) {
+  if (!fatalUtf8) return Buffer.from(bytes).toString('utf8');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  } catch {
+    const error = new Error('Sub2API response is not valid UTF-8');
+    error.code = 'SUB2API_RESPONSE_UTF8_INVALID';
+    throw error;
+  }
+}
+
+async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024, options = {}) {
+  const fatalUtf8 = options.fatalUtf8 === true;
   if (!response?.body || typeof response.body.getReader !== 'function') {
     const text = await response.text();
     if (Buffer.byteLength(text, 'utf8') > limit) {
       const error = new Error('Sub2API response body too large');
       error.code = 'SUB2API_RESPONSE_TOO_LARGE';
+      throw error;
+    }
+    // fetch Response#text normally performs replacement decoding. Test doubles
+    // and older fetch implementations may expose only that already-decoded
+    // string, so reject replacement/lone-surrogate evidence conservatively.
+    if (fatalUtf8 && hasInvalidUnicodeText(text)) {
+      const error = new Error('Sub2API response is not valid UTF-8');
+      error.code = 'SUB2API_RESPONSE_UTF8_INVALID';
       throw error;
     }
     return text;
@@ -504,31 +540,141 @@ async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024) {
   } finally {
     try { reader.releaseLock(); } catch {}
   }
-  return Buffer.concat(chunks).toString('utf8');
+  return decodeResponseBytes(Buffer.concat(chunks), fatalUtf8);
+}
+
+function parseAccountTestSse(text) {
+  const events = [];
+  let terminal = null;
+  let invalidReason = null;
+  let doneSeen = false;
+  let frameLines = [];
+
+  const invalidate = (reason) => {
+    if (!invalidReason) invalidReason = reason;
+  };
+  const consumeFrame = () => {
+    if (frameLines.length === 0 || invalidReason) {
+      frameLines = [];
+      return;
+    }
+    const dataLines = [];
+    for (const line of frameLines) {
+      if (line.startsWith(':')) continue;
+      const colon = line.indexOf(':');
+      const field = colon < 0 ? line : line.slice(0, colon);
+      if (field !== 'data') continue;
+      let value = colon < 0 ? '' : line.slice(colon + 1);
+      if (value.startsWith(' ')) value = value.slice(1);
+      dataLines.push(value);
+    }
+    frameLines = [];
+    if (dataLines.length === 0) return;
+    const data = dataLines.join('\n');
+    if (data.trim() === '[DONE]') {
+      if (!terminal) invalidate('done_before_terminal');
+      else doneSeen = true;
+      return;
+    }
+    if (doneSeen) {
+      invalidate('event_after_done');
+      return;
+    }
+    if (!data.trim()) {
+      invalidate('malformed_json');
+      return;
+    }
+    let parsed;
+    try {
+      parsed = JSON.parse(data);
+    } catch {
+      invalidate('malformed_json');
+      return;
+    }
+    if (!isPlainObject(parsed) || typeof parsed.type !== 'string' || !parsed.type) {
+      invalidate('invalid_event_shape');
+      return;
+    }
+    if (terminal) {
+      invalidate(
+        parsed.type === 'error' || parsed.type === 'test_complete'
+          ? 'duplicate_terminal'
+          : 'event_after_terminal',
+      );
+      return;
+    }
+    events.push(parsed);
+    if (parsed.type === 'error') {
+      terminal = { kind: 'failure', event: parsed };
+      return;
+    }
+    if (parsed.type === 'test_complete') {
+      if (typeof parsed.success !== 'boolean') {
+        invalidate('invalid_terminal');
+        return;
+      }
+      if (parsed.success === true
+          && (Object.prototype.hasOwnProperty.call(parsed, 'error')
+            || Object.prototype.hasOwnProperty.call(parsed, 'message'))) {
+        invalidate('conflicting_terminal');
+        return;
+      }
+      terminal = {
+        kind: parsed.success ? 'success' : 'failure',
+        event: parsed,
+      };
+    }
+  };
+
+  let source = String(text || '');
+  if (source.charCodeAt(0) === 0xfeff) source = source.slice(1);
+  for (const line of source.split(/\r\n|\r|\n/)) {
+    if (line === '') consumeFrame();
+    else frameLines.push(line);
+  }
+  // A fully-consumed HTTP body is an unambiguous EOF boundary. Accept the
+  // final SSE frame even when the producer omitted the customary blank line.
+  consumeFrame();
+  return { events, terminal, invalidReason };
 }
 
 function parseSseEvents(text) {
-  const events = [];
-  for (const line of String(text || '').split(/\r?\n/)) {
-    if (!/^data\s*:/i.test(line)) continue;
-    const value = line.replace(/^data\s*:/i, '').trim();
-    if (!value || value === '[DONE]') continue;
-    try {
-      const parsed = JSON.parse(value);
-      if (parsed && typeof parsed === 'object') events.push(parsed);
-    } catch {
-      // Sub2API emits JSON SSE events. Ignore non-JSON keepalive lines.
-    }
+  const parsed = parseAccountTestSse(text);
+  if (parsed.invalidReason) {
+    const error = new Error('Sub2API SSE response contract is invalid');
+    error.code = 'SUB2API_SSE_INVALID';
+    error.reason = parsed.invalidReason;
+    throw error;
   }
-  return events;
+  return parsed.events;
 }
 
-function sseErrorMessage(events) {
-  const errorEvent = [...(events || [])].reverse().find((event) => (
-    event?.type === 'error'
-      || (event?.type === 'test_complete' && event?.success === false)
-  ));
-  return errorEvent?.error || errorEvent?.message || null;
+function responseContentType(response) {
+  try {
+    if (response?.headers && typeof response.headers.get === 'function') {
+      return String(response.headers.get('content-type') || '');
+    }
+    if (response?.headers && typeof response.headers === 'object') {
+      const entry = Object.entries(response.headers).find(
+        ([name]) => String(name).toLowerCase() === 'content-type',
+      );
+      if (entry) return Array.isArray(entry[1]) ? entry[1].join(', ') : String(entry[1] || '');
+    }
+  } catch {}
+  return '';
+}
+
+function isEventStreamResponse(response) {
+  const contentType = responseContentType(response).split(';', 1)[0].trim().toLowerCase();
+  return contentType === 'text/event-stream';
+}
+
+function isSuccessfulHttpResponse(response) {
+  const status = Number(response?.status);
+  return response?.ok === true
+    && Number.isSafeInteger(status)
+    && status >= 200
+    && status <= 299;
 }
 
 function forwardAbortSignal(signal, controller, markExternalAbort = null) {
@@ -1041,7 +1187,11 @@ class Sub2ApiAdminClient {
         // through a cross-host redirect.
         redirect: 'error',
       });
-      text = await readResponseTextWithLimit(response, this.maxResponseBytes);
+      text = await readResponseTextWithLimit(
+        response,
+        this.maxResponseBytes,
+        { fatalUtf8: true },
+      );
     } catch (error) {
       let failure;
       let reason = 'transport';
@@ -1060,6 +1210,9 @@ class Sub2ApiAdminClient {
       } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
         failure = requestFailure('SUB2API_TEST_RESPONSE_TOO_LARGE', 'Sub2API 账号测试响应过大');
         reason = 'response_too_large';
+      } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
+        failure = requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应编码无效');
+        reason = 'invalid_utf8';
       } else if (error?.code === 'JOB_INTERRUPTED') {
         failure = error;
         reason = 'external_abort';
@@ -1087,7 +1240,7 @@ class Sub2ApiAdminClient {
         'empty_response',
       );
     }
-    if (!response.ok) {
+    if (!isSuccessfulHttpResponse(response)) {
       const error = markAccountTestOutcomeUnknown(
         requestFailure('SUB2API_TEST_REQUEST_REJECTED', 'Sub2API 账号测试请求被上游拒绝（HTTP ' + response.status + '）'),
         'response_rejected',
@@ -1104,28 +1257,31 @@ class Sub2ApiAdminClient {
       throw error;
     }
 
-    const events = parseSseEvents(text);
-    const errorMessage = sseErrorMessage(events);
-    const completions = events.filter((event) => event?.type === 'test_complete');
-    const completed = completions.at(-1);
-    const terminalInvalid = completions.length > 1
-      || (completed && typeof completed.success !== 'boolean')
-      || Boolean(errorMessage && completed?.success === true);
-    if (terminalInvalid || (!completed && !errorMessage)) {
+    if (!isEventStreamResponse(response)) {
       throw markAccountTestOutcomeUnknown(
-        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试缺少可确认的终态'),
-        terminalInvalid ? 'invalid_terminal' : 'missing_terminal',
+        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应类型无效'),
+        'invalid_content_type',
       );
     }
+    const parsedSse = parseAccountTestSse(text);
+    if (parsedSse.invalidReason || !parsedSse.terminal) {
+      throw markAccountTestOutcomeUnknown(
+        requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应契约无效'),
+        parsedSse.invalidReason || 'missing_terminal',
+      );
+    }
+    const completed = parsedSse.terminal.event;
     const eventModel = safeModelId(completed?.model);
-    const completedModel = eventModel || modelId || null;
-    if (completed?.success === true && modelId && eventModel && eventModel !== modelId) {
+    // The request model is local trusted context. A response model is useful
+    // only for mismatch detection; never reflect arbitrary upstream text in a
+    // result or log record.
+    const completedModel = modelId || null;
+    if (parsedSse.terminal.kind === 'success' && modelId && eventModel && eventModel !== modelId) {
       const detail = 'Sub2API 返回的测试模型与请求不一致';
       writeLog(this.logger, 'warn', 'sub2api.account_test_model_mismatch', {
         ...this.logContext,
         accountId: Number(id),
         model: modelId,
-        returnedModel: eventModel,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
         error: detail,
@@ -1134,10 +1290,8 @@ class Sub2ApiAdminClient {
       error.code = 'SUB2API_TEST_MODEL_MISMATCH';
       throw markAccountTestReconciliation(error, 'model_mismatch', { testSuccess: true });
     }
-    if (errorMessage || completed?.success !== true) {
-      const detail = errorMessage
-        ? 'Sub2API 返回失败测试结果'
-        : 'Sub2API 未返回成功测试结果';
+    if (parsedSse.terminal.kind === 'failure') {
+      const detail = 'Sub2API 返回失败测试结果';
       writeLog(this.logger, 'warn', 'sub2api.account_test_unsuccessful', {
         ...this.logContext,
         accountId: Number(id),

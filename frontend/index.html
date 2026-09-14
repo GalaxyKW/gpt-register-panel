@@ -31,6 +31,9 @@
         <div class="job-heading"><strong id="jobTitle">任务</strong><span id="jobStatus" class="badge badge-neutral">-</span></div>
         <p id="jobMeta">-</p>
       </div>
+      <button id="reconciliationAckButton" class="button button-danger reconciliation-ack-button" type="button" hidden>
+        人工核对并解除阻挡
+      </button>
     </section>
 
     <section class="metrics" aria-label="概览">
@@ -152,6 +155,40 @@
       <div class="auth-dialog-actions">
         <button class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
         <button class="button button-primary" type="submit" value="confirm">验证并重试</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="reconciliationAckDialog" class="auth-dialog reconciliation-dialog" aria-labelledby="reconciliationAckTitle" aria-describedby="reconciliationAckHelp">
+    <form id="reconciliationAckForm" method="dialog" class="auth-dialog-form">
+      <div class="auth-dialog-heading">
+        <span class="reconciliation-dialog-mark" aria-hidden="true">!</span>
+        <div>
+          <h2 id="reconciliationAckTitle">人工核对后解除未来操作阻挡</h2>
+          <p id="reconciliationAckHelp">面板不会自动核对实际状态。请先在对应系统中按账号 ID、强身份字段和文件状态完成核对，再继续。此操作只释放未来任务的保护键，不会使原任务变得可重试。</p>
+        </div>
+      </div>
+      <div class="reconciliation-target" aria-live="polite">
+        <span>任务</span><code id="reconciliationAckJobId">-</code>
+        <span>当前阻挡范围</span><strong id="reconciliationAckScope">-</strong>
+        <span>保护键摘要</span><code id="reconciliationAckDigest">-</code>
+      </div>
+      <label class="auth-dialog-field" for="reconciliationAckResolution">
+        <span>人工核对结论</span>
+        <select id="reconciliationAckResolution" required>
+          <option value="">请选择核对结论</option>
+          <option value="operation_applied">原操作已生效</option>
+          <option value="operation_not_applied">原操作未生效</option>
+          <option value="state_manually_reconciled">实际状态已人工修正为期望值</option>
+        </select>
+      </label>
+      <label class="auth-dialog-field" for="reconciliationAckConfirmation">
+        <span>二次确认：输入“<code>我已按强身份完成人工核对</code>”</span>
+        <input id="reconciliationAckConfirmation" type="text" autocomplete="off" spellcheck="false" maxlength="32" required>
+      </label>
+      <p id="reconciliationAckError" class="dialog-error" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="reconciliationAckCancel" class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
+        <button id="reconciliationAckConfirm" class="button button-danger" type="submit" value="confirm">记录结论并解除阻挡</button>
       </div>
     </form>
   </dialog>

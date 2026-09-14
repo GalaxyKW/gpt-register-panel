@@ -73,6 +73,19 @@ test('reads token directories in deterministic order and redacts username passwo
   assert.equal(serialized.includes('refresh-1'), false);
 });
 
+test('case-insensitive filename ties have a stable total order', () => {
+  const fixture = fixtureRoot();
+  fs.writeFileSync(path.join(fixture.root, 'tokens', 'A.json'), JSON.stringify({
+    access_token: 'uppercase-token',
+    email: 'uppercase@example.test',
+  }));
+  const sources = readGptRegisterSources({ rootDirectory: fixture.root });
+  assert.deepEqual(
+    sources.tokens.filter((item) => item.source === 'tokens').map((item) => item.fileName),
+    ['A.json', 'a.json', 'b.json'],
+  );
+});
+
 test('safe username summaries never pass nested source values through', () => {
   const fixture = fixtureRoot();
   fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([{
@@ -225,9 +238,170 @@ test('write-plan source reads reject malformed username JSON', () => {
   const diagnostic = readGptRegisterSources({ rootDirectory: fixture.root });
   assert.deepEqual(diagnostic.usernames, []);
   assert.throws(
-    () => readGptRegisterSources({ rootDirectory: fixture.root, includeRaw: true }),
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    }),
     (error) => error.code === 'GPT_REGISTER_USERNAME_INVALID',
   );
+});
+
+test('complete source snapshots reject malformed username identity and terminal fields', () => {
+  const fixture = fixtureRoot();
+  for (const record of [
+    { email: { access_token: 'nested-email-secret' }, password: 'present', status: 'oauth_done' },
+    { email: 'valid@example.test', password: 'present', status: { value: 'account_deleted' } },
+    { email: 'valid@example.test', password: { value: 'nested-password-secret' }, status: 'oauth_done' },
+  ]) {
+    fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([record]));
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_USERNAME_INVALID'
+        && !JSON.stringify(error).includes('nested-'),
+    );
+  }
+});
+
+test('complete source snapshots reject every missing required source explicitly', () => {
+  for (const missing of ['tokens', 'use_token', 'username.json']) {
+    const fixture = fixtureRoot();
+    const target = path.join(fixture.root, missing);
+    if (missing.endsWith('.json')) fs.unlinkSync(target);
+    else fs.rmSync(target, { recursive: true });
+
+    const diagnostic = readGptRegisterSources({ rootDirectory: fixture.root });
+    assert.ok(diagnostic);
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_SOURCE_MISSING',
+      missing,
+    );
+  }
+});
+
+test('write-plan snapshots stop before any remote read when a required source is missing', async () => {
+  const fixture = fixtureRoot();
+  fs.unlinkSync(path.join(fixture.root, 'username.json'));
+  let remoteReads = 0;
+  await assert.rejects(
+    buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      requireCompleteSources: true,
+      client: {
+        async listAccounts() {
+          remoteReads += 1;
+          return [];
+        },
+      },
+    }),
+    (error) => error.code === 'GPT_REGISTER_SOURCE_MISSING',
+  );
+  assert.equal(remoteReads, 0);
+});
+
+test('complete source snapshots reject unreadable token identities instead of using an older file', () => {
+  const fixture = fixtureRoot();
+  const original = path.join(fixture.root, 'tokens', 'unreadable.json');
+  const alias = path.join(fixture.root, 'tokens', 'unreadable-alias.json');
+  fs.writeFileSync(original, JSON.stringify({
+    access_token: 'must-not-appear',
+    account_id: 'same-account-as-an-older-file',
+  }));
+  fs.linkSync(original, alias);
+
+  const diagnostic = readGptRegisterSources({ rootDirectory: fixture.root });
+  assert.equal(
+    diagnostic.tokens.filter((item) => item.fileName.startsWith('unreadable')).length,
+    2,
+  );
+  assert.throws(
+    () => readGptRegisterSources({
+      rootDirectory: fixture.root,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    }),
+    (error) => error.code === 'GPT_REGISTER_SOURCE_INCOMPLETE',
+  );
+  assert.equal(JSON.stringify(diagnostic).includes('must-not-appear'), false);
+});
+
+test('complete source snapshots detect token directory changes during enumeration', () => {
+  const fixture = fixtureRoot();
+  const tokenDirectory = path.join(fixture.root, 'tokens');
+  const originalReaddirSync = fs.readdirSync;
+  let tokenReads = 0;
+  fs.readdirSync = function changingReaddir(target, ...args) {
+    const result = originalReaddirSync.call(fs, target, ...args);
+    let realTarget = '';
+    try { realTarget = fs.realpathSync(String(target)); } catch {}
+    if (realTarget === tokenDirectory && ++tokenReads === 1) {
+      fs.writeFileSync(path.join(tokenDirectory, 'appeared-during-scan.json'), JSON.stringify({
+        access_token: 'late-token-must-not-appear',
+        account_id: 'late-account',
+      }));
+    }
+    return result;
+  };
+  try {
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_SOURCE_CHANGED',
+    );
+  } finally {
+    fs.readdirSync = originalReaddirSync;
+  }
+});
+
+test('complete source snapshots reject changes between different source reads', () => {
+  const fixture = fixtureRoot();
+  const changingPath = path.join(fixture.root, 'use_token', 'cross-source.json');
+  fs.writeFileSync(changingPath, JSON.stringify({
+    access_token: 'initial-cross-source-token',
+    email: 'cross-source@example.test',
+  }));
+  const triggerPath = path.join(fixture.root, 'tokens', 'a.json');
+  const originalReadSync = fs.readSync;
+  let changed = false;
+  fs.readSync = function changingRead(descriptor, ...args) {
+    const count = originalReadSync.call(fs, descriptor, ...args);
+    let descriptorPath = '';
+    try { descriptorPath = fs.realpathSync('/proc/self/fd/' + descriptor); } catch {}
+    if (!changed && descriptorPath === triggerPath) {
+      changed = true;
+      fs.writeFileSync(changingPath, JSON.stringify({
+        access_token: 'changed-cross-source-token',
+        email: 'cross-source@example.test',
+      }));
+    }
+    return count;
+  };
+  try {
+    assert.throws(
+      () => readGptRegisterSources({
+        rootDirectory: fixture.root,
+        includeRaw: true,
+        strictCompleteSnapshot: true,
+      }),
+      (error) => error.code === 'GPT_REGISTER_SOURCE_CHANGED',
+    );
+    assert.equal(changed, true);
+  } finally {
+    fs.readSync = originalReadSync;
+  }
 });
 
 test('username reads reject replacement of the fixed gpt_register root', () => {
@@ -1569,6 +1743,7 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
       ok: true,
       status: 200,
       statusText: 'OK',
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
       body: null,
       async text() {
         return 'data: ' + JSON.stringify({
@@ -1592,6 +1767,7 @@ test('Sub2API model values are bounded and cannot carry credential text', async 
       ok: true,
       status: 200,
       statusText: 'OK',
+      headers: new Headers({ 'content-type': 'text/event-stream' }),
       body: null,
       async text() {
         return 'data: ' + JSON.stringify({
@@ -1616,6 +1792,7 @@ test('Sub2API account tests distinguish pre-dispatch interruption from unknown s
     ok: true,
     status: 200,
     statusText: 'OK',
+    headers: new Headers({ 'content-type': 'text/event-stream' }),
     body: null,
     async text() { return body; },
     ...overrides,
@@ -1698,7 +1875,7 @@ test('Sub2API account tests distinguish pre-dispatch interruption from unknown s
       {
         body: 'data: {not-json}\n\n',
         code: 'SUB2API_TEST_RESPONSE_INVALID',
-        reason: 'missing_terminal',
+        reason: 'malformed_json',
       },
       {
         body: 'data: {"type":"status","text":"running"}\n\n',

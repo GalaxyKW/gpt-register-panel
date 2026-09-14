@@ -32,7 +32,11 @@ const {
 const { getAccountAvailability } = require('./accountAvailability');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
-const { parseJwtPayload, normalizeIdentityValue } = require('./lib/token');
+const {
+  parseJwtPayload,
+  normalizeIdentityValue,
+  tokenCredentialField,
+} = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
 
@@ -379,6 +383,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     throwIfJobInterrupted(signal);
     const sources = readGptRegisterSources({
       includeRaw: options.includeRaw === true,
+      strictCompleteSnapshot: options.requireCompleteSources === true,
       rootDirectory: options.rootDirectory,
     });
     throwIfJobInterrupted(signal);
@@ -1339,13 +1344,12 @@ function sourceCredentialValue(raw, snakeKey, camelKey, maximumLength = 1024) {
   return text;
 }
 
-function sourceTokenValue(raw, snakeKey, camelKey, maximumLength) {
-  const value = raw?.[snakeKey] ?? raw?.[camelKey];
-  if (value === undefined || value === null || value === '') return '';
-  if (typeof value !== 'string' || value.trim().length > maximumLength) {
+function sourceTokenValue(raw, kind) {
+  const field = tokenCredentialField(raw, kind);
+  if (field.invalid) {
     throw targetVerificationError('来源 token 字段类型或长度无效', 'SOURCE_CREDENTIAL_SCHEMA_INVALID');
   }
-  return value.trim();
+  return field.value;
 }
 
 function verifiedIdentityValue(item, recordKey, prefix) {
@@ -1361,8 +1365,8 @@ function verifiedIdentityValue(item, recordKey, prefix) {
 }
 
 function credentialFingerprintExtra(raw) {
-  const accessToken = sourceTokenValue(raw, 'access_token', 'accessToken', 2 * 1024 * 1024);
-  const refreshToken = sourceTokenValue(raw, 'refresh_token', 'refreshToken', 256 * 1024);
+  const accessToken = sourceTokenValue(raw, 'access');
+  const refreshToken = sourceTokenValue(raw, 'refresh');
   return {
     ...(accessToken ? {
       access_token_sha256: crypto.createHash('sha256').update(accessToken).digest('hex'),
@@ -1376,13 +1380,13 @@ function credentialFingerprintExtra(raw) {
 function buildOAuthUpdatePayload(item) {
   const raw = item?._raw && typeof item._raw === 'object' ? item._raw : {};
   const record = item?._record || {};
-  const accessToken = sourceTokenValue(raw, 'access_token', 'accessToken', 2 * 1024 * 1024);
+  const accessToken = sourceTokenValue(raw, 'access');
   if (!accessToken) {
     throw targetVerificationError('来源缺少可更新的 access_token', 'SOURCE_ACCESS_TOKEN_MISSING');
   }
   const credentials = { access_token: accessToken };
-  const refreshToken = sourceTokenValue(raw, 'refresh_token', 'refreshToken', 256 * 1024);
-  const idToken = sourceTokenValue(raw, 'id_token', 'idToken', 2 * 1024 * 1024);
+  const refreshToken = sourceTokenValue(raw, 'refresh');
+  const idToken = sourceTokenValue(raw, 'id');
   if (refreshToken) credentials.refresh_token = refreshToken;
   // Sub2API preserves an existing refresh_token when an access-only update is
   // applied, but client_id is not treated as sensitive. Send the fixed public
@@ -1492,7 +1496,11 @@ function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
   }
   let sources;
   try {
-    sources = readGptRegisterSources({ rootDirectory, includeRaw: true });
+    sources = readGptRegisterSources({
+      rootDirectory,
+      includeRaw: true,
+      strictCompleteSnapshot: true,
+    });
   } catch {
     throw sourceTokenChanged();
   }
@@ -2008,6 +2016,8 @@ async function executeImport({
   logger = null,
   signal = null,
   client: providedClient = null,
+  persistResult = null,
+  persistFailure = null,
 }) {
   const startedAt = Date.now();
   writeLog(logger, 'info', 'import.started', {
@@ -2034,13 +2044,17 @@ async function executeImport({
       error.code = 'IMPORT_SELECTION_REQUIRED';
       throw error;
     }
-    const result = await withControlPlaneLock(() => withSyncLock(async () => {
+    const result = await withControlPlaneLock(async () => {
+      let lockedResult;
+      try {
+        lockedResult = await withSyncLock(async () => {
       throwIfJobInterrupted(signal);
       const client = providedClient
         || new Sub2ApiAdminClient({ logger, logContext: { jobId, actor } });
       const current = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
         includeRaw: true,
         includeInternal: true,
+        requireCompleteSources: true,
         client,
         logger,
         jobId,
@@ -2062,7 +2076,14 @@ async function executeImport({
         throw error;
       }
       throwIfJobInterrupted(signal);
-      await db?.updateJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+      if (db && jobId) {
+        if (typeof db.startMutationJob !== 'function') {
+          const error = new Error('任务执行安全检查不可用，尚未开始导入');
+          error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+          throw error;
+        }
+        await db.startMutationJob(jobId);
+      }
       throwIfJobInterrupted(signal);
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
       const fullSummary = importPlanSummary(fullPlan);
@@ -2350,7 +2371,7 @@ async function executeImport({
         reconciliationCount,
         notAttempted: notAttempted.length,
       });
-      return {
+          return {
         ...importPlanSummary(plan),
         imported,
         notAttempted,
@@ -2363,8 +2384,40 @@ async function executeImport({
         halted: haltedForReconciliation,
         requiresReconciliation: haltedForReconciliation,
         reconciliationCount,
-      };
-    }, { signal }), { signal });
+          };
+        }, { signal });
+      } catch (error) {
+        if (typeof persistFailure === 'function') {
+          try {
+            // Keep the durable job status in step with the protected operation.
+            // The observer repeats this idempotently if local persistence is
+            // temporarily unavailable.
+            await persistFailure(error);
+          } catch (jobError) {
+            writeLog(logger, 'error', 'import.job_update_deferred', {
+              jobId,
+              actor,
+              terminalOutcome: 'failed',
+              error: safeErrorMessage(jobError),
+            });
+          }
+        }
+        throw error;
+      }
+      if (typeof persistResult === 'function') {
+        try {
+          await persistResult(lockedResult);
+        } catch (jobError) {
+          writeLog(logger, 'error', 'import.job_update_deferred', {
+            jobId,
+            actor,
+            terminalOutcome: 'completed',
+            error: safeErrorMessage(jobError),
+          });
+        }
+      }
+      return lockedResult;
+    }, { signal });
     writeLog(logger, result.failed > 0 ? 'warn' : 'info', 'import.completed', {
       jobId,
       actor,

@@ -36,7 +36,10 @@ test('frontend treats every blocking plan item as a conflict and explains termin
       plan: null,
       importRequestPending: false,
       snapshot: { readOnly: false },
+      reconciliationHolds: { total: 0 },
+      job: null,
     },
+    reconciliationHoldJobs: () => [],
     escapeHtml: (value) => String(value ?? ''),
     actionLabel: (value) => value,
     formatFingerprint: (value) => value || '-',
@@ -575,16 +578,18 @@ test('frontend globally locks mutating actions while any request or task is unre
   assert.match(lockContract, /cleanupRequestPending/);
   assert.match(lockContract, /snapshotRequestsPending > 0/);
   assert.match(lockContract, /\['queued', 'running', 'unknown'\]/);
-  assert.match(updateContract, /phase3Button\.disabled = locked/);
-  assert.match(updateContract, /accountTestButton\.disabled = locked/);
+  assert.match(updateContract, /phase3Button\.disabled = mutationLocked/);
+  assert.match(updateContract, /accountTestButton\.disabled = mutationLocked/);
   assert.match(updateContract, /previewButton\.disabled = locked/);
   assert.match(updateContract, /previewButton\.disabled = locked \|\| !comparisonAvailable\(\)/);
-  assert.match(updateContract, /phase3Button\.disabled = locked \|\| !canRunPhase3/);
+  assert.match(updateContract, /phase3Button\.disabled = mutationLocked \|\| !canRunPhase3/);
   assert.match(updateContract, /clearSelectionButton\.disabled = locked/);
   assert.match(updateContract, /selectAll\.disabled = locked/);
   assert.match(updateContract, /input\.disabled = locked/);
   assert.match(updateContract, /updateImportButtonState\(\)/);
-  assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| locked/);
+  assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked/);
+  assert.match(updateContract, /writeBlocked = reconciliationWriteBlocked\(\)/);
+  assert.match(updateContract, /当前全部写操作已阻止/);
 });
 
 test('mobile layout keeps controls usable and wide tables horizontally scrollable', () => {
@@ -594,6 +599,7 @@ test('mobile layout keeps controls usable and wide tables horizontally scrollabl
   assert.match(mobile, /\.toolbar label, \.toolbar \.search-field \{ width: 100%; min-width: 0; \}/);
   assert.match(mobile, /\.toolbar \.search-field \{ flex: 0 0 auto; \}/);
   assert.match(mobile, /\.job-copy p \{ white-space: normal; \}/);
+  assert.match(mobile, /\.reconciliation-ack-button \{ width: calc\(100% - 43px\); margin-left: 43px; \}/);
 });
 
 test('frontend refreshes every terminal job outcome before preserving its notice', () => {
@@ -1067,11 +1073,13 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
       clearSelectionButton: {},
       selectAll: {},
       previewButton: {},
+      importButton: {},
       cleanupButton: {},
     },
     document: { querySelectorAll: () => [] },
     accountTestRows: () => [],
     actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
     updateImportButtonState() {},
     comparisonAvailable: () => true,
   };

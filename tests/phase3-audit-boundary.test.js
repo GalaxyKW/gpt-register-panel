@@ -12,6 +12,7 @@ const {
   classifyPhase3ProcessError,
   runPhase3Job,
 } = require('../backend/phase3Worker');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 function phase3Fixture(email, script) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-audit-'));
@@ -78,6 +79,7 @@ async function withPhase3Environment(root, callback) {
 function phase3Db() {
   return {
     async audit() {},
+    async startMutationJob() {},
     async updateJob() {},
   };
 }
@@ -90,15 +92,38 @@ test('Phase3 requires a durable checkpoint immediately before spawning', async (
     "fs.writeFileSync(path.join(process.cwd(), 'spawned'), 'yes');",
   ].join('\n'));
   const logger = recordingLogger(() => false);
+  let terminalPersisted = false;
+  let followerObservedTerminal = false;
+  let markWorkerStarted;
+  const workerStarted = new Promise((resolve) => { markWorkerStarted = resolve; });
 
   await withPhase3Environment(root, async () => {
+    const running = runPhase3Job({
+      email,
+      db: {
+        ...phase3Db(),
+        async startMutationJob() { markWorkerStarted(); },
+      },
+      jobId: 'spawn-checkpoint',
+      logger,
+      async persistFailure(error) {
+        assert.equal(error.code, 'AUDIT_LOG_UNAVAILABLE');
+        terminalPersisted = true;
+      },
+    });
+    await workerStarted;
+    const follower = withControlPlaneLock(() => {
+      followerObservedTerminal = terminalPersisted;
+    });
     await assert.rejects(
-      runPhase3Job({ email, db: phase3Db(), jobId: 'spawn-checkpoint', logger }),
+      running,
       (error) => error.code === 'AUDIT_LOG_UNAVAILABLE',
     );
+    await follower;
   });
 
   assert.equal(fs.existsSync(path.join(root, 'spawned')), false);
+  assert.equal(followerObservedTerminal, true);
   assert.deepEqual(
     logger.events.filter((item) => item.level === 'checkpoint').map((item) => item.event),
     ['phase3.process_spawn_checkpoint'],

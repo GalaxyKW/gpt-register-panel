@@ -728,6 +728,19 @@ function phase3ProcessSummary(details = {}) {
   };
 }
 
+function phase3TokenPostflightError(cause) {
+  const error = new Error('Phase 3 已执行，但无法确认 token 输出；必须人工对账，禁止直接重试');
+  error.code = 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN';
+  error.writeOutcomeUnknown = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'phase3_token_output';
+  error.reconciliationReason = 'phase3_postflight_source_unavailable';
+  if (cause) error.cause = cause;
+  return error;
+}
+
 function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
   const details = error?.details || {};
   const hasProcessDetails = details && typeof details === 'object'
@@ -839,11 +852,18 @@ function comparePhase3TokenFreshness(left, right, nowMs = Date.now()) {
   if (leftSourcePriority !== rightSourcePriority) {
     return leftSourcePriority > rightSourcePriority ? -1 : 1;
   }
-  return String(left?.relativePath || '').localeCompare(
-    String(right?.relativePath || ''),
+  const leftPath = String(left?.relativePath || '');
+  const rightPath = String(right?.relativePath || '');
+  const naturalOrder = leftPath.localeCompare(
+    rightPath,
     'en',
     { numeric: true, sensitivity: 'base' },
   );
+  if (naturalOrder !== 0) return naturalOrder;
+  if (leftPath === rightPath) return 0;
+  const byteOrder = Buffer.compare(Buffer.from(leftPath, 'utf8'), Buffer.from(rightPath, 'utf8'));
+  if (byteOrder !== 0) return byteOrder;
+  return leftPath < rightPath ? -1 : 1;
 }
 
 function isUsablePhase3Token(token, nowMs = Date.now()) {
@@ -1249,7 +1269,11 @@ async function runPhase3JobNow({
     scriptHandle = openPinnedRegularFile(scriptPath, 'gpt_register/index.js', { parentPinned: true });
     const nodePath = path.resolve(process.env.GPT_REGISTER_NODE_PATH || process.execPath);
     nodeHandle = openPinnedRegularFile(nodePath, 'GPT_REGISTER_NODE_PATH', { executable: true });
-    const beforeSources = readGptRegisterSources({ rootDirectory: root, rootHandle });
+    const beforeSources = readGptRegisterSources({
+      rootDirectory: root,
+      rootHandle,
+      strictCompleteSnapshot: true,
+    });
     const beforeTokens = beforeSources.tokens
       .filter((item) => item.historical !== true && item.parseStatus === 'ok' && item.email === entry.email)
       .map((item) => ({
@@ -1348,7 +1372,16 @@ async function runPhase3JobNow({
       classifyPhase3ProcessError(processMarker, entry, rootHandle);
       if (processMarker.accountDisposition === 'discard') throw processMarker;
     }
-    const sources = readGptRegisterSources({ rootDirectory: root, rootHandle });
+    let sources;
+    try {
+      sources = readGptRegisterSources({
+        rootDirectory: root,
+        rootHandle,
+        strictCompleteSnapshot: true,
+      });
+    } catch (error) {
+      throw phase3TokenPostflightError(error);
+    }
     const tokenObservedAt = Date.now();
     const beforeByPath = new Map(beforeTokens.map((item) => [item.relativePath, item]));
     const changedTokens = sources.tokens
@@ -1548,6 +1581,7 @@ function resolvePhase3Requests(requests = []) {
   const sources = readGptRegisterSources({
     rootDirectory: root,
     requireValidUsername: true,
+    strictCompleteSnapshot: true,
     usernameMaxBytes: phase3UsernameMaxBytes(),
     usernameMaxRecords: usernameRecordLimit(),
   });
@@ -1680,13 +1714,34 @@ function runPhase3Job(args = {}) {
       // A job waiting behind another panel process is still queued. Mark it
       // running only after the cross-process lease has actually been acquired.
       if (args.db && args.jobId) {
-        await args.db.updateJob(args.jobId, {
-          status: 'running',
-          startedAt: new Date().toISOString(),
-        });
+        if (typeof args.db.startMutationJob !== 'function') {
+          const error = new Error('任务执行安全检查不可用，尚未开始 Phase 3');
+          error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+          throw error;
+        }
+        await args.db.startMutationJob(args.jobId);
       }
       throwIfJobInterrupted(args.signal);
-      return runPhase3JobNow(args);
+      try {
+        return await runPhase3JobNow(args);
+      } catch (error) {
+        if (typeof args.persistFailure === 'function') {
+          try {
+            // Persist the terminal failure before releasing the global lease.
+            // This prevents the next queued worker from mistaking a completed
+            // predecessor for a still-running mutation.
+            await args.persistFailure(error);
+          } catch (jobError) {
+            writeLog(args.logger, 'error', 'phase3.job_update_deferred', {
+              jobId: args.jobId || null,
+              actor: args.actor || 'local',
+              terminalOutcome: 'failed',
+              error: redactText(String(jobError?.message || jobError)),
+            });
+          }
+        }
+        throw error;
+      }
     }, { signal: args.signal });
   }, { signal: args.signal });
   phase3Queue = queued.run.catch(() => {});

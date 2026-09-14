@@ -148,7 +148,9 @@ Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 
 
 “清理过期 token”只扫描 `GPT_REGISTER_ROOT/tokens` 和 `GPT_REGISTER_ROOT/use_token` 下的普通 JSON 文件，要求能解析且明确存在过期时间；扫描结果带版本号，确认操作时会重新校验版本，文件发生变化就拒绝处理。所谓删除实际是移动到 `GPT_REGISTER_ROOT/.panel-quarantine/expired-tokens`（或 `PANEL_TOKEN_QUARANTINE_DIR` 指定的目录），并按批次保留原相对路径，便于恢复；跨文件系统时会先完整复制并刷盘，再移除来源。删除列表、跳过项和操作者会写入结构化日志与 SQLite 审计，不会记录 token 原文；无 access token、无法解析、无过期时间或未过期文件不会处理。恢复时将隔离目录中的文件移回原来的 `tokens/` 或 `use_token/` 目录。
 
-导入和 Phase 3 任务会先记录为 `queued`，执行阶段改为 `running`，结束为 `succeeded`、`partial`、`failed` 或 `interrupted`。服务重启不会假装恢复浏览器/远程 API 操作，旧的 queued/running 任务会明确标记为 `interrupted`；WebUI 会轮询任务终态后再刷新账号表。
+导入和 Phase 3 任务会先记录为 `queued`，执行阶段改为 `running`，结束为 `succeeded`、`partial`、`failed` 或 `interrupted`。服务重启不会假装恢复浏览器/远程 API 操作：已确认尚未开始的死队列任务可安全释放；已运行或已标记外部结果未知的任务会保留持久 claim。在各工作流尚未共享同一资源键空间前，任一未解除的 hold 会保守阻止全部新写任务和过期 token 清理，避免跨类型操作破坏人工对账现场。旧版已删除 claim 但仍保留可信保护键的未知终态，会在启动时重建阻挡；键冲突或元数据不可验证时则拒绝启动，不会自动删除安全屏障。
+
+WebUI 会显示持久对账阻挡。只有通过管理员令牌认证的 `panel-admin`，在 Sub2API 和源文件中按账号 ID、account/user 强身份、token 指纹及调度状态完成人工核对后，才能用快照中的 claim 摘要解除该任务对未来操作的阻挡。面板不会自动证明人工结论；解除后原任务仍为不可重试，不得把“已解除阻挡”解读为“原操作未执行”。可信的历史未知任务若完全没有保护键，会迁移为阻挡全部写操作的合成全局 hold；普通终态不会被误迁移，元数据不可验证时则拒绝启动。
 
 浏览器刷新后，WebUI 会自动接回最近的 queued/running 任务；任务状态接口短暂失败时会有限重试，避免把仍在执行的任务误显示成失败。
 

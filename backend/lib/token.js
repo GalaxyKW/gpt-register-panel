@@ -79,6 +79,18 @@ function stringAliases(object, keys, maximumLength) {
   return { value, invalid };
 }
 
+const TOKEN_CREDENTIAL_FIELDS = Object.freeze({
+  access: Object.freeze({ keys: Object.freeze(['access_token', 'accessToken']), maximumLength: 2 * 1024 * 1024 }),
+  refresh: Object.freeze({ keys: Object.freeze(['refresh_token', 'refreshToken']), maximumLength: 256 * 1024 }),
+  id: Object.freeze({ keys: Object.freeze(['id_token', 'idToken']), maximumLength: 2 * 1024 * 1024 }),
+});
+
+function tokenCredentialField(document, kind) {
+  const definition = TOKEN_CREDENTIAL_FIELDS[kind];
+  if (!definition) return { value: '', invalid: true };
+  return stringAliases(document, definition.keys, definition.maximumLength);
+}
+
 function claimScalar(object, key, maximumLength, allowNumber = true) {
   if (!object || !Object.prototype.hasOwnProperty.call(object, key)) {
     return { value: '', invalid: false };
@@ -149,9 +161,9 @@ function normalizeTokenDocument({
   }
 
   const document = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
-  const accessField = stringAliases(document, ['access_token', 'accessToken'], 2 * 1024 * 1024);
-  const refreshField = stringAliases(document, ['refresh_token', 'refreshToken'], 256 * 1024);
-  const idField = stringAliases(document, ['id_token', 'idToken'], 2 * 1024 * 1024);
+  const accessField = tokenCredentialField(document, 'access');
+  const refreshField = tokenCredentialField(document, 'refresh');
+  const idField = tokenCredentialField(document, 'id');
   const explicitAccount = stringAliases(
     document,
     ['chatgpt_account_id', 'account_id', 'accountId'],
@@ -336,6 +348,7 @@ module.exports = {
   parseDateValue,
   parseJwtPayload,
   tokenFingerprint,
+  tokenCredentialField,
   buildIdentityKeys,
   normalizeTokenDocument,
   toSafeTokenSummary,

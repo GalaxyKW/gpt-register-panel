@@ -23,6 +23,7 @@ const DEFAULT_TOKEN_MAX_FILES = 10_000;
 const HARD_TOKEN_MAX_FILES = 100_000;
 const DEFAULT_TOKEN_TOTAL_MAX_BYTES = 256 * 1024 * 1024;
 const HARD_TOKEN_TOTAL_MAX_BYTES = 1024 * 1024 * 1024;
+const HARD_TOKEN_DIRECTORY_ENTRIES = HARD_TOKEN_MAX_FILES * 2;
 
 function gptPathError(label, cause) {
   const error = new Error(label + ' 不存在、不可读取、已变化或包含符号链接');
@@ -35,6 +36,17 @@ function sourceSizeError(label) {
   const error = new Error(label + ' 超过允许的大小上限');
   error.code = 'GPT_REGISTER_FILE_TOO_LARGE';
   return error;
+}
+
+function incompleteSourceError(label, cause, code = 'GPT_REGISTER_SOURCE_INCOMPLETE') {
+  const error = new Error(label + ' 无法形成完整可信快照');
+  error.code = code;
+  if (cause) error.cause = cause;
+  return error;
+}
+
+function sourceChangedError(label, cause) {
+  return incompleteSourceError(label, cause, 'GPT_REGISTER_SOURCE_CHANGED');
 }
 
 function configuredByteLimit(value, fallback, hardMaximum) {
@@ -57,6 +69,44 @@ function usernameRecordLimit(value = process.env.GPT_REGISTER_USERNAME_MAX_RECOR
     DEFAULT_USERNAME_MAX_RECORDS,
     HARD_USERNAME_MAX_RECORDS,
   );
+}
+
+function usernameInvalidError(message = 'username.json 账号记录字段无效') {
+  const error = new Error(message);
+  error.code = 'GPT_REGISTER_USERNAME_INVALID';
+  return error;
+}
+
+function validateUsernameRecords(records) {
+  for (const record of records) {
+    if (!record || typeof record !== 'object' || Array.isArray(record)) {
+      throw usernameInvalidError();
+    }
+    const email = record.email;
+    if (typeof email !== 'string'
+        || email.length > 320
+        || !/^[^\s@]+@[^\s@]+$/.test(email.trim())) {
+      throw usernameInvalidError();
+    }
+    if (record.password !== undefined && record.password !== null
+        && typeof record.password !== 'string') {
+      throw usernameInvalidError();
+    }
+    if (record.status !== undefined && record.status !== null) {
+      if (typeof record.status !== 'string'
+          || !/^[a-z0-9_-]{1,64}$/i.test(record.status.trim())) {
+        throw usernameInvalidError();
+      }
+    }
+    if (record.phone !== undefined && record.phone !== null) {
+      const phone = typeof record.phone === 'string' || typeof record.phone === 'number'
+        ? String(record.phone).trim()
+        : '';
+      if (!phone || phone.length > 64 || !/^[+\d\s().-]+$/.test(phone)) {
+        throw usernameInvalidError();
+      }
+    }
+  }
 }
 
 function sameFileIdentity(left, right) {
@@ -346,7 +396,9 @@ function assertReadableFileParent(filePath, label) {
 }
 
 function readJsonArraySnapshot(filePath, options = {}) {
-  const fallback = { records: [], contentHash: null, mtimeMs: 0, size: 0 };
+  const fallback = {
+    records: [], contentHash: null, mtimeMs: 0, size: 0, present: false, fileState: null,
+  };
   const maximumBytes = configuredByteLimit(
     options.maxBytes ?? process.env.GPT_REGISTER_USERNAME_MAX_BYTES,
     DEFAULT_USERNAME_MAX_BYTES,
@@ -366,11 +418,18 @@ function readJsonArraySnapshot(filePath, options = {}) {
     try {
       observed = fs.lstatSync(context.openPath);
     } catch (error) {
-      if (error?.code === 'ENOENT') return fallback;
+      if (error?.code === 'ENOENT') {
+        if (options.requireCompleteSnapshot === true) {
+          throw incompleteSourceError('gpt_register/username.json', error, 'GPT_REGISTER_SOURCE_MISSING');
+        }
+        return fallback;
+      }
       throw error;
     }
     if (observed.isSymbolicLink() || !observed.isFile()) {
-      if (options.strict === true) throw gptPathError('JSON 文件');
+      if (options.strict === true || options.requireCompleteSnapshot === true) {
+        throw gptPathError('JSON 文件');
+      }
       return { ...fallback, mtimeMs: observed.mtimeMs, size: observed.size };
     }
     const { bytes, stat } = readVerifiedRegularFile(context, 'JSON 文件', maximumBytes);
@@ -393,7 +452,15 @@ function readJsonArraySnapshot(filePath, options = {}) {
         error.code = 'GPT_REGISTER_USERNAME_RECORD_LIMIT';
         throw error;
       }
-      return { records, contentHash, mtimeMs: stat.mtimeMs, size: stat.size };
+      if (options.requireValidRecords === true) validateUsernameRecords(records);
+      return {
+        records,
+        contentHash,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        present: true,
+        fileState: stat,
+      };
     } catch (error) {
       if (error?.code === 'GPT_REGISTER_USERNAME_RECORD_LIMIT') throw error;
       if (options.requireValidJson === true) {
@@ -405,14 +472,23 @@ function readJsonArraySnapshot(filePath, options = {}) {
       }
       // Malformed JSON remains an empty record set, but its exact bytes still
       // participate in snapshot versioning.
-      return { records: [], contentHash, mtimeMs: stat.mtimeMs, size: stat.size };
+      return {
+        records: [],
+        contentHash,
+        mtimeMs: stat.mtimeMs,
+        size: stat.size,
+        present: true,
+        fileState: stat,
+      };
     }
   } catch (error) {
     if (['GPT_REGISTER_PATH_PERMISSIONS_INVALID', 'GPT_REGISTER_USERNAME_RECORD_LIMIT']
       .includes(error?.code)) throw error;
     if (options.strict === true) {
       if (['GPT_REGISTER_PATH_INVALID', 'GPT_REGISTER_PATH_PERMISSIONS_INVALID',
-        'GPT_REGISTER_FILE_TOO_LARGE', 'GPT_REGISTER_USERNAME_INVALID']
+        'GPT_REGISTER_FILE_TOO_LARGE', 'GPT_REGISTER_USERNAME_INVALID',
+        'GPT_REGISTER_SOURCE_MISSING', 'GPT_REGISTER_SOURCE_INCOMPLETE',
+        'GPT_REGISTER_SOURCE_CHANGED']
         .includes(error?.code)) throw error;
       throw gptPathError('JSON 文件', error);
     }
@@ -427,18 +503,224 @@ function readJsonArray(filePath) {
 }
 
 function sortFileNames(left, right) {
-  return left.localeCompare(right, 'en', {
+  const naturalOrder = left.localeCompare(right, 'en', {
     numeric: true,
     sensitivity: 'base',
   });
+  if (naturalOrder !== 0) return naturalOrder;
+  if (left < right) return -1;
+  if (left > right) return 1;
+  return 0;
 }
 
 function isHistoricalTokenFile(fileName) {
   return /^old_codex[-_]/i.test(String(fileName || ''));
 }
 
+function errorHasCode(error, code) {
+  const visited = new Set();
+  let current = error;
+  while (current && !visited.has(current)) {
+    if (current.code === code) return true;
+    visited.add(current);
+    current = current.cause;
+  }
+  return false;
+}
+
+function readBoundedManifestNames(directoryHandle, maximumJsonFiles) {
+  const names = [];
+  let entryCount = 0;
+  let directory;
+  try {
+    directory = fs.opendirSync(directoryHandle.traversalPath);
+    while (true) {
+      const entry = directory.readSync();
+      if (!entry) break;
+      entryCount += 1;
+      if (entryCount > HARD_TOKEN_DIRECTORY_ENTRIES) {
+        const error = new Error('token 目录项数量超过安全上限');
+        error.code = 'GPT_REGISTER_SOURCE_LIMIT';
+        throw error;
+      }
+      if (!entry.name.toLowerCase().endsWith('.json')) continue;
+      names.push(entry.name);
+      if (names.length > maximumJsonFiles) {
+        const error = new Error('token 文件数量超过安全上限');
+        error.code = 'GPT_REGISTER_SOURCE_LIMIT';
+        throw error;
+      }
+    }
+    return names.sort(sortFileNames);
+  } finally {
+    if (directory) directory.closeSync();
+  }
+}
+
+function captureTokenDirectoryManifest(
+  rootHandle,
+  rootDirectory,
+  directory,
+  source,
+  budget,
+) {
+  let directoryHandle = null;
+  const label = 'gpt_register/' + source;
+  try {
+    const context = childPathContext(rootHandle, rootDirectory, directory, label);
+    directoryHandle = openVerifiedDirectory(context.logicalPath, {
+      label,
+      openPath: context.openPath,
+      expectedRealPath: context.expectedRealPath,
+      rootRealPath: context.rootRealPath,
+    });
+    const remainingFiles = Math.max(0, budget.maximumFiles - budget.files);
+    const names = readBoundedManifestNames(directoryHandle, remainingFiles);
+    budget.files += names.length;
+    const fileStats = new Map();
+    for (const name of names) {
+      const stat = fs.lstatSync(path.join(directoryHandle.traversalPath, name));
+      if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+        throw incompleteSourceError('token 文件');
+      }
+      assertTrustedOwnerAndMode(stat, 'token 文件');
+      fileStats.set(name, stat);
+    }
+    assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+    assertDirectoryHandleCurrent(directoryHandle, label);
+    const directoryStat = fs.fstatSync(directoryHandle.descriptor);
+    if (!sameStableFileState(directoryHandle.stat, directoryStat)) {
+      throw sourceChangedError(label);
+    }
+    return {
+      directory,
+      source,
+      directoryStat,
+      names,
+      fileStats,
+    };
+  } catch (error) {
+    if (['GPT_REGISTER_SOURCE_LIMIT', 'GPT_REGISTER_SOURCE_CHANGED',
+      'GPT_REGISTER_PATH_PERMISSIONS_INVALID', 'GPT_REGISTER_SOURCE_INCOMPLETE']
+      .includes(error?.code)) throw error;
+    throw incompleteSourceError(
+      label,
+      error,
+      errorHasCode(error, 'ENOENT')
+        ? 'GPT_REGISTER_SOURCE_MISSING'
+        : 'GPT_REGISTER_SOURCE_INCOMPLETE',
+    );
+  } finally {
+    closeDirectoryHandle(directoryHandle);
+  }
+}
+
+function captureRegularFileManifest(rootHandle, rootDirectory, filePath, label) {
+  try {
+    const context = childPathContext(rootHandle, rootDirectory, filePath, label);
+    const stat = fs.lstatSync(context.openPath);
+    if (stat.isSymbolicLink() || !stat.isFile() || stat.nlink !== 1) {
+      throw incompleteSourceError(label);
+    }
+    assertTrustedOwnerAndMode(stat, label);
+    assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+    return stat;
+  } catch (error) {
+    if (['GPT_REGISTER_PATH_PERMISSIONS_INVALID', 'GPT_REGISTER_SOURCE_INCOMPLETE']
+      .includes(error?.code)) throw error;
+    throw incompleteSourceError(
+      label,
+      error,
+      errorHasCode(error, 'ENOENT')
+        ? 'GPT_REGISTER_SOURCE_MISSING'
+        : 'GPT_REGISTER_SOURCE_INCOMPLETE',
+    );
+  }
+}
+
+function assertTokenManifestMatches(expected, current) {
+  const label = 'gpt_register/' + expected.source;
+  if (!current
+      || expected.directory !== current.directory
+      || expected.source !== current.source
+      || !sameStableFileState(expected.directoryStat, current.directoryStat)
+      || expected.names.length !== current.names.length
+      || expected.names.some((name, index) => name !== current.names[index])) {
+    throw sourceChangedError(label);
+  }
+  for (const name of expected.names) {
+    if (!sameStableFileState(expected.fileStats.get(name), current.fileStats.get(name))) {
+      throw sourceChangedError(label);
+    }
+  }
+}
+
+function verifyTokenDirectoryManifest(rootHandle, rootDirectory, manifest) {
+  let directoryHandle = null;
+  const label = 'gpt_register/' + manifest.source;
+  try {
+    const context = childPathContext(
+      rootHandle,
+      rootDirectory,
+      manifest.directory,
+      label,
+    );
+    directoryHandle = openVerifiedDirectory(context.logicalPath, {
+      label,
+      openPath: context.openPath,
+      expectedRealPath: context.expectedRealPath,
+      rootRealPath: context.rootRealPath,
+    });
+    if (!sameStableFileState(manifest.directoryStat, directoryHandle.stat)) {
+      throw sourceChangedError(label);
+    }
+    const names = fs.readdirSync(directoryHandle.traversalPath)
+      .filter((name) => name.toLowerCase().endsWith('.json'))
+      .sort(sortFileNames);
+    if (names.length !== manifest.names.length
+        || names.some((name, index) => name !== manifest.names[index])) {
+      throw sourceChangedError(label);
+    }
+    for (const name of names) {
+      const expected = manifest.fileStats.get(name);
+      const current = fs.lstatSync(path.join(directoryHandle.traversalPath, name));
+      if (!expected || current.isSymbolicLink() || !current.isFile() || current.nlink !== 1
+          || !sameStableFileState(expected, current)) {
+        throw sourceChangedError(label);
+      }
+      assertTrustedOwnerAndMode(current, 'token 文件');
+    }
+    assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+    assertDirectoryHandleCurrent(directoryHandle, label);
+  } catch (error) {
+    if (['GPT_REGISTER_SOURCE_CHANGED', 'GPT_REGISTER_PATH_PERMISSIONS_INVALID']
+      .includes(error?.code)) throw error;
+    throw sourceChangedError(label, error);
+  } finally {
+    closeDirectoryHandle(directoryHandle);
+  }
+}
+
+function verifyRegularFileManifest(rootHandle, rootDirectory, filePath, expected, label) {
+  try {
+    const context = childPathContext(rootHandle, rootDirectory, filePath, label);
+    const current = fs.lstatSync(context.openPath);
+    if (!expected || current.isSymbolicLink() || !current.isFile() || current.nlink !== 1
+        || !sameStableFileState(expected, current)) {
+      throw sourceChangedError(label);
+    }
+    assertTrustedOwnerAndMode(current, label);
+    assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+  } catch (error) {
+    if (['GPT_REGISTER_SOURCE_CHANGED', 'GPT_REGISTER_PATH_PERMISSIONS_INVALID']
+      .includes(error?.code)) throw error;
+    throw sourceChangedError(label, error);
+  }
+}
+
 function readTokenDirectory(directory, source, rootDirectory, includeRaw = false, options = {}) {
   const records = [];
+  const observedFiles = new Map();
   const maximumBytes = configuredByteLimit(
     options.maxBytes ?? process.env.GPT_REGISTER_TOKEN_MAX_BYTES,
     DEFAULT_TOKEN_MAX_BYTES,
@@ -483,6 +765,14 @@ function readTokenDirectory(directory, source, rootDirectory, includeRaw = false
   } catch (error) {
     if (ownedRootHandle) closeDirectoryHandle(rootHandle);
     if (error?.code === 'GPT_REGISTER_PATH_PERMISSIONS_INVALID') throw error;
+    if (options.requireCompleteSnapshot === true) {
+      const missing = error?.cause?.code === 'ENOENT';
+      throw incompleteSourceError(
+        'gpt_register/' + source,
+        error,
+        missing ? 'GPT_REGISTER_SOURCE_MISSING' : 'GPT_REGISTER_SOURCE_INCOMPLETE',
+      );
+    }
     if (options.strict === true && error?.cause?.code !== 'ENOENT') throw error;
     return records;
   }
@@ -533,9 +823,13 @@ function readTokenDirectory(directory, source, rootDirectory, includeRaw = false
         budget.bytes += bytes.length;
         assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
         assertDirectoryHandleCurrent(directoryHandle, 'gpt_register/' + source);
+        observedFiles.set(fileName, stat);
       } catch (error) {
         if (error?.code === 'GPT_REGISTER_SOURCE_LIMIT') throw error;
         if (error?.code === 'GPT_REGISTER_PATH_PERMISSIONS_INVALID') throw error;
+        if (options.requireCompleteSnapshot === true) {
+          throw incompleteSourceError('token 文件', error);
+        }
         records.push(normalizeTokenDocument({
           source,
           relativePath: path.relative(rootDirectory, absolutePath),
@@ -567,6 +861,44 @@ function readTokenDirectory(directory, source, rootDirectory, includeRaw = false
         historical: isHistoricalTokenFile(fileName),
         includeRaw,
       }));
+    }
+    if (options.requireCompleteSnapshot === true) {
+      try {
+        assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+        assertDirectoryHandleCurrent(directoryHandle, 'gpt_register/' + source);
+        const latestNames = fs.readdirSync(directoryHandle.traversalPath)
+          .filter((name) => name.toLowerCase().endsWith('.json'))
+          .sort(sortFileNames);
+        if (latestNames.length !== names.length
+            || latestNames.some((name, index) => name !== names[index])) {
+          throw sourceChangedError('gpt_register/' + source);
+        }
+        for (const [fileName, expectedStat] of observedFiles) {
+          const current = fs.lstatSync(path.join(directoryHandle.traversalPath, fileName));
+          if (current.isSymbolicLink() || !current.isFile() || current.nlink !== 1
+              || !sameStableFileState(expectedStat, current)) {
+            throw sourceChangedError('gpt_register/' + source);
+          }
+          assertTrustedOwnerAndMode(current, 'token 文件');
+        }
+        const latestDirectoryStat = fs.fstatSync(directoryHandle.descriptor);
+        if (!sameStableFileState(directoryHandle.stat, latestDirectoryStat)) {
+          throw sourceChangedError('gpt_register/' + source);
+        }
+        if (Array.isArray(options.manifestCollector)) {
+          options.manifestCollector.push({
+            directory,
+            source,
+            directoryStat: latestDirectoryStat,
+            names: [...names],
+            fileStats: new Map(observedFiles),
+          });
+        }
+      } catch (error) {
+        if (['GPT_REGISTER_SOURCE_CHANGED', 'GPT_REGISTER_PATH_PERMISSIONS_INVALID']
+          .includes(error?.code)) throw error;
+        throw sourceChangedError('gpt_register/' + source, error);
+      }
     }
   } finally {
     closeDirectoryHandle(directoryHandle);
@@ -623,14 +955,29 @@ function readGptRegisterSources(options = {}) {
   }
   if (!suppliedRootHandle) {
     assertReadableDirectory(rootDirectory, 'GPT_REGISTER_ROOT');
-    assertReadableDirectory(tokensDirectory, 'gpt_register/tokens');
-    assertReadableDirectory(useTokenDirectory, 'gpt_register/use_token');
-    assertReadableFileParent(usernameFile, 'gpt_register/username.json');
+    const tokensPresent = assertReadableDirectory(tokensDirectory, 'gpt_register/tokens');
+    const useTokenPresent = assertReadableDirectory(useTokenDirectory, 'gpt_register/use_token');
+    const usernamePresent = assertReadableFileParent(usernameFile, 'gpt_register/username.json');
+    if (options.strictCompleteSnapshot === true) {
+      const missing = [
+        tokensPresent ? null : 'tokens',
+        useTokenPresent ? null : 'use_token',
+        usernamePresent ? null : 'username.json',
+      ].filter(Boolean);
+      if (missing.length > 0) {
+        throw incompleteSourceError(
+          'gpt_register 来源',
+          null,
+          'GPT_REGISTER_SOURCE_MISSING',
+        );
+      }
+    }
   }
   const rootHandle = suppliedRootHandle
     || openRootDirectory(rootDirectory, 'GPT_REGISTER_ROOT');
   const ownedRootHandle = !suppliedRootHandle;
   assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+  const snapshotRootStat = fs.fstatSync(rootHandle.descriptor);
   let tokenRecords;
   let usernameSnapshot;
   const tokenBudget = {
@@ -647,17 +994,49 @@ function readGptRegisterSources(options = {}) {
       HARD_TOKEN_TOTAL_MAX_BYTES,
     ),
   };
+  const tokenManifests = [];
   try {
+    let initialTokenManifests = [];
+    let initialUsernameState = null;
+    if (options.strictCompleteSnapshot === true) {
+      const manifestBudget = { files: 0, maximumFiles: tokenBudget.maximumFiles };
+      initialTokenManifests = [
+        captureTokenDirectoryManifest(
+          rootHandle,
+          rootDirectory,
+          tokensDirectory,
+          'tokens',
+          manifestBudget,
+        ),
+        captureTokenDirectoryManifest(
+          rootHandle,
+          rootDirectory,
+          useTokenDirectory,
+          'use_token',
+          manifestBudget,
+        ),
+      ];
+      initialUsernameState = captureRegularFileManifest(
+        rootHandle,
+        rootDirectory,
+        usernameFile,
+        'gpt_register/username.json',
+      );
+    }
     tokenRecords = [
       ...readTokenDirectory(tokensDirectory, 'tokens', rootDirectory, options.includeRaw === true, {
         rootHandle,
         strict: true,
+        requireCompleteSnapshot: options.strictCompleteSnapshot === true,
+        manifestCollector: tokenManifests,
         maxBytes: options.tokenMaxBytes,
         budget: tokenBudget,
       }),
       ...readTokenDirectory(useTokenDirectory, 'use_token', rootDirectory, options.includeRaw === true, {
         rootHandle,
         strict: true,
+        requireCompleteSnapshot: options.strictCompleteSnapshot === true,
+        manifestCollector: tokenManifests,
         maxBytes: options.tokenMaxBytes,
         budget: tokenBudget,
       }),
@@ -666,13 +1045,41 @@ function readGptRegisterSources(options = {}) {
       rootHandle,
       rootDirectory,
       strict: true,
+      requireCompleteSnapshot: options.strictCompleteSnapshot === true,
       // Raw token reads are used to build or execute a write plan. Losing a
       // terminal username status because the JSON is corrupt must stop that
       // plan instead of treating the file as an empty account list.
-      requireValidJson: options.requireValidUsername === true || options.includeRaw === true,
+      requireValidJson: options.requireValidUsername === true
+        || options.strictCompleteSnapshot === true,
+      requireValidRecords: options.requireValidUsername === true
+        || options.strictCompleteSnapshot === true,
       maxBytes: options.usernameMaxBytes,
       maxRecords: options.usernameMaxRecords,
     });
+    if (options.strictCompleteSnapshot === true) {
+      for (const initialManifest of initialTokenManifests) {
+        const readManifest = tokenManifests.find(
+          (manifest) => manifest.source === initialManifest.source,
+        );
+        assertTokenManifestMatches(initialManifest, readManifest);
+        verifyTokenDirectoryManifest(rootHandle, rootDirectory, initialManifest);
+      }
+      if (!sameStableFileState(initialUsernameState, usernameSnapshot.fileState)) {
+        throw sourceChangedError('gpt_register/username.json');
+      }
+      verifyRegularFileManifest(
+        rootHandle,
+        rootDirectory,
+        usernameFile,
+        initialUsernameState,
+        'gpt_register/username.json',
+      );
+      assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
+      const latestRootStat = fs.fstatSync(rootHandle.descriptor);
+      if (!sameStableFileState(snapshotRootStat, latestRootStat)) {
+        throw sourceChangedError('GPT_REGISTER_ROOT');
+      }
+    }
   } finally {
     if (ownedRootHandle) closeDirectoryHandle(rootHandle);
   }

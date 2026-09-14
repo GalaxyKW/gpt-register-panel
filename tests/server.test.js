@@ -18,6 +18,7 @@ const {
   openVerifiedStaticFile,
   phase3ClaimKeys,
   phase3FailureMetadata,
+  mutationFailureMetadata,
   readJsonBody,
   resetAuthFailureBuckets,
   safeStaticPath,
@@ -81,6 +82,47 @@ test('Phase3 failures persist only bounded reconciliation metadata', () => {
     dispositionOutcome: 'untrusted',
     dispositionErrorCode: 'x'.repeat(97),
   }), { code: null, accountDisposition: null });
+
+  assert.deepEqual(phase3FailureMetadata({
+    code: 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_token_output',
+    reconciliationReason: 'phase3_postflight_source_unavailable',
+  }), {
+    code: 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN',
+    accountDisposition: null,
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationScope: 'phase3_token_output',
+    reconciliationReason: 'phase3_postflight_source_unavailable',
+  });
+});
+
+test('generic worker failures preserve only bounded reconciliation signals', () => {
+  const metadata = mutationFailureMetadata({
+    code: 'sub2api_write_reconciliation_required',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationReason: 'post_write_verification',
+    message: 'Bearer must-not-persist',
+    credential: 'must-not-persist',
+  });
+  assert.deepEqual(metadata, {
+    code: 'SUB2API_WRITE_RECONCILIATION_REQUIRED',
+    requiresReconciliation: true,
+    writeOutcomeUnknown: true,
+    doNotRetry: true,
+    retryAllowed: false,
+    reconciliationReason: 'post_write_verification',
+  });
+  assert.equal(JSON.stringify(metadata).includes('must-not-persist'), false);
 });
 
 test('HTTP server applies bounded slow-request and connection limits', () => {
@@ -781,6 +823,17 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.equal(snapshot.body.includes('hidden-password'), false);
     assert.equal(snapshot.body.includes('refresh-hidden'), false);
 
+    fs.renameSync(path.join(root, 'use_token'), path.join(root, 'use_token-missing'));
+    const incompleteSourcePreview = await postJson(baseUrl, '/api/sync/preview', {
+      selectedKeys: [],
+    });
+    assert.equal(incompleteSourcePreview.status, 400);
+    assert.equal(
+      JSON.parse(incompleteSourcePreview.body).error,
+      'GPT_REGISTER_SOURCE_MISSING',
+    );
+    fs.renameSync(path.join(root, 'use_token-missing'), path.join(root, 'use_token'));
+
     const incompletePreview = await postJson(baseUrl, '/api/sync/preview', {
       selectedKeys: [],
     });
@@ -889,6 +942,7 @@ test('expired token deletion fails closed when its durable audit intent cannot b
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async assertNoReconciliationHold() {},
         async audit() { throw new Error('simulated audit storage failure'); },
       },
       logger: {
@@ -952,6 +1006,7 @@ test('expired token deletion reports reconciliation and forbids retry when compl
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async assertNoReconciliationHold() {},
         async audit(entry) {
           audits.push(entry);
           if (audits.length === 2) throw new Error('simulated completion audit failure');
@@ -1036,6 +1091,7 @@ test('expired token deletion rechecks its log checkpoint after waiting for the c
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async assertNoReconciliationHold() {},
         async audit(entry) { audits.push(entry); },
       },
       logger: {
@@ -1118,6 +1174,7 @@ test('shutdown cancels a queued expired token deletion before any audit or file 
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async assertNoReconciliationHold() {},
         async audit() { auditCalls += 1; },
         async interruptOwnedActiveJobs() { return []; },
       },
@@ -1199,6 +1256,7 @@ test('shutdown after expired token mutation reports reconciliation instead of a 
     server = createServer({
       db: {
         dbPath: path.join(root, 'unused.sqlite3'),
+        async assertNoReconciliationHold() {},
         async audit() {
           auditCalls += 1;
           if (auditCalls === 2) {

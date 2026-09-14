@@ -218,7 +218,7 @@ test('account-test worker propagates shutdown cancellation as a job interruption
   const run = runAccountTestJobNow({
     accountIds: [17],
     targetBaselines: [accountTestTargetBaseline(account)],
-    db: { async updateJob() {}, async audit() {} },
+    db: { async startMutationJob() {}, async updateJob() {}, async audit() {} },
     jobId: 'job-account-interrupt',
     client,
     logger: testAuditLogger,
@@ -260,7 +260,7 @@ test('account-test cancellation after a successful probe records reconciliation 
   const outcome = await runAccountTestJobNow({
     accountIds: [18],
     targetBaselines: [accountTestTargetBaseline(account)],
-    db: { async updateJob() {}, async audit() {} },
+    db: { async startMutationJob() {}, async updateJob() {}, async audit() {} },
     jobId: 'job-account-post-test-interrupt',
     client,
     logger: testAuditLogger,
@@ -314,8 +314,8 @@ test('shutdown timeout retains an active job claim until its real terminal outco
   const protectedClaim = 'phase3:email:still-unwinding@example.test';
   const orphanClaim = 'phase3:email:unobserved@example.test';
   const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [protectedClaim] });
-  await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
   const orphan = await db.createJob('phase3', {}, 'tester', { claimKeys: [orphanClaim] });
+  await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
   const manager = createBackgroundJobManager({ db });
   const record = manager.begin(job, 'phase3');
   let releaseWorker;

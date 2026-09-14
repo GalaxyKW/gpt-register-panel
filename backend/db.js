@@ -19,6 +19,17 @@ const MAX_JOB_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_JOB_ERROR_BYTES = 64 * 1024;
 const MAX_AUDIT_TEXT_BYTES = 16 * 1024;
 const MAX_AUDIT_DETAILS_BYTES = 512 * 1024;
+const MAX_JOB_CLAIM_KEYS = 1000;
+const MAX_JOB_CLAIM_KEY_BYTES = 512;
+const MAX_RECONCILIATION_LIST_JOBS = 100;
+const LEGACY_GLOBAL_CLAIM_PREFIX = 'reconciliation:legacy-global:';
+const RECONCILIATION_ACK_CONFIRMATION = '我已按强身份完成人工核对';
+const RECONCILIATION_ACK_RESOLUTIONS = Object.freeze([
+  'operation_applied',
+  'operation_not_applied',
+  'state_manually_reconciled',
+]);
+const RECONCILIATION_ACK_RESOLUTION_SET = new Set(RECONCILIATION_ACK_RESOLUTIONS);
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
 const JOB_STATUSES = new Set([...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES]);
@@ -60,6 +71,19 @@ function storedJobOwnerIsAlive(job) {
   return isProcessOwnerAlive(job?.owner_pid, job?.owner_start_id, job?.owner_boot_id);
 }
 
+function storedJobOwnerIsDefinitelyGone(job) {
+  const pid = Number(job?.owner_pid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  const verifier = currentProcessOwner();
+  const identityIncomplete = (verifier.processStartId && !String(job?.owner_start_id || '').trim())
+    || (verifier.processBootId && !String(job?.owner_boot_id || '').trim());
+  // Missing identity dimensions cannot distinguish the original owner from a
+  // reused, currently-live PID. They may only be treated as dead once that PID
+  // itself is no longer alive.
+  if (identityIncomplete) return !isProcessOwnerAlive(pid);
+  return !storedJobOwnerIsAlive(job);
+}
+
 function jsonString(value) {
   return JSON.stringify(value === undefined ? null : value);
 }
@@ -95,6 +119,791 @@ function resultRows(result) {
   if (!result || result.length === 0) return [];
   const [{ columns, values }] = result;
   return values.map((row) => Object.fromEntries(columns.map((column, index) => [column, row[index]])));
+}
+
+function claimIntegrityError(message) {
+  const error = new Error(message);
+  error.code = 'JOB_CLAIM_INTEGRITY_INVALID';
+  return error;
+}
+
+function reconciliationError(code, message, fields = {}) {
+  const error = new Error(message);
+  error.code = code;
+  if (fields && typeof fields === 'object' && !Array.isArray(fields)) {
+    Object.assign(error, fields);
+  }
+  return error;
+}
+
+function normalizeClaimKeys(value, { stored = false } = {}) {
+  if (value === undefined && !stored) return [];
+  if (!Array.isArray(value) || value.length > MAX_JOB_CLAIM_KEYS) {
+    throw claimIntegrityError(stored
+      ? '任务保护键元数据无效，拒绝解除并发安全屏障'
+      : '任务保护键参数无效');
+  }
+  const normalized = [];
+  const seen = new Set();
+  for (const rawKey of value) {
+    if (typeof rawKey !== 'string') {
+      throw claimIntegrityError(stored
+        ? '任务保护键元数据无效，拒绝解除并发安全屏障'
+        : '任务保护键必须是字符串');
+    }
+    const key = rawKey.trim();
+    if (!key || Buffer.byteLength(key, 'utf8') > MAX_JOB_CLAIM_KEY_BYTES) {
+      throw claimIntegrityError(stored
+        ? '任务保护键元数据无效，拒绝解除并发安全屏障'
+        : '任务保护键为空或超过安全上限');
+    }
+    if (stored && key !== rawKey) {
+      throw claimIntegrityError('任务保护键未按规范存储，拒绝解除并发安全屏障');
+    }
+    if (!stored && key.startsWith(LEGACY_GLOBAL_CLAIM_PREFIX)) {
+      throw claimIntegrityError('任务保护键使用了保留命名空间');
+    }
+    if (seen.has(key)) {
+      if (stored) {
+        throw claimIntegrityError('任务保护键元数据重复，拒绝解除并发安全屏障');
+      }
+      continue;
+    }
+    seen.add(key);
+    normalized.push(key);
+  }
+  return normalized;
+}
+
+function legacyGlobalClaimKey(jobId) {
+  return LEGACY_GLOBAL_CLAIM_PREFIX
+    + crypto.createHash('sha256').update(String(jobId)).digest('hex').slice(0, 32);
+}
+
+function isLegacyGlobalClaimKey(value) {
+  return typeof value === 'string'
+    && new RegExp('^' + LEGACY_GLOBAL_CLAIM_PREFIX.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      + '[a-f0-9]{32}$').test(value);
+}
+
+function parseStoredClaimKeys(job) {
+  let parsed;
+  try {
+    parsed = JSON.parse(job?.claim_keys_json);
+  } catch {
+    throw claimIntegrityError('任务保护键元数据无法解析，拒绝解除并发安全屏障');
+  }
+  return normalizeClaimKeys(parsed, { stored: true });
+}
+
+function claimDigest(claimKeys) {
+  return crypto.createHash('sha256').update(jsonString([...claimKeys].sort())).digest('hex');
+}
+
+function isCanonicalIsoTimestamp(value) {
+  if (typeof value !== 'string' || value.length !== 24) return false;
+  const timestamp = new Date(value);
+  return Number.isFinite(timestamp.getTime()) && timestamp.toISOString() === value;
+}
+
+function parseStoredResult(job) {
+  if (job?.result_json === null || job?.result_json === undefined) return null;
+  let result;
+  try {
+    result = JSON.parse(job.result_json);
+  } catch {
+    throw claimIntegrityError('终态任务的结果元数据无法解析，拒绝处理保护键');
+  }
+  if (!result || typeof result !== 'object' || Array.isArray(result)) {
+    throw claimIntegrityError('终态任务的结果元数据无效，拒绝处理保护键');
+  }
+  return result;
+}
+
+function resultHasReconciliationSignal(result) {
+  return result?.requiresReconciliation === true
+    || result?.reconciliationHold === true
+    || result?.writeOutcomeUnknown === true;
+}
+
+function legacyInterruptedExecutionUnknown(job, result) {
+  return job?.status === 'interrupted'
+    && result === null
+    && isCanonicalIsoTimestamp(job?.started_at)
+    && isCanonicalIsoTimestamp(job?.finished_at);
+}
+
+function sameClaims(expected, actual) {
+  return expected.size === actual.size
+    && [...expected].every((claimKey) => actual.has(claimKey));
+}
+
+function recordClaimRecoveryAudit(database, job, result, details, createdAt) {
+  const statement = database.prepare(`INSERT INTO audit_events
+    (job_id, actor, action, target_key, before_fingerprint, after_fingerprint,
+      result, details_json, created_at)
+    VALUES (?, 'local', 'job_claim_recovery', NULL, NULL, NULL, ?, ?, ?)`);
+  try {
+    statement.run([
+      job.id,
+      result,
+      jsonString(details),
+      createdAt,
+    ]);
+  } finally {
+    statement.free();
+  }
+}
+
+function recordTerminalClaimCleanup(database, job, count, createdAt) {
+  recordClaimRecoveryAudit(database, job, 'stale_terminal_claim_removed', {
+    claimCount: count,
+    terminalStatus: job.status,
+  }, createdAt);
+}
+
+function validateAcknowledgedReconciliation(job, storedResult, expectedKeys, actual) {
+  const digest = claimDigest(expectedKeys);
+  const globalScope = job.reconciliation_scope === 'global';
+  const claimScope = job.reconciliation_scope === 'claims';
+  const hasLegacyGlobalKey = expectedKeys.length === 1
+    && isLegacyGlobalClaimKey(expectedKeys[0]);
+  if ((!globalScope && !claimScope)
+      || expectedKeys.length === 0
+      || globalScope !== hasLegacyGlobalKey
+      || actual.size !== 0
+      || !/^[a-f0-9]{64}$/.test(String(job.reconciliation_claim_digest || ''))
+      || job.reconciliation_claim_digest !== digest
+      || !isCanonicalIsoTimestamp(job.reconciliation_acknowledged_at)
+      || !RECONCILIATION_ACK_RESOLUTION_SET.has(job.reconciliation_resolution)
+      || job.reconciliation_acknowledged_by !== 'panel-admin'
+      || storedResult?.reconciliationResolved !== true
+      || storedResult?.reconciliationHold !== false
+      || storedResult?.requiresReconciliation !== false
+      || storedResult?.futureOperationsUnblocked !== true
+      || storedResult?.doNotRetry !== true
+      || storedResult?.retryAllowed !== false
+      || storedResult?.reconciliationClaimDigest !== digest
+      || storedResult?.reconciliationHoldScope !== (globalScope ? 'all_future_jobs' : 'claim_keys')
+      || storedResult?.reconciliationBlockScope !== 'none'
+      || storedResult?.reconciliationBlockScopeWas !== 'all_mutating_operations'
+      || storedResult?.reconciliationResolution !== job.reconciliation_resolution
+      || storedResult?.reconciliationAcknowledgedAt !== job.reconciliation_acknowledged_at
+      || storedResult?.reconciliationAcknowledgedBy !== job.reconciliation_acknowledged_by) {
+    throw claimIntegrityError('已确认对账任务的持久元数据不一致');
+  }
+}
+
+function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } = {}) {
+  const jobs = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
+      owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
+      reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
+      reconciliation_resolution, reconciliation_acknowledged_by
+    FROM sync_jobs`));
+  const jobsById = new Map();
+  for (const job of jobs) {
+    const id = typeof job.id === 'string' ? job.id : '';
+    if (!id || jobsById.has(id)) {
+      throw claimIntegrityError('任务标识无效，拒绝处理并发安全屏障');
+    }
+    jobsById.set(id, job);
+  }
+
+  const actualByJobId = new Map();
+  const claimOwnerByKey = new Map();
+  const claims = resultRows(database.exec(
+    'SELECT claim_key, job_id, job_type FROM job_claims',
+  ));
+  for (const claim of claims) {
+    const jobId = typeof claim.job_id === 'string' ? claim.job_id : '';
+    const job = jobsById.get(jobId);
+    if (!job) {
+      throw claimIntegrityError('任务保护键指向不存在的任务，拒绝自动删除');
+    }
+    if (typeof claim.claim_key !== 'string'
+        || claim.claim_key !== claim.claim_key.trim()
+        || !claim.claim_key
+        || Buffer.byteLength(claim.claim_key, 'utf8') > MAX_JOB_CLAIM_KEY_BYTES
+        || claim.job_type !== job.type) {
+      throw claimIntegrityError('任务保护键与任务元数据不一致，拒绝处理');
+    }
+    if (!actualByJobId.has(jobId)) actualByJobId.set(jobId, new Set());
+    actualByJobId.get(jobId).add(claim.claim_key);
+    claimOwnerByKey.set(claim.claim_key, jobId);
+  }
+
+  const activeJobs = [];
+  const staleTerminalJobs = [];
+  for (const job of jobs) {
+    const active = ACTIVE_JOB_STATUSES.has(job.status);
+    const holdValue = Number(job.reconciliation_hold);
+    if (holdValue !== 0 && holdValue !== 1) {
+      throw claimIntegrityError('待对账 hold 标记无效');
+    }
+    let hold = holdValue === 1;
+    if (active && hold) {
+      throw claimIntegrityError('活跃任务不得同时标记为待对账 hold');
+    }
+    if (!active && !TERMINAL_JOB_STATUSES.has(job.status)) {
+      if (actualByJobId.has(job.id) || hold) {
+        throw claimIntegrityError('任务状态无效，拒绝处理保护键');
+      }
+      continue;
+    }
+    const acknowledgementMetadataPresent = [
+      job.reconciliation_scope,
+      job.reconciliation_claim_digest,
+      job.reconciliation_acknowledged_at,
+      job.reconciliation_resolution,
+      job.reconciliation_acknowledged_by,
+    ].some((value) => value !== null && value !== undefined);
+    let legacyTerminalResult = null;
+    let legacyTerminalSignal = false;
+    if (!active && !hold && !actualByJobId.has(job.id) && !acknowledgementMetadataPresent) {
+      legacyTerminalResult = parseStoredResult(job);
+      legacyTerminalSignal = resultHasReconciliationSignal(legacyTerminalResult);
+      if (!legacyTerminalSignal && legacyInterruptedExecutionUnknown(job, legacyTerminalResult)) {
+        legacyTerminalResult = {
+          code: 'JOB_EXECUTION_OUTCOME_UNKNOWN',
+          outcome: 'requires_reconciliation',
+          executionOutcome: 'unknown',
+          writeOutcomeUnknown: true,
+          requiresReconciliation: true,
+          reconciliationReason: 'legacy_owner_process_exited_while_running',
+          retryAllowed: false,
+          doNotRetry: true,
+        };
+        legacyTerminalSignal = true;
+      }
+      if (!legacyTerminalSignal) continue;
+    }
+
+    let expectedKeys;
+    const claimMetadataWasMissing = job.claim_keys_json === null;
+    if (claimMetadataWasMissing) {
+      const recoverableKeys = [...(actualByJobId.get(job.id) || [])].sort();
+      if (recoverableKeys.length > 0) {
+        const repair = database.prepare('UPDATE sync_jobs SET claim_keys_json = ? WHERE id = ? AND claim_keys_json IS NULL');
+        try {
+          repair.run([jsonString(recoverableKeys), job.id]);
+        } finally {
+          repair.free();
+        }
+        job.claim_keys_json = jsonString(recoverableKeys);
+        expectedKeys = recoverableKeys;
+      } else if (active
+          && job.status === 'queued'
+          && !jobExecutionOutcomeUnknown(job)
+          && storedJobOwnerIsDefinitelyGone(job)) {
+        const repair = database.prepare("UPDATE sync_jobs SET claim_keys_json = '[]' WHERE id = ? AND claim_keys_json IS NULL");
+        try {
+          repair.run([job.id]);
+        } finally {
+          repair.free();
+        }
+        job.claim_keys_json = '[]';
+        job.force_recovery = true;
+        expectedKeys = [];
+      } else if (active
+          && Number.isSafeInteger(Number(job.owner_pid))
+          && Number(job.owner_pid) > 0
+          && !storedJobOwnerIsDefinitelyGone(job)) {
+        // A live owner may still dispatch this queued task. Neither inventing
+        // an empty claim list nor terminalizing the row is safe while that
+        // process is active, so fail closed and leave its state untouched.
+        throw claimIntegrityError('活动任务缺少可恢复的保护键元数据，拒绝并发处理');
+      } else if (active) {
+        // Rows created before durable claims existed cannot identify the
+        // affected target after execution may have started. Convert that
+        // uncertainty into an explicit global barrier. A unique synthetic key
+        // makes the hold acknowledgeable without pretending it is a target key.
+        const globalClaimKey = legacyGlobalClaimKey(job.id);
+        const repairedAt = new Date().toISOString();
+        const repair = database.prepare(`UPDATE sync_jobs
+          SET claim_keys_json = ?, reconciliation_scope = 'global'
+          WHERE id = ? AND claim_keys_json IS NULL`);
+        const insert = database.prepare(`INSERT INTO job_claims
+          (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+        try {
+          repair.run([jsonString([globalClaimKey]), job.id]);
+          insert.run([globalClaimKey, job.id, job.type, repairedAt]);
+        } finally {
+          repair.free();
+          insert.free();
+        }
+        recordClaimRecoveryAudit(database, job, 'legacy_global_hold_created', {
+          claimCount: 1,
+          previousClaimMetadata: 'missing',
+          scope: 'all_future_jobs',
+          activeStatus: job.status,
+        }, repairedAt);
+        job.claim_keys_json = jsonString([globalClaimKey]);
+        job.reconciliation_scope = 'global';
+        job.force_recovery = true;
+        expectedKeys = [globalClaimKey];
+        actualByJobId.set(job.id, new Set(expectedKeys));
+      } else if (!active && !hold && !acknowledgementMetadataPresent && legacyTerminalSignal) {
+        // A pre-claim-schema terminal row cannot identify its original target,
+        // but a trusted unknown-outcome signal still requires a durable safety
+        // barrier. Let the keyless legacy migration below assign a synthetic
+        // global key instead of making the whole database permanently
+        // unopenable. Ordinary terminal rows without that signal were already
+        // skipped above and remain untouched.
+        expectedKeys = [];
+      } else {
+        throw claimIntegrityError('旧版任务缺少可恢复的保护键元数据，拒绝启动');
+      }
+    } else {
+      expectedKeys = parseStoredClaimKeys(job);
+    }
+    const expected = new Set(expectedKeys);
+    const actual = actualByJobId.get(job.id) || new Set();
+    if (!active && !hold && !acknowledgementMetadataPresent) {
+      if (!legacyTerminalResult) legacyTerminalResult = parseStoredResult(job);
+      legacyTerminalSignal = resultHasReconciliationSignal(legacyTerminalResult);
+      if (legacyTerminalSignal) {
+        if (expectedKeys.length === 0) {
+          if (actual.size !== 0) {
+            throw claimIntegrityError('旧版终态任务声明无保护键但仍存在映射，拒绝自动迁移');
+          }
+          // The block policy is deliberately global until every workflow
+          // shares one resource key space. A synthetic key makes even an old
+          // keyless unknown outcome durable and acknowledgeable.
+          const globalClaimKey = legacyGlobalClaimKey(job.id);
+          const repairedAt = new Date().toISOString();
+          const repair = database.prepare(`UPDATE sync_jobs
+            SET claim_keys_json = ?, reconciliation_scope = 'global'
+            WHERE id = ? AND reconciliation_hold = 0`);
+          const insert = database.prepare(`INSERT INTO job_claims
+            (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+          try {
+            repair.run([jsonString([globalClaimKey]), job.id]);
+            insert.run([globalClaimKey, job.id, job.type, repairedAt]);
+          } finally {
+            repair.free();
+            insert.free();
+          }
+          expectedKeys.push(globalClaimKey);
+          expected.add(globalClaimKey);
+          actual.add(globalClaimKey);
+          actualByJobId.set(job.id, actual);
+          claimOwnerByKey.set(globalClaimKey, job.id);
+          job.claim_keys_json = jsonString(expectedKeys);
+          job.reconciliation_scope = 'global';
+          recordClaimRecoveryAudit(database, job, 'legacy_terminal_global_hold_created', {
+            claimCount: 1,
+            terminalStatus: job.status,
+            previousClaimMetadata: claimMetadataWasMissing ? 'missing' : 'empty',
+            scope: 'all_future_jobs',
+          }, repairedAt);
+        }
+
+        const legacyGlobal = expectedKeys.length === 1
+          && expectedKeys[0] === legacyGlobalClaimKey(job.id);
+        if (expectedKeys.some(isLegacyGlobalClaimKey) && !legacyGlobal) {
+          throw claimIntegrityError('旧版终态任务包含无法验证归属的全局保护键');
+        }
+        for (const claimKey of expectedKeys) {
+          const ownerJobId = claimOwnerByKey.get(claimKey);
+          if (ownerJobId && ownerJobId !== job.id) {
+            throw claimIntegrityError('旧版终态任务的保护键已被其他任务占用，拒绝自动迁移');
+          }
+        }
+        if (actual.size !== 0 && !sameClaims(expected, actual)) {
+          throw claimIntegrityError('旧版终态任务的保护键映射不完整，拒绝自动迁移');
+        }
+
+        const repairedAt = new Date().toISOString();
+        const digest = claimDigest(expectedKeys);
+        const scope = legacyGlobal ? 'global' : 'claims';
+        const holdFields = {
+          requiresReconciliation: true,
+          reconciliationHold: true,
+          reconciliationResolved: false,
+          futureOperationsUnblocked: false,
+          reconciliationHoldUnavailable: false,
+          reconciliationHoldReason: null,
+          reconciliationClaimDigest: digest,
+          heldClaimCount: expectedKeys.length,
+          reconciliationHoldScope: legacyGlobal ? 'all_future_jobs' : 'claim_keys',
+          reconciliationBlockScope: 'all_mutating_operations',
+          reconciliationResolution: null,
+          reconciliationAcknowledgedAt: null,
+          reconciliationAcknowledgedBy: null,
+          retryAllowed: false,
+          doNotRetry: true,
+        };
+        const boundedHold = boundedReconciliationResult(
+          legacyTerminalResult,
+          holdFields,
+          job.result_json,
+        );
+        const holdResult = boundedHold.result;
+        const holdResultJson = boundedHold.json;
+        const repair = database.prepare(`UPDATE sync_jobs
+          SET result_json = ?, reconciliation_hold = 1,
+            reconciliation_scope = ?, reconciliation_claim_digest = ?
+          WHERE id = ? AND reconciliation_hold = 0`);
+        const insert = database.prepare(`INSERT INTO job_claims
+          (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+        try {
+          repair.run([
+            holdResultJson,
+            scope,
+            digest,
+            job.id,
+          ]);
+          for (const claimKey of expectedKeys) {
+            if (!claimOwnerByKey.has(claimKey)) {
+              insert.run([claimKey, job.id, job.type, repairedAt]);
+              actual.add(claimKey);
+              claimOwnerByKey.set(claimKey, job.id);
+            }
+          }
+        } finally {
+          repair.free();
+          insert.free();
+        }
+        recordClaimRecoveryAudit(database, job, 'legacy_terminal_hold_rebuilt', {
+          claimCount: expectedKeys.length,
+          terminalStatus: job.status,
+          scope: legacyGlobal ? 'all_future_jobs' : 'claim_keys',
+        }, repairedAt);
+        actualByJobId.set(job.id, actual);
+        job.result_json = holdResultJson;
+        job.reconciliation_hold = 1;
+        job.reconciliation_scope = scope;
+        job.reconciliation_claim_digest = digest;
+        hold = true;
+      }
+    }
+    const acknowledged = !active && !hold && Boolean(job.reconciliation_acknowledged_at);
+    if (acknowledged) {
+      const storedResult = parseStoredResult(job);
+      validateAcknowledgedReconciliation(job, storedResult, expectedKeys, actual);
+      continue;
+    }
+    if (!sameClaims(expected, actual)) {
+      throw claimIntegrityError('任务保护键与任务内保护键列表不一致，拒绝解除安全屏障');
+    }
+
+    if (active) {
+      const activeGlobal = job.reconciliation_scope === 'global';
+      if (activeGlobal !== (expected.size === 1 && isLegacyGlobalClaimKey(expectedKeys[0]))) {
+        throw claimIntegrityError('旧版全局保护键与任务范围不一致');
+      }
+      if (!activeGlobal && job.reconciliation_scope !== null) {
+        throw claimIntegrityError('活跃任务的对账范围无效');
+      }
+      if (job.reconciliation_claim_digest !== null
+          || job.reconciliation_acknowledged_at !== null
+          || job.reconciliation_resolution !== null
+          || job.reconciliation_acknowledged_by !== null) {
+        throw claimIntegrityError('活跃任务包含非法的对账确认元数据');
+      }
+      activeJobs.push(job);
+      continue;
+    }
+    const storedResult = parseStoredResult(job);
+    if (hold) {
+      const digest = claimDigest(expected);
+      const globalScope = job.reconciliation_scope === 'global';
+      const claimScope = job.reconciliation_scope === 'claims';
+      const hasLegacyGlobalKey = expected.size === 1
+        && isLegacyGlobalClaimKey(expectedKeys[0]);
+      if ((!globalScope && !claimScope)
+          || expected.size === 0
+          || globalScope !== hasLegacyGlobalKey
+          || !/^[a-f0-9]{64}$/.test(String(job.reconciliation_claim_digest || ''))
+          || job.reconciliation_claim_digest !== digest
+          || storedResult?.reconciliationHold !== true
+          || storedResult?.requiresReconciliation !== true
+          || storedResult?.reconciliationResolved !== false
+          || storedResult?.futureOperationsUnblocked !== false
+          || storedResult?.doNotRetry !== true
+          || storedResult?.retryAllowed !== false
+          || storedResult?.reconciliationClaimDigest !== digest
+          || storedResult?.reconciliationHoldScope !== (globalScope ? 'all_future_jobs' : 'claim_keys')
+          || storedResult?.reconciliationBlockScope !== 'all_mutating_operations'
+          || job.reconciliation_acknowledged_at !== null
+          || job.reconciliation_resolution !== null
+          || job.reconciliation_acknowledged_by !== null) {
+        throw claimIntegrityError('待对账任务的持久 hold 元数据不一致');
+      }
+    } else {
+      if (acknowledgementMetadataPresent) {
+        throw claimIntegrityError('非 hold 任务的对账范围与确认状态不一致');
+      }
+      if (resultHasReconciliationSignal(storedResult)) {
+        throw claimIntegrityError('终态任务仍需对账，拒绝将其保护键当作普通残留删除');
+      }
+      staleTerminalJobs.push({ job, count: actual.size });
+    }
+  }
+
+  if (cleanupOrdinaryTerminalClaims && staleTerminalJobs.length > 0) {
+    const now = new Date().toISOString();
+    const remove = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
+    try {
+      for (const { job, count } of staleTerminalJobs) {
+        recordTerminalClaimCleanup(database, job, count, now);
+        remove.run([job.id]);
+      }
+    } finally {
+      remove.free();
+    }
+  } else if (staleTerminalJobs.length > 0) {
+    throw claimIntegrityError('检测到普通终态任务的残留保护键，需要在持久化锁内清理');
+  }
+  return activeJobs;
+}
+
+function jobExecutionOutcomeUnknown(job) {
+  return job?.status === 'running'
+    || [job?.started_at, job?.finished_at, job?.result_json, job?.error]
+      .some((value) => value !== null && value !== undefined);
+}
+
+function recoveredJobResult(job) {
+  if (!jobExecutionOutcomeUnknown(job)) {
+    return {
+      code: 'JOB_OWNER_EXITED_BEFORE_START',
+      outcome: 'not_started',
+      executionOutcome: 'not_started',
+      retryAllowed: true,
+      doNotRetry: false,
+      requiresReconciliation: false,
+    };
+  }
+  return {
+    code: 'JOB_EXECUTION_OUTCOME_UNKNOWN',
+    outcome: 'requires_reconciliation',
+    executionOutcome: 'unknown',
+    writeOutcomeUnknown: true,
+    requiresReconciliation: true,
+    reconciliationResolved: false,
+    futureOperationsUnblocked: false,
+    retryAllowed: false,
+    doNotRetry: true,
+    reconciliationReason: job?.status === 'running'
+      ? 'owner_process_exited_while_running'
+      : 'queued_state_inconsistent',
+  };
+}
+
+function interruptDeadOwnerJob(database, job, interruptedAt) {
+  let claimKeys = parseStoredClaimKeys(job);
+  const result = recoveredJobResult(job);
+  if (result.requiresReconciliation && claimKeys.length === 0) {
+    const globalClaimKey = legacyGlobalClaimKey(job.id);
+    const claimStatement = database.prepare(`INSERT INTO job_claims
+      (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+    try {
+      claimStatement.run([globalClaimKey, job.id, job.type, interruptedAt]);
+    } finally {
+      claimStatement.free();
+    }
+    claimKeys = [globalClaimKey];
+    job.claim_keys_json = jsonString(claimKeys);
+    job.reconciliation_scope = 'global';
+  }
+  const retainClaims = result.requiresReconciliation && claimKeys.length > 0;
+  const globalScope = retainClaims && job?.reconciliation_scope === 'global';
+  const digest = retainClaims ? claimDigest(claimKeys) : null;
+  if (retainClaims) {
+    result.reconciliationHold = true;
+    result.reconciliationHoldUnavailable = false;
+    result.reconciliationHoldReason = null;
+    result.reconciliationClaimDigest = digest;
+    result.heldClaimCount = claimKeys.length;
+    result.reconciliationHoldScope = globalScope ? 'all_future_jobs' : 'claim_keys';
+    result.reconciliationBlockScope = 'all_mutating_operations';
+  } else if (result.requiresReconciliation) {
+    result.reconciliationHold = false;
+    result.reconciliationHoldUnavailable = true;
+    result.reconciliationHoldReason = 'no_claim_keys';
+    result.reconciliationBlockScope = null;
+  }
+  const message = retainClaims
+    ? '任务所属进程退出且执行结果未知；已保留持久保护键，请先人工核对操作影响的实际状态'
+    : result.requiresReconciliation
+      ? '任务所属进程退出且执行结果未知；该任务未配置保护键，无法为后续操作建立持久阻挡'
+    : '任务所属进程已退出，排队任务未开始执行';
+  const statement = database.prepare(`UPDATE sync_jobs
+    SET status = 'interrupted', result_json = ?, error = ?, finished_at = ?,
+      claim_keys_json = ?, reconciliation_hold = ?, reconciliation_scope = ?,
+      reconciliation_claim_digest = ?
+    WHERE id = ? AND status = ?`);
+  try {
+    statement.run([
+      jsonString(result),
+      message,
+      interruptedAt,
+      jsonString(claimKeys),
+      retainClaims ? 1 : 0,
+      retainClaims ? (globalScope ? 'global' : 'claims') : null,
+      digest,
+      job.id,
+      job.status,
+    ]);
+  } finally {
+    statement.free();
+  }
+  if (!retainClaims) {
+    const release = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
+    try {
+      release.run([job.id]);
+    } finally {
+      release.free();
+    }
+  }
+  return result;
+}
+
+function reconciliationHoldError(job) {
+  return reconciliationError(
+    'JOB_RECONCILIATION_REQUIRED',
+    '上一个任务的执行结果未知，持久保护键已阻止新操作；请先人工核对操作影响的实际状态',
+    {
+      existingJobId: job?.id || null,
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationHoldScope: job?.reconciliation_scope === 'global'
+        ? 'all_future_jobs'
+        : 'claim_keys',
+      reconciliationBlockScope: 'all_mutating_operations',
+      retryAllowed: false,
+      doNotRetry: true,
+    },
+  );
+}
+
+function firstReconciliationBarrier(database) {
+  return resultRows(database.exec(`SELECT id, reconciliation_scope
+    FROM sync_jobs
+    WHERE reconciliation_hold = 1
+    ORDER BY CASE WHEN reconciliation_scope = 'global' THEN 0 ELSE 1 END,
+      created_at ASC, id ASC LIMIT 1`))[0] || null;
+}
+
+function firstRunningMutation(database) {
+  return resultRows(database.exec(`SELECT id, type
+    FROM sync_jobs
+    WHERE status = 'running'
+    ORDER BY COALESCE(started_at, created_at) ASC, id ASC LIMIT 1`))[0] || null;
+}
+
+function runningMutationError(job) {
+  const error = new Error('已有写任务正在执行，已保守阻止新的写操作');
+  error.code = 'JOB_ALREADY_CLAIMED';
+  error.existingJobId = job?.id || null;
+  error.blockScope = 'all_mutating_operations';
+  return error;
+}
+
+function blockedBeforeExecutionError(code, message, job) {
+  const error = new Error(message);
+  error.code = code;
+  error.blockedBeforeStart = true;
+  error.executionOutcome = 'not_started';
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.existingJobId = job?.id || null;
+  return error;
+}
+
+function reconciliationResultSummary(result) {
+  const safeString = (value, maximum = 128) => {
+    if (typeof value !== 'string') return undefined;
+    const normalized = value.trim();
+    return normalized && normalized.length <= maximum && /^[A-Za-z0-9_.:-]+$/.test(normalized)
+      ? normalized
+      : undefined;
+  };
+  const safeCount = (value) => {
+    const number = Number(value);
+    return Number.isSafeInteger(number) && number >= 0 && number <= 1_000_000
+      ? number
+      : undefined;
+  };
+  return {
+    code: safeString(result?.code),
+    outcome: safeString(result?.outcome),
+    executionOutcome: safeString(result?.executionOutcome),
+    requiresReconciliation: result?.requiresReconciliation === true,
+    reconciliationHold: result?.reconciliationHold === true,
+    reconciliationResolved: result?.reconciliationResolved === true,
+    reconciliationHoldUnavailable: result?.reconciliationHoldUnavailable === true,
+    reconciliationHoldReason: safeString(result?.reconciliationHoldReason),
+    reconciliationReason: safeString(result?.reconciliationReason),
+    reconciliationClaimDigest: /^[a-f0-9]{64}$/.test(String(result?.reconciliationClaimDigest || ''))
+      ? result.reconciliationClaimDigest
+      : undefined,
+    reconciliationHoldScope: safeString(result?.reconciliationHoldScope),
+    reconciliationBlockScope: safeString(result?.reconciliationBlockScope),
+    reconciliationBlockScopeWas: safeString(result?.reconciliationBlockScopeWas),
+    heldClaimCount: safeCount(result?.heldClaimCount),
+    succeeded: safeCount(result?.succeeded),
+    failed: safeCount(result?.failed),
+    skipped: safeCount(result?.skipped),
+    runtimeSkipped: safeCount(result?.runtimeSkipped),
+    reconciliationCount: safeCount(result?.reconciliationCount),
+    notAttemptedCount: safeCount(result?.notAttemptedCount),
+    writeOutcomeUnknown: result?.writeOutcomeUnknown === true,
+    retryAllowed: result?.retryAllowed === true,
+    doNotRetry: result?.doNotRetry === true,
+    futureOperationsUnblocked: result?.futureOperationsUnblocked === true,
+  };
+}
+
+function boundedReconciliationResult(originalResult, requiredFields, originalSerialized = null) {
+  const result = { ...originalResult, ...requiredFields };
+  try {
+    return {
+      result,
+      json: boundedJsonString('sync_jobs.result_json', result, MAX_JOB_RESULT_BYTES),
+    };
+  } catch (error) {
+    if (error?.code !== 'PANEL_DB_FIELD_TOO_LARGE') throw error;
+    const serialized = typeof originalSerialized === 'string'
+      ? originalSerialized
+      : jsonString(redactValue(originalResult));
+    // A result that was legal in the previous schema may leave no room for
+    // newly required hold metadata. Keep the operational summary plus a digest
+    // of the original bounded value so the safety barrier remains durable and
+    // acknowledgeable instead of making startup or terminal persistence fail.
+    const compact = {
+      ...reconciliationResultSummary(originalResult),
+      originalResultCompacted: true,
+      originalResultBytes: Buffer.byteLength(serialized, 'utf8'),
+      originalResultDigest: crypto.createHash('sha256').update(serialized).digest('hex'),
+      ...requiredFields,
+    };
+    return {
+      result: compact,
+      json: boundedJsonString('sync_jobs.result_json', compact, MAX_JOB_RESULT_BYTES),
+    };
+  }
+}
+
+function normalizedJobListLimit(limit, fallback = 50) {
+  let raw;
+  let parsed;
+  try {
+    raw = limit === null || limit === undefined ? '' : String(limit).trim();
+    parsed = Number(limit);
+  } catch {
+    return fallback;
+  }
+  if (!raw || !Number.isFinite(parsed)) return fallback;
+  // Clamp before truncating so even a finite value outside the safe-integer
+  // range can never be interpolated into SQL as an unsafe or decimal LIMIT.
+  return Math.trunc(Math.max(1, Math.min(200, parsed)));
+}
+
+function boundedJobListText(value, maximumCharacters) {
+  if (value === null || value === undefined) return null;
+  return redactText(String(value)).slice(0, maximumCharacters);
 }
 
 class PanelDb {
@@ -319,7 +1128,13 @@ class PanelDb {
         claim_keys_json TEXT,
         owner_pid INTEGER,
         owner_start_id TEXT,
-        owner_boot_id TEXT
+        owner_boot_id TEXT,
+        reconciliation_hold INTEGER NOT NULL DEFAULT 0,
+        reconciliation_scope TEXT,
+        reconciliation_claim_digest TEXT,
+        reconciliation_acknowledged_at TEXT,
+        reconciliation_resolution TEXT,
+        reconciliation_acknowledged_by TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_sync_jobs_created_at ON sync_jobs(created_at DESC);
       CREATE TABLE IF NOT EXISTS job_claims (
@@ -364,6 +1179,24 @@ class PanelDb {
     if (!columns.includes('owner_boot_id')) {
       this.database.run('ALTER TABLE sync_jobs ADD COLUMN owner_boot_id TEXT');
     }
+    if (!columns.includes('reconciliation_hold')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_hold INTEGER NOT NULL DEFAULT 0');
+    }
+    if (!columns.includes('reconciliation_scope')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_scope TEXT');
+    }
+    if (!columns.includes('reconciliation_claim_digest')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_claim_digest TEXT');
+    }
+    if (!columns.includes('reconciliation_acknowledged_at')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_acknowledged_at TEXT');
+    }
+    if (!columns.includes('reconciliation_resolution')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_resolution TEXT');
+    }
+    if (!columns.includes('reconciliation_acknowledged_by')) {
+      this.database.run('ALTER TABLE sync_jobs ADD COLUMN reconciliation_acknowledged_by TEXT');
+    }
   }
 
   pruneRows() {
@@ -375,17 +1208,15 @@ class PanelDb {
     // not, even when a burst temporarily exceeds the retention limit.
     this.database.run(`DELETE FROM sync_jobs WHERE id IN (
       SELECT id FROM sync_jobs
-      WHERE status NOT IN ('queued', 'running')
-      ORDER BY created_at DESC LIMIT -1 OFFSET ${maxJobs}
+      WHERE status NOT IN ('queued', 'running') AND reconciliation_hold = 0
+      ORDER BY COALESCE(reconciliation_acknowledged_at, finished_at, created_at) DESC
+      LIMIT -1 OFFSET ${maxJobs}
     )`);
     this.database.run(`DELETE FROM audit_events WHERE id IN (
       SELECT id FROM audit_events ORDER BY id DESC LIMIT -1 OFFSET ${maxAudit}
     )`);
     this.database.run(`DELETE FROM sync_snapshots WHERE id IN (
       SELECT id FROM sync_snapshots ORDER BY created_at DESC LIMIT -1 OFFSET ${maxSnapshots}
-    )`);
-    this.database.run(`DELETE FROM job_claims WHERE job_id NOT IN (
-      SELECT id FROM sync_jobs WHERE status IN ('queued', 'running')
     )`);
   }
 
@@ -404,26 +1235,16 @@ class PanelDb {
       // proves that queued/running work was interrupted. This also prevents a
       // second PanelDb object in the same process from releasing live claims.
       const interruptedAt = new Date().toISOString();
-      const activeJobs = resultRows(this.database.exec(`SELECT id, owner_pid, owner_start_id, owner_boot_id
-        FROM sync_jobs WHERE status IN ('queued', 'running')`));
+      // Claims are the durable barrier against duplicate remote mutations.
+      // Validate both directions before recovery; attempting to "repair" an
+      // incomplete mapping by deleting rows could silently remove that barrier.
+      const activeJobs = validateJobClaims(this.database, {
+        cleanupOrdinaryTerminalClaims: true,
+      });
       const interrupted = activeJobs.filter((job) => (
-        !storedJobOwnerIsAlive(job)
+        job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job)
       ));
-      if (interrupted.length > 0) {
-        const statement = this.database.prepare(`UPDATE sync_jobs
-          SET status = 'interrupted', error = ?, finished_at = ?
-          WHERE id = ? AND status IN ('queued', 'running')`);
-        try {
-          for (const job of interrupted) {
-            statement.run(['面板任务所属进程已退出，任务未恢复执行', interruptedAt, job.id]);
-          }
-        } finally {
-          statement.free();
-        }
-      }
-      this.database.run(`DELETE FROM job_claims WHERE job_id NOT IN (
-        SELECT id FROM sync_jobs WHERE status IN ('queued', 'running')
-      )`);
+      for (const job of interrupted) interruptDeadOwnerJob(this.database, job, interruptedAt);
       this.pruneRows();
       this.persistUnlocked();
     });
@@ -537,12 +1358,11 @@ class PanelDb {
   createJob(type, payload = {}, requestedBy = 'local', options = {}) {
     const id = randomId('job');
     const now = new Date().toISOString();
-    const claimKeys = [...new Set((Array.isArray(options.claimKeys) ? options.claimKeys : [])
-      .map((key) => String(key || '').trim())
-      .filter((key) => key && key.length <= 512))];
+    let claimKeys;
     const owner = currentProcessOwner();
     let safePayloadJson;
     try {
+      claimKeys = normalizeClaimKeys(options.claimKeys);
       safePayloadJson = boundedJsonString('sync_jobs.payload_json', payload, MAX_JOB_PAYLOAD_BYTES);
     } catch (error) {
       return Promise.reject(error);
@@ -550,32 +1370,63 @@ class PanelDb {
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
+        const activeJobs = validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
+        for (const activeJob of activeJobs.filter((job) => (
+          job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job)
+        ))) {
+          interruptDeadOwnerJob(database, activeJob, now);
+        }
+        const reconciliationBarrier = firstReconciliationBarrier(database);
+        if (reconciliationBarrier) {
+          // Validation may just have migrated one or more legacy unknown jobs
+          // into durable holds. Persist that fail-closed repair before returning
+          // the conflict to the caller. Until resource claims span every
+          // workflow, any unresolved outcome blocks every new mutation job.
+          database.run('COMMIT');
+          return {
+            recoveryBlock: {
+              jobId: reconciliationBarrier.id,
+              scope: reconciliationBarrier.reconciliation_scope || 'claims',
+            },
+          };
+        }
+        const runningMutation = firstRunningMutation(database);
+        if (runningMutation) {
+          database.run('COMMIT');
+          return { runningBlock: runningMutation };
+        }
+        let recoveryBlock = null;
         for (const claimKey of claimKeys) {
           let existing = resultRows(database.exec(
             'SELECT job_id FROM job_claims WHERE claim_key = ' + sqlString(claimKey) + ' LIMIT 1',
           ))[0];
           if (existing) {
-            const owner = resultRows(database.exec(`SELECT id, status, owner_pid, owner_start_id, owner_boot_id
+            const existingJob = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
+                owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
+                reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
+                reconciliation_resolution, reconciliation_acknowledged_by
               FROM sync_jobs WHERE id = ${sqlString(existing.job_id)} LIMIT 1`))[0];
-            const ownerIsActive = owner && ['queued', 'running'].includes(owner.status);
-            if (!ownerIsActive || !storedJobOwnerIsAlive(owner)) {
-              if (ownerIsActive) {
-                const interrupted = database.prepare(`UPDATE sync_jobs
-                  SET status = 'interrupted', error = ?, finished_at = ?
-                  WHERE id = ? AND status IN ('queued', 'running')`);
-                try {
-                  interrupted.run([
-                    '面板任务所属进程已退出，任务未恢复执行',
-                    now,
-                    existing.job_id,
-                  ]);
-                } finally {
-                  interrupted.free();
-                }
+            if (Number(existingJob?.reconciliation_hold) === 1) {
+              // Validation may have rebuilt this legacy terminal hold in the
+              // current transaction. Commit the repair before surfacing the
+              // conflict so the hold is visible and acknowledgeable later.
+              recoveryBlock = {
+                jobId: existingJob.id,
+                scope: existingJob.reconciliation_scope || 'claims',
+              };
+              break;
+            }
+            // An incomplete legacy owner identity is not proof that the owner
+            // has exited. In particular, do not reclaim a queued claim while
+            // its recorded PID is still alive: that process may still dispatch
+            // the original mutation. This must use the same conservative
+            // predicate as the active-job recovery pass above.
+            if (storedJobOwnerIsDefinitelyGone(existingJob)) {
+              const recovery = interruptDeadOwnerJob(database, existingJob, now);
+              if (recovery.requiresReconciliation) {
+                recoveryBlock = { jobId: existing.job_id };
+                break;
               }
-              database.run(
-                'DELETE FROM job_claims WHERE job_id = ' + sqlString(existing.job_id),
-              );
               existing = null;
             }
           }
@@ -586,6 +1437,10 @@ class PanelDb {
             error.claimKey = claimKey;
             throw error;
           }
+        }
+        if (recoveryBlock) {
+          database.run('COMMIT');
+          return { recoveryBlock };
         }
         const statement = database.prepare(`INSERT INTO sync_jobs
           (id, type, status, requested_by, payload_json, created_at, claim_keys_json,
@@ -613,7 +1468,370 @@ class PanelDb {
           }
         }
         database.run('COMMIT');
-        return { id, type, status: 'queued', requestedBy, createdAt: now };
+        return { job: { id, type, status: 'queued', requestedBy, createdAt: now } };
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
+    }).then((outcome) => {
+      if (outcome?.recoveryBlock) {
+        throw reconciliationHoldError({
+          id: outcome.recoveryBlock.jobId,
+          reconciliation_scope: outcome.recoveryBlock.scope || 'claims',
+        });
+      }
+      if (outcome?.runningBlock) throw runningMutationError(outcome.runningBlock);
+      return outcome.job;
+    });
+  }
+
+  assertNoReconciliationHold() {
+    const now = new Date().toISOString();
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        const activeJobs = validateJobClaims(database, {
+          cleanupOrdinaryTerminalClaims: true,
+        });
+        for (const activeJob of activeJobs.filter((job) => (
+          job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job)
+        ))) {
+          interruptDeadOwnerJob(database, activeJob, now);
+        }
+        const barrier = firstReconciliationBarrier(database);
+        const runningMutation = barrier ? null : firstRunningMutation(database);
+        database.run('COMMIT');
+        return { barrier, runningMutation };
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
+    }).then(({ barrier, runningMutation }) => {
+      if (barrier) throw reconciliationHoldError(barrier);
+      if (runningMutation) throw runningMutationError(runningMutation);
+      return { allowed: true };
+    });
+  }
+
+  startMutationJob(id) {
+    const jobId = typeof id === 'string' ? id.trim() : '';
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) {
+      const error = new Error('任务标识无效');
+      error.code = 'JOB_ID_INVALID';
+      return Promise.reject(error);
+    }
+    const startedAt = new Date().toISOString();
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        const activeJobs = validateJobClaims(database, {
+          cleanupOrdinaryTerminalClaims: true,
+        });
+        for (const activeJob of activeJobs.filter((job) => (
+          job.id !== jobId
+            && (job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job))
+        ))) {
+          interruptDeadOwnerJob(database, activeJob, startedAt);
+        }
+        const current = resultRows(database.exec(`SELECT id, status FROM sync_jobs
+          WHERE id = ${sqlString(jobId)} LIMIT 1`))[0];
+        if (!current) {
+          const error = new Error('任务不存在');
+          error.code = 'JOB_NOT_FOUND';
+          throw error;
+        }
+        if (current.status !== 'queued') {
+          const error = new Error('只有排队中的任务可以开始执行');
+          error.code = 'JOB_STATUS_CONFLICT';
+          error.currentStatus = current.status || null;
+          error.requestedStatus = 'running';
+          throw error;
+        }
+        const barrier = firstReconciliationBarrier(database);
+        if (barrier) {
+          database.run('COMMIT');
+          return { barrier };
+        }
+        const runningMutation = firstRunningMutation(database);
+        if (runningMutation) {
+          database.run('COMMIT');
+          return { runningMutation };
+        }
+        const statement = database.prepare(`UPDATE sync_jobs
+          SET status = 'running', started_at = ?
+          WHERE id = ? AND status = 'queued'`);
+        try {
+          statement.run([startedAt, jobId]);
+          if (database.getRowsModified() !== 1) {
+            const error = new Error('任务状态在开始执行时发生变化');
+            error.code = 'JOB_STATUS_CONFLICT';
+            throw error;
+          }
+        } finally {
+          statement.free();
+        }
+        database.run('COMMIT');
+        return { startedAt };
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
+    }).then(({ barrier, runningMutation, startedAt: persistedStartedAt }) => {
+      if (barrier) {
+        throw blockedBeforeExecutionError(
+          'JOB_BLOCKED_BY_RECONCILIATION',
+          '存在待人工对账的任务，本任务尚未开始且已被安全阻止',
+          barrier,
+        );
+      }
+      if (runningMutation) {
+        throw blockedBeforeExecutionError(
+          'JOB_BLOCKED_BY_RUNNING_MUTATION',
+          '另一个写任务仍处于运行状态，本任务尚未开始且已被安全阻止',
+          runningMutation,
+        );
+      }
+      return { status: 'running', startedAt: persistedStartedAt };
+    });
+  }
+
+  acknowledgeJobReconciliation(id, acknowledgement = {}) {
+    const jobId = typeof id === 'string' ? id.trim() : '';
+    const actor = acknowledgement?.actor;
+    const confirmation = acknowledgement?.confirmation;
+    const resolution = acknowledgement?.resolution;
+    const expectedDigest = typeof acknowledgement?.claimDigest === 'string'
+      ? acknowledgement.claimDigest.trim().toLowerCase()
+      : '';
+    if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_JOB_ID_INVALID',
+        '待对账任务标识无效',
+      ));
+    }
+    if (actor !== 'panel-admin') {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_ADMIN_REQUIRED',
+        '只允许经过认证的面板管理员解除待对账阻挡',
+      ));
+    }
+    if (confirmation !== RECONCILIATION_ACK_CONFIRMATION) {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_CONFIRMATION_INVALID',
+        '人工对账确认语不正确',
+      ));
+    }
+    if (!RECONCILIATION_ACK_RESOLUTION_SET.has(resolution)) {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_RESOLUTION_INVALID',
+        '人工对账结论无效',
+      ));
+    }
+    if (!/^[a-f0-9]{64}$/.test(expectedDigest)) {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_DIGEST_INVALID',
+        '任务保护键摘要无效',
+      ));
+    }
+
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
+        const job = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
+            result_json, reconciliation_hold, reconciliation_scope, reconciliation_claim_digest,
+            reconciliation_acknowledged_at, reconciliation_resolution,
+            reconciliation_acknowledged_by
+          FROM sync_jobs WHERE id = ${sqlString(jobId)} LIMIT 1`))[0];
+        if (!job) {
+          throw reconciliationError(
+            'JOB_RECONCILIATION_NOT_FOUND',
+            '待对账任务不存在',
+          );
+        }
+        if (Number(job.reconciliation_hold) !== 1) {
+          const idempotent = job.reconciliation_acknowledged_at
+            && job.reconciliation_claim_digest === expectedDigest
+            && job.reconciliation_resolution === resolution
+            && job.reconciliation_acknowledged_by === actor;
+          if (!idempotent) {
+            throw reconciliationError(
+              job.reconciliation_acknowledged_at
+                ? 'JOB_RECONCILIATION_ACK_CONFLICT'
+                : 'JOB_RECONCILIATION_NOT_HELD',
+              job.reconciliation_acknowledged_at
+                ? '该任务已使用不同结论完成人工对账'
+                : '该任务当前没有待解除的持久阻挡',
+            );
+          }
+          database.run('COMMIT');
+          return {
+            jobId,
+            status: 'acknowledged',
+            resolution,
+            claimDigest: expectedDigest,
+            acknowledgedAt: job.reconciliation_acknowledged_at,
+            releasedClaimCount: 0,
+            idempotent: true,
+          };
+        }
+        if (!TERMINAL_JOB_STATUSES.has(job.status)) {
+          throw claimIntegrityError('待对账 hold 所属任务不是可确认的终态');
+        }
+        const claimKeys = parseStoredClaimKeys(job);
+        const currentDigest = claimDigest(claimKeys);
+        if (job.reconciliation_claim_digest !== currentDigest
+            || expectedDigest !== currentDigest) {
+          throw reconciliationError(
+            'JOB_RECONCILIATION_DIGEST_MISMATCH',
+            '待对账任务的保护键已变化，请刷新后重新核对',
+          );
+        }
+        const previousResult = parseStoredResult(job);
+        if (!resultHasReconciliationSignal(previousResult)
+            || previousResult.reconciliationHold !== true
+            || previousResult.reconciliationClaimDigest !== currentDigest) {
+          throw claimIntegrityError('待对账任务的结果与持久 hold 不一致');
+        }
+        const acknowledgedAt = new Date().toISOString();
+        const nextResult = {
+          ...previousResult,
+          writeOutcomeWasUnknown: previousResult.writeOutcomeUnknown === true,
+          writeOutcomeUnknown: false,
+          requiresReconciliation: false,
+          reconciliationHold: false,
+          reconciliationResolved: true,
+          futureOperationsUnblocked: true,
+          reconciliationResolution: resolution,
+          reconciliationAcknowledgedAt: acknowledgedAt,
+          reconciliationAcknowledgedBy: actor,
+          reconciliationBlockScope: 'none',
+          reconciliationBlockScopeWas: 'all_mutating_operations',
+          // These fields continue to describe the original ambiguous
+          // operation. Releasing its claim permits future work; it never turns
+          // the old request itself into a safe retry.
+          retryAllowed: false,
+          doNotRetry: true,
+        };
+        let nextResultJson;
+        try {
+          nextResultJson = boundedJsonString(
+            'sync_jobs.result_json',
+            nextResult,
+            MAX_JOB_RESULT_BYTES,
+          );
+        } catch (error) {
+          if (error?.code !== 'PANEL_DB_FIELD_TOO_LARGE') throw error;
+          // Older versions could persist a hold whose result consumed almost
+          // the entire field budget. Never make such a safety barrier
+          // impossible to acknowledge merely because confirmation metadata
+          // needs a few more bytes. Preserve a digest and the bounded
+          // operational summary while dropping only oversized detail.
+          const compactResult = {
+            ...reconciliationResultSummary(previousResult),
+            originalResultCompacted: true,
+            originalResultBytes: Buffer.byteLength(String(job.result_json || ''), 'utf8'),
+            originalResultDigest: crypto.createHash('sha256')
+              .update(String(job.result_json || ''))
+              .digest('hex'),
+            writeOutcomeWasUnknown: previousResult.writeOutcomeUnknown === true,
+            writeOutcomeUnknown: false,
+            requiresReconciliation: false,
+            reconciliationHold: false,
+            reconciliationResolved: true,
+            futureOperationsUnblocked: true,
+            reconciliationResolution: resolution,
+            reconciliationAcknowledgedAt: acknowledgedAt,
+            reconciliationAcknowledgedBy: actor,
+            reconciliationBlockScope: 'none',
+            reconciliationBlockScopeWas: 'all_mutating_operations',
+            retryAllowed: false,
+            doNotRetry: true,
+          };
+          nextResultJson = boundedJsonString(
+            'sync_jobs.result_json',
+            compactResult,
+            MAX_JOB_RESULT_BYTES,
+          );
+        }
+        const auditDetails = boundedJsonString(
+          'audit_events.details_json',
+          {
+            resolution,
+            claimDigest: currentDigest,
+            holdScope: job.reconciliation_scope,
+            releasedClaimCount: claimKeys.length,
+          },
+          MAX_AUDIT_DETAILS_BYTES,
+        );
+
+        if (typeof acknowledgement.beforeRelease === 'function') {
+          acknowledgement.beforeRelease({
+            jobId,
+            resolution,
+            claimDigest: currentDigest,
+            holdScope: job.reconciliation_scope,
+            releasedClaimCount: claimKeys.length,
+          });
+        }
+
+        // The intent audit and hold release are part of one SQLite export.
+        // A failed audit insert aborts before either the job row or claims are
+        // changed; a persist failure leaves the previous durable hold intact.
+        const audit = database.prepare(`INSERT INTO audit_events
+          (job_id, actor, action, target_key, before_fingerprint,
+            after_fingerprint, result, details_json, created_at)
+          VALUES (?, ?, 'job_reconciliation_acknowledge', NULL, NULL, NULL,
+            'acknowledged', ?, ?)`);
+        try {
+          audit.run([jobId, actor, auditDetails, acknowledgedAt]);
+        } finally {
+          audit.free();
+        }
+        const update = database.prepare(`UPDATE sync_jobs
+          SET reconciliation_hold = 0,
+            reconciliation_acknowledged_at = ?, reconciliation_resolution = ?,
+            reconciliation_acknowledged_by = ?, result_json = ?
+          WHERE id = ? AND status IN ('succeeded', 'partial', 'failed', 'interrupted')
+            AND reconciliation_hold = 1
+            AND reconciliation_claim_digest = ?`);
+        try {
+          update.run([
+            acknowledgedAt,
+            resolution,
+            actor,
+            nextResultJson,
+            jobId,
+            currentDigest,
+          ]);
+          if (database.getRowsModified() !== 1) {
+            throw reconciliationError(
+              'JOB_RECONCILIATION_ACK_CONFLICT',
+              '待对账任务在确认期间已变化',
+            );
+          }
+        } finally {
+          update.free();
+        }
+        const release = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
+        try {
+          release.run([jobId]);
+          if (database.getRowsModified() !== claimKeys.length) {
+            throw claimIntegrityError('待对账任务的保护键释放数量不一致');
+          }
+        } finally {
+          release.free();
+        }
+        database.run('COMMIT');
+        return {
+          jobId,
+          status: 'acknowledged',
+          resolution,
+          claimDigest: currentDigest,
+          acknowledgedAt,
+          releasedClaimCount: claimKeys.length,
+          idempotent: false,
+        };
       } catch (error) {
         try { database.run('ROLLBACK'); } catch {}
         throw error;
@@ -622,19 +1840,14 @@ class PanelDb {
   }
 
   updateJob(id, patch = {}) {
-    const fields = [];
-    const values = [];
-    const add = (column, value) => {
-      if (value === undefined) return;
-      fields.push(column + ' = ?');
-      values.push(value);
-    };
+    let safeResult = patch.result;
     let safeResultJson;
     let safeError;
     try {
+      if (patch.result !== undefined) safeResult = redactValue(patch.result);
       safeResultJson = patch.result === undefined
         ? undefined
-        : boundedJsonString('sync_jobs.result_json', patch.result, MAX_JOB_RESULT_BYTES);
+        : boundedJsonString('sync_jobs.result_json', safeResult, MAX_JOB_RESULT_BYTES);
       safeError = patch.error === undefined
         ? undefined
         : patch.error === null
@@ -647,12 +1860,6 @@ class PanelDb {
     } catch (error) {
       return Promise.reject(error);
     }
-    add('status', patch.status);
-    add('result_json', safeResultJson);
-    add('error', safeError);
-    add('started_at', patch.startedAt);
-    add('finished_at', patch.finishedAt);
-    if (fields.length === 0) return Promise.resolve();
     const hasRequestedStatus = patch.status !== undefined;
     const requestedStatus = hasRequestedStatus ? patch.status : null;
     if (hasRequestedStatus && !JOB_STATUSES.has(requestedStatus)) {
@@ -663,10 +1870,18 @@ class PanelDb {
     const terminalStatus = TERMINAL_JOB_STATUSES.has(requestedStatus)
       ? requestedStatus
       : null;
+    if (patch.status === undefined
+        && patch.result === undefined
+        && patch.error === undefined
+        && patch.startedAt === undefined
+        && patch.finishedAt === undefined) return Promise.resolve();
     return this.write((database) => {
-      const row = resultRows(database.exec(
-        'SELECT status FROM sync_jobs WHERE id = ' + sqlString(id) + ' LIMIT 1',
-      ))[0];
+      if (terminalStatus) {
+        validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
+      }
+      const row = resultRows(database.exec(`SELECT type, status, claim_keys_json, result_json,
+          reconciliation_hold, reconciliation_scope, reconciliation_claim_digest
+        FROM sync_jobs WHERE id = ${sqlString(id)} LIMIT 1`))[0];
       if (!row) {
         const error = new Error('任务不存在');
         error.code = 'JOB_NOT_FOUND';
@@ -709,6 +1924,73 @@ class PanelDb {
         error.requestedStatus = requestedStatus;
         throw error;
       }
+      let retainClaims = false;
+      let holdDigest = null;
+      let holdClaimKeys = null;
+      let holdGlobalScope = false;
+      const terminalResult = terminalStatus && patch.result === undefined
+        ? parseStoredResult(row)
+        : safeResult;
+      if (terminalStatus && resultHasReconciliationSignal(terminalResult)) {
+        holdClaimKeys = parseStoredClaimKeys(row);
+        if (holdClaimKeys.length === 0) {
+          holdClaimKeys = [legacyGlobalClaimKey(id)];
+          holdGlobalScope = true;
+        } else if (holdClaimKeys.some(isLegacyGlobalClaimKey)) {
+          holdGlobalScope = holdClaimKeys.length === 1
+            && row.reconciliation_scope === 'global';
+          if (!holdGlobalScope) {
+            throw claimIntegrityError('任务包含无法验证归属的全局保护键');
+          }
+        }
+        retainClaims = true;
+        holdDigest = claimDigest(holdClaimKeys);
+        const holdFields = {
+          requiresReconciliation: true,
+          reconciliationHold: true,
+          reconciliationResolved: false,
+          futureOperationsUnblocked: false,
+          reconciliationHoldUnavailable: false,
+          reconciliationHoldReason: null,
+          reconciliationClaimDigest: holdDigest,
+          heldClaimCount: holdClaimKeys.length,
+          reconciliationHoldScope: holdGlobalScope ? 'all_future_jobs' : 'claim_keys',
+          reconciliationBlockScope: 'all_mutating_operations',
+          reconciliationResolution: null,
+          reconciliationAcknowledgedAt: null,
+          reconciliationAcknowledgedBy: null,
+          retryAllowed: false,
+          doNotRetry: true,
+        };
+        const boundedHold = boundedReconciliationResult(
+          terminalResult,
+          holdFields,
+          patch.result === undefined ? row.result_json : safeResultJson,
+        );
+        safeResult = boundedHold.result;
+        safeResultJson = boundedHold.json;
+      }
+      const fields = [];
+      const values = [];
+      const add = (column, value) => {
+        if (value === undefined) return;
+        fields.push(column + ' = ?');
+        values.push(value);
+      };
+      add('status', patch.status);
+      add('result_json', safeResultJson);
+      add('error', safeError);
+      add('started_at', patch.startedAt);
+      add('finished_at', patch.finishedAt);
+      if (terminalStatus) {
+        if (holdGlobalScope) add('claim_keys_json', jsonString(holdClaimKeys));
+        add('reconciliation_hold', retainClaims ? 1 : 0);
+        add('reconciliation_scope', retainClaims ? (holdGlobalScope ? 'global' : 'claims') : null);
+        add('reconciliation_claim_digest', holdDigest);
+        add('reconciliation_acknowledged_at', null);
+        add('reconciliation_resolution', null);
+        add('reconciliation_acknowledged_by', null);
+      }
       const statement = database.prepare(
         'UPDATE sync_jobs SET ' + fields.join(', ') + ' WHERE id = ? AND status = ?',
       );
@@ -725,10 +2007,23 @@ class PanelDb {
         error.requestedStatus = requestedStatus;
         throw error;
       }
-      if (terminalStatus && applied) {
+      if (terminalStatus && applied && !retainClaims) {
         const claimStatement = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
         claimStatement.run([id]);
         claimStatement.free();
+      } else if (terminalStatus && applied && holdGlobalScope) {
+        const claimStatement = database.prepare(`INSERT INTO job_claims
+          (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
+        try {
+          claimStatement.run([
+            holdClaimKeys[0],
+            id,
+            row.type,
+            patch.finishedAt || new Date().toISOString(),
+          ]);
+        } finally {
+          claimStatement.free();
+        }
       }
       return {
         applied: true,
@@ -751,32 +2046,33 @@ class PanelDb {
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
+        validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
         const startCondition = owner.processStartId
           ? 'owner_start_id = ' + sqlString(owner.processStartId)
           : 'owner_start_id IS NULL';
         const bootCondition = owner.processBootId
           ? 'owner_boot_id = ' + sqlString(owner.processBootId)
           : 'owner_boot_id IS NULL';
-        const rows = resultRows(database.exec(`SELECT id FROM sync_jobs
+        const rows = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
+            owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
+            reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
+            reconciliation_resolution, reconciliation_acknowledged_by
+          FROM sync_jobs
           WHERE status IN ('queued', 'running')
             AND owner_pid = ${sqlString(owner.pid)}
             AND ${startCondition}
             AND ${bootCondition}`))
           .filter((row) => !excludedJobIds.has(String(row.id)));
-        if (rows.length > 0) {
-          const statement = database.prepare(`UPDATE sync_jobs
-            SET status = 'interrupted', error = ?, finished_at = ?
-            WHERE id = ? AND status IN ('queued', 'running')`);
-          try {
-            for (const row of rows) statement.run([safeReason, finishedAt, row.id]);
-          } finally {
-            statement.free();
-          }
-          const release = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
-          try {
-            for (const row of rows) release.run([row.id]);
-          } finally {
-            release.free();
+        for (const row of rows) {
+          const result = interruptDeadOwnerJob(database, row, finishedAt);
+          if (!result.requiresReconciliation && safeReason) {
+            const statement = database.prepare(`UPDATE sync_jobs SET error = ?
+              WHERE id = ? AND status = 'interrupted'`);
+            try {
+              statement.run([safeReason, row.id]);
+            } finally {
+              statement.free();
+            }
           }
         }
         database.run('COMMIT');
@@ -788,23 +2084,33 @@ class PanelDb {
     });
   }
 
-  decodeJob(row) {
+  decodeJob(row, options = {}) {
     if (!row) return null;
+    const listSummary = options.listSummary === true || options.reconciliationSummary === true;
     let payload = null;
     let result = null;
-    try { payload = redactValue(JSON.parse(row.payload_json)); } catch {}
+    if (!listSummary) {
+      try { payload = redactValue(JSON.parse(row.payload_json)); } catch {}
+    }
     try { result = row.result_json ? redactValue(JSON.parse(row.result_json)) : null; } catch {}
+    if (listSummary && result !== null) result = reconciliationResultSummary(result);
     return {
-      id: row.id,
-      type: row.type,
-      status: row.status,
-      requestedBy: row.requested_by,
+      id: listSummary ? boundedJobListText(row.id, 128) : row.id,
+      type: listSummary ? boundedJobListText(row.type, 64) : row.type,
+      status: listSummary ? boundedJobListText(row.status, 32) : row.status,
+      requestedBy: listSummary ? boundedJobListText(row.requested_by, 32) : row.requested_by,
       payload,
       result,
-      error: row.error ? redactText(String(row.error)) : null,
-      createdAt: row.created_at,
-      startedAt: row.started_at || null,
-      finishedAt: row.finished_at || null,
+      error: row.error
+        ? redactText(String(row.error)).slice(0, listSummary ? 1000 : MAX_JOB_ERROR_BYTES)
+        : null,
+      createdAt: listSummary ? boundedJobListText(row.created_at, 64) : row.created_at,
+      startedAt: listSummary
+        ? boundedJobListText(row.started_at, 64)
+        : row.started_at || null,
+      finishedAt: listSummary
+        ? boundedJobListText(row.finished_at, 64)
+        : row.finished_at || null,
     };
   }
 
@@ -815,10 +2121,51 @@ class PanelDb {
     return this.decodeJob(rows[0]);
   }
 
+  async listJobsPage(limit = 50) {
+    const safeLimit = normalizedJobListLimit(limit);
+    const rows = await this.read((database) => {
+      const heldTotal = Number(resultRows(database.exec(`SELECT COUNT(*) AS count
+        FROM sync_jobs WHERE reconciliation_hold = 1`))[0]?.count) || 0;
+      // A normal history limit must never hide a durable hold. Bound the
+      // exceptional set separately and report truncation rather than silently
+      // implying that the returned list is complete. Global upgrade barriers
+      // and oldest holds come first so the blocking path remains actionable.
+      const held = resultRows(database.exec(`SELECT id, type, status, requested_by,
+          result_json, error, created_at, started_at, finished_at
+        FROM sync_jobs
+        WHERE reconciliation_hold = 1
+        ORDER BY CASE WHEN reconciliation_scope = 'global' THEN 0 ELSE 1 END,
+          created_at ASC, id ASC
+        LIMIT ${MAX_RECONCILIATION_LIST_JOBS}`));
+      const ordinary = resultRows(database.exec(`SELECT id, type, status, requested_by,
+          result_json, error, created_at, started_at, finished_at
+        FROM sync_jobs
+        WHERE reconciliation_hold = 0
+        ORDER BY created_at DESC LIMIT ${safeLimit}`));
+      return { held, heldTotal, ordinary };
+    });
+    return {
+      jobs: [
+        ...rows.held.map((row) => this.decodeJob(row, { listSummary: true })),
+        ...rows.ordinary.map((row) => this.decodeJob(row, { listSummary: true })),
+      ],
+      reconciliationHolds: {
+        total: rows.heldTotal,
+        returned: rows.held.length,
+        truncated: rows.heldTotal > rows.held.length,
+        maximumReturned: MAX_RECONCILIATION_LIST_JOBS,
+      },
+      history: {
+        limit: safeLimit,
+        returned: rows.ordinary.length,
+      },
+    };
+  }
+
   async listJobs(limit = 50) {
-    const safeLimit = Math.max(1, Math.min(200, Number(limit) || 50));
+    const safeLimit = normalizedJobListLimit(limit);
     const rows = await this.read((database) => resultRows(database.exec(
-      'SELECT * FROM sync_jobs ORDER BY created_at DESC LIMIT ' + safeLimit,
+      `SELECT * FROM sync_jobs ORDER BY created_at DESC LIMIT ${safeLimit}`,
     )));
     return rows.map((row) => this.decodeJob(row));
   }
@@ -926,4 +2273,6 @@ class PanelDb {
 module.exports = {
   PanelDb,
   DEFAULT_DB_PATH,
+  RECONCILIATION_ACK_CONFIRMATION,
+  RECONCILIATION_ACK_RESOLUTIONS,
 };

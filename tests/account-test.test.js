@@ -17,6 +17,7 @@ const {
 } = require('../backend/accountTestWorker');
 const { parseSseEvents } = require('../backend/adapters/sub2apiAdmin');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
+const { PanelDb } = require('../backend/db');
 
 const testAuditLogger = {
   checkpoint() { return true; },
@@ -32,6 +33,56 @@ function runAccountTestJob(args = {}) {
 function runAccountTestJobNow(args = {}) {
   return runAccountTestJobNowWithoutLogger({ logger: testAuditLogger, ...args });
 }
+
+test('queued mutation workers persist a normal failure before the next worker starts', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-terminal-before-unlock-'));
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
+  const previousLockPath = process.env.PANEL_CONTROL_LOCK_PATH;
+  process.env.PANEL_CONTROL_LOCK_PATH = path.join(root, 'control-plane.lock');
+  try {
+    const first = await db.createJob('account_test', {}, 'tester', {
+      claimKeys: ['account_test:terminal-before-unlock:first'],
+    });
+    const second = await db.createJob('account_test', {}, 'tester', {
+      claimKeys: ['account_test:terminal-before-unlock:second'],
+    });
+    const run = (job, code) => runAccountTestJob({
+      accountIds: [],
+      targetBaselines: [],
+      db,
+      jobId: job.id,
+      client: {
+        async listAccounts() {
+          const error = new Error(code);
+          error.code = code;
+          throw error;
+        },
+      },
+      async persistFailure(error) {
+        await db.updateJob(job.id, {
+          status: 'failed',
+          result: { code: error.code },
+          error: error.message,
+          finishedAt: new Date().toISOString(),
+        });
+      },
+    });
+
+    const outcomes = await Promise.allSettled([
+      run(first, 'FIRST_WORKER_FAILED'),
+      run(second, 'SECOND_WORKER_FAILED'),
+    ]);
+    assert.deepEqual(outcomes.map((outcome) => outcome.reason?.code), [
+      'FIRST_WORKER_FAILED',
+      'SECOND_WORKER_FAILED',
+    ]);
+    assert.equal((await db.getJob(first.id)).status, 'failed');
+    assert.equal((await db.getJob(second.id)).status, 'failed');
+  } finally {
+    if (previousLockPath === undefined) delete process.env.PANEL_CONTROL_LOCK_PATH;
+    else process.env.PANEL_CONTROL_LOCK_PATH = previousLockPath;
+  }
+});
 
 function requestJson(baseUrl, pathname, options = {}) {
   return new Promise((resolve, reject) => {
@@ -177,6 +228,7 @@ test('account test baseline binds normalized submission state without raw identi
 
 function fakeWorkerDb() {
   return {
+    async startMutationJob() {},
     async updateJob() {},
     async audit() {},
   };
@@ -821,6 +873,7 @@ test('unknown dispatched account-test outcome is persisted and halts without sch
     accountIds: [31, 32],
     targetBaselines: targetBaselines(...accounts),
     db: {
+      async startMutationJob() {},
       async updateJob() {},
       async audit(entry) { audits.push(entry); },
     },

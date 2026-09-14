@@ -27,6 +27,7 @@ const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   canonicalPhase3Keys,
   classifyPhase3ProcessError,
+  comparePhase3TokenFreshness,
   findUsernameEntry,
   phase3TerminationBudget,
   sanitizeLog,
@@ -434,6 +435,7 @@ test('phase3 jobs run serially, run the main-gated entrypoint, and reject duplic
   const updates = [];
   const events = [];
   const db = {
+    async startMutationJob(id) { updates.push({ id, patch: { status: 'running' } }); },
     async updateJob(id, patch) { updates.push({ id, patch }); },
     async audit() { throw new Error('simulated audit storage failure'); },
   };
@@ -590,6 +592,7 @@ test('Phase3 shutdown preserves success when a valid token was already published
     const running = runPhase3Job({
       email: 'shutdown-token@example.test',
       db: {
+        async startMutationJob() {},
         async updateJob() {},
         async audit() { order.push('audit'); },
       },
@@ -655,13 +658,59 @@ test('Phase3 preserves a valid freshest token after a confirmed non-zero process
     const result = await runPhase3Job({
       email: 'nonzero-token@example.test',
       jobId: 'nonzero-token-job',
-      db: { async audit() {}, async updateJob() {} },
+      db: { async audit() {}, async startMutationJob() {}, async updateJob() {} },
       logger: successfulCheckpointLogger,
     });
     assert.equal(result.tokenFile, 'tokens/freshest.json');
     assert.equal(result.processEndedWithError, true);
     assert.equal(result.processErrorCode, 'PHASE3_PROCESS_FAILED');
     assert.equal(result.process.code, 7);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('Phase3 requires reconciliation when postflight token sources become unavailable', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-postflight-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'postflight@example.test', password: 'hidden' },
+  ]));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "fs.renameSync(path.join(process.cwd(), 'use_token'), path.join(process.cwd(), 'use_token-moved'));",
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    await assert.rejects(
+      runPhase3Job({
+        email: 'postflight@example.test',
+        jobId: 'postflight-unknown-job',
+        db: { async audit() {}, async startMutationJob() {}, async updateJob() {} },
+        logger: successfulCheckpointLogger,
+      }),
+      (error) => error.code === 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN'
+        && error.writeOutcomeUnknown === true
+        && error.requiresReconciliation === true
+        && error.retryAllowed === false
+        && error.doNotRetry === true
+        && error.reconciliationScope === 'phase3_token_output'
+        && error.reconciliationReason === 'phase3_postflight_source_unavailable',
+    );
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous.root;
@@ -776,7 +825,7 @@ test('phase3 pins one source tree while preserving cwd, __dirname, and relative 
     const result = await runPhase3Job({
       email: 'pinned@example.test',
       jobId: 'pinned-job',
-      db: { async audit() {}, async updateJob() {} },
+      db: { async audit() {}, async startMutationJob() {}, async updateJob() {} },
       logger,
     });
     assert.equal(result.tokenFile, 'tokens/real.json');
@@ -860,7 +909,7 @@ test('phase3 executes the validated index inode even when its path is replaced b
     const result = await runPhase3Job({
       email: 'index-pin@example.test',
       jobId: 'index-pin-job',
-      db: { async audit() {}, async updateJob() {} },
+      db: { async audit() {}, async startMutationJob() {}, async updateJob() {} },
       logger: successfulCheckpointLogger,
     });
     assert.equal(result.tokenFile, 'tokens/original.json');
@@ -1336,7 +1385,7 @@ test('phase3 persists a discard disposition when the account is deactivated', as
       runPhase3Job({
         email: 'discard@example.test',
         jobId: 'discard-job',
-        db: { async audit() {}, async updateJob() {} },
+        db: { async audit() {}, async startMutationJob() {}, async updateJob() {} },
         logger,
       }),
       (error) => {
@@ -1922,6 +1971,8 @@ test('natural path ties have a strict order and select the same token after inpu
     buildImportPlan({ tokens: [lower, upper], usernames: [] }, [])[0].fingerprints.access,
     buildImportPlan({ tokens: [upper, lower], usernames: [] }, [])[0].fingerprints.access,
   );
+  assert.equal(comparePhase3TokenFreshness(upper, lower) < 0, true);
+  assert.equal(comparePhase3TokenFreshness(lower, upper) > 0, true);
 });
 
 test('create preflight requires a canonical name and rejects casefold-equivalent occupancy', async () => {
@@ -2278,6 +2329,35 @@ test('OAuth update payload preserves refresh metadata without exposing it in sum
   assert.match(payload.extra.access_token_sha256, /^[a-f0-9]{64}$/);
   assert.match(payload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
   assert.notEqual(payload.extra.access_token_sha256, payload.extra.refresh_token_sha256);
+});
+
+test('OAuth payload uses the same canonical token aliases as source validation', () => {
+  const source = syntheticToken('tokens/camel-alias.json', ['account:alias-account'], {
+    accountId: 'alias-account',
+    accessToken: 'placeholder-access',
+  });
+  source.raw.access_token = '   ';
+  source.raw.accessToken = 'camel-access-value';
+  source.raw.refresh_token = '';
+  source.raw.refreshToken = 'camel-refresh-value';
+  source.raw.id_token = null;
+  source.raw.idToken = 'camel-id-value';
+
+  const payload = buildOAuthUpdatePayload({
+    _raw: source.raw,
+    _record: source,
+    email: source.email,
+    expiresAt: source.expiresAt,
+  });
+  assert.equal(payload.credentials.access_token, 'camel-access-value');
+  assert.equal(payload.credentials.refresh_token, 'camel-refresh-value');
+  assert.equal(payload.credentials.id_token, 'camel-id-value');
+
+  source.raw.access_token = 'different-access-value';
+  assert.throws(
+    () => buildOAuthUpdatePayload({ _raw: source.raw, _record: source }),
+    (error) => error.code === 'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+  );
 });
 
 test('update preflight refuses the remote write when its audit checkpoint is unavailable', async () => {
@@ -3115,6 +3195,8 @@ test('token import returns reconciliation details and never starts the next acco
     const controller = new AbortController();
     let importCalls = 0;
     let postflightReads = 0;
+    let importTerminalPersisted = false;
+    let followerObservedImportTerminal = false;
     const audits = [];
     const client = {
       async listAccounts(options) {
@@ -3145,11 +3227,12 @@ test('token import returns reconciliation details and never starts the next acco
         throw new Error('postflight must not run after cancellation');
       },
     };
-    const result = await executeImport({
+    const importRun = executeImport({
       snapshotVersion: preview.version,
       selectedKeys,
       actor: 'tester',
       db: {
+        async startMutationJob() {},
         async updateJob() {},
         async audit(entry) { audits.push(entry); },
         async saveLink() {},
@@ -3157,7 +3240,17 @@ test('token import returns reconciliation details and never starts the next acco
       jobId: 'token-import-abort-job',
       signal: controller.signal,
       client,
+      async persistResult(value) {
+        assert.equal(value.requiresReconciliation, true);
+        importTerminalPersisted = true;
+      },
     });
+    const importFollower = withControlPlaneLock(() => {
+      followerObservedImportTerminal = importTerminalPersisted;
+    });
+    const result = await importRun;
+    await importFollower;
+    assert.equal(followerObservedImportTerminal, true);
     assert.equal(importCalls, 1);
     assert.equal(postflightReads, 0);
     assert.equal(result.halted, true);
@@ -3182,6 +3275,7 @@ test('token import returns reconciliation details and never starts the next acco
       selectedKeys,
       actor: 'tester',
       db: {
+        async startMutationJob() {},
         async updateJob() {},
         async audit() {},
         async saveLink() {},
