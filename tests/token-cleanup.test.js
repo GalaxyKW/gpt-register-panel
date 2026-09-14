@@ -38,6 +38,20 @@ function makeRoot() {
   return root;
 }
 
+function operationPathEquals(actualPath, expectedPath) {
+  const actual = String(actualPath);
+  if (actual === expectedPath) return true;
+  try {
+    return path.join(fs.realpathSync(path.dirname(actual)), path.basename(actual)) === expectedPath;
+  } catch {
+    return false;
+  }
+}
+
+function operationDirectory(filePath) {
+  try { return fs.realpathSync(String(filePath)); } catch { return path.resolve(String(filePath)); }
+}
+
 function deadClaimPath(directory, originalFileName, content, nonce = '0123456789abcdef') {
   const contentHash = crypto.createHash('sha256').update(content).digest('hex');
   const encodedName = Buffer.from(originalFileName, 'utf8').toString('base64url');
@@ -300,9 +314,11 @@ test('cleanup refuses a source that becomes writable by other users after listin
   const originalOpenSync = fs.openSync;
   let sourceOpens = 0;
   fs.openSync = function changePermissionsBeforeCleanup(target, ...args) {
-    if (String(target) === sourcePath) {
+    if (String(target).startsWith('/proc/self/fd/')
+        && path.basename(String(target)) === path.basename(sourcePath)
+        && fs.existsSync(path.join(root, '.panel-quarantine', 'expired-tokens'))) {
       sourceOpens += 1;
-      if (sourceOpens === 2) fs.chmodSync(sourcePath, 0o666);
+      if (sourceOpens === 1) fs.chmodSync(sourcePath, 0o666);
     }
     return originalOpenSync.call(fs, target, ...args);
   };
@@ -451,7 +467,7 @@ test('expired token cleanup atomically claims the source before validating a rep
   let injected = false;
   fs.renameSync = function renameWithReplacement(from, to) {
     if (!injected
-        && from === sourcePath
+        && operationPathEquals(from, sourcePath)
         && path.basename(to).startsWith('.panel-token-cleanup-claim-')) {
       injected = true;
       originalRenameSync(from, displacedPath);
@@ -472,7 +488,8 @@ test('expired token cleanup atomically claims the source before validating a rep
     assert.deepEqual(JSON.parse(fs.readFileSync(sourcePath, 'utf8')), freshDocument);
     assert.equal(fs.existsSync(displacedPath), true);
     const quarantineRoot = path.join(root, '.panel-quarantine', 'expired-tokens');
-    assert.deepEqual(fs.readdirSync(quarantineRoot), []);
+    const [emptyBatch] = fs.readdirSync(quarantineRoot);
+    assert.deepEqual(fs.readdirSync(path.join(quarantineRoot, emptyBatch, 'tokens')), []);
   } finally {
     fs.renameSync = originalRenameSync;
   }
@@ -509,12 +526,27 @@ test('a dead cleanup process leaves a self-describing claim that the next delete
   assert.equal(fs.existsSync(sourcePath), false);
   assert.equal(fs.existsSync(path.join(root, 'tokens', claimed.name)), true);
 
-  const result = deleteExpiredTokens({
-    rootDirectory: root,
-    expectedVersion: listing.version,
-    confirmation: CONFIRMATION,
-    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
-  });
+  const originalLinkSync = fs.linkSync;
+  let pinnedRecoveryObserved = false;
+  fs.linkSync = function observePinnedRecovery(from, to) {
+    if (!pinnedRecoveryObserved && path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
+      pinnedRecoveryObserved = String(from).startsWith('/proc/self/fd/')
+        && String(to).startsWith('/proc/self/fd/');
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+  let result;
+  try {
+    result = deleteExpiredTokens({
+      rootDirectory: root,
+      expectedVersion: listing.version,
+      confirmation: CONFIRMATION,
+      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+    });
+  } finally {
+    fs.linkSync = originalLinkSync;
+  }
+  assert.equal(pinnedRecoveryObserved, true);
   assert.equal(result.count, 1);
   assert.equal(fs.existsSync(sourcePath), false);
   assert.equal(fs.readdirSync(path.join(root, 'tokens')).some((name) => name.startsWith('.panel-token-cleanup-claim-')), false);
@@ -973,7 +1005,7 @@ test('cleanup fails closed when a claimed file cannot be restored or quarantined
   fs.linkSync = function failClaimRecovery(from, to) {
     if (path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
       const error = new Error('simulated ordinary claim recovery failure');
-      if (String(to) === sourcePath) {
+      if (operationPathEquals(to, sourcePath)) {
         restoreFailureInjected = true;
         error.code = 'EACCES';
       } else {
@@ -1052,7 +1084,7 @@ test('cleanup reports an unknown outcome instead of file_unavailable after sourc
   fs.openSync = function trackOpenedDirectory(filePath, ...args) {
     const descriptor = originalOpenSync.call(fs, filePath, ...args);
     if (typeof filePath === 'string') {
-      openedDirectories.set(descriptor, path.resolve(filePath));
+      openedDirectories.set(descriptor, operationDirectory(filePath));
     }
     return descriptor;
   };
@@ -1066,7 +1098,7 @@ test('cleanup reports an unknown outcome instead of file_unavailable after sourc
         && fs.readdirSync(tokensDirectory).length === 0) {
       injected = true;
       const error = new Error('simulated directory flush failure');
-      error.code = 'EIO';
+      error.code = 'ENOTSUP';
       throw error;
     }
     return originalFsyncSync.call(fs, descriptor);
@@ -1391,11 +1423,12 @@ test('same-filesystem cleanup reports unknown when the published target identity
   let replacementPath = null;
   fs.lstatSync = function replacePublishedTarget(filePath) {
     const normalized = String(filePath);
-    if (normalized.includes(path.join('.panel-quarantine', 'expired-tokens'))
+    const resolvedParent = operationDirectory(path.dirname(normalized));
+    if (resolvedParent.includes(path.join('.panel-quarantine', 'expired-tokens'))
         && path.basename(normalized) === 'expired.json') {
       targetChecks += 1;
       if (targetChecks === 2) {
-        replacementPath = normalized;
+        replacementPath = fs.realpathSync(normalized);
         originalRenameSync(normalized, normalized + '.original-link');
         fs.writeFileSync(normalized, 'unrelated replacement');
       }
@@ -1429,6 +1462,227 @@ test('same-filesystem cleanup reports unknown when the published target identity
   } finally {
     fs.lstatSync = originalLstatSync;
   }
+});
+
+test('cleanup fsyncs every newly-created quarantine parent before the first claim', () => {
+  const root = makeRoot();
+  const expired = (suffix) => JSON.stringify({
+    access_token: jwt({ user: 'durable-' + suffix, suffix: '-durable-' + suffix }),
+    email: 'durable-' + suffix + '@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  fs.writeFileSync(path.join(root, 'tokens', 'one.json'), expired('one'), { mode: 0o600 });
+  fs.writeFileSync(path.join(root, 'use_token', 'two.json'), expired('two'), { mode: 0o600 });
+  const options = { rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') };
+  const listing = listExpiredTokens(options);
+  const originalMkdirSync = fs.mkdirSync;
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalRenameSync = fs.renameSync;
+  const originalLinkSync = fs.linkSync;
+  const opened = new Map();
+  const created = [];
+  const fsynced = new Set();
+  let firstClaimChecked = false;
+  let pinnedTargetUsed = false;
+  fs.mkdirSync = function trackCreatedDirectory(directory, ...args) {
+    const result = originalMkdirSync.call(fs, directory, ...args);
+    created.push(fs.realpathSync(directory));
+    return result;
+  };
+  fs.openSync = function trackOpenedDirectory(directory, ...args) {
+    const fd = originalOpenSync.call(fs, directory, ...args);
+    if (typeof directory === 'string') opened.set(fd, operationDirectory(directory));
+    return fd;
+  };
+  fs.closeSync = function forgetOpenedDirectory(fd) {
+    opened.delete(fd);
+    return originalCloseSync.call(fs, fd);
+  };
+  fs.fsyncSync = function trackDirectoryFsync(fd) {
+    if (opened.has(fd)) fsynced.add(opened.get(fd));
+    return originalFsyncSync.call(fs, fd);
+  };
+  fs.renameSync = function inspectFirstClaim(from, to) {
+    if (!firstClaimChecked && path.basename(String(to)).startsWith('.panel-token-cleanup-claim-')) {
+      firstClaimChecked = true;
+      assert.equal(String(from).startsWith('/proc/self/fd/'), true);
+      const quarantine = path.join(root, '.panel-quarantine', 'expired-tokens');
+      const [batchName] = fs.readdirSync(quarantine);
+      const batch = path.join(quarantine, batchName);
+      const required = [
+        path.join(root, '.panel-quarantine'),
+        quarantine,
+        batch,
+        path.join(batch, 'tokens'),
+        path.join(batch, 'use_token'),
+      ];
+      for (const directory of required) {
+        const stat = fs.lstatSync(directory);
+        assert.equal(stat.isDirectory() && !stat.isSymbolicLink(), true);
+        if (typeof process.getuid === 'function') assert.equal(stat.uid, process.getuid());
+        assert.equal(stat.mode & 0o077, 0);
+      }
+      for (const directory of created) assert.equal(fsynced.has(path.dirname(directory)), true);
+    }
+    return originalRenameSync.call(fs, from, to);
+  };
+  fs.linkSync = function requirePinnedQuarantineTarget(from, to) {
+    if (['one.json', 'two.json'].includes(path.basename(String(to)))) {
+      pinnedTargetUsed = pinnedTargetUsed || String(to).startsWith('/proc/self/fd/');
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+  try {
+    const result = deleteExpiredTokens({
+      ...options,
+      expectedVersion: listing.version,
+      confirmation: CONFIRMATION,
+    });
+    assert.equal(result.count, 2);
+  } finally {
+    fs.mkdirSync = originalMkdirSync;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+    fs.renameSync = originalRenameSync;
+    fs.linkSync = originalLinkSync;
+  }
+  assert.equal(firstClaimChecked, true);
+  assert.equal(pinnedTargetUsed, true);
+});
+
+test('cleanup fails before claiming when any new quarantine parent cannot be fsynced', () => {
+  const cases = [
+    { layer: 'root', code: 'EIO' },
+    { layer: 'quarantine', code: 'EINVAL' },
+    { layer: 'expired', code: 'ENOTSUP' },
+    { layer: 'batch', code: 'EIO' },
+  ];
+  for (const scenario of cases) {
+    const root = makeRoot();
+    const sourcePath = path.join(root, 'tokens', 'expired-' + scenario.layer + '.json');
+    fs.writeFileSync(sourcePath, JSON.stringify({
+      access_token: jwt({ suffix: '-fsync-' + scenario.layer }),
+      email: 'fsync-' + scenario.layer + '@example.test',
+      expired: '2020-01-01T00:00:00.000Z',
+    }), { mode: 0o600 });
+    const options = { rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') };
+    const listing = listExpiredTokens(options);
+    const originalOpenSync = fs.openSync;
+    const originalCloseSync = fs.closeSync;
+    const originalFsyncSync = fs.fsyncSync;
+    const originalRenameSync = fs.renameSync;
+    const opened = new Map();
+    const quarantineBase = path.join(root, '.panel-quarantine');
+    const expiredRoot = path.join(quarantineBase, 'expired-tokens');
+    let injected = false;
+    let claims = 0;
+    fs.openSync = function trackOpenedDirectory(directory, ...args) {
+      const fd = originalOpenSync.call(fs, directory, ...args);
+      if (typeof directory === 'string') opened.set(fd, operationDirectory(directory));
+      return fd;
+    };
+    fs.closeSync = function forgetOpenedDirectory(fd) {
+      opened.delete(fd);
+      return originalCloseSync.call(fs, fd);
+    };
+    fs.fsyncSync = function failSelectedParent(fd) {
+      const directory = opened.get(fd);
+      const matches = scenario.layer === 'root'
+        ? directory === root && fs.existsSync(quarantineBase)
+        : scenario.layer === 'quarantine'
+          ? directory === quarantineBase && fs.existsSync(expiredRoot)
+          : scenario.layer === 'expired'
+            ? directory === expiredRoot && fs.readdirSync(expiredRoot).length > 0
+            : path.dirname(directory || '') === expiredRoot
+              && fs.existsSync(path.join(directory, 'tokens'));
+      if (!injected && matches) {
+        injected = true;
+        const error = new Error('simulated strict directory fsync failure');
+        error.code = scenario.code;
+        throw error;
+      }
+      return originalFsyncSync.call(fs, fd);
+    };
+    fs.renameSync = function countClaims(from, to) {
+      if (path.basename(String(to)).startsWith('.panel-token-cleanup-claim-')) claims += 1;
+      return originalRenameSync.call(fs, from, to);
+    };
+    try {
+      assert.throws(
+        () => deleteExpiredTokens({
+          ...options,
+          expectedVersion: listing.version,
+          confirmation: CONFIRMATION,
+        }),
+        (error) => error.code === (['EINVAL', 'ENOTSUP'].includes(scenario.code)
+          ? 'TOKEN_CLEANUP_DIRECTORY_FSYNC_UNSUPPORTED'
+          : 'TOKEN_CLEANUP_PATH_INVALID'),
+      );
+    } finally {
+      fs.openSync = originalOpenSync;
+      fs.closeSync = originalCloseSync;
+      fs.fsyncSync = originalFsyncSync;
+      fs.renameSync = originalRenameSync;
+    }
+    assert.equal(injected, true, scenario.layer);
+    assert.equal(claims, 0, scenario.layer);
+    assert.equal(fs.existsSync(sourcePath), true, scenario.layer);
+    assert.equal(fs.readdirSync(path.join(root, 'tokens')).some(
+      (name) => name.startsWith('.panel-token-cleanup-claim-'),
+    ), false, scenario.layer);
+  }
+});
+
+test('cleanup detects quarantine path replacement and restores its pinned source claim', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'replacement-race.json');
+  const document = JSON.stringify({
+    access_token: jwt({ suffix: '-directory-replacement-race' }),
+    email: 'directory-replacement-race@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  fs.writeFileSync(sourcePath, document, { mode: 0o600 });
+  const options = { rootDirectory: root, nowMs: Date.parse('2026-01-01T00:00:00.000Z') };
+  const listing = listExpiredTokens(options);
+  const originalRenameSync = fs.renameSync;
+  let injected = false;
+  let replacementDirectory = null;
+  let displacedDirectory = null;
+  fs.renameSync = function replaceQuarantineDirectory(from, to) {
+    if (!injected && path.basename(String(to)).startsWith('.panel-token-cleanup-claim-')) {
+      const quarantine = path.join(root, '.panel-quarantine', 'expired-tokens');
+      const [batchName] = fs.readdirSync(quarantine);
+      replacementDirectory = path.join(quarantine, batchName, 'tokens');
+      displacedDirectory = replacementDirectory + '.displaced';
+      originalRenameSync(replacementDirectory, displacedDirectory);
+      fs.mkdirSync(replacementDirectory, { mode: 0o700 });
+      injected = true;
+    }
+    return originalRenameSync.call(fs, from, to);
+  };
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => error.code === 'TOKEN_CLEANUP_PATH_INVALID'
+        && error.cleanupInfrastructureInvalid === true,
+    );
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+  assert.equal(injected, true);
+  assert.equal(fs.readFileSync(sourcePath, 'utf8'), document);
+  assert.deepEqual(fs.readdirSync(replacementDirectory), []);
+  assert.deepEqual(fs.readdirSync(displacedDirectory), []);
+  assert.equal(fs.readdirSync(path.join(root, 'tokens')).some(
+    (name) => name.startsWith('.panel-token-cleanup-claim-'),
+  ), false);
 });
 
 test('expired token cleanup rejects a symlinked quarantine parent', () => {

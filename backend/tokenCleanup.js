@@ -4,7 +4,7 @@ const path = require('node:path');
 
 const { readGptRegisterSources } = require('./adapters/gptRegisterFs');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
-const { ensureDirectoryTree, assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
+const { assertDirectoryTree } = require('./lib/safeFs');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
 
 const CONFIRMATION = 'DELETE_EXPIRED_TOKENS';
@@ -54,6 +54,26 @@ function copyBoundedFile(sourceDescriptor, targetDescriptor, expectedSize) {
 
 function sameInode(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
+}
+
+function syncCleanupDirectory(directory) {
+  let descriptor;
+  let operationError;
+  try {
+    descriptor = fs.openSync(
+      directory,
+      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0),
+    );
+    try { fs.fsyncSync(descriptor); } catch (error) { operationError = error; }
+  } catch (error) {
+    operationError = error;
+  }
+  if (descriptor !== undefined) {
+    try { fs.closeSync(descriptor); } catch (error) {
+      if (!operationError) operationError = error;
+    }
+  }
+  if (operationError) throw operationError;
 }
 
 function safeCleanupErrorCode(value) {
@@ -198,7 +218,7 @@ function rollbackOwnedPath(filePath, expectedStat) {
     // even an already-absent entry so that retrying this confirmation can
     // establish durability instead of silently accepting an unflushed rename.
     try {
-      syncDirectory(path.dirname(filePath));
+      syncCleanupDirectory(path.dirname(filePath));
       return true;
     } catch {
       return false;
@@ -207,7 +227,7 @@ function rollbackOwnedPath(filePath, expectedStat) {
   if (!sameInode(latest, expectedStat)) return false;
   try {
     fs.unlinkSync(filePath);
-    syncDirectory(path.dirname(filePath));
+    syncCleanupDirectory(path.dirname(filePath));
   } catch {
     return false;
   }
@@ -239,11 +259,9 @@ function quarantineDirectory(options = {}) {
   );
 }
 
-function ensureDirectory(directory, label, create = false) {
+function ensureDirectory(directory, label) {
   try {
-    return create
-      ? ensureDirectoryTree(directory, label)
-      : assertDirectoryTree(directory, label);
+    return assertDirectoryTree(directory, label);
   } catch (error) {
     const wrapped = new Error(label + ' 不存在、不可读取或包含符号链接');
     wrapped.code = 'TOKEN_CLEANUP_PATH_INVALID';
@@ -252,21 +270,186 @@ function ensureDirectory(directory, label, create = false) {
   }
 }
 
-function ensurePrivateDirectory(directory, label, create = false) {
-  const resolved = ensureDirectory(directory, label, create);
-  const stat = fs.lstatSync(resolved);
-  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
-  if (!stat.isDirectory() || stat.isSymbolicLink()
-      || (currentUid !== null && stat.uid !== currentUid)
-      || (stat.mode & 0o077) !== 0) {
-    const error = new Error(label + ' 必须由当前用户持有且权限为 0700 或更严格');
-    error.code = 'TOKEN_CLEANUP_PATH_INVALID';
-    throw error;
-  }
-  return resolved;
+const CLEANUP_FD_ROOT = '/proc/self/fd';
+const UNSUPPORTED_CLEANUP_FSYNC = new Set(['EINVAL', 'ENOSYS', 'ENOTSUP', 'EOPNOTSUPP']);
+
+function cleanupDirectoryError(error, label, syncing = false) {
+  const unsupported = syncing && UNSUPPORTED_CLEANUP_FSYNC.has(error?.code);
+  const wrapped = new Error(unsupported
+    ? label + ' 所在文件系统不支持目录 fsync，拒绝开始 token 清理'
+    : label + ' 无法安全验证或持久化，拒绝开始 token 清理');
+  wrapped.code = unsupported
+    ? 'TOKEN_CLEANUP_DIRECTORY_FSYNC_UNSUPPORTED'
+    : 'TOKEN_CLEANUP_PATH_INVALID';
+  wrapped.cleanupInfrastructureInvalid = true;
+  const causeCode = safeCleanupErrorCode(error?.code);
+  if (causeCode) wrapped.causeCode = causeCode;
+  return wrapped;
 }
 
-function moveToQuarantine(sourcePath, targetPath) {
+function verifyCleanupDirectory(stat, label, privateRequired) {
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+  if (!stat?.isDirectory() || stat.isSymbolicLink()
+      || (privateRequired && currentUid !== null && stat.uid !== currentUid)
+      || (privateRequired && (stat.mode & 0o077) !== 0)) {
+    throw cleanupDirectoryError(null, label);
+  }
+}
+
+function assertCleanupDirectoryPin(pin) {
+  try {
+    const opened = fs.fstatSync(pin.fd);
+    const linked = fs.lstatSync(pin.displayPath);
+    verifyCleanupDirectory(opened, pin.label, pin.privateRequired);
+    verifyCleanupDirectory(linked, pin.label, pin.privateRequired);
+    if (!sameInode(opened, pin.identity) || !sameInode(linked, pin.identity)) {
+      throw cleanupDirectoryError(null, pin.label);
+    }
+  } catch (error) {
+    if (error?.cleanupInfrastructureInvalid === true) throw error;
+    throw cleanupDirectoryError(error, pin.label);
+  }
+}
+
+function openCleanupDirectory(operationPath, displayPath, label, privateRequired = false) {
+  let fd;
+  try {
+    fd = fs.openSync(
+      operationPath,
+      fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0) | (fs.constants.O_NOFOLLOW || 0),
+    );
+    const identity = fs.fstatSync(fd);
+    verifyCleanupDirectory(identity, label, privateRequired);
+    const pin = { fd, displayPath: path.resolve(displayPath), identity, label, privateRequired };
+    assertCleanupDirectoryPin(pin);
+    return pin;
+  } catch (error) {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    if (error?.cleanupInfrastructureInvalid === true) throw error;
+    throw cleanupDirectoryError(error, label);
+  }
+}
+
+function cleanupFdPath(pin, fileName = '') {
+  return path.join(CLEANUP_FD_ROOT, String(pin.fd), fileName);
+}
+
+function strictFsyncCleanupDirectory(pin) {
+  assertCleanupDirectoryPin(pin);
+  try { fs.fsyncSync(pin.fd); } catch (error) {
+    throw cleanupDirectoryError(error, pin.label, true);
+  }
+  assertCleanupDirectoryPin(pin);
+}
+
+function createPrivateCleanupChild(parentPin, name, label) {
+  if (!name || name === '.' || name === '..' || path.basename(name) !== name) {
+    throw cleanupDirectoryError(null, label);
+  }
+  assertCleanupDirectoryPin(parentPin);
+  const operationPath = cleanupFdPath(parentPin, name);
+  const displayPath = path.join(parentPin.displayPath, name);
+  let created = false;
+  try {
+    fs.mkdirSync(operationPath, { mode: 0o700 });
+    created = true;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw cleanupDirectoryError(error, label);
+  }
+  const pin = openCleanupDirectory(operationPath, displayPath, label, true);
+  try {
+    if (created) strictFsyncCleanupDirectory(parentPin);
+    assertCleanupDirectoryPin(pin);
+    return { pin, created };
+  } catch (error) {
+    try { fs.closeSync(pin.fd); } catch {}
+    throw error;
+  }
+}
+
+function closeCleanupDirectoryPins(pins) {
+  for (const pin of [...pins].reverse()) try { fs.closeSync(pin.fd); } catch {}
+}
+
+function prepareCleanupSourceDirectories(rootDirectory) {
+  const pins = [];
+  const sourcePins = new Map();
+  try {
+    const rootPin = openCleanupDirectory(rootDirectory, rootDirectory, 'GPT_REGISTER_ROOT');
+    pins.push(rootPin);
+    for (const source of SOURCES) {
+      const displayPath = path.join(rootDirectory, source);
+      const pin = openCleanupDirectory(cleanupFdPath(rootPin, source), displayPath, source + ' 目录');
+      strictFsyncCleanupDirectory(pin);
+      pins.push(pin);
+      sourcePins.set(source, pin);
+    }
+    return { pins, sourcePins };
+  } catch (error) {
+    closeCleanupDirectoryPins(pins);
+    throw error;
+  }
+}
+
+function prepareQuarantineDirectories(rootDirectory, quarantineRoot, sources) {
+  const pins = [];
+  try {
+    const resolvedQuarantine = path.resolve(quarantineRoot);
+    let boundary = resolvedQuarantine.startsWith(rootDirectory + path.sep)
+      ? rootDirectory
+      : path.dirname(resolvedQuarantine);
+    while (!pathEntryExists(boundary)) boundary = path.dirname(boundary);
+    let quarantinePin = openCleanupDirectory(boundary, boundary, 'token 隔离目录边界');
+    pins.push(quarantinePin);
+    const relative = path.relative(boundary, resolvedQuarantine);
+    if (!relative || relative.startsWith('..' + path.sep) || path.isAbsolute(relative)) {
+      throw cleanupDirectoryError(null, '过期 token 隔离目录');
+    }
+    for (const component of relative.split(path.sep).filter(Boolean)) {
+      const created = createPrivateCleanupChild(quarantinePin, component, '过期 token 隔离目录');
+      quarantinePin = created.pin;
+      pins.push(quarantinePin);
+    }
+    strictFsyncCleanupDirectory(quarantinePin);
+
+    let batch;
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      const batchName = new Date().toISOString().replace(/[:.]/g, '-')
+        + '-' + process.pid + '-' + crypto.randomBytes(4).toString('hex');
+      const created = createPrivateCleanupChild(quarantinePin, batchName, 'token 隔离批次目录');
+      if (created.created) {
+        batch = created.pin;
+        pins.push(batch);
+        break;
+      }
+      try { fs.closeSync(created.pin.fd); } catch {}
+    }
+    if (!batch) throw cleanupDirectoryError(null, 'token 隔离批次目录');
+
+    const quarantineSourcePins = new Map();
+    for (const source of [...sources].sort(compareCleanupPaths)) {
+      if (!SOURCES.has(source)) throw cleanupDirectoryError(null, 'token 隔离子目录');
+      const created = createPrivateCleanupChild(batch, source, 'token 隔离子目录');
+      if (!created.created) {
+        try { fs.closeSync(created.pin.fd); } catch {}
+        throw cleanupDirectoryError(null, 'token 隔离子目录');
+      }
+      pins.push(created.pin);
+      quarantineSourcePins.set(source, created.pin);
+    }
+    for (const pin of pins) assertCleanupDirectoryPin(pin);
+    return { pins, quarantinePin, batch, quarantineSourcePins };
+  } catch (error) {
+    closeCleanupDirectoryPins(pins);
+    throw error;
+  }
+}
+
+function assertPreparedCleanupDirectories(prepared) {
+  for (const pin of prepared.pins) assertCleanupDirectoryPin(pin);
+}
+
+function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let targetLinked = false;
   let linkedTargetDescriptor;
   let targetIdentity = null;
@@ -296,7 +479,7 @@ function moveToQuarantine(sourcePath, targetPath) {
       throw new Error('隔离目标在权限收紧前发生变化');
     }
     fs.fchmodSync(linkedTargetDescriptor, 0o600);
-    syncDirectory(path.dirname(targetPath));
+    syncCleanupDirectory(path.dirname(targetPath));
     const latestSource = fs.lstatSync(sourcePath);
     const latestTarget = fs.lstatSync(targetPath);
     const finalOpenedTarget = fs.fstatSync(linkedTargetDescriptor);
@@ -307,9 +490,10 @@ function moveToQuarantine(sourcePath, targetPath) {
         || !sameInode(finalOpenedTarget, targetStat)) {
       throw new Error('隔离来源或目标在发布后发生变化');
     }
+    if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
     fs.unlinkSync(sourcePath);
     sourceRemoved = true;
-    syncDirectory(path.dirname(sourcePath));
+    syncCleanupDirectory(path.dirname(sourcePath));
     fs.closeSync(linkedTargetDescriptor);
     linkedTargetDescriptor = undefined;
     return;
@@ -381,7 +565,7 @@ function moveToQuarantine(sourcePath, targetPath) {
       error.code = 'TOKEN_CLEANUP_ROLLBACK_FAILED';
       throw error;
     }
-    syncDirectory(path.dirname(targetPath));
+    syncCleanupDirectory(path.dirname(targetPath));
     const finalSource = fs.fstatSync(sourceDescriptor);
     const latest = fs.lstatSync(sourcePath);
     const latestTarget = fs.lstatSync(targetPath);
@@ -396,9 +580,10 @@ function moveToQuarantine(sourcePath, targetPath) {
         || finalSource.ctimeMs !== after.ctimeMs) {
       throw new Error('隔离来源在发布前发生变化');
     }
+    if (typeof options.beforeSourceUnlink === 'function') options.beforeSourceUnlink();
     fs.unlinkSync(sourcePath);
     copiedSourceRemoved = true;
-    syncDirectory(path.dirname(sourcePath));
+    syncCleanupDirectory(path.dirname(sourcePath));
   } catch (error) {
     let rollbackUnconfirmed = temporaryIdentity
       ? !rollbackOwnedPath(temporaryPath, temporaryIdentity)
@@ -468,7 +653,7 @@ function claimSourcePath(sourcePath, expectedHash) {
     try {
       replacementStarted = true;
       fs.renameSync(sourcePath, claimPath);
-      syncDirectory(directory);
+      syncCleanupDirectory(directory);
     } catch (error) {
       if (replacementStarted) {
         throw cleanupWriteOutcomeUnknown(error, {
@@ -562,7 +747,7 @@ function cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat) {
     }
     if (!sameInode(latestSource, claimStat)) return false;
     fs.unlinkSync(sourcePath);
-    syncDirectory(path.dirname(sourcePath));
+    syncCleanupDirectory(path.dirname(sourcePath));
     try {
       const after = fs.lstatSync(sourcePath);
       return !sameInode(after, claimStat);
@@ -606,7 +791,7 @@ function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
       }
       throw restoreOutcomeUnknown();
     }
-    syncDirectory(path.dirname(sourcePath));
+    syncCleanupDirectory(path.dirname(sourcePath));
     const latestSource = fs.lstatSync(sourcePath);
     if (latestSource.isSymbolicLink() || !latestSource.isFile()
         || !sameInode(latestSource, claimStat)) {
@@ -637,7 +822,7 @@ function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
       }
       claimRemoved = true;
     }
-    syncDirectory(path.dirname(claimPath));
+    syncCleanupDirectory(path.dirname(claimPath));
     sourceLinkCreated = false;
     return true;
   } catch (error) {
@@ -737,14 +922,15 @@ function safeItem(record, snapshot) {
   };
 }
 
-function recoverTokenCleanupClaims(rootDirectory) {
+function recoverTokenCleanupClaims(rootDirectory, options = {}) {
   const discovered = [];
   // Discovery and validation are deliberately separated from restoration.
   // A conflict in the last directory must not be able to surface only after
   // an earlier claim has already been moved back into the producer namespace.
   for (const source of SOURCES) {
-    const directory = path.join(rootDirectory, source);
-    ensureDirectory(directory, source + ' 目录');
+    const pinnedDirectory = options.sourceDirectories?.get?.(source);
+    const directory = pinnedDirectory || path.join(rootDirectory, source);
+    if (!pinnedDirectory) ensureDirectory(directory, source + ' 目录');
     let names;
     try {
       names = fs.readdirSync(directory).sort(compareCleanupPaths);
@@ -946,182 +1132,220 @@ function deleteExpiredTokens(options = {}) {
   throwIfJobInterrupted(options.signal);
   if (typeof options.beforeMutation === 'function') options.beforeMutation();
   throwIfJobInterrupted(options.signal);
-  // Claim recovery can rename or relink files, so no validation or audit
-  // checkpoint that protects mutations may be placed below this line.
-  recoverTokenCleanupClaims(cleanupRoot(options));
-  const current = listExpiredTokens(options);
-  if (!/^[a-f0-9]{64}$/i.test(String(options.expectedVersion || ''))
-      || String(options.expectedVersion).toLowerCase() !== current.version.toLowerCase()) {
-    const error = new Error('过期 token 清单已变化，请重新扫描后再删除');
-    error.code = 'TOKEN_CLEANUP_STALE';
-    error.currentVersion = current.version;
-    throw error;
-  }
-  const deleted = [];
-  const skipped = [];
-  const quarantineRoot = ensurePrivateDirectory(
-    quarantineDirectory(options),
-    '过期 token 隔离目录',
-    true,
-  );
-  const batchDirectory = path.join(
-    quarantineRoot,
-    new Date().toISOString().replace(/[:.]/g, '-') + '-' + process.pid + '-' + crypto.randomBytes(4).toString('hex'),
-  );
-  let batchCreated = false;
-  const createdSourceFolders = new Set();
-  for (const item of current._internalItems || []) {
-    const directory = item.source === 'tokens'
-      ? path.join(current.rootDirectory, 'tokens')
-      : path.join(current.rootDirectory, 'use_token');
-    try { ensureDirectory(directory, item.source + ' 目录'); } catch {
-      skipped.push({ ...item, reason: 'source_directory_unavailable' });
-      continue;
+  const rootDirectory = ensureDirectory(cleanupRoot(options), 'GPT_REGISTER_ROOT');
+  const preparedSources = prepareCleanupSourceDirectories(rootDirectory);
+  let preparedQuarantine = null;
+  let cleanupResult = null;
+  let quarantineRoot = null;
+  let batchDirectory = null;
+  try {
+    // Claim recovery can rename or relink files, so no validation or audit
+    // checkpoint that protects mutations may be placed below this line.
+    recoverTokenCleanupClaims(rootDirectory, {
+      sourceDirectories: new Map([...preparedSources.sourcePins].map(
+        ([source, pin]) => [source, cleanupFdPath(pin)],
+      )),
+    });
+    assertPreparedCleanupDirectories(preparedSources);
+    const current = listExpiredTokens({ ...options, rootDirectory });
+    assertPreparedCleanupDirectories(preparedSources);
+    if (!/^[a-f0-9]{64}$/i.test(String(options.expectedVersion || ''))
+        || String(options.expectedVersion).toLowerCase() !== current.version.toLowerCase()) {
+      const error = new Error('过期 token 清单已变化，请重新扫描后再删除');
+      error.code = 'TOKEN_CLEANUP_STALE';
+      error.currentVersion = current.version;
+      throw error;
     }
-    const absolutePath = safeAbsolutePath(directory, path.basename(item.relativePath));
-    if (!absolutePath) {
-      skipped.push({ ...item, reason: 'unsafe_path' });
-      continue;
+    const deleted = [];
+    const skipped = [];
+    if ((current._internalItems || []).length === 0) {
+      return { version: current.version, deleted, skipped, count: 0 };
     }
-    let claimPath = null;
-    let quarantinedPath = null;
-    try {
-      const sourceSnapshot = regularFileSnapshot(absolutePath);
-      if (sourceSnapshot.contentHash !== item.contentHash) {
-        skipped.push({ ...item, reason: 'file_changed' });
-        continue;
-      }
-      const sourceFolder = path.join(batchDirectory, item.source);
-      ensurePrivateDirectory(sourceFolder, 'token 隔离子目录', true);
-      createdSourceFolders.add(sourceFolder);
-      quarantinedPath = path.join(sourceFolder, path.basename(item.relativePath));
-      // A rename is recoverable and stays on the same filesystem in normal
-      // deployments. Never overwrite an existing quarantine file.
-      if (fs.existsSync(quarantinedPath)) {
-        skipped.push({ ...item, reason: 'quarantine_target_exists' });
-        continue;
-      }
-      // First atomically remove the path from the producer-visible namespace.
-      // Every subsequent digest/copy/unlink uses this unguessable staging name,
-      // never the original path where a fresh token may be recreated.
-      claimPath = claimSourcePath(absolutePath, item.contentHash);
-      const claimedSnapshot = regularFileSnapshot(claimPath);
-      if (claimedSnapshot.contentHash !== item.contentHash) {
-        if (!restoreClaimedPath(claimPath, absolutePath)) {
-          const changedPath = path.join(
-            sourceFolder,
-            'changed-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
-          );
-          moveToQuarantine(claimPath, changedPath);
-          assertCleanupClaimResolved(claimPath);
-          claimPath = null;
-          batchCreated = true;
-          skipped.push({
-            ...item,
-            reason: 'file_changed_quarantined',
-            quarantinePath: path.relative(quarantineRoot, changedPath),
-          });
-        } else {
-          claimPath = null;
+    const plannedSources = new Set(
+      (current._internalItems || []).map((item) => item.source).filter((source) => SOURCES.has(source)),
+    );
+    preparedQuarantine = prepareQuarantineDirectories(
+      rootDirectory,
+      quarantineDirectory(options),
+      plannedSources,
+    );
+    quarantineRoot = preparedQuarantine.quarantinePin.displayPath;
+    batchDirectory = preparedQuarantine.batch.displayPath;
+    // All quarantine components, the batch and every required source folder are
+    // durable and pinned before the first producer-visible rename.
+    assertPreparedCleanupDirectories(preparedQuarantine);
+    assertPreparedCleanupDirectories(preparedSources);
+    for (const item of current._internalItems || []) {
+      const sourcePin = preparedSources.sourcePins.get(item.source);
+      const quarantineSourcePin = preparedQuarantine.quarantineSourcePins.get(item.source);
+      if (!sourcePin || !quarantineSourcePin) throw cleanupDirectoryError(null, 'token 清理目录');
+      assertPreparedCleanupDirectories(preparedSources);
+      assertPreparedCleanupDirectories(preparedQuarantine);
+      const fileName = path.basename(item.relativePath);
+      const absolutePath = cleanupFdPath(sourcePin, fileName);
+      const sourceFolder = quarantineSourcePin.displayPath;
+      const operationSourceFolder = cleanupFdPath(quarantineSourcePin);
+      let claimPath = null;
+      let quarantinedPath = null;
+      let quarantinedDisplayPath = null;
+      try {
+        const sourceSnapshot = regularFileSnapshot(absolutePath);
+        if (sourceSnapshot.contentHash !== item.contentHash) {
           skipped.push({ ...item, reason: 'file_changed' });
+          continue;
         }
-        continue;
-      }
-      moveToQuarantine(claimPath, quarantinedPath);
-      assertCleanupClaimResolved(claimPath);
-      claimPath = null;
-      batchCreated = true;
-      deleted.push({
-        source: item.source,
-        relativePath: item.relativePath,
-        email: item.email,
-        expiresAt: item.expiresAt,
-        fingerprint: item.fingerprint,
-        mtimeMs: item.mtimeMs,
-        quarantinePath: path.relative(quarantineRoot, quarantinedPath),
-      });
-    } catch (error) {
-      if (error?.writeOutcomeUnknown === true
-          || error?.requiresReconciliation === true
-          || error?.doNotRetry === true) {
-        const failure = attachCleanupProgress(
-          error,
-          item,
-          deleted.length,
-          skipped.length,
-          {
-            quarantinePath: error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN' && quarantinedPath
-              ? path.relative(quarantineRoot, quarantinedPath)
-              : null,
+        quarantinedPath = path.join(operationSourceFolder, fileName);
+        quarantinedDisplayPath = path.join(sourceFolder, fileName);
+        // A rename is recoverable and stays on the same filesystem in normal
+        // deployments. Never overwrite an existing quarantine file.
+        if (fs.existsSync(quarantinedPath)) {
+          skipped.push({ ...item, reason: 'quarantine_target_exists' });
+          continue;
+        }
+        // First atomically remove the path from the producer-visible namespace.
+        // Every subsequent digest/copy/unlink uses this unguessable staging name,
+        // never the original path where a fresh token may be recreated.
+        assertPreparedCleanupDirectories(preparedSources);
+        assertPreparedCleanupDirectories(preparedQuarantine);
+        claimPath = claimSourcePath(absolutePath, item.contentHash);
+        const claimedSnapshot = regularFileSnapshot(claimPath);
+        assertPreparedCleanupDirectories(preparedSources);
+        assertPreparedCleanupDirectories(preparedQuarantine);
+        if (claimedSnapshot.contentHash !== item.contentHash) {
+          if (!restoreClaimedPath(claimPath, absolutePath)) {
+            const changedPath = path.join(
+              operationSourceFolder,
+              'changed-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
+            );
+            moveToQuarantine(claimPath, changedPath, {
+              beforeSourceUnlink: () => assertPreparedCleanupDirectories(preparedQuarantine),
+            });
+            assertCleanupClaimResolved(claimPath);
+            claimPath = null;
+            skipped.push({
+              ...item,
+              reason: 'file_changed_quarantined',
+              quarantinePath: path.join(
+                path.basename(batchDirectory),
+                item.source,
+                path.basename(changedPath),
+              ),
+            });
+          } else {
+            claimPath = null;
+            skipped.push({ ...item, reason: 'file_changed' });
+          }
+          continue;
+        }
+        moveToQuarantine(claimPath, quarantinedPath, {
+          beforeSourceUnlink: () => {
+            assertPreparedCleanupDirectories(preparedSources);
+            assertPreparedCleanupDirectories(preparedQuarantine);
           },
-        );
-        throw failure;
-      }
-      if (claimPath) {
-        let restored = false;
-        try {
-          restored = restoreClaimedPath(claimPath, absolutePath);
-        } catch (recoveryError) {
-          throw attachCleanupProgress(
-            cleanupClaimRecoveryOutcomeUnknown(recoveryError),
+        });
+        assertCleanupClaimResolved(claimPath);
+        claimPath = null;
+        deleted.push({
+          source: item.source,
+          relativePath: item.relativePath,
+          email: item.email,
+          expiresAt: item.expiresAt,
+          fingerprint: item.fingerprint,
+          mtimeMs: item.mtimeMs,
+          quarantinePath: path.relative(quarantineRoot, quarantinedDisplayPath),
+        });
+      } catch (error) {
+        if (error?.writeOutcomeUnknown === true
+            || error?.requiresReconciliation === true
+            || error?.doNotRetry === true) {
+          const failure = attachCleanupProgress(
+            error,
             item,
             deleted.length,
             skipped.length,
+            {
+              quarantinePath: error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN' && quarantinedDisplayPath
+                ? path.relative(quarantineRoot, quarantinedDisplayPath)
+                : null,
+            },
           );
+          throw failure;
         }
-        if (restored) {
-          claimPath = null;
-        } else {
-          let recoveryPath = null;
+        if (error?.cleanupInfrastructureInvalid === true && !claimPath) throw error;
+        if (claimPath) {
+          let restored = false;
           try {
-            const sourceFolder = path.join(batchDirectory, item.source);
-            ensurePrivateDirectory(sourceFolder, 'token 隔离子目录', true);
-            createdSourceFolders.add(sourceFolder);
-            recoveryPath = path.join(
-              sourceFolder,
-              'recovery-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
-            );
-            moveToQuarantine(claimPath, recoveryPath);
-            assertCleanupClaimResolved(claimPath);
-            claimPath = null;
-            batchCreated = true;
-            skipped.push({
-              ...item,
-              reason: 'file_unavailable_quarantined',
-              quarantinePath: path.relative(quarantineRoot, recoveryPath),
-            });
-            continue;
+            restored = restoreClaimedPath(claimPath, absolutePath);
           } catch (recoveryError) {
             throw attachCleanupProgress(
               cleanupClaimRecoveryOutcomeUnknown(recoveryError),
               item,
               deleted.length,
               skipped.length,
-              {
-                quarantinePath: recoveryError?.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
-                  && recoveryPath
-                  ? path.relative(quarantineRoot, recoveryPath)
-                  : null,
-              },
             );
           }
+          if (restored) {
+            claimPath = null;
+            if (error?.cleanupInfrastructureInvalid === true) throw error;
+          } else {
+            if (error?.cleanupInfrastructureInvalid === true) {
+              throw attachCleanupProgress(
+                cleanupClaimRecoveryOutcomeUnknown(error),
+                item,
+                deleted.length,
+                skipped.length,
+              );
+            }
+            let recoveryPath = null;
+            let recoveryDisplayPath = null;
+            try {
+              recoveryPath = path.join(
+                operationSourceFolder,
+                'recovery-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
+              );
+              recoveryDisplayPath = path.join(sourceFolder, path.basename(recoveryPath));
+              moveToQuarantine(claimPath, recoveryPath, {
+                beforeSourceUnlink: () => assertPreparedCleanupDirectories(preparedQuarantine),
+              });
+              assertCleanupClaimResolved(claimPath);
+              claimPath = null;
+              skipped.push({
+                ...item,
+                reason: 'file_unavailable_quarantined',
+                quarantinePath: path.relative(quarantineRoot, recoveryDisplayPath),
+              });
+              continue;
+            } catch (recoveryError) {
+              throw attachCleanupProgress(
+                cleanupClaimRecoveryOutcomeUnknown(recoveryError),
+                item,
+                deleted.length,
+                skipped.length,
+                {
+                  quarantinePath: recoveryError?.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+                    && recoveryDisplayPath
+                    ? path.relative(quarantineRoot, recoveryDisplayPath)
+                    : null,
+                },
+              );
+            }
+          }
         }
+        if (error?.cleanupInfrastructureInvalid === true) throw error;
+        skipped.push({ ...item, reason: 'file_unavailable' });
       }
-      skipped.push({ ...item, reason: 'file_unavailable' });
     }
+    cleanupResult = {
+      version: current.version,
+      deleted,
+      skipped: skipped.map(publicExpiredTokenItem),
+      count: deleted.length,
+    };
+  } finally {
+    if (preparedQuarantine) closeCleanupDirectoryPins(preparedQuarantine.pins);
+    closeCleanupDirectoryPins(preparedSources.pins);
   }
-  if (!batchCreated) {
-    for (const sourceFolder of createdSourceFolders) {
-      try { fs.rmdirSync(sourceFolder); } catch {}
-    }
-    try { fs.rmdirSync(batchDirectory); } catch {}
-  }
-  return {
-    version: current.version,
-    deleted,
-    skipped: skipped.map(publicExpiredTokenItem),
-    count: deleted.length,
-  };
+  return cleanupResult;
 }
 
 module.exports = {
