@@ -335,9 +335,12 @@ test('a running token cleanup owned by a dead process recovers as an actionable 
   await db.startMutationJob(job.id);
   await db.write((database) => {
     const statement = database.prepare(
-      'UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?',
+      'UPDATE sync_jobs SET owner_pid = ? WHERE id = ?',
     );
-    statement.run([2147483647, 'definitely-not-live', job.id]);
+    // Preserve the valid boot/start identity written by createJob. A missing
+    // PID is positive evidence that the original owner exited; malformed
+    // identity metadata is intentionally handled as unverifiable instead.
+    statement.run([2147483647, job.id]);
     statement.free();
   });
 

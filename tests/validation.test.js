@@ -851,8 +851,8 @@ test('PanelDb interrupts only jobs whose owner process is no longer alive', asyn
   const db = new PanelDb(file);
   const job = await db.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:dead-owner'] });
   await db.write((database) => {
-    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?');
-    statement.run([2147483647, 'definitely-not-live', job.id]);
+    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ? WHERE id = ?');
+    statement.run([2147483647, job.id]);
     statement.free();
   });
   const restarted = new PanelDb(file);
@@ -868,8 +868,8 @@ test('PanelDb reclaims a dead owner claim without requiring another restart', as
   const claimKey = 'phase3:dead-owner-live-reclaim';
   const abandoned = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
   await db.write((database) => {
-    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?');
-    statement.run([2147483647, 'definitely-not-live', abandoned.id]);
+    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ? WHERE id = ?');
+    statement.run([2147483647, abandoned.id]);
     statement.free();
   });
 

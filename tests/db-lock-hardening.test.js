@@ -68,7 +68,7 @@ async function writeLegacyDatabase(file) {
   database.close();
 }
 
-test('PanelDb persists boot identity and rejects a live PID from another boot', async (context) => {
+test('PanelDb distinguishes a proven boot mismatch from an unverifiable incomplete owner', async (context) => {
   const owner = currentProcessOwner();
   if (!owner.processBootId) {
     context.skip('Linux boot_id is unavailable');
@@ -130,19 +130,98 @@ test('PanelDb persists boot identity and rejects a live PID from another boot', 
     statement.free();
   });
   const afterLegacyMigration = new PanelDb(file);
-  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'queued');
+  const incompleteOwner = await afterLegacyMigration.getJob(legacyOwned.id);
+  assert.equal(incompleteOwner.status, 'interrupted');
+  assert.equal(incompleteOwner.result.executionOutcome, 'unknown');
+  assert.equal(incompleteOwner.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(incompleteOwner.result.reconciliationHold, true);
+  assert.equal(incompleteOwner.result.reconciliationHoldScope, 'claim_keys');
   await assert.rejects(
     afterLegacyMigration.createJob('phase3', {}, 'tester', {
       claimKeys: [legacyClaimKey],
     }),
-    (error) => error.code === 'JOB_ALREADY_CLAIMED'
+    (error) => error.code === 'JOB_RECONCILIATION_REQUIRED'
       && error.existingJobId === legacyOwned.id,
   );
-  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'queued');
-  await afterLegacyMigration.updateJob(legacyOwned.id, {
-    status: 'failed',
-    error: 'test cleanup',
-  });
+  assert.equal((await afterLegacyMigration.getJob(legacyOwned.id)).status, 'interrupted');
+});
+
+test('malformed persisted owner fields become unknown holds instead of dead-owner releases', async (context) => {
+  const owner = currentProcessOwner();
+  if (!owner.processStartId || !owner.processBootId) {
+    context.skip('full Linux process identity is unavailable');
+    return;
+  }
+  const variants = [
+    {
+      label: 'start-format',
+      pid: owner.pid,
+      startId: 'not-a-start-time',
+      bootId: owner.processBootId,
+    },
+    {
+      label: 'boot-format',
+      pid: owner.pid,
+      startId: owner.processStartId,
+      bootId: 'not-a-boot-id',
+    },
+    {
+      label: 'pid-storage-type',
+      pid: 'not-a-pid',
+      startId: owner.processStartId,
+      bootId: owner.processBootId,
+    },
+    {
+      label: 'pid-fraction',
+      pid: 1.5,
+      startId: owner.processStartId,
+      bootId: owner.processBootId,
+    },
+    {
+      label: 'pid-unsafe-integer',
+      pid: Number.MAX_SAFE_INTEGER + 1,
+      startId: owner.processStartId,
+      bootId: owner.processBootId,
+    },
+  ];
+
+  for (const variant of variants) {
+    const file = path.join(
+      fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-owner-' + variant.label + '-')),
+      'panel.sqlite3',
+    );
+    const db = new PanelDb(file);
+    const claimKey = 'phase3:malformed-owner:' + variant.label;
+    const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+    await db.write((database) => {
+      const statement = database.prepare(`UPDATE sync_jobs
+        SET owner_pid = ?, owner_start_id = ?, owner_boot_id = ? WHERE id = ?`);
+      try {
+        statement.run([variant.pid, variant.startId, variant.bootId, job.id]);
+      } finally {
+        statement.free();
+      }
+    });
+
+    const restarted = new PanelDb(file);
+    const held = await restarted.getJob(job.id);
+    assert.equal(held.status, 'interrupted', variant.label);
+    assert.equal(held.result.executionOutcome, 'unknown', variant.label);
+    assert.equal(held.result.reconciliationReason, 'owner_identity_unverifiable', variant.label);
+    assert.equal(held.result.reconciliationHold, true, variant.label);
+    assert.equal(held.result.reconciliationHoldScope, 'claim_keys', variant.label);
+    const claims = await restarted.read((database) => queryRows(
+      database,
+      `SELECT claim_key FROM job_claims WHERE job_id = '${job.id}'`,
+    ));
+    assert.deepEqual(claims.map((row) => row.claim_key), [claimKey], variant.label);
+    await assert.rejects(
+      restarted.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] }),
+      (error) => error.code === 'JOB_RECONCILIATION_REQUIRED'
+        && error.existingJobId === job.id,
+      variant.label,
+    );
+  }
 });
 
 test('bakery lock cancellation interrupts polling and removes only its own lease', async () => {

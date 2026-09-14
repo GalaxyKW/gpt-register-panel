@@ -67,6 +67,23 @@ const RECONCILIATION_ACK_RESOLUTION_SET = new Set(RECONCILIATION_ACK_RESOLUTIONS
 const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
 const JOB_STATUSES = new Set([...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES]);
+const JOB_OWNER_STATES = Object.freeze({
+  TRUSTED_ALIVE: 'trusted_alive',
+  PROVEN_DEAD: 'proven_dead',
+  UNVERIFIABLE: 'unverifiable',
+});
+const CANONICAL_PROCESS_START_ID_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
+const CANONICAL_BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RECONCILIATION_SAFETY_BOOLEAN_FIELDS = Object.freeze([
+  'requiresReconciliation',
+  'reconciliationHold',
+  'writeOutcomeUnknown',
+  'reconciliationResolved',
+  'futureOperationsUnblocked',
+  'reconciliationHoldUnavailable',
+  'retryAllowed',
+  'doNotRetry',
+]);
 
 function sameInode(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
@@ -96,26 +113,68 @@ function readDatabaseBytes(descriptor, maximumBytes) {
   return Buffer.concat(chunks, total);
 }
 
-function storedJobOwnerIsAlive(job) {
+function storedJobOwnerHasCanonicalShape(job) {
+  return job?.owner_pid_storage_type === 'integer'
+    && Number.isSafeInteger(job.owner_pid)
+    && job.owner_pid > 0
+    && typeof job.owner_start_id === 'string'
+    && CANONICAL_PROCESS_START_ID_PATTERN.test(job.owner_start_id)
+    && typeof job.owner_boot_id === 'string'
+    && CANONICAL_BOOT_ID_PATTERN.test(job.owner_boot_id);
+}
+
+function inspectStoredOwnerProcess(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    if (error?.code === 'ESRCH') return { definitelyGone: true, startId: null };
+    if (error?.code !== 'EPERM') return { definitelyGone: false, startId: null };
+  }
+  if (process.platform !== 'linux') {
+    return { definitelyGone: false, startId: null };
+  }
+  try {
+    const value = fs.readFileSync('/proc/' + String(pid) + '/stat', 'utf8');
+    const commandEnd = value.lastIndexOf(')');
+    if (commandEnd < 0) return { definitelyGone: false, startId: null };
+    const fields = value.slice(commandEnd + 2).trim().split(/\s+/);
+    if (['Z', 'X'].includes(fields[0])) return { definitelyGone: true, startId: null };
+    const startId = fields[19] || '';
+    return {
+      definitelyGone: false,
+      startId: CANONICAL_PROCESS_START_ID_PATTERN.test(startId) ? startId : null,
+    };
+  } catch {
+    // A failed /proc read may be a permission boundary rather than owner exit.
+    // Only a second explicit ESRCH is sufficient to call the process gone.
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (error?.code === 'ESRCH') return { definitelyGone: true, startId: null };
+    }
+    return { definitelyGone: false, startId: null };
+  }
+}
+
+function storedJobOwnerState(job) {
+  if (!storedJobOwnerHasCanonicalShape(job)) return JOB_OWNER_STATES.UNVERIFIABLE;
   const verifier = currentProcessOwner();
-  // Legacy rows without the identity dimensions available on this host cannot
-  // prove that a reused PID still belongs to the process that queued the job.
-  if (verifier.processStartId && !String(job?.owner_start_id || '').trim()) return false;
-  if (verifier.processBootId && !String(job?.owner_boot_id || '').trim()) return false;
-  return isProcessOwnerAlive(job?.owner_pid, job?.owner_start_id, job?.owner_boot_id);
+  const currentBootId = String(verifier.processBootId || '');
+  if (CANONICAL_BOOT_ID_PATTERN.test(currentBootId)
+      && job.owner_boot_id !== currentBootId) {
+    return JOB_OWNER_STATES.PROVEN_DEAD;
+  }
+  const inspected = inspectStoredOwnerProcess(job.owner_pid);
+  if (inspected.definitelyGone) return JOB_OWNER_STATES.PROVEN_DEAD;
+  if (!CANONICAL_BOOT_ID_PATTERN.test(currentBootId) || !inspected.startId) {
+    return JOB_OWNER_STATES.UNVERIFIABLE;
+  }
+  if (inspected.startId !== job.owner_start_id) return JOB_OWNER_STATES.PROVEN_DEAD;
+  return JOB_OWNER_STATES.TRUSTED_ALIVE;
 }
 
 function storedJobOwnerIsDefinitelyGone(job) {
-  const pid = Number(job?.owner_pid);
-  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-  const verifier = currentProcessOwner();
-  const identityIncomplete = (verifier.processStartId && !String(job?.owner_start_id || '').trim())
-    || (verifier.processBootId && !String(job?.owner_boot_id || '').trim());
-  // Missing identity dimensions cannot distinguish the original owner from a
-  // reused, currently-live PID. They may only be treated as dead once that PID
-  // itself is no longer alive.
-  if (identityIncomplete) return !isProcessOwnerAlive(pid);
-  return !storedJobOwnerIsAlive(job);
+  return storedJobOwnerState(job) === JOB_OWNER_STATES.PROVEN_DEAD;
 }
 
 function storedJobOwnedBy(job, owner) {
@@ -177,6 +236,37 @@ function claimIntegrityError(message) {
   const error = new Error(message);
   error.code = 'JOB_CLAIM_INTEGRITY_INVALID';
   return error;
+}
+
+function validateJobClaimSchema(database) {
+  const requireSingleColumnUniqueIdentity = (tableName, columnName) => {
+    const columns = resultRows(database.exec(
+      'PRAGMA table_info(' + sqlString(tableName) + ')',
+    ));
+    const primaryKeyColumns = columns
+      .filter((column) => Number(column.pk) > 0)
+      .sort((left, right) => Number(left.pk) - Number(right.pk));
+    if (primaryKeyColumns.length === 1 && primaryKeyColumns[0]?.name === columnName) return;
+    const identityColumn = columns.find((column) => column.name === columnName);
+    if (Number(identityColumn?.notnull) === 1) {
+      const indexes = resultRows(database.exec(
+        'PRAGMA index_list(' + sqlString(tableName) + ')',
+      ));
+      for (const index of indexes) {
+        if (Number(index.unique) !== 1 || Number(index.partial) !== 0
+            || typeof index.name !== 'string') continue;
+        const indexColumns = resultRows(database.exec(
+          'PRAGMA index_info(' + sqlString(index.name) + ')',
+        )).sort((left, right) => Number(left.seqno) - Number(right.seqno));
+        if (indexColumns.length === 1 && indexColumns[0]?.name === columnName) return;
+      }
+    }
+    throw claimIntegrityError(
+      '任务保护键数据库结构缺少必需的主键或唯一性保证',
+    );
+  };
+  requireSingleColumnUniqueIdentity('sync_jobs', 'id');
+  requireSingleColumnUniqueIdentity('job_claims', 'claim_key');
 }
 
 function reconciliationError(code, message, fields = {}) {
@@ -269,7 +359,18 @@ function parseStoredResult(job) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) {
     throw claimIntegrityError('终态任务的结果元数据无效，拒绝处理保护键');
   }
+  validateReconciliationSafetyBooleans(result);
   return result;
+}
+
+function validateReconciliationSafetyBooleans(result) {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return;
+  for (const field of RECONCILIATION_SAFETY_BOOLEAN_FIELDS) {
+    if (Object.prototype.hasOwnProperty.call(result, field)
+        && typeof result[field] !== 'boolean') {
+      throw claimIntegrityError('任务结果中的对账安全标记类型无效');
+    }
+  }
 }
 
 function resultHasReconciliationSignal(result) {
@@ -348,8 +449,10 @@ function validateAcknowledgedReconciliation(job, storedResult, expectedKeys, act
 
 function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } = {}) {
   const jobs = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
-      owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
-      reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
+      owner_pid, typeof(owner_pid) AS owner_pid_storage_type,
+      owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
+      reconciliation_hold, typeof(reconciliation_hold) AS reconciliation_hold_storage_type,
+      reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
       reconciliation_resolution, reconciliation_acknowledged_by
     FROM sync_jobs`));
   const jobsById = new Map();
@@ -357,6 +460,9 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
     const id = typeof job.id === 'string' ? job.id : '';
     if (!id || jobsById.has(id)) {
       throw claimIntegrityError('任务标识无效，拒绝处理并发安全屏障');
+    }
+    if (!JOB_STATUSES.has(job.status)) {
+      throw claimIntegrityError('任务状态无效，拒绝处理保护键');
     }
     jobsById.set(id, job);
   }
@@ -379,6 +485,9 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
         || claim.job_type !== job.type) {
       throw claimIntegrityError('任务保护键与任务元数据不一致，拒绝处理');
     }
+    if (claimOwnerByKey.has(claim.claim_key)) {
+      throw claimIntegrityError('同一任务保护键存在重复归属，拒绝并发处理');
+    }
     if (!actualByJobId.has(jobId)) actualByJobId.set(jobId, new Set());
     actualByJobId.get(jobId).add(claim.claim_key);
     claimOwnerByKey.set(claim.claim_key, jobId);
@@ -388,19 +497,21 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
   const staleTerminalJobs = [];
   for (const job of jobs) {
     const active = ACTIVE_JOB_STATUSES.has(job.status);
-    const holdValue = Number(job.reconciliation_hold);
-    if (holdValue !== 0 && holdValue !== 1) {
+    const ownerState = active ? storedJobOwnerState(job) : null;
+    const holdValue = job.reconciliation_hold;
+    if (job.reconciliation_hold_storage_type !== 'integer'
+        || !Number.isSafeInteger(holdValue)
+        || (holdValue !== 0 && holdValue !== 1)) {
       throw claimIntegrityError('待对账 hold 标记无效');
     }
     let hold = holdValue === 1;
     if (active && hold) {
       throw claimIntegrityError('活跃任务不得同时标记为待对账 hold');
     }
-    if (!active && !TERMINAL_JOB_STATUSES.has(job.status)) {
-      if (actualByJobId.has(job.id) || hold) {
-        throw claimIntegrityError('任务状态无效，拒绝处理保护键');
-      }
-      continue;
+    if (active && job.result_json !== null && job.result_json !== undefined) {
+      // Progress metadata on an active row is not allowed to smuggle a
+      // truthy/falsy reconciliation control value past terminal validation.
+      parseStoredResult(job);
     }
     const acknowledgementMetadataPresent = [
       job.reconciliation_scope,
@@ -446,7 +557,7 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
       } else if (active
           && job.status === 'queued'
           && !jobExecutionOutcomeUnknown(job)
-          && storedJobOwnerIsDefinitelyGone(job)) {
+          && ownerState === JOB_OWNER_STATES.PROVEN_DEAD) {
         const repair = database.prepare("UPDATE sync_jobs SET claim_keys_json = '[]' WHERE id = ? AND claim_keys_json IS NULL");
         try {
           repair.run([job.id]);
@@ -456,10 +567,7 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
         job.claim_keys_json = '[]';
         job.force_recovery = true;
         expectedKeys = [];
-      } else if (active
-          && Number.isSafeInteger(Number(job.owner_pid))
-          && Number(job.owner_pid) > 0
-          && !storedJobOwnerIsDefinitelyGone(job)) {
+      } else if (active && ownerState === JOB_OWNER_STATES.TRUSTED_ALIVE) {
         // A live owner may still dispatch this queued task. Neither inventing
         // an empty claim list nor terminalizing the row is safe while that
         // process is active, so fail closed and leave its state untouched.
@@ -492,6 +600,9 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
         job.claim_keys_json = jsonString([globalClaimKey]);
         job.reconciliation_scope = 'global';
         job.force_recovery = true;
+        if (ownerState === JOB_OWNER_STATES.UNVERIFIABLE) {
+          job.force_unknown_recovery = true;
+        }
         expectedKeys = [globalClaimKey];
         actualByJobId.set(job.id, new Set(expectedKeys));
       } else if (!active && !hold && !acknowledgementMetadataPresent && legacyTerminalSignal) {
@@ -656,7 +767,15 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
       // A synthetic global scope means a previous validation could not prove
       // what the already-started legacy worker touched. Keep the recovery
       // decision durable across a second validation in the same write path.
-      if (activeGlobal) job.force_recovery = true;
+      if (activeGlobal && ownerState === JOB_OWNER_STATES.TRUSTED_ALIVE) {
+        throw claimIntegrityError('可验证的活动任务包含无法安全解释的全局保护键');
+      }
+      if (ownerState !== JOB_OWNER_STATES.TRUSTED_ALIVE || activeGlobal) {
+        job.force_recovery = true;
+      }
+      if (ownerState === JOB_OWNER_STATES.UNVERIFIABLE) {
+        job.force_unknown_recovery = true;
+      }
       activeJobs.push(job);
       continue;
     }
@@ -721,7 +840,8 @@ function jobExecutionOutcomeUnknown(job) {
 }
 
 function recoveredJobResult(job) {
-  if (!jobExecutionOutcomeUnknown(job)) {
+  const ownerIdentityUnverifiable = job?.force_unknown_recovery === true;
+  if (!ownerIdentityUnverifiable && !jobExecutionOutcomeUnknown(job)) {
     return {
       code: 'JOB_OWNER_EXITED_BEFORE_START',
       outcome: 'not_started',
@@ -742,9 +862,11 @@ function recoveredJobResult(job) {
     futureOperationsUnblocked: false,
     retryAllowed: false,
     doNotRetry: true,
-    reconciliationReason: job?.status === 'running'
-      ? 'owner_process_exited_while_running'
-      : 'queued_state_inconsistent',
+    reconciliationReason: ownerIdentityUnverifiable
+      ? 'owner_identity_unverifiable'
+      : job?.status === 'running'
+        ? 'owner_process_exited_while_running'
+        : 'queued_state_inconsistent',
   };
 }
 
@@ -781,11 +903,14 @@ function interruptDeadOwnerJob(database, job, interruptedAt) {
     result.reconciliationHoldReason = 'no_claim_keys';
     result.reconciliationBlockScope = null;
   }
-  const message = retainClaims
-    ? '任务所属进程退出且执行结果未知；已保留持久保护键，请先人工核对操作影响的实际状态'
+  const ownerIdentityUnverifiable = job?.force_unknown_recovery === true;
+  const message = ownerIdentityUnverifiable
+    ? '任务所属进程身份无法可靠核验且执行结果未知；已保留持久保护键，请先人工核对操作影响的实际状态'
+    : retainClaims
+      ? '任务所属进程退出且执行结果未知；已保留持久保护键，请先人工核对操作影响的实际状态'
     : result.requiresReconciliation
       ? '任务所属进程退出且执行结果未知；该任务未配置保护键，无法为后续操作建立持久阻挡'
-    : '任务所属进程已退出，排队任务未开始执行';
+      : '任务所属进程已退出，排队任务未开始执行';
   const statement = database.prepare(`UPDATE sync_jobs
     SET status = 'interrupted', result_json = ?, error = ?, finished_at = ?,
       claim_keys_json = ?, reconciliation_hold = ?, reconciliation_scope = ?,
@@ -1886,6 +2011,10 @@ class PanelDb {
       this.database.run('ALTER TABLE sync_jobs ADD COLUMN submission_key_hash TEXT');
     }
     this.database.run('CREATE INDEX IF NOT EXISTS idx_sync_jobs_submission_key_hash ON sync_jobs(submission_key_hash)');
+    // CREATE TABLE IF NOT EXISTS does not verify an existing legacy or damaged
+    // schema. Without these unique identities, two queued jobs could appear to
+    // own the same claim while the in-memory maps silently overwrite one owner.
+    validateJobClaimSchema(this.database);
   }
 
   pruneRows({ pruneMutationReceipts = true } = {}) {
@@ -2105,7 +2234,8 @@ class PanelDb {
           ))[0];
           if (existing) {
             const existingJob = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
-                owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
+                owner_pid, typeof(owner_pid) AS owner_pid_storage_type,
+                owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
                 reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
                 reconciliation_resolution, reconciliation_acknowledged_by
               FROM sync_jobs WHERE id = ${sqlString(existing.job_id)} LIMIT 1`))[0];
@@ -2487,7 +2617,7 @@ class PanelDb {
           cleanupOrdinaryTerminalClaims: true,
         });
         for (const activeJob of activeJobs.filter((job) => (
-          job.id !== jobId
+          (job.id !== jobId || job.force_recovery === true)
             && (job.force_recovery === true || storedJobOwnerIsDefinitelyGone(job))
         ))) {
           interruptDeadOwnerJob(database, activeJob, startedAt);
@@ -2499,17 +2629,17 @@ class PanelDb {
           error.code = 'JOB_NOT_FOUND';
           throw error;
         }
+        const barrier = firstReconciliationBarrier(database);
+        if (barrier) {
+          database.run('COMMIT');
+          return { barrier };
+        }
         if (current.status !== 'queued') {
           const error = new Error('只有排队中的任务可以开始执行');
           error.code = 'JOB_STATUS_CONFLICT';
           error.currentStatus = current.status || null;
           error.requestedStatus = 'running';
           throw error;
-        }
-        const barrier = firstReconciliationBarrier(database);
-        if (barrier) {
-          database.run('COMMIT');
-          return { barrier };
         }
         const runningMutation = firstRunningMutation(database);
         if (runningMutation) {
@@ -2803,7 +2933,10 @@ class PanelDb {
     let safeResultJson;
     let safeError;
     try {
-      if (patch.result !== undefined) safeResult = redactValue(patch.result);
+      if (patch.result !== undefined) {
+        safeResult = redactValue(patch.result);
+        validateReconciliationSafetyBooleans(safeResult);
+      }
       safeResultJson = patch.result === undefined
         ? undefined
         : boundedJsonString('sync_jobs.result_json', safeResult, MAX_JOB_RESULT_BYTES);

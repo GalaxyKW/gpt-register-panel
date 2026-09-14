@@ -17,7 +17,12 @@ async function makeOwnerDead(db, jobId) {
   await db.write((database) => {
     const statement = database.prepare(`UPDATE sync_jobs
       SET owner_pid = ?, owner_start_id = ?, owner_boot_id = ? WHERE id = ?`);
-    statement.run([2147483647, 'dead-owner-start', 'dead-owner-boot', jobId]);
+    statement.run([
+      2147483647,
+      '1',
+      '00000000-0000-0000-0000-000000000000',
+      jobId,
+    ]);
     statement.free();
   });
 }
@@ -483,6 +488,307 @@ test('claim corruption and orphan claims fail closed without deleting the barrie
   assert.equal(await scalar(orphanDb, "SELECT COUNT(*) FROM job_claims WHERE job_id = 'job_missing'"), 1);
 });
 
+test('unknown stored job status fails closed even after every claim mapping is lost', async () => {
+  const file = databasePath('unknown-status-without-claims');
+  const db = new PanelDb(file);
+  const job = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:unknown-status'],
+  });
+  await db.write((database) => {
+    const update = database.prepare(`UPDATE sync_jobs
+      SET status = 'queud', claim_keys_json = '[]' WHERE id = ?`);
+    try {
+      update.run([job.id]);
+      const remove = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
+      try { remove.run([job.id]); } finally { remove.free(); }
+    } finally {
+      update.free();
+    }
+  });
+
+  await assert.rejects(
+    new PanelDb(file).ready,
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /任务状态无效/.test(error.message),
+  );
+  await assert.rejects(
+    db.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:unknown-status'] }),
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID',
+  );
+  assert.equal(await scalar(db,
+    `SELECT COUNT(*) FROM sync_jobs WHERE id = '${job.id}'`), 1);
+});
+
+test('claim schema without a single-column unique identity fails closed on duplicate owners', async () => {
+  const file = databasePath('duplicate-claim-schema');
+  const db = new PanelDb(file);
+  const first = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:first-owner'],
+  });
+  const second = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:second-owner'],
+  });
+  await db.write((database) => {
+    database.run(`DROP TABLE job_claims;
+      CREATE TABLE job_claims (
+        claim_key TEXT NOT NULL,
+        job_id TEXT NOT NULL,
+        job_type TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        PRIMARY KEY (claim_key, job_id)
+      );`);
+    const insert = database.prepare(`INSERT INTO job_claims
+      (claim_key, job_id, job_type, created_at) VALUES (?, ?, 'phase3', ?)`);
+    const now = new Date().toISOString();
+    try {
+      insert.run(['phase3:shared-owner', first.id, now]);
+      insert.run(['phase3:shared-owner', second.id, now]);
+    } finally {
+      insert.free();
+    }
+    const update = database.prepare('UPDATE sync_jobs SET claim_keys_json = ? WHERE id = ?');
+    try {
+      update.run([JSON.stringify(['phase3:shared-owner']), first.id]);
+      update.run([JSON.stringify(['phase3:shared-owner']), second.id]);
+    } finally {
+      update.free();
+    }
+  });
+
+  await assert.rejects(
+    new PanelDb(file).ready,
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /主键或唯一性/.test(error.message),
+  );
+  assert.equal(await scalar(db,
+    "SELECT COUNT(*) FROM job_claims WHERE claim_key = 'phase3:shared-owner'"), 2);
+});
+
+test('a non-partial single-column UNIQUE claim identity remains schema-compatible', async () => {
+  const file = databasePath('unique-claim-schema');
+  const db = new PanelDb(file);
+  await db.ready;
+  await db.write((database) => database.run(`DROP TABLE job_claims;
+    CREATE TABLE job_claims (
+      claim_key TEXT NOT NULL UNIQUE,
+      job_id TEXT NOT NULL,
+      job_type TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );`));
+
+  const restarted = new PanelDb(file);
+  await restarted.ready;
+  const job = await restarted.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:unique-index-owner'],
+  });
+  assert.equal(job.status, 'queued');
+  assert.equal(await scalar(restarted,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${job.id}'`), 1);
+});
+
+test('stored hold types and reconciliation safety flag types fail closed before claims are released', async () => {
+  const holdFile = databasePath('invalid-hold-storage-type');
+  const holdDb = new PanelDb(holdFile);
+  const heldJob = await holdDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:invalid-hold-type'],
+  });
+  await holdDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET reconciliation_hold = ? WHERE id = ?`);
+    try { statement.run([Uint8Array.of(0), heldJob.id]); } finally { statement.free(); }
+  });
+  await assert.rejects(
+    new PanelDb(holdFile).ready,
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /hold 标记无效/.test(error.message),
+  );
+  assert.equal(await scalar(holdDb,
+    `SELECT typeof(reconciliation_hold) FROM sync_jobs WHERE id = '${heldJob.id}'`), 'blob');
+
+  const inputFile = databasePath('invalid-result-flag-input');
+  const inputDb = new PanelDb(inputFile);
+  const inputJob = await inputDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:invalid-result-input'],
+  });
+  await assert.rejects(
+    inputDb.updateJob(inputJob.id, {
+      status: 'failed',
+      result: { requiresReconciliation: 'true' },
+      finishedAt: new Date().toISOString(),
+    }),
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /安全标记类型无效/.test(error.message),
+  );
+  assert.equal((await inputDb.getJob(inputJob.id)).status, 'queued');
+  assert.equal(await scalar(inputDb,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${inputJob.id}'`), 1);
+
+  const storedFile = databasePath('invalid-result-flag-stored');
+  const storedDb = new PanelDb(storedFile);
+  const storedJob = await storedDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:invalid-result-stored'],
+  });
+  await storedDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET status = 'failed', result_json = ?, finished_at = ? WHERE id = ?`);
+    try {
+      statement.run([
+        JSON.stringify({ writeOutcomeUnknown: 1 }),
+        new Date().toISOString(),
+        storedJob.id,
+      ]);
+    } finally {
+      statement.free();
+    }
+  });
+  await assert.rejects(
+    new PanelDb(storedFile).ready,
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /安全标记类型无效/.test(error.message),
+  );
+  assert.equal(await scalar(storedDb,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${storedJob.id}'`), 1);
+
+  const activeFile = databasePath('invalid-active-result-flag-stored');
+  const activeDb = new PanelDb(activeFile);
+  const activeJob = await activeDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:invalid-active-result-stored'],
+  });
+  await activeDb.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET result_json = ? WHERE id = ?');
+    try {
+      statement.run([
+        JSON.stringify({ requiresReconciliation: 1 }),
+        activeJob.id,
+      ]);
+    } finally {
+      statement.free();
+    }
+  });
+  await assert.rejects(
+    new PanelDb(activeFile).ready,
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
+      && /安全标记类型无效/.test(error.message),
+  );
+  assert.equal(await scalar(activeDb,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${activeJob.id}'`), 1);
+});
+
+test('an unverifiable queued owner becomes an unknown hold and is never guessed not-started', async () => {
+  const globalFile = databasePath('owner-unverifiable-global');
+  const globalDb = new PanelDb(globalFile);
+  const globalJob = await globalDb.createJob('legacy_worker', {}, 'tester');
+  await globalDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET owner_pid = NULL, owner_start_id = NULL, owner_boot_id = NULL WHERE id = ?`);
+    try { statement.run([globalJob.id]); } finally { statement.free(); }
+  });
+
+  let restarted = new PanelDb(globalFile);
+  let unknown = await restarted.getJob(globalJob.id);
+  assert.equal(unknown.status, 'interrupted');
+  assert.equal(unknown.result.executionOutcome, 'unknown');
+  assert.equal(unknown.result.writeOutcomeUnknown, true);
+  assert.equal(unknown.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(unknown.result.reconciliationHold, true);
+  assert.equal(unknown.result.reconciliationHoldScope, 'all_future_jobs');
+  assert.equal(unknown.result.retryAllowed, false);
+  assert.equal(unknown.result.doNotRetry, true);
+  assert.equal(await scalar(restarted,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${globalJob.id}'`), 1);
+  await assert.rejects(
+    restarted.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:blocked-by-owner'] }),
+    (error) => error.code === 'JOB_RECONCILIATION_REQUIRED'
+      && error.existingJobId === globalJob.id,
+  );
+
+  restarted = new PanelDb(globalFile);
+  unknown = await restarted.getJob(globalJob.id);
+  assert.equal(unknown.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(await scalar(restarted,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${globalJob.id}'`), 1);
+
+  const scopedFile = databasePath('owner-unverifiable-scoped');
+  const scopedDb = new PanelDb(scopedFile);
+  const scopedClaim = 'phase3:owner-unverifiable';
+  const scopedJob = await scopedDb.createJob('phase3', {}, 'tester', {
+    claimKeys: [scopedClaim],
+  });
+  await scopedDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET owner_pid = NULL, owner_start_id = NULL, owner_boot_id = NULL WHERE id = ?`);
+    try { statement.run([scopedJob.id]); } finally { statement.free(); }
+  });
+  const scopedRestart = new PanelDb(scopedFile);
+  const scopedUnknown = await scopedRestart.getJob(scopedJob.id);
+  assert.equal(scopedUnknown.status, 'interrupted');
+  assert.equal(scopedUnknown.result.executionOutcome, 'unknown');
+  assert.equal(scopedUnknown.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(scopedUnknown.result.reconciliationHoldScope, 'claim_keys');
+  assert.equal(await scalar(scopedRestart,
+    `SELECT claim_key FROM job_claims WHERE job_id = '${scopedJob.id}'`), scopedClaim);
+
+  const executionFile = databasePath('owner-unverifiable-at-execution');
+  const executionDb = new PanelDb(executionFile);
+  const executionJob = await executionDb.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:owner-unverifiable-execution'],
+  });
+  await executionDb.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET owner_pid = NULL, owner_start_id = NULL, owner_boot_id = NULL WHERE id = ?`);
+    try { statement.run([executionJob.id]); } finally { statement.free(); }
+  });
+  await assert.rejects(
+    executionDb.startMutationJob(executionJob.id),
+    (error) => error.code === 'JOB_BLOCKED_BY_RECONCILIATION'
+      && error.existingJobId === executionJob.id,
+  );
+  const executionHold = await executionDb.getJob(executionJob.id);
+  assert.equal(executionHold.status, 'interrupted');
+  assert.equal(executionHold.result.executionOutcome, 'unknown');
+  assert.equal(executionHold.result.reconciliationReason, 'owner_identity_unverifiable');
+});
+
+test('unverifiable-owner recovery is atomic across an export failure', async () => {
+  const file = databasePath('owner-unverifiable-persist-failure');
+  const db = new PanelDb(file);
+  const job = await db.createJob('legacy_worker', {}, 'tester');
+  await db.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET owner_pid = NULL, owner_start_id = NULL, owner_boot_id = NULL WHERE id = ?`);
+    try { statement.run([job.id]); } finally { statement.free(); }
+  });
+
+  const originalPersist = db.persistUnlocked.bind(db);
+  const simulated = Object.assign(new Error('simulated owner recovery export failure'), {
+    code: 'SIMULATED_OWNER_RECOVERY_PERSIST_FAILURE',
+  });
+  db.persistUnlocked = () => { throw simulated; };
+  try {
+    await assert.rejects(
+      db.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:must-not-persist'] }),
+      (error) => error.code === simulated.code,
+    );
+  } finally {
+    db.persistUnlocked = originalPersist;
+  }
+
+  const durableBeforeRetry = await db.getJob(job.id);
+  assert.equal(durableBeforeRetry.status, 'queued');
+  assert.equal(durableBeforeRetry.result, null);
+  assert.equal(await scalar(db,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${job.id}'`), 0);
+
+  const restarted = new PanelDb(file);
+  const recovered = await restarted.getJob(job.id);
+  assert.equal(recovered.status, 'interrupted');
+  assert.equal(recovered.result.executionOutcome, 'unknown');
+  assert.equal(recovered.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(recovered.result.reconciliationHold, true);
+  assert.equal(await scalar(restarted,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${job.id}'`), 1);
+});
+
 test('legacy NULL claim metadata is reconstructed before stale terminal claims are audit-cleaned', async () => {
   const activeFile = databasePath('legacy-active');
   const activeDb = new PanelDb(activeFile);
@@ -552,11 +858,15 @@ test('live queued work with missing claim metadata cannot silently lose its barr
       owner_boot_id = NULL WHERE id = '${incomplete.id}';
     DELETE FROM job_claims WHERE job_id = '${incomplete.id}';
   `));
-  await assert.rejects(
-    new PanelDb(incompleteFile).ready,
-    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID'
-      && /活动任务缺少可恢复/.test(error.message),
-  );
+  const incompleteRestart = new PanelDb(incompleteFile);
+  const incompleteHold = await incompleteRestart.getJob(incomplete.id);
+  assert.equal(incompleteHold.status, 'interrupted');
+  assert.equal(incompleteHold.result.executionOutcome, 'unknown');
+  assert.equal(incompleteHold.result.reconciliationReason, 'owner_identity_unverifiable');
+  assert.equal(incompleteHold.result.reconciliationHold, true);
+  assert.equal(incompleteHold.result.reconciliationHoldScope, 'all_future_jobs');
+  assert.equal(await scalar(incompleteRestart,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${incomplete.id}'`), 1);
 });
 
 test('a provably dead clean queue with missing claim metadata is terminalized before new work', async () => {
@@ -567,7 +877,7 @@ test('a provably dead clean queue with missing claim metadata is terminalized be
   });
   await db.write((database) => database.run(`
     UPDATE sync_jobs SET claim_keys_json = NULL, owner_pid = 2147483647,
-      owner_start_id = 'dead-owner-start', owner_boot_id = 'dead-owner-boot'
+      owner_start_id = '1', owner_boot_id = '00000000-0000-0000-0000-000000000000'
       WHERE id = '${job.id}';
     DELETE FROM job_claims WHERE job_id = '${job.id}';
   `));
