@@ -155,7 +155,87 @@ test('frontend token import totals separate errors, runtime skips, and successes
       runtimeSkipped: 99,
     });
   `, context);
-  assert.deepEqual({ ...context.result }, { succeeded: 1, skipped: 1, failed: 1 });
+  assert.deepEqual({ ...context.result }, {
+    succeeded: 1,
+    skipped: 1,
+    failed: 1,
+    reconciliation: 0,
+    notAttempted: 0,
+  });
+});
+
+test('frontend separates unknown write outcomes from failures and shows halted items', () => {
+  const countsContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const renderContract = sourceSection('function renderJob', 'function stopJobPolling');
+  const context = {
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+    elements: {
+      jobPanel: { dataset: {} },
+      jobTitle: {},
+      jobStatus: {},
+      jobMeta: {},
+    },
+    jobStatusClass: () => 'badge-danger',
+    jobStatusLabel: () => '失败',
+    formatDate: () => '现在',
+  };
+  vm.runInNewContext(countsContract + '\n' + renderContract + `
+    const importResult = {
+      imported: [
+        { action: 'create' },
+        {
+          action: 'update',
+          error: 'request timed out',
+          outcome: 'requires_reconciliation',
+          requiresReconciliation: true,
+          writeOutcomeUnknown: true,
+          reconciliationReason: 'timeout',
+        },
+      ],
+      notAttempted: [
+        { action: 'create', outcome: 'not_attempted' },
+        { action: 'update', outcome: 'not_attempted' },
+      ],
+      failed: 1,
+      requiresReconciliation: true,
+    };
+    counts = tokenImportResultCounts(importResult);
+    notice = tokenImportReconciliationNotice(importResult);
+    renderJob({
+      id: 'import-job',
+      type: 'token_import',
+      status: 'partial',
+      result: importResult,
+      finishedAt: 'now',
+    });
+    rendered = {
+      status: elements.jobStatus.textContent,
+      statusClass: elements.jobStatus.className,
+      detail: elements.jobMeta.textContent,
+    };
+  `, context);
+  assert.deepEqual({ ...context.counts }, {
+    succeeded: 1,
+    skipped: 0,
+    failed: 0,
+    reconciliation: 1,
+    notAttempted: 2,
+  });
+  assert.deepEqual({ ...context.rendered }, {
+    status: '待人工核对',
+    statusClass: 'badge badge-warning',
+    detail: '成功 1 · 跳过 0 · 失败 0 · 待人工核对 1 · 未执行 2 · 已停止后续写入 · 原因：请求超时，远端是否写入未知 · 现在',
+  });
+  assert.equal(
+    context.notice,
+    'Token 导入有 1 个写入结果待人工核对，另有 2 个账号未执行。请先按账号 ID 和强身份字段核对 Sub2API，确认前不要重复提交。',
+  );
+  const terminalBranch = sourceSection(
+    'if (loaded.every((job) => terminalJob(job.status)))',
+    '// Even a failed/interrupted operation',
+  );
+  assert.match(terminalBranch, /tokenImportNeedsReconciliation\(job\.result\)/);
+  assert.match(terminalBranch, /terminalNoticeKind = 'notice-warning'/);
 });
 
 test('frontend renders a completed Phase3 result without bogus zero counters', () => {

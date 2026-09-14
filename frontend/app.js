@@ -901,16 +901,96 @@ function jobStatusClass(status) {
 function tokenImportResultCounts(result) {
   const items = Array.isArray(result?.imported) ? result.imported : null;
   if (items) {
-    const failed = items.filter((item) => Boolean(item?.error)).length;
+    const reconciliation = items.filter((item) => item?.requiresReconciliation === true
+      || item?.writeOutcomeUnknown === true
+      || item?.outcome === 'requires_reconciliation').length;
+    const failed = items.filter((item) => Boolean(item?.error)
+      && item?.requiresReconciliation !== true
+      && item?.writeOutcomeUnknown !== true
+      && item?.outcome !== 'requires_reconciliation').length;
     const skipped = items.filter((item) => !item?.error
       && (item?.skipped === true || item?.action === 'skip')).length;
-    return { succeeded: items.length - failed - skipped, skipped, failed };
+    const notAttempted = Array.isArray(result?.notAttempted)
+      ? result.notAttempted.length
+      : Math.max(0, finiteNumber(result?.notAttemptedCount));
+    return {
+      succeeded: Math.max(0, items.length - failed - skipped - reconciliation),
+      skipped,
+      failed,
+      reconciliation,
+      notAttempted,
+    };
   }
   return {
-    succeeded: finiteNumber(result?.succeeded),
-    skipped: finiteNumber(result?.runtimeSkipped),
-    failed: finiteNumber(result?.failed),
+    succeeded: Math.max(0, finiteNumber(result?.succeeded)),
+    skipped: Math.max(0, finiteNumber(result?.runtimeSkipped)),
+    failed: Math.max(0, finiteNumber(result?.failed)),
+    reconciliation: Math.max(
+      0,
+      finiteNumber(result?.reconciliationCount),
+      result?.requiresReconciliation === true ? 1 : 0,
+    ),
+    notAttempted: Math.max(0, finiteNumber(result?.notAttemptedCount)),
   };
+}
+
+function tokenImportReconciliationReason(result) {
+  const item = Array.isArray(result?.imported)
+    ? result.imported.find((entry) => entry?.requiresReconciliation === true
+      || entry?.writeOutcomeUnknown === true
+      || entry?.outcome === 'requires_reconciliation')
+    : null;
+  const reason = String(item?.reconciliationReason || '').trim().toLowerCase();
+  return {
+    timeout: '请求超时，远端是否写入未知',
+    external_abort: '停机中断请求，远端是否写入未知',
+    post_write_abort: '停机中断写后核验',
+    transport: '连接中断，远端是否写入未知',
+    response_too_large: '响应过大，无法核验写入结果',
+    empty_response: '响应为空，无法核验写入结果',
+    invalid_json: '响应格式无效，无法核验写入结果',
+    response_rejected: '远端拒绝响应，实际写入状态仍需核验',
+    response_schema: '响应结构无效，无法核验写入结果',
+    response_mismatch: '响应目标不一致，无法核验写入结果',
+    update_postflight: '更新后的账号核验失败',
+    create_postflight: '新建账号的写后核验失败',
+    post_write_verification: '写后核验失败',
+    write_outcome_unknown: '写入结果未知',
+    unknown: '写入结果未知',
+  }[reason] || (reason ? '写入结果未知' : '');
+}
+
+function tokenImportNeedsReconciliation(result) {
+  return result?.requiresReconciliation === true
+    || tokenImportResultCounts(result).reconciliation > 0;
+}
+
+function tokenImportReconciliationNotice(result) {
+  const counts = tokenImportResultCounts(result);
+  const pending = counts.reconciliation > 0
+    ? counts.reconciliation + ' 个写入结果'
+    : '写入结果';
+  const halted = counts.notAttempted > 0 ? '，另有 ' + counts.notAttempted + ' 个账号未执行' : '';
+  return 'Token 导入有 ' + pending + '待人工核对' + halted
+    + '。请先按账号 ID 和强身份字段核对 Sub2API，确认前不要重复提交。';
+}
+
+function tokenImportResultDetail(result) {
+  const counts = tokenImportResultCounts(result);
+  const parts = [
+    '成功 ' + counts.succeeded,
+    '跳过 ' + counts.skipped,
+    '失败 ' + counts.failed,
+  ];
+  const requiresReconciliation = tokenImportNeedsReconciliation(result);
+  if (requiresReconciliation) parts.push('待人工核对 ' + counts.reconciliation);
+  if (counts.notAttempted > 0) parts.push('未执行 ' + counts.notAttempted);
+  if (requiresReconciliation) {
+    parts.push('已停止后续写入');
+    const reason = tokenImportReconciliationReason(result);
+    if (reason) parts.push('原因：' + reason);
+  }
+  return parts.join(' · ');
 }
 
 function renderJob(job) {
@@ -928,8 +1008,14 @@ function renderJob(job) {
     : isPhase3
     ? (jobs.length > 1 ? 'Phase 3 批量任务' : 'Phase 3 任务')
     : (jobs.length > 1 ? '批量任务' : 'Token 导入任务');
-  elements.jobStatus.className = 'badge ' + jobStatusClass(job.status);
-  elements.jobStatus.textContent = jobStatusLabel(job.status);
+  const importNeedsReconciliation = jobs.length === 1
+    && job.type === 'token_import'
+    && tokenImportNeedsReconciliation(job.result);
+  elements.jobStatus.className = 'badge '
+    + (importNeedsReconciliation ? 'badge-warning' : jobStatusClass(job.status));
+  elements.jobStatus.textContent = importNeedsReconciliation
+    ? '待人工核对'
+    : jobStatusLabel(job.status);
   if (jobs.length > 1) {
     const terminalCount = jobs.filter((item) => ['succeeded', 'partial', 'failed', 'interrupted'].includes(item.status)).length;
     const failedCount = jobs.filter((item) => ['failed', 'interrupted', 'partial'].includes(item.status)).length;
@@ -947,8 +1033,7 @@ function renderJob(job) {
         + ' · 失败 ' + (job.result.failed || 0)
         + ' · 跳过 ' + (job.result.skipped || 0);
     } else if (job.type === 'token_import') {
-      const counts = tokenImportResultCounts(job.result);
-      detail = '成功 ' + counts.succeeded + ' · 跳过 ' + counts.skipped + ' · 失败 ' + counts.failed;
+      detail = tokenImportResultDetail(job.result);
     } else if (job.type === 'phase3') {
       detail = 'Phase 3 已完成并检测到 token 更新';
     } else {
@@ -1024,7 +1109,12 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         stopJobPolling();
         let terminalNotice;
         let terminalNoticeKind;
-        if (loaded.every((job) => job.status === 'succeeded')) {
+        const reconciliationJob = loaded.find((job) => job.type === 'token_import'
+          && tokenImportNeedsReconciliation(job.result));
+        if (reconciliationJob) {
+          terminalNotice = tokenImportReconciliationNotice(reconciliationJob.result);
+          terminalNoticeKind = 'notice-warning';
+        } else if (loaded.every((job) => job.status === 'succeeded')) {
           terminalNotice = '任务已完成，账号状态已刷新。';
           terminalNoticeKind = 'notice-info';
         } else if (loaded.some((job) => job.status === 'succeeded' || job.status === 'partial')) {
