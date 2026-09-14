@@ -306,3 +306,14 @@ test('systemd documentation keeps the root profile distinct from NTFS and servic
   assert.equal(systemdSection.includes('\n    npm ci\n'), false);
   assert.match(systemdSection, /不能用一次递归 `chown` 把未经核验的现有依赖/);
 });
+
+test('write-enablement documentation never supplies a copyable invalid token placeholder', () => {
+  const readme = fs.readFileSync(README_PATH, 'utf8');
+  const writeSection = readme.slice(
+    readme.indexOf('## 写入开关'),
+    readme.indexOf('##', readme.indexOf('## 写入开关') + 3),
+  );
+  assert.match(writeSection, /至少 16 位随机、无空白的可打印 ASCII/);
+  assert.match(writeSection, /PANEL_ADMIN_TOKEN=\n/);
+  assert.equal(writeSection.includes('PANEL_ADMIN_TOKEN=请换成随机长令牌'), false);
+});
