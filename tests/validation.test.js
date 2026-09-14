@@ -814,6 +814,20 @@ test('authentication ignores forged actors, rate-limits failures, and protects r
     );
     assert.doesNotThrow(() => validateListenConfiguration('127.0.0.1'));
     assert.doesNotThrow(() => validateListenConfiguration('::1'));
+
+    process.env.PANEL_ADMIN_TOKEN = 'test-admin-token-123456';
+    assert.throws(
+      () => validateListenConfiguration('0.0.0.0'),
+      (error) => error.code === 'PANEL_REMOTE_HTTP_CONFIRMATION_REQUIRED',
+    );
+    process.env.PANEL_ALLOW_INSECURE_REMOTE = '1';
+    assert.doesNotThrow(() => validateListenConfiguration('0.0.0.0'));
+
+    delete process.env.PANEL_ADMIN_TOKEN;
+    assert.throws(
+      () => validateListenConfiguration('0.0.0.0'),
+      (error) => error.code === 'PANEL_REMOTE_AUTH_REQUIRED',
+    );
   } finally {
     if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
     else process.env.PANEL_ADMIN_TOKEN = previous.token;

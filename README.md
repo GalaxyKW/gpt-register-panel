@@ -46,7 +46,11 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 在 `panel.env` 中填写有效的 Sub2API 管理 API key 或 JWT，以及至少 16 位的随机 `PANEL_ADMIN_TOKEN`。项目本地 `.env` 只保留为开发兼容默认值，也必须满足相同权限检查；父进程已有的环境变量优先于文件中的同名配置。
 
-默认只监听 127.0.0.1:4170，打开 http://127.0.0.1:4170/ 即可查看账号表格。页面支持筛选、搜索、勾选、差异预览、上游账号测试和任务查询；模型列表会优先从 Sub2API 读取，并保证可选择 `5.6-luna`（实际请求 ID 为 `gpt-5.6-luna`）。
+默认只监听 127.0.0.1:4170。在服务器本机打开 http://127.0.0.1:4170/ 即可查看账号表格；另一台电脑浏览器里的 `127.0.0.1` 指向那台电脑本身，并不是服务器。远程管理优先保持面板监听回环地址并建立 SSH 隧道：
+
+    ssh -N -L 4170:127.0.0.1:4170 user@server
+
+随后在本机浏览器打开同一地址。页面支持筛选、搜索、勾选、差异预览、上游账号测试和任务查询；模型列表会优先从 Sub2API 读取，并保证可选择 `5.6-luna`（实际请求 ID 为 `gpt-5.6-luna`）。
 
 ## systemd 服务
 
@@ -110,7 +114,9 @@ unit 使用只读文件系统视图，只开放以下默认写路径：
 
 配置了 `PANEL_ADMIN_TOKEN` 或启用 `PANEL_REQUIRE_AUTH=1` 后，所有 `/api/*` 接口都需要通过 `x-panel-token` 或 `Authorization: Bearer ...` 访问；WebUI 收到 401 会提示输入令牌并仅保存在当前浏览器会话。客户端不能通过 `x-panel-actor` 伪造审计操作者，日志中的操作者只会是 `panel-admin`、`local` 或 `anonymous`。认证失败按来源地址限流，超过阈值会短暂返回 429。日志会自动脱敏 access/refresh/id token、JWT、Bearer、API key、密码和 Phase 3 输出，不记录请求体或 token 原文。
 
-示例配置默认 `PANEL_REQUIRE_AUTH=1`。`PANEL_ADMIN_TOKEN` 应使用至少 16 个字符的随机值，并放在仓库外的私有 `panel.env` 中。若将 `PANEL_HOST` 改成非回环地址，没有管理员令牌时面板会拒绝启动；只有明确设置 `PANEL_ALLOW_INSECURE_REMOTE=1` 才会放行（不建议）。
+示例配置默认 `PANEL_REQUIRE_AUTH=1`。`PANEL_ADMIN_TOKEN` 应使用至少 16 个字符的随机值，并放在仓库外的私有 `panel.env` 中。非回环监听始终要求有效管理员令牌，而且还必须显式设置 `PANEL_ALLOW_INSECURE_REMOTE=1` 来确认明文 HTTP 风险；这个开关不能绕过认证。更安全的做法是保持回环监听，通过 SSH 隧道访问，或让同机 HTTPS 反向代理连接回环地址。
+
+`PANEL_PORT` 留空时使用 4170；部署配置只接受 1–65535 的十进制端口，避免空值意外变成随机端口。只有程序化测试通过 `startServer({ port: 0 })` 时才允许由系统选择临时端口。
 
 ## 写入开关
 

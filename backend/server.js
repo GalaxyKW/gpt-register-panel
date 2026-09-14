@@ -286,14 +286,51 @@ function isLoopbackHost(host) {
   return value === 'localhost' || isLoopbackAddress(value);
 }
 
+function configuredListenHost(optionHost, environment = process.env) {
+  const raw = optionHost !== undefined ? optionHost : environment.PANEL_HOST;
+  if (raw === undefined) return '127.0.0.1';
+  if (typeof raw !== 'string' || raw.length > 253 || raw.includes('\0') || raw.trim() === '') {
+    const error = new Error('PANEL_HOST 必须是非空监听主机名或地址');
+    error.code = 'PANEL_HOST_INVALID';
+    throw error;
+  }
+  return raw.trim();
+}
+
+function configuredListenPort(optionPort, environment = process.env) {
+  const fromOption = optionPort !== undefined;
+  const raw = fromOption ? optionPort : environment.PANEL_PORT;
+  if (!fromOption && (raw === undefined || String(raw).trim() === '')) return 4170;
+  const normalized = typeof raw === 'number' ? String(raw) : String(raw || '').trim();
+  if (!/^\d+$/.test(normalized)) {
+    const error = new Error('PANEL_PORT 必须是有效的十进制端口');
+    error.code = 'PANEL_PORT_INVALID';
+    throw error;
+  }
+  const port = Number(normalized);
+  const minimum = fromOption ? 0 : 1;
+  if (!Number.isSafeInteger(port) || port < minimum || port > 65535) {
+    const error = new Error(fromOption
+      ? '监听端口必须是 0 到 65535 的整数'
+      : 'PANEL_PORT 必须是 1 到 65535 的整数');
+    error.code = 'PANEL_PORT_INVALID';
+    throw error;
+  }
+  return port;
+}
+
 function validateListenConfiguration(host) {
   validateRuntimeConfiguration();
   const configuredToken = configuredPanelToken();
-  if (!isLoopbackHost(host)
-      && !configuredToken
-      && !booleanEnvEnabled('PANEL_ALLOW_INSECURE_REMOTE')) {
-    const error = new Error('非回环监听必须配置 PANEL_ADMIN_TOKEN，或明确设置 PANEL_ALLOW_INSECURE_REMOTE=1');
+  if (isLoopbackHost(host)) return;
+  if (!configuredToken) {
+    const error = new Error('非回环监听必须配置 PANEL_ADMIN_TOKEN');
     error.code = 'PANEL_REMOTE_AUTH_REQUIRED';
+    throw error;
+  }
+  if (!booleanEnvEnabled('PANEL_ALLOW_INSECURE_REMOTE')) {
+    const error = new Error('非回环监听会使用明文 HTTP，必须明确设置 PANEL_ALLOW_INSECURE_REMOTE=1');
+    error.code = 'PANEL_REMOTE_HTTP_CONFIRMATION_REQUIRED';
     throw error;
   }
 }
@@ -1745,13 +1782,8 @@ function createServer(options = {}) {
 
 async function startServer(options = {}) {
   validateRuntimeConfiguration();
-  const host = options.host ?? process.env.PANEL_HOST ?? '127.0.0.1';
-  const port = Number(options.port ?? process.env.PANEL_PORT ?? 4170);
-  if (!Number.isInteger(port) || port < 0 || port > 65535) {
-    const error = new Error('PANEL_PORT 必须是 0 到 65535 的整数');
-    error.code = 'PANEL_PORT_INVALID';
-    throw error;
-  }
+  const host = configuredListenHost(options.host);
+  const port = configuredListenPort(options.port);
   let server;
   try {
     validateListenConfiguration(host);
@@ -1901,6 +1933,8 @@ if (require.main === module) {
 
 module.exports = {
   buildSnapshot,
+  configuredListenHost,
+  configuredListenPort,
   createServer,
   installShutdownSignalHandlers,
   shutdownServer,

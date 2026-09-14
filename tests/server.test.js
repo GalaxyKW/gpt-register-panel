@@ -12,6 +12,8 @@ require('./test-isolation');
 const {
   authFailureBucketCount,
   authorizationError,
+  configuredListenHost,
+  configuredListenPort,
   createServer,
   openVerifiedStaticFile,
   phase3ClaimKeys,
@@ -78,6 +80,26 @@ test('HTTP limits treat blank values as defaults and clamp explicit bounds', () 
       if (previous[name] === undefined) delete process.env[name];
       else process.env[name] = previous[name];
     }
+  }
+});
+
+test('listen host and port reject ambiguous deployment values', () => {
+  assert.equal(configuredListenHost(undefined, {}), '127.0.0.1');
+  assert.equal(configuredListenHost(undefined, { PANEL_HOST: ' 127.0.0.1 ' }), '127.0.0.1');
+  assert.throws(
+    () => configuredListenHost(undefined, { PANEL_HOST: '   ' }),
+    (error) => error.code === 'PANEL_HOST_INVALID',
+  );
+
+  assert.equal(configuredListenPort(undefined, {}), 4170);
+  assert.equal(configuredListenPort(undefined, { PANEL_PORT: '   ' }), 4170);
+  assert.equal(configuredListenPort(undefined, { PANEL_PORT: '4171' }), 4171);
+  assert.equal(configuredListenPort(0, { PANEL_PORT: '4171' }), 0);
+  for (const invalid of ['0', '-1', '1e3', '0x1050', '65536', 'port']) {
+    assert.throws(
+      () => configuredListenPort(undefined, { PANEL_PORT: invalid }),
+      (error) => error.code === 'PANEL_PORT_INVALID',
+    );
   }
 });
 
