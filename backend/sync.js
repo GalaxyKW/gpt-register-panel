@@ -18,6 +18,7 @@ const {
   accountKeys,
   accountCredentialPresence,
   credentialsInSync,
+  sourceTerminalEvidence,
   sourceTerminalStatus,
   sourceStateImportDecision,
   isExpectedSub2ApiAccount,
@@ -917,6 +918,8 @@ function importPlanIntentItem(item) {
     sourceExpired: item?.sourceExpired === true,
     sourceDisabled: item?.sourceDisabled === true,
     sourceTerminalStatus: item?.sourceTerminalStatus || null,
+    sourceTerminalIdentityBasis: item?.sourceTerminalIdentityBasis || null,
+    sourceTerminalUsernameMatch: item?.sourceTerminalUsernameMatch || null,
     conflictingVersions: item?.conflictingVersions === true,
     identityConflict: item?.identityConflict === true,
     supersededBy: item?.supersededBy || null,
@@ -1266,7 +1269,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
         || !hasStrongIdentity(entry.candidate.sourceIdentityKeys)
         || !selectedCandidate(entry.candidate, selectedKeys)
         || isExpiryInvalid(entry.candidate.record)
-        || sourceTerminalStatus(sources?.usernames, entry.candidate.record)) continue;
+        || sourceTerminalEvidence(sources?.usernames, entry.candidate.record)) continue;
     const accountId = entry.account.id;
     if (accountId === undefined || accountId === null) continue;
     const key = String(accountId);
@@ -1280,8 +1283,9 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   for (const entry of entries) {
     const { candidate, matches, ambiguousHints, account } = entry;
     if (!selectedCandidate(candidate, selectedKeys)) continue;
-    const terminalStatus = sourceTerminalStatus(sources?.usernames, candidate.record);
-    const sourceDecision = sourceStateImportDecision(candidate.record, { terminalStatus });
+    const terminalEvidence = sourceTerminalEvidence(sources?.usernames, candidate.record);
+    const terminalStatus = terminalEvidence?.status || null;
+    const sourceDecision = sourceStateImportDecision(candidate.record, { terminalEvidence });
     let action = 'create';
     let reason = 'token_only';
     let assignedName = null;
@@ -1308,7 +1312,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       assignedName = account.name;
       const decision = matchedAccountImportDecision(candidate.record, account, {
         nowMs,
-        terminalStatus,
+        terminalEvidence,
         superseded,
       });
       action = decision.action;
@@ -1356,6 +1360,8 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       sourceExpired: isExpired(candidate.record, nowMs),
       sourceDisabled: candidate.record.disabled === true,
       sourceTerminalStatus: terminalStatus,
+      sourceTerminalIdentityBasis: terminalEvidence?.identityBasis || null,
+      sourceTerminalUsernameMatch: terminalEvidence?.usernameMatch || null,
       supersededBy: superseded ? preferred.candidate.record.relativePath : null,
       ...sourceSelectionMetadata(candidate, selectedKeys),
       _raw: candidate.record.raw,
@@ -1392,6 +1398,8 @@ function safeImportItem(item) {
     sourceExpired: item.sourceExpired,
     sourceDisabled: item.sourceDisabled,
     sourceTerminalStatus: item.sourceTerminalStatus || null,
+    sourceTerminalIdentityBasis: item.sourceTerminalIdentityBasis || null,
+    sourceTerminalUsernameMatch: item.sourceTerminalUsernameMatch || null,
     supersededBy: item.supersededBy || null,
     sourceVersionCount: Number(item.sourceVersionCount) || 1,
     selectedSourcePaths: Array.isArray(item.selectedSourcePaths) ? item.selectedSourcePaths : [],
@@ -1501,15 +1509,18 @@ async function resolveGroupIds(client, options = {}) {
       error.code = 'SUB2API_GROUP_NOT_FOUND';
       throw error;
     }
-    const unique = [...new Set(resolved)].sort((left, right) => left - right);
-    if (unique.length !== 1) {
+    // The management API response itself must identify exactly one row.
+    // Deduplicating IDs here would accept two conflicting/duplicated rows
+    // with the same ID, while the explicit-ID branch above correctly rejects
+    // that shape. Keep both resolution modes fail-closed and consistent.
+    if (resolved.length !== 1) {
       const error = new Error(useDefaultBinding
-        ? 'Sub2API 的 OpenAI 默认分组匹配到多个 ID'
-        : '配置的 Sub2API 分组名称匹配到多个 ID：' + wanted);
+        ? 'Sub2API 的 OpenAI 默认分组匹配到多条记录'
+        : '配置的 Sub2API 分组名称匹配到多条记录：' + wanted);
       error.code = 'SUB2API_GROUP_AMBIGUOUS';
       throw error;
     }
-    return unique;
+    return resolved;
   } catch (error) {
     rethrowIfJobInterrupted(error, signal);
     if ([

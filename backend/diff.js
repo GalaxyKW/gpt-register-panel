@@ -1,11 +1,12 @@
 const { normalizeIdentityValue } = require('./lib/token');
 const { getAccountAvailability } = require('./accountAvailability');
 
-const TERMINAL_SOURCE_STATUSES = new Set([
+const TERMINAL_SOURCE_STATUS_PRIORITY = Object.freeze([
   'account_deleted',
   'account_deactivated',
   'account_disabled',
 ]);
+const TERMINAL_SOURCE_STATUSES = new Set(TERMINAL_SOURCE_STATUS_PRIORITY);
 
 function accountKeys(account) {
   if (Array.isArray(account?.identityKeys) && account.identityKeys.length > 0) {
@@ -203,14 +204,29 @@ function credentialDifferenceReason(token, account) {
   return 'token_changed';
 }
 
-function sourceTerminalStatus(usernames = [], record) {
+function sourceTerminalEvidence(usernames = [], record) {
   const email = String(record?.email || '').trim().toLowerCase();
   if (!email) return null;
-  const terminal = (Array.isArray(usernames) ? usernames : []).find((item) => (
-    String(item?.email || '').trim().toLowerCase() === email
-      && TERMINAL_SOURCE_STATUSES.has(String(item?.status || '').trim().toLowerCase())
-  ));
-  return terminal ? String(terminal.status).trim().toLowerCase() : null;
+  // username.json does not carry account/user IDs, so this email-only match
+  // is a conservative write blocker, never identity authorization. More than
+  // one row can share an email; choose a stable most-terminal result rather
+  // than letting file order alter the import-plan intent.
+  const matches = (Array.isArray(usernames) ? usernames : [])
+    .filter((item) => String(item?.email || '').trim().toLowerCase() === email);
+  const statuses = new Set(matches
+    .map((item) => String(item?.status || '').trim().toLowerCase())
+    .filter((status) => TERMINAL_SOURCE_STATUSES.has(status)));
+  const status = TERMINAL_SOURCE_STATUS_PRIORITY.find((candidate) => statuses.has(candidate));
+  if (!status) return null;
+  return {
+    status,
+    identityBasis: 'email_only',
+    usernameMatch: matches.length === 1 ? 'unique' : 'ambiguous',
+  };
+}
+
+function sourceTerminalStatus(usernames = [], record) {
+  return sourceTerminalEvidence(usernames, record)?.status || null;
 }
 
 function isExpectedSub2ApiAccount(account) {
@@ -222,10 +238,23 @@ function isExpectedSub2ApiAccount(account) {
 // planner. Keeping them separate preserves that precedence when callers have
 // not yet established a unique strong-identity mapping.
 function sourceStateImportDecision(token, options = {}) {
-  const terminalStatus = options.terminalStatus
-    || sourceTerminalStatus(options.usernames, token);
+  const terminalEvidence = options.terminalEvidence
+    || (options.terminalStatus
+      ? {
+          status: options.terminalStatus,
+          identityBasis: 'email_only',
+          usernameMatch: 'unknown',
+        }
+      : sourceTerminalEvidence(options.usernames, token));
+  const terminalStatus = terminalEvidence?.status || null;
   if (terminalStatus) {
-    return { action: 'skip', reason: 'source_account_terminal', terminalStatus };
+    return {
+      action: 'skip',
+      reason: 'source_account_terminal',
+      terminalStatus,
+      sourceTerminalIdentityBasis: terminalEvidence.identityBasis,
+      sourceTerminalUsernameMatch: terminalEvidence.usernameMatch,
+    };
   }
   if (isExpiryInvalid(token)) {
     return { action: 'skip', reason: 'source_expiry_invalid', terminalStatus: null };
@@ -475,6 +504,8 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
         account: null,
         decisionAction: decision?.action ?? null,
         decisionReason: decision?.reason || null,
+        sourceTerminalIdentityBasis: decision?.sourceTerminalIdentityBasis || null,
+        sourceTerminalUsernameMatch: decision?.sourceTerminalUsernameMatch || null,
         issues: identityAmbiguous
           ? [
               'ambiguous_sub2api_identity',
@@ -524,6 +555,8 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       observedKind,
       decisionAction: decision.action,
       decisionReason: decision.reason,
+      sourceTerminalIdentityBasis: decision.sourceTerminalIdentityBasis || null,
+      sourceTerminalUsernameMatch: decision.sourceTerminalUsernameMatch || null,
       source: token.source,
       relativePath: token.relativePath,
       fileName: token.fileName,
@@ -625,6 +658,8 @@ function toSafeDiff(diff) {
       observedKind: item.observedKind || item.kind,
       decisionAction: item.decisionAction || null,
       decisionReason: item.decisionReason || null,
+      sourceTerminalIdentityBasis: item.sourceTerminalIdentityBasis || null,
+      sourceTerminalUsernameMatch: item.sourceTerminalUsernameMatch || null,
       source: item.source,
       relativePath: item.relativePath,
       fileName: item.fileName,
@@ -682,6 +717,7 @@ module.exports = {
   accountCredentialPresence,
   credentialsInSync,
   credentialDifferenceReason,
+  sourceTerminalEvidence,
   sourceTerminalStatus,
   sourceStateImportDecision,
   isExpectedSub2ApiAccount,

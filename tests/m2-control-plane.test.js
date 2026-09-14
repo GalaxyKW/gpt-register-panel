@@ -2063,6 +2063,76 @@ test('no-remote and ambiguous diff decisions match planner blockers when they ar
   ]);
 });
 
+test('email-only terminal username evidence blocks writes without merging strong identities', () => {
+  const email = 'shared-terminal@example.test';
+  const first = syntheticToken(
+    'tokens/terminal-first.json',
+    ['account:terminal-account-one', 'user:terminal-user-one', 'email:' + email],
+    {
+      email,
+      accountId: 'terminal-account-one',
+      userId: 'terminal-user-one',
+    },
+  );
+  const second = syntheticToken(
+    'tokens/terminal-second.json',
+    ['account:terminal-account-two', 'user:terminal-user-two', 'email:' + email],
+    {
+      email,
+      accountId: 'terminal-account-two',
+      userId: 'terminal-user-two',
+    },
+  );
+  const remote = {
+    id: 271,
+    name: 'free00271',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    schedulable: false,
+    identityKeys: first.identityKeys,
+    tokenFingerprints: { access: 'older-access' },
+  };
+  const terminalRows = [
+    { email, status: 'account_disabled' },
+    { email: email.toUpperCase(), status: 'account_deleted' },
+  ];
+
+  for (const usernames of [terminalRows, [...terminalRows].reverse()]) {
+    const sources = { tokens: [first, second], usernames };
+    const plan = buildImportPlan(sources, [remote]);
+    assert.equal(plan.length, 2);
+    assert.deepEqual(plan.map((item) => item.action), ['skip', 'skip']);
+    assert.deepEqual(plan.map((item) => item.reason), [
+      'source_account_terminal',
+      'source_account_terminal',
+    ]);
+    assert.deepEqual(plan.map((item) => item.sourceTerminalStatus), [
+      'account_deleted',
+      'account_deleted',
+    ]);
+    assert.equal(plan.every((item) => item.sourceTerminalIdentityBasis === 'email_only'), true);
+    assert.equal(plan.every((item) => item.sourceTerminalUsernameMatch === 'ambiguous'), true);
+    assert.equal(plan.some((item) => ['create', 'update'].includes(item.action)), false);
+
+    const diff = buildDiff(sources.tokens, [remote], { usernames });
+    assert.equal(diff.items.length, 2);
+    assert.equal(diff.items.every((item) => item.decisionAction === 'skip'), true);
+    assert.equal(diff.items.every((item) => item.decisionReason === 'source_account_terminal'), true);
+    assert.equal(diff.items.every(
+      (item) => item.sourceTerminalIdentityBasis === 'email_only',
+    ), true);
+    assert.equal(diff.items.every(
+      (item) => item.sourceTerminalUsernameMatch === 'ambiguous',
+    ), true);
+    const safeDiff = toSafeDiff(diff);
+    assert.equal(safeDiff.items.every(
+      (item) => item.sourceTerminalUsernameMatch === 'ambiguous',
+    ), true);
+  }
+});
+
 test('aggregated strong identity refuses a partial remote even when the freshest source matches it', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-duplicate-source-'));
   fs.mkdirSync(path.join(root, 'tokens'));
@@ -2939,6 +3009,17 @@ test('group resolution accepts only one exact safe match', async () => {
     await assert.rejects(
       resolveGroupIds({
         async listGroups() {
+          return [
+            { id: 3, name: 'share', platform: 'openai', status: 'active' },
+            { id: 3, name: 'share', platform: 'openai', status: 'active' },
+          ];
+        },
+      }),
+      (error) => error.code === 'SUB2API_GROUP_AMBIGUOUS',
+    );
+    await assert.rejects(
+      resolveGroupIds({
+        async listGroups() {
           return [{ id: true, name: 'share', platform: 'openai', status: 'active' }];
         },
       }),
@@ -2950,6 +3031,19 @@ test('group resolution accepts only one exact safe match', async () => {
       (error) => error.code === 'SUB2API_GROUP_RESOLVE_FAILED'
         && error.message === '读取 Sub2API 分组失败'
         && !error.message.includes(opaqueGroupFailure),
+    );
+
+    process.env.SUB2API_GROUP_NAME = '';
+    await assert.rejects(
+      resolveGroupIds({
+        async listGroups() {
+          return [
+            { id: 11, name: 'openai-default', platform: 'openai', status: 'active' },
+            { id: 11, name: 'openai-default', platform: 'openai', status: 'active' },
+          ];
+        },
+      }),
+      (error) => error.code === 'SUB2API_GROUP_AMBIGUOUS',
     );
 
     process.env.SUB2API_GROUP_IDS = '9, 7,9';
