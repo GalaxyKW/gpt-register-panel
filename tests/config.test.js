@@ -115,6 +115,19 @@ test('loadEnv uses PANEL_ENV_FILE without exposing or copying its values', () =>
   assert.equal(environment.PANEL_ENV_FILE, filePath);
 });
 
+test('loadEnv fails closed when an explicitly selected environment file is missing', () => {
+  const missing = path.join(os.tmpdir(), 'missing-panel-env-' + process.pid + '.env');
+  assert.equal(fs.existsSync(missing), false);
+  assert.throws(
+    () => loadEnv(undefined, { PANEL_ENV_FILE: missing }),
+    (error) => error.code === 'ENV_FILE_MISSING',
+  );
+  assert.throws(
+    () => loadEnv(missing, {}),
+    (error) => error.code === 'ENV_FILE_MISSING',
+  );
+});
+
 test('readEnvFile rejects final and parent-directory symlinks', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-'));
   const realDirectory = path.join(directory, 'real');
@@ -233,4 +246,21 @@ test('readEnvFile rejects any group or other access and multiply linked secret f
     () => readEnvFile(linked),
     (error) => error.code === 'ENV_FILE_LINK_INVALID',
   );
+});
+
+test('readEnvFile rejects a private file beneath a replaceable parent directory', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-env-parent-'));
+  const unsafeDirectory = path.join(root, 'replaceable');
+  fs.mkdirSync(unsafeDirectory, { mode: 0o700 });
+  const filePath = path.join(unsafeDirectory, 'panel.env');
+  fs.writeFileSync(filePath, 'SAFE_VALUE=fake\n', { mode: 0o600 });
+  fs.chmodSync(unsafeDirectory, 0o777);
+  try {
+    assert.throws(
+      () => readEnvFile(filePath),
+      (error) => error.code === 'ENV_PARENT_PERMISSIONS_INVALID',
+    );
+  } finally {
+    fs.chmodSync(unsafeDirectory, 0o700);
+  }
 });

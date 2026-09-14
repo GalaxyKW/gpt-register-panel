@@ -116,6 +116,36 @@ function assertSecureEnvFileStat(stat) {
   if (error) throw error;
 }
 
+function assertSecureEnvParentTree(directory) {
+  const absolute = path.resolve(directory);
+  const parsed = path.parse(absolute);
+  const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const parts = absolute.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  let current = parsed.root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    let stat;
+    try { stat = fs.lstatSync(current); } catch {
+      throw envPathError('ENV_PARENT_INVALID', '环境配置父目录无法安全检查');
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw envPathError('ENV_PARENT_INVALID', '环境配置父目录不能包含符号链接');
+    }
+    const trustedOwner = currentUid === null || stat.uid === currentUid || stat.uid === 0;
+    const writableByOthers = (stat.mode & 0o022) !== 0;
+    // Root/current-user owned sticky directories (for example /tmp) prevent
+    // unrelated users from replacing entries they do not own. Other writable
+    // ancestors would let a local user swap a verified environment path.
+    const trustedStickyDirectory = trustedOwner && (stat.mode & 0o1000) !== 0;
+    if (!trustedOwner || (writableByOthers && !trustedStickyDirectory)) {
+      throw envPathError(
+        'ENV_PARENT_PERMISSIONS_INVALID',
+        '环境配置父目录所有权或写权限不安全',
+      );
+    }
+  }
+}
+
 function isEnvironmentFileError(error) {
   return typeof error?.code === 'string' && error.code.startsWith('ENV_');
 }
@@ -152,6 +182,7 @@ function readEnvFile(filePath) {
   try { assertDirectoryTree(path.dirname(absolute), '环境配置父目录'); } catch {
     throw envPathError('ENV_PARENT_INVALID', '环境配置父目录不可信');
   }
+  assertSecureEnvParentTree(path.dirname(absolute));
   let realParent;
   try { realParent = fs.realpathSync(path.dirname(absolute)); } catch {
     throw envPathError('ENV_PARENT_INVALID', '环境配置父目录无法解析');
@@ -223,8 +254,15 @@ function configuredEnvFile(environment = process.env) {
 }
 
 function loadEnv(filePath, environment = process.env) {
-  const content = readEnvFile(filePath === undefined ? configuredEnvFile(environment) : filePath);
-  if (content === null) return false;
+  const explicitlySelected = filePath !== undefined || environment.PANEL_ENV_FILE !== undefined;
+  const selectedFile = filePath === undefined ? configuredEnvFile(environment) : filePath;
+  const content = readEnvFile(selectedFile);
+  if (content === null) {
+    if (explicitlySelected) {
+      throw envPathError('ENV_FILE_MISSING', '显式指定的环境配置文件不存在');
+    }
+    return false;
+  }
   // Parse and validate the complete file before mutating process.env. This
   // prevents an invalid trailing line or duplicate from leaving a partially
   // applied deployment configuration behind.

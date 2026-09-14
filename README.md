@@ -37,7 +37,7 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
     node --version
     npm ci
 
-敏感配置必须位于支持 Unix 权限的文件系统，文件由启动面板的账号持有且权限不宽于 `0600`。可用 `PANEL_ENV_FILE` 指定绝对路径；不要在 NTFS 上的项目目录中继续使用无法落实私有权限的 `.env`：
+敏感配置必须位于支持 Unix 权限的文件系统，文件由启动面板的账号持有且权限不宽于 `0600`，父目录也不能由不可信用户替换。可用 `PANEL_ENV_FILE` 指定绝对路径；显式路径不存在或不安全时面板会拒绝启动。不要在 NTFS 上的项目目录中继续使用无法落实私有权限的 `.env`：
 
     sudo install -d -o root -g root -m 0700 /etc/gpt-register-panel
     sudo install -o root -g root -m 0600 .env.example /etc/gpt-register-panel/panel.env
