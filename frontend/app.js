@@ -14,6 +14,8 @@ const state = {
   jobPollTimer: null,
   cleanupRequestPending: false,
   snapshotRequestSequence: 0,
+  snapshotRequestsPending: 0,
+  selectionRevision: 0,
   resumeJobsPending: false,
 };
 
@@ -442,7 +444,10 @@ function activeJobPending() {
 }
 
 function actionsLocked() {
-  return actionRequestPending() || activeJobPending() || state.snapshotRefreshPending;
+  return actionRequestPending()
+    || activeJobPending()
+    || state.snapshotRefreshPending
+    || state.snapshotRequestsPending > 0;
 }
 
 function updateImportButtonState() {
@@ -510,15 +515,37 @@ function invalidatePlan() {
   showNotice('选择已变化，请重新执行“检查差异”。', 'notice-warning');
 }
 
+function selectionsEqual(left, right) {
+  if (left.size !== right.size) return false;
+  return [...left].every((key) => right.has(key));
+}
+
+function changeSelection(nextSelected) {
+  if (actionsLocked()) return false;
+  const next = new Set(nextSelected);
+  if (selectionsEqual(state.selected, next)) return false;
+  state.selected = next;
+  state.selectionRevision += 1;
+  invalidatePlan();
+  renderRows();
+  return true;
+}
+
+function selectionStillCurrent(revision, selectedKeys) {
+  if (state.selectionRevision !== revision || state.selected.size !== selectedKeys.length) return false;
+  return selectedKeys.every((key) => state.selected.has(key));
+}
+
 function renderRows() {
   const rows = state.rows;
+  const checkboxDisabled = actionsLocked() ? ' disabled' : '';
   elements.accountRows.innerHTML = rows.map((row) => {
     const checked = state.selected.has(row.key) ? ' checked' : '';
     const displayName = row.accountName || row.fileName || '(未命名)';
     const issueText = row.issues?.length ? ' title="' + escapeHtml(row.issues.join(', ')) + '"' : '';
     const usageTitle = row.usageError ? ' title="' + escapeHtml(row.usageError) + '"' : '';
     return '<tr class="' + (state.selected.has(row.key) ? 'is-selected' : '') + '">'
-      + '<td class="check-col"><input class="row-check" data-key="' + escapeHtml(row.key) + '" type="checkbox" aria-label="选择 ' + escapeHtml(displayName) + '"' + checked + '></td>'
+      + '<td class="check-col"><input class="row-check" data-key="' + escapeHtml(row.key) + '" type="checkbox" aria-label="选择 ' + escapeHtml(displayName) + '"' + checked + checkboxDisabled + '></td>'
       + '<td><strong>' + escapeHtml(displayName) + '</strong><small>' + escapeHtml(row.chatgptAccountId || row.userId || row.relativePath || '-') + '</small></td>'
       + '<td>' + escapeHtml(row.email || '-') + '</td>'
       + '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(statusLabel(row.status)) + '</span>'
@@ -541,10 +568,10 @@ function renderRows() {
   elements.selectAll.indeterminate = selectedVisible > 0 && !elements.selectAll.checked;
   document.querySelectorAll('.row-check').forEach((input) => {
     input.addEventListener('change', () => {
-      if (input.checked) state.selected.add(input.dataset.key);
-      else state.selected.delete(input.dataset.key);
-      invalidatePlan();
-      renderRows();
+      const next = new Set(state.selected);
+      if (input.checked) next.add(input.dataset.key);
+      else next.delete(input.dataset.key);
+      if (!changeSelection(next)) input.checked = state.selected.has(input.dataset.key);
     });
   });
   updateActionState();
@@ -875,10 +902,12 @@ async function resumeActiveJob() {
 
 async function loadSnapshot(options = {}) {
   const requestId = ++state.snapshotRequestSequence;
+  state.snapshotRequestsPending += 1;
   if (options.resumeJobs) state.resumeJobsPending = true;
   let loaded = false;
   elements.loadingLabel.hidden = false;
   elements.refreshButton.disabled = true;
+  updateActionState();
   try {
     const query = new URLSearchParams({ withSub2api: '1' });
     if (elements.historicalToggle?.checked) query.set('includeHistorical', '1');
@@ -887,8 +916,10 @@ async function loadSnapshot(options = {}) {
     if (requestId !== state.snapshotRequestSequence) return false;
     if (!response.ok) throw new Error(snapshot.message || snapshot.error || '读取失败');
     state.snapshot = snapshot;
-    const validKeys = new Set(snapshot.rows.map((row) => row.key));
-    state.selected = new Set([...state.selected].filter((key) => validKeys.has(key)));
+    // A stable row key does not prove that the file at that path still belongs
+    // to the same account. Never carry a selection across snapshot versions.
+    state.selected = new Set();
+    state.selectionRevision += 1;
     renderPlan(null);
     renderMetrics(snapshot);
     renderSelectOptions(elements.statusFilter, snapshot.filters.statuses, {}, '全部状态');
@@ -921,43 +952,53 @@ async function loadSnapshot(options = {}) {
     applyFilters();
     void loadAccountTestModels(snapshot);
     loaded = true;
+    if (requestId === state.snapshotRequestSequence && state.resumeJobsPending) {
+      state.resumeJobsPending = false;
+      await resumeActiveJob();
+    }
   } catch (error) {
     if (requestId === state.snapshotRequestSequence) showNotice(error.message, 'notice-danger');
   } finally {
-    if (requestId === state.snapshotRequestSequence) {
-      elements.loadingLabel.hidden = true;
-      elements.refreshButton.disabled = false;
-    }
-  }
-  if (requestId === state.snapshotRequestSequence && state.resumeJobsPending) {
-    state.resumeJobsPending = false;
-    await resumeActiveJob();
+    state.snapshotRequestsPending = Math.max(0, state.snapshotRequestsPending - 1);
+    elements.loadingLabel.hidden = state.snapshotRequestsPending === 0;
+    elements.refreshButton.disabled = state.snapshotRequestsPending > 0;
+    updateActionState();
   }
   return loaded;
 }
 
 elements.refreshButton.addEventListener('click', loadSnapshot);
-elements.previewButton.addEventListener('click', async () => {
+async function previewSelection() {
   if (state.previewRequestPending) return;
   state.previewRequestPending = true;
-  updateActionState();
   const selectedKeys = [...state.selected];
+  const selectionRevision = state.selectionRevision;
+  // Do not leave an older plan importable if this request later proves stale.
+  renderPlan(null);
+  updateActionState();
   try {
     const response = await apiFetch('/api/sync/preview', {
       method: 'POST',
       body: JSON.stringify({ selectedKeys }),
     });
     const body = await response.json();
+    if (!selectionStillCurrent(selectionRevision, selectedKeys)) return false;
     if (!response.ok) throw new Error(body.message || body.error || '差异检查失败');
     renderPlan({ ...body, selectedKeys });
     showNotice(selectedKeys.length ? '差异预览已生成，确认前仍会重新检查来源版本。' : '已生成全部差异预览；如需导入，请先选择账号后重新检查。', 'notice-info');
+    return true;
   } catch (error) {
-    showNotice(error.message, 'notice-danger');
+    if (selectionStillCurrent(selectionRevision, selectedKeys)) {
+      showNotice(error.message, 'notice-danger');
+    }
+    return false;
   } finally {
     state.previewRequestPending = false;
     updateActionState();
   }
-});
+}
+
+elements.previewButton.addEventListener('click', previewSelection);
 
 elements.importButton.addEventListener('click', async () => {
   if (!state.plan || state.importRequestPending) return;
@@ -1099,16 +1140,16 @@ if (elements.cleanupButton) {
 }
 
 elements.clearSelectionButton.addEventListener('click', () => {
-  state.selected.clear();
-  invalidatePlan();
-  renderRows();
+  changeSelection(new Set());
 });
 
 elements.selectAll.addEventListener('change', () => {
-  if (elements.selectAll.checked) state.rows.forEach((row) => state.selected.add(row.key));
-  else state.rows.forEach((row) => state.selected.delete(row.key));
-  invalidatePlan();
-  renderRows();
+  const next = new Set(state.selected);
+  if (elements.selectAll.checked) state.rows.forEach((row) => next.add(row.key));
+  else state.rows.forEach((row) => next.delete(row.key));
+  if (!changeSelection(next)) {
+    elements.selectAll.checked = state.rows.length > 0 && state.rows.every((row) => state.selected.has(row.key));
+  }
 });
 
 [elements.searchInput, elements.statusFilter, elements.availabilityFilter, elements.sourceFilter, elements.diffFilter]
@@ -1148,7 +1189,9 @@ function updateActionState() {
       elements.accountTestButton.title = '使用所选模型测试上游账号；error 账号成功后恢复并启用';
     }
   }
-  elements.clearSelectionButton.disabled = state.selected.size === 0;
+  elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
+  elements.selectAll.disabled = locked;
+  document.querySelectorAll('.row-check').forEach((input) => { input.disabled = locked; });
   elements.previewButton.disabled = locked;
   updateImportButtonState();
   if (elements.cleanupButton) {

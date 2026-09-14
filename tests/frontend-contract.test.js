@@ -241,10 +241,14 @@ test('frontend globally locks mutating actions while any request or task is unre
   assert.match(lockContract, /phase3RequestPending/);
   assert.match(lockContract, /accountTestRequestPending/);
   assert.match(lockContract, /cleanupRequestPending/);
+  assert.match(lockContract, /snapshotRequestsPending > 0/);
   assert.match(lockContract, /\['queued', 'running', 'unknown'\]/);
   assert.match(updateContract, /phase3Button\.disabled = locked/);
   assert.match(updateContract, /accountTestButton\.disabled = locked/);
   assert.match(updateContract, /previewButton\.disabled = locked/);
+  assert.match(updateContract, /clearSelectionButton\.disabled = locked/);
+  assert.match(updateContract, /selectAll\.disabled = locked/);
+  assert.match(updateContract, /input\.disabled = locked/);
   assert.match(updateContract, /updateImportButtonState\(\)/);
   assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| locked/);
 });
@@ -398,13 +402,16 @@ test('frontend keeps an in-memory token fallback when session storage is unavail
   });
 });
 
-test('frontend ignores an older snapshot response that arrives last', async () => {
+test('frontend keeps concurrent snapshot requests locked and clears selection on replacement', async () => {
   const loadSnapshotContract = sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'");
   const requests = [];
+  const lockStates = [];
   const stateForTest = {
     snapshot: null,
-    selected: new Set(),
+    selected: new Set(['same-key']),
     snapshotRequestSequence: 0,
+    snapshotRequestsPending: 0,
+    selectionRevision: 4,
     resumeJobsPending: false,
     job: null,
   };
@@ -419,7 +426,7 @@ test('frontend ignores an older snapshot response that arrives last', async () =
       diffFilter: {},
     },
     state: stateForTest,
-    apiFetch: () => new Promise((resolve) => requests.push(resolve)),
+    apiFetch: () => new Promise((resolve, reject) => requests.push({ resolve, reject })),
     applyFilters() {},
     loadAccountTestModels() {},
     renderMetrics() {},
@@ -427,29 +434,125 @@ test('frontend ignores an older snapshot response that arrives last', async () =
     renderSelectOptions() {},
     resumeActiveJob: async () => {},
     showNotice() {},
+    updateActionState() {
+      lockStates.push(stateForTest.snapshotRequestsPending > 0);
+    },
   };
   vm.runInNewContext(loadSnapshotContract + `
     firstPromise = loadSnapshot();
     secondPromise = loadSnapshot();
   `, context);
   assert.equal(requests.length, 2);
+  assert.equal(stateForTest.snapshotRequestsPending, 2);
+  assert.equal(context.elements.refreshButton.disabled, true);
   const newer = {
     marker: 'newer',
-    rows: [{ key: 'newer' }],
+    rows: [{ key: 'same-key' }],
     filters: { statuses: [], availabilities: [], diffKinds: [] },
     sub2api: { apiError: null, statsError: null },
   };
-  requests[1]({ ok: true, json: async () => newer });
+  requests[1].resolve({ ok: true, json: async () => newer });
   assert.equal(await context.secondPromise, true);
+  assert.equal(stateForTest.snapshotRequestsPending, 1);
+  assert.equal(context.elements.refreshButton.disabled, true);
+  assert.equal(context.elements.loadingLabel.hidden, false);
+  assert.deepEqual([...stateForTest.selected], []);
+  assert.equal(stateForTest.selectionRevision, 5);
   const older = {
     marker: 'older',
     rows: [{ key: 'older' }],
     filters: { statuses: [], availabilities: [], diffKinds: [] },
     sub2api: { apiError: null, statsError: null },
   };
-  requests[0]({ ok: true, json: async () => older });
+  requests[0].resolve({ ok: true, json: async () => older });
   assert.equal(await context.firstPromise, false);
   assert.equal(stateForTest.snapshot.marker, 'newer');
+  assert.equal(stateForTest.snapshotRequestsPending, 0);
+  assert.equal(context.elements.refreshButton.disabled, false);
+  assert.equal(context.elements.loadingLabel.hidden, true);
+  assert.equal(lockStates.at(-1), false);
+
+  vm.runInNewContext('failurePromise = loadSnapshot();', context);
+  assert.equal(stateForTest.snapshotRequestsPending, 1);
+  requests[2].reject(new Error('offline'));
+  assert.equal(await context.failurePromise, false);
+  assert.equal(stateForTest.snapshotRequestsPending, 0);
+  assert.equal(context.elements.refreshButton.disabled, false);
+  assert.equal(lockStates.at(-1), false);
+});
+
+test('frontend selection mutations are blocked while actions are locked', () => {
+  const selectionContract = sourceSection('function selectionsEqual', 'function renderRows');
+  let locked = true;
+  let invalidations = 0;
+  let renders = 0;
+  const context = {
+    state: { selected: new Set(['one']), selectionRevision: 7 },
+    actionsLocked: () => locked,
+    invalidatePlan: () => { invalidations += 1; },
+    renderRows: () => { renders += 1; },
+  };
+  vm.runInNewContext(selectionContract + `
+    blocked = changeSelection(new Set(['two']));
+  `, context);
+  assert.equal(context.blocked, false);
+  assert.deepEqual([...context.state.selected], ['one']);
+  assert.equal(context.state.selectionRevision, 7);
+
+  locked = false;
+  vm.runInNewContext(`
+    changed = changeSelection(new Set(['two']));
+    unchanged = changeSelection(new Set(['two']));
+  `, context);
+  assert.equal(context.changed, true);
+  assert.equal(context.unchanged, false);
+  assert.deepEqual([...context.state.selected], ['two']);
+  assert.equal(context.state.selectionRevision, 8);
+  assert.equal(invalidations, 1);
+  assert.equal(renders, 1);
+
+  const rowContract = sourceSection('function renderRows', 'function renderPlan');
+  assert.match(rowContract, /changeSelection\(next\)/);
+  const bulkHandlers = sourceSection("elements.clearSelectionButton.addEventListener", "\[elements.searchInput");
+  assert.equal((bulkHandlers.match(/changeSelection\(/g) || []).length, 2);
+});
+
+test('frontend discards a preview when the selected keys or revision changes in flight', async () => {
+  const freshnessContract = sourceSection('function selectionStillCurrent', 'function renderRows');
+  const previewContract = sourceSection('async function previewSelection', "elements.previewButton.addEventListener('click', previewSelection);");
+  const requests = [];
+  const plans = [];
+  const notices = [];
+  const stateForTest = {
+    selected: new Set(['one']),
+    selectionRevision: 3,
+    previewRequestPending: false,
+  };
+  const context = {
+    state: stateForTest,
+    apiFetch: () => new Promise((resolve) => requests.push(resolve)),
+    renderPlan: (plan) => plans.push(plan),
+    showNotice: (...args) => notices.push(args),
+    updateActionState() {},
+  };
+  vm.runInNewContext(freshnessContract + '\n' + previewContract + `
+    changedKeysPromise = previewSelection();
+  `, context);
+  assert.equal(stateForTest.previewRequestPending, true);
+  stateForTest.selected.add('two');
+  requests[0]({ ok: true, json: async () => ({ version: 'stale-keys', items: [] }) });
+  assert.equal(await context.changedKeysPromise, false);
+  assert.equal(stateForTest.previewRequestPending, false);
+  assert.deepEqual(plans, [null]);
+  assert.equal(notices.length, 0);
+
+  stateForTest.selected = new Set(['one']);
+  vm.runInNewContext('changedRevisionPromise = previewSelection();', context);
+  stateForTest.selectionRevision += 1;
+  requests[1]({ ok: true, json: async () => ({ version: 'stale-revision', items: [] }) });
+  assert.equal(await context.changedRevisionPromise, false);
+  assert.deepEqual(plans, [null, null]);
+  assert.equal(notices.length, 0);
 });
 
 test('frontend account search includes phone numbers', () => {
