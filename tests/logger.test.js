@@ -262,6 +262,59 @@ test('audit checkpoints are contextual, redacted, and fsynced before returning s
   assert.ok(checkpointFsyncs >= 1);
 });
 
+test('custom log directory is fsynced after rotation and current-log recreation', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-durable-'));
+  const dbDirectory = path.join(root, 'db');
+  const logDirectory = path.join(root, 'custom-log');
+  fs.mkdirSync(dbDirectory, { mode: 0o700 });
+  fs.mkdirSync(logDirectory, { mode: 0o700 });
+  const filePath = path.join(logDirectory, 'panel.log');
+  const logDirectoryStat = fs.statSync(logDirectory);
+  const dbDirectoryStat = fs.statSync(dbDirectory);
+  const originalFsyncSync = fs.fsyncSync;
+  const fsyncTargets = [];
+  let logger;
+  fs.fsyncSync = function trackedCustomDirectoryFsync(descriptor) {
+    const stat = fs.fstatSync(descriptor);
+    fsyncTargets.push({
+      kind: stat.isDirectory() ? 'directory' : 'file',
+      dev: stat.dev,
+      ino: stat.ino,
+    });
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    logger = new PanelLogger({
+      dbPath: path.join(dbDirectory, 'panel.sqlite3'),
+      filePath,
+      console: false,
+      maxBytes: 1024,
+      rotations: 2,
+    });
+    assert.ok(fsyncTargets.some((target) => target.kind === 'directory'
+      && target.dev === logDirectoryStat.dev && target.ino === logDirectoryStat.ino));
+    assert.equal(fsyncTargets.some((target) => target.kind === 'directory'
+      && target.dev === dbDirectoryStat.dev && target.ino === dbDirectoryStat.ino), false);
+
+    fs.appendFileSync(filePath, JSON.stringify({
+      event: 'existing.large',
+      padding: 'x'.repeat(1100),
+    }) + '\n');
+    fsyncTargets.length = 0;
+    assert.equal(logger.checkpoint('test.custom_log_rotation'), true);
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  assert.equal(fs.existsSync(filePath + '.1'), true);
+  assert.equal(logger.tail(1)[0].event, 'test.custom_log_rotation');
+  assert.ok(fsyncTargets.some((target) => target.kind === 'directory'
+    && target.dev === logDirectoryStat.dev && target.ino === logDirectoryStat.ino));
+  assert.equal(fsyncTargets.some((target) => target.kind === 'directory'
+    && target.dev === dbDirectoryStat.dev && target.ino === dbDirectoryStat.ino), false);
+  assert.deepEqual(fsyncTargets.slice(-2).map((target) => target.kind), ['file', 'directory']);
+});
+
 test('audit checkpoint assertion fails closed for missing, rejected, or throwing sinks', () => {
   for (const logger of [
     null,
@@ -292,6 +345,41 @@ test('a checkpoint fsync failure marks the logger unhealthy and fails closed', (
       () => assertAuditLogCheckpoint(logger, 'test.fsync_failure'),
       (error) => error?.code === 'AUDIT_LOG_UNAVAILABLE'
         && !String(error.message).includes('simulated checkpoint fsync failure'),
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(logger.health().healthy, false);
+  assert.equal(logger.health().consecutiveWriteFailures, 1);
+});
+
+test('a custom log directory fsync failure makes an audit checkpoint fail closed', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-dir-fsync-'));
+  const logDirectory = path.join(root, 'custom-log');
+  fs.mkdirSync(logDirectory, { mode: 0o700 });
+  const filePath = path.join(logDirectory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024, rotations: 2 });
+  fs.appendFileSync(filePath, JSON.stringify({
+    event: 'existing.large',
+    padding: 'x'.repeat(1100),
+  }) + '\n');
+
+  const logDirectoryStat = fs.statSync(logDirectory);
+  const originalFsyncSync = fs.fsyncSync;
+  fs.fsyncSync = function failingCustomDirectoryFsync(descriptor) {
+    const stat = fs.fstatSync(descriptor);
+    if (stat.isDirectory() && stat.dev === logDirectoryStat.dev && stat.ino === logDirectoryStat.ino) {
+      const error = new Error('simulated custom log directory fsync failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    assert.throws(
+      () => assertAuditLogCheckpoint(logger, 'test.directory_fsync_failure'),
+      (error) => error?.code === 'AUDIT_LOG_UNAVAILABLE'
+        && !String(error.message).includes('simulated custom log directory fsync failure'),
     );
   } finally {
     fs.fsyncSync = originalFsyncSync;
@@ -335,7 +423,7 @@ test('logger treats rotation failure as a failed write until rotation recovers',
 
   const originalRenameSync = fs.renameSync;
   fs.renameSync = function failingRotation(from, to) {
-    if (from === filePath) {
+    if (path.basename(String(from)) === path.basename(filePath)) {
       const error = new Error('forced rotation failure');
       error.code = 'EACCES';
       throw error;
@@ -470,7 +558,7 @@ test('logger tail does not follow a file swapped to a symbolic link before open'
   const originalOpenSync = fs.openSync;
   let swapped = false;
   fs.openSync = function guardedOpen(target, ...args) {
-    if (!swapped && target === filePath) {
+    if (!swapped && path.basename(String(target)) === path.basename(filePath)) {
       swapped = true;
       fs.renameSync(filePath, filePath + '.original');
       fs.symlinkSync(outsidePath, filePath);
@@ -494,7 +582,7 @@ test('logger writes do not follow a file swapped to a symbolic link before open'
   const originalOpenSync = fs.openSync;
   let swapped = false;
   fs.openSync = function guardedOpen(target, ...args) {
-    if (!swapped && target === filePath) {
+    if (!swapped && path.basename(String(target)) === path.basename(filePath)) {
       swapped = true;
       fs.renameSync(filePath, filePath + '.original');
       fs.symlinkSync(outsidePath, filePath);

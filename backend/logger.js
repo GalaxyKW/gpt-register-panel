@@ -345,6 +345,7 @@ class PanelLogger {
 
   ensureDirectory() {
     let descriptor;
+    let pinnedDirectory;
     try {
       const directory = ensureDirectoryTree(path.dirname(this.filePath), '日志目录');
       const directoryStat = fs.lstatSync(directory);
@@ -359,8 +360,10 @@ class PanelLogger {
         dev: directoryStat.dev,
         ino: directoryStat.ino,
       };
+      pinnedDirectory = this.openPinnedDirectory();
+      const pinnedFilePath = this.filePathIn(pinnedDirectory);
       let fileStat;
-      try { fileStat = fs.lstatSync(this.filePath); } catch (error) {
+      try { fileStat = fs.lstatSync(pinnedFilePath); } catch (error) {
         if (error?.code === 'ENOENT') fileStat = null;
         else throw error;
       }
@@ -380,13 +383,17 @@ class PanelLogger {
         event: 'logger.write_preflight',
         pid: this.pid,
       }) + '\n';
-      this.rotateIfNeeded(Buffer.byteLength(line));
-      descriptor = this.openValidatedFile();
+      this.rotateIfNeeded(Buffer.byteLength(line), pinnedDirectory);
+      descriptor = this.openValidatedFile(pinnedDirectory);
       fs.fchmodSync(descriptor, 0o600);
       fs.writeFileSync(descriptor, line);
       fs.fsyncSync(descriptor);
       fs.closeSync(descriptor);
       descriptor = undefined;
+      // A file fsync does not make a newly-created current log or rotation
+      // rename durable. Sync the exact directory FD used for the write before
+      // the startup preflight is allowed to report success.
+      this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
       this.lastWriteSucceededAt = timestamp;
     } catch (error) {
@@ -400,14 +407,78 @@ class PanelLogger {
       wrapped.code = 'PANEL_LOG_INITIALIZATION_FAILED';
       wrapped.cause = error;
       throw wrapped;
+    } finally {
+      if (pinnedDirectory?.descriptor !== undefined) {
+        try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
+      }
     }
   }
 
-  openValidatedFile() {
+  filePathIn(pinnedDirectory) {
+    return path.join(pinnedDirectory.accessDirectory, path.basename(this.filePath));
+  }
+
+  assertPinnedDirectory(pinnedDirectory) {
+    if (!pinnedDirectory || !Number.isInteger(pinnedDirectory.descriptor)) {
+      throw new Error('日志目录未固定');
+    }
+    const stat = fs.fstatSync(pinnedDirectory.descriptor);
+    const identity = this.directoryIdentity;
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (!identity || !stat.isDirectory()
+        || stat.dev !== identity.dev || stat.ino !== identity.ino
+        || (currentUid !== null && stat.uid !== currentUid)
+        || (stat.mode & 0o022) !== 0) {
+      throw new Error('日志目录 FD 与初始化时的安全目录不一致');
+    }
     this.assertDirectorySafe();
+  }
+
+  openPinnedDirectory() {
+    this.assertDirectorySafe();
+    const identity = this.directoryIdentity;
+    let descriptor;
+    try {
+      descriptor = fs.openSync(
+        identity.realPath,
+        fs.constants.O_RDONLY
+          | (fs.constants.O_DIRECTORY || 0)
+          | (fs.constants.O_NOFOLLOW || 0),
+      );
+      const pinnedDirectory = {
+        descriptor,
+        accessDirectory: identity.realPath,
+      };
+      this.assertPinnedDirectory(pinnedDirectory);
+      if (process.platform === 'linux') {
+        const accessDirectory = '/proc/self/fd/' + descriptor;
+        if (fs.realpathSync(accessDirectory) !== identity.realPath) {
+          throw new Error('日志目录 FD 解析结果不一致');
+        }
+        pinnedDirectory.accessDirectory = accessDirectory;
+      }
+      descriptor = undefined;
+      return pinnedDirectory;
+    } finally {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+    }
+  }
+
+  syncPinnedDirectory(pinnedDirectory) {
+    this.assertPinnedDirectory(pinnedDirectory);
+    fs.fsyncSync(pinnedDirectory.descriptor);
+    // Do not return a durable-checkpoint success if the configured path was
+    // replaced while the pinned directory itself was being synchronized.
+    this.assertPinnedDirectory(pinnedDirectory);
+  }
+
+  openValidatedFile(pinnedDirectory) {
+    this.assertPinnedDirectory(pinnedDirectory);
     const noFollow = fs.constants.O_NOFOLLOW || 0;
     const descriptor = fs.openSync(
-      this.filePath,
+      this.filePathIn(pinnedDirectory),
       fs.constants.O_APPEND
         | fs.constants.O_CREAT
         | fs.constants.O_WRONLY
@@ -432,6 +503,7 @@ class PanelLogger {
 
   probe() {
     let descriptor;
+    let pinnedDirectory;
     try {
       const line = JSON.stringify({
         timestamp: new Date().toISOString(),
@@ -439,12 +511,13 @@ class PanelLogger {
         event: 'logger.write_preflight',
         pid: this.pid,
       }) + '\n';
-      this.assertDirectorySafe();
-      this.rotateIfNeeded(Buffer.byteLength(line));
-      descriptor = this.openValidatedFile();
+      pinnedDirectory = this.openPinnedDirectory();
+      this.rotateIfNeeded(Buffer.byteLength(line), pinnedDirectory);
+      descriptor = this.openValidatedFile(pinnedDirectory);
       fs.fchmodSync(descriptor, 0o600);
       fs.writeFileSync(descriptor, line);
       fs.fsyncSync(descriptor);
+      this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = new Date().toISOString();
@@ -460,11 +533,15 @@ class PanelLogger {
       if (descriptor !== undefined) {
         try { fs.closeSync(descriptor); } catch {}
       }
+      if (pinnedDirectory?.descriptor !== undefined) {
+        try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
+      }
     }
   }
 
   checkpoint(event, fields = {}) {
     let descriptor;
+    let pinnedDirectory;
     const checkpointEvent = String(event || 'logger.audit_checkpoint');
     try {
       const timestamp = new Date().toISOString();
@@ -478,12 +555,13 @@ class PanelLogger {
         event: redactText(checkpointEvent),
         pid: this.pid,
       }) + '\n';
-      this.assertDirectorySafe();
-      this.rotateIfNeeded(Buffer.byteLength(line));
-      descriptor = this.openValidatedFile();
+      pinnedDirectory = this.openPinnedDirectory();
+      this.rotateIfNeeded(Buffer.byteLength(line), pinnedDirectory);
+      descriptor = this.openValidatedFile(pinnedDirectory);
       fs.fchmodSync(descriptor, 0o600);
       fs.writeFileSync(descriptor, line);
       fs.fsyncSync(descriptor);
+      this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = timestamp;
@@ -501,6 +579,9 @@ class PanelLogger {
     } finally {
       if (descriptor !== undefined) {
         try { fs.closeSync(descriptor); } catch {}
+      }
+      if (pinnedDirectory?.descriptor !== undefined) {
+        try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
       }
     }
   }
@@ -533,10 +614,12 @@ class PanelLogger {
     return LEVELS[level] >= LEVELS[this.level];
   }
 
-  rotateIfNeeded(nextBytes) {
+  rotateIfNeeded(nextBytes, pinnedDirectory) {
+    this.assertPinnedDirectory(pinnedDirectory);
+    const currentPath = this.filePathIn(pinnedDirectory);
     let fileStat;
     try {
-      fileStat = fs.lstatSync(this.filePath);
+      fileStat = fs.lstatSync(currentPath);
     } catch (error) {
       if (error?.code === 'ENOENT') return;
       throw error;
@@ -544,11 +627,12 @@ class PanelLogger {
     if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
       throw new Error('日志轮转源必须是普通文件');
     }
-    if (fileStat.size + nextBytes <= this.maxBytes) return;
+    if (fileStat.size + nextBytes <= this.maxBytes) return false;
+    let directoryChanged = false;
     try {
       for (let index = this.rotations - 1; index >= 1; index -= 1) {
-        const from = this.filePath + '.' + index;
-        const to = this.filePath + '.' + (index + 1);
+        const from = currentPath + '.' + index;
+        const to = currentPath + '.' + (index + 1);
         let fromStat;
         try { fromStat = fs.lstatSync(from); } catch (error) {
           if (error?.code === 'ENOENT') fromStat = null;
@@ -567,8 +651,9 @@ class PanelLogger {
           throw new Error('日志轮转目标必须是普通文件');
         }
         fs.renameSync(from, to);
+        directoryChanged = true;
       }
-      const target = this.filePath + '.1';
+      const target = currentPath + '.1';
       let targetStat;
       try { targetStat = fs.lstatSync(target); } catch (error) {
         if (error?.code === 'ENOENT') targetStat = null;
@@ -577,8 +662,17 @@ class PanelLogger {
       if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
         throw new Error('日志轮转目标必须是普通文件');
       }
-      fs.renameSync(this.filePath, target);
+      fs.renameSync(currentPath, target);
+      directoryChanged = true;
+      return true;
     } catch (error) {
+      // If a multi-file rotation stopped part way through, at least persist the
+      // resulting directory state before reporting the operation as failed.
+      if (directoryChanged) {
+        try { this.syncPinnedDirectory(pinnedDirectory); } catch (syncError) {
+          error = syncError;
+        }
+      }
       this.fallback('error', 'logger.rotate_failed', { error: error.message });
       const wrapped = new Error('日志轮转失败');
       wrapped.code = 'PANEL_LOG_ROTATION_FAILED';
@@ -619,15 +713,23 @@ class PanelLogger {
       this.fallback('error', 'logger.serialize_failed', { error: error.message, originalEvent: event });
       return null;
     }
+    let pinnedDirectory;
     try {
-      this.assertDirectorySafe();
+      pinnedDirectory = this.openPinnedDirectory();
       const bytes = Buffer.byteLength(line);
-      this.rotateIfNeeded(bytes);
-      const descriptor = this.openValidatedFile();
+      const rotated = this.rotateIfNeeded(bytes, pinnedDirectory);
+      const currentPath = this.filePathIn(pinnedDirectory);
+      let currentExisted = true;
+      try { fs.lstatSync(currentPath); } catch (error) {
+        if (error?.code === 'ENOENT') currentExisted = false;
+        else throw error;
+      }
+      const descriptor = this.openValidatedFile(pinnedDirectory);
       try {
         fs.fchmodSync(descriptor, 0o600);
         fs.writeFileSync(descriptor, line);
       } finally { fs.closeSync(descriptor); }
+      if (rotated || !currentExisted) this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = new Date().toISOString();
@@ -637,6 +739,10 @@ class PanelLogger {
       this.consecutiveWriteFailures += 1;
       this.lastWriteFailureAt = new Date().toISOString();
       this.fallback('error', 'logger.write_failed', { error: error.message, originalEvent: event });
+    } finally {
+      if (pinnedDirectory?.descriptor !== undefined) {
+        try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
+      }
     }
     if (this.consoleEnabled) {
       try { process.stdout.write(line); } catch {}
