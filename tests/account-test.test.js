@@ -2219,7 +2219,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
       headers,
       body: { targets: [targetFor(2)], modelId: 'gpt-5.6-luna' },
     });
-    assert.equal(incompleteSelection.status, 400);
+    assert.equal(incompleteSelection.status, 502);
     assert.equal(incompleteSelection.json.error, 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED');
     assert.equal(testCalls.length, 0);
 

@@ -181,7 +181,9 @@ test('acknowledgement route requires an authenticated administrator and a durabl
     });
     db.acknowledgeJobReconciliation = originalAcknowledge;
     assert.equal(persistenceFailure.status, 503);
-    assert.equal(persistenceFailure.json.error, 'SIMULATED_DATABASE_PERSISTENCE_FAILURE');
+    assert.equal(persistenceFailure.json.error, 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED');
+    assert.equal(persistenceFailure.body.includes('database persistence unavailable'), false);
+    assert.equal(persistenceFailure.body.includes('SIMULATED_DATABASE_PERSISTENCE_FAILURE'), false);
     assert.equal((await db.getJob(held.id)).result.reconciliationHold, true);
 
     const unavailable = await requestJson(baseUrl, route, {

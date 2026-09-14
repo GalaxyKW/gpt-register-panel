@@ -20,8 +20,11 @@ const {
   phase3ClaimKeys,
   phase3FailureMetadata,
   mutationFailureMetadata,
+  publicApiError,
+  publicTokenCleanupErrorFields,
   reconciliationReviewDetail,
   readJsonBody,
+  requestLogPath,
   resetAuthFailureBuckets,
   safeStaticPath,
   shutdownServer,
@@ -39,6 +42,192 @@ test('static routing exposes only the three declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
   assert.equal(safeStaticPath('/debug.json'), null);
   assert.equal(safeStaticPath('/nested/asset.js'), null);
+});
+
+test('public API errors expose only fixed codes, messages, and statuses', () => {
+  const mappings = new Map([
+    [400, [
+      'INVALID_JSON_BODY',
+      'INVALID_REQUEST_BODY',
+      'IDEMPOTENCY_KEY_REQUIRED',
+      'IDEMPOTENCY_KEY_INVALID',
+      'SNAPSHOT_VERSION_REQUIRED',
+      'IMPORT_SELECTION_REQUIRED',
+      'IMPORT_SELECTION_INVALID',
+      'IMPORT_SELECTION_MISMATCH',
+      'PHASE3_BATCH_INVALID',
+      'PHASE3_SELECTION_INVALID',
+      'PHASE3_ACCOUNT_INVALID',
+      'PHASE3_TARGET_REVISION_INVALID',
+      'PHASE3_BATCH_EMPTY',
+      'ACCOUNT_TEST_REQUEST_INVALID',
+      'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
+      'ACCOUNT_TEST_SELECTION_INVALID',
+      'ACCOUNT_TEST_TARGET_INVALID',
+      'ACCOUNT_TEST_ACCOUNT_ID_INVALID',
+      'ACCOUNT_TEST_TARGET_DUPLICATE',
+      'ACCOUNT_TEST_TARGET_REVISION_INVALID',
+      'ACCOUNT_TEST_MODEL_INVALID',
+      'ACCOUNT_TEST_PROMPT_INVALID',
+      'TOKEN_CLEANUP_CONFIRMATION_REQUIRED',
+      'TOKEN_CLEANUP_VERSION_REQUIRED',
+      'JOB_RECONCILIATION_JOB_ID_INVALID',
+      'JOB_RECONCILIATION_REQUEST_INVALID',
+      'JOB_RECONCILIATION_JOB_ID_MISMATCH',
+      'JOB_RECONCILIATION_CONFIRMATION_INVALID',
+      'JOB_RECONCILIATION_RESOLUTION_INVALID',
+      'JOB_RECONCILIATION_DIGEST_INVALID',
+    ]],
+    [403, [
+      'JOB_RECONCILIATION_ADMIN_REQUIRED',
+      'PHASE3_DISABLED',
+      'WRITE_DISABLED',
+    ]],
+    [404, ['JOB_RECONCILIATION_NOT_FOUND']],
+    [409, [
+      'IDEMPOTENCY_KEY_REUSED',
+      'PHASE3_DUPLICATE',
+      'JOB_ALREADY_CLAIMED',
+      'JOB_QUEUE_FULL',
+      'JOB_RECONCILIATION_REQUIRED',
+      'JOB_BLOCKED_BY_RECONCILIATION',
+      'JOB_BLOCKED_BY_RUNNING_MUTATION',
+      'ACCOUNT_TEST_TARGET_REVISION_STALE',
+      'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS',
+      'TOKEN_CLEANUP_STALE',
+      'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+      'JOB_RECONCILIATION_NOT_HELD',
+      'JOB_RECONCILIATION_ACK_CONFLICT',
+      'JOB_RECONCILIATION_DIGEST_MISMATCH',
+      'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+    ]],
+    [413, ['REQUEST_BODY_TOO_LARGE']],
+    [502, [
+      'SUB2API_READ_FAILED',
+      'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
+      'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
+      'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    ]],
+    [503, [
+      'REQUEST_ABORTED',
+      'JOB_INTERRUPTED',
+      'IDEMPOTENCY_REQUEST_INVALID',
+      'IDEMPOTENCY_WORKFLOW_INVALID',
+      'IDEMPOTENCY_SCOPE_INVALID',
+      'IDEMPOTENCY_RESPONSE_INVALID',
+      'IDEMPOTENCY_JOBS_INVALID',
+      'IDEMPOTENCY_CAPACITY_EXCEEDED',
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      'IDEMPOTENCY_STORE_UNAVAILABLE',
+      'CONTROL_PLANE_LOCK_RELEASE_FAILED',
+      'JOB_ADMISSION_RECOVERY_FAILED',
+      'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+      'JOB_CLAIM_INTEGRITY_INVALID',
+      'AUDIT_LOG_UNAVAILABLE',
+      'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
+      'ACCOUNT_TEST_BASELINE_INVALID',
+      'GPT_REGISTER_SOURCE_MISSING',
+    ]],
+  ]);
+  for (const [expectedStatus, codes] of mappings) {
+    for (const code of codes) {
+      const privateMarker = 'private-error-message-' + code;
+      const error = new Error(privateMarker);
+      error.code = code;
+      const output = publicApiError(error, { write: true });
+      assert.equal(output.statusCode, expectedStatus, code);
+      assert.equal(output.body.error, code);
+      assert.equal(JSON.stringify(output.body).includes(privateMarker), false, code);
+    }
+  }
+
+  const malicious = new Error('private-message-must-not-escape');
+  malicious.code = 'MALICIOUS_PUBLIC_CODE';
+  const readFailure = publicApiError(malicious, {
+    fallbackCode: 'preview_failed',
+    fallbackMessage: '差异预览未能安全完成，请稍后重试',
+  });
+  assert.equal(readFailure.statusCode, 500);
+  assert.equal(readFailure.body.error, 'preview_failed');
+  assert.equal(JSON.stringify(readFailure.body).includes('MALICIOUS_PUBLIC_CODE'), false);
+  assert.equal(JSON.stringify(readFailure.body).includes('private-message-must-not-escape'), false);
+
+  const writeFailure = publicApiError(malicious, {
+    write: true,
+    fallbackCode: 'import_failed',
+    fallbackMessage: '导入请求未能安全完成，请稍后重试',
+  });
+  assert.equal(writeFailure.statusCode, 503);
+  assert.equal(writeFailure.body.error, 'import_failed');
+  assert.equal(JSON.stringify(writeFailure.body).includes('MALICIOUS_PUBLIC_CODE'), false);
+  assert.equal(JSON.stringify(writeFailure.body).includes('private-message-must-not-escape'), false);
+
+  const hostileError = {};
+  Object.defineProperty(hostileError, 'code', {
+    get() { throw new Error('private-code-getter-marker'); },
+  });
+  Object.defineProperty(hostileError, 'message', {
+    get() { throw new Error('private-message-getter-marker'); },
+  });
+  assert.deepEqual(publicApiError(hostileError), {
+    statusCode: 500,
+    body: {
+      error: 'internal_error',
+      message: '请求处理失败，请稍后重试',
+    },
+  });
+});
+
+test('cleanup public fields expose only a strict current version and bounded recovery counts', () => {
+  const currentVersion = 'a'.repeat(64);
+  assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_STALE', {
+    currentVersion,
+  }), { currentVersion });
+  for (const invalid of [
+    'A'.repeat(64),
+    'a'.repeat(63),
+    'a'.repeat(65),
+    ' ' + 'a'.repeat(64),
+    'private-current-version',
+    123,
+  ]) {
+    assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_STALE', {
+      currentVersion: invalid,
+    }), {});
+  }
+  assert.deepEqual(publicTokenCleanupErrorFields('unknown_cleanup_failure', {
+    currentVersion,
+  }), {});
+  const hostileVersion = {};
+  Object.defineProperty(hostileVersion, 'currentVersion', {
+    get() { throw new Error('private-version-getter-marker'); },
+  });
+  assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_STALE', hostileVersion), {});
+  assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_RECOVERY_REQUIRED', {
+    recoveryRequired: true,
+    claimCount: 7,
+    claimCountTruncated: true,
+    currentVersion,
+  }), {
+    recoveryRequired: true,
+    claimCount: 7,
+    claimCountTruncated: true,
+  });
+});
+
+test('request log paths use fixed templates without raw dynamic or unknown segments', () => {
+  assert.equal(requestLogPath('/api/health'), '/api/health');
+  assert.equal(requestLogPath('/api/jobs/job_' + 'a'.repeat(24)), '/api/jobs/:jobId');
+  assert.equal(
+    requestLogPath('/api/jobs/%65ncoded-private/reconciliation'),
+    '/api/jobs/:jobId/reconciliation',
+  );
+  assert.equal(
+    requestLogPath('/api/jobs/%65ncoded-private/reconciliation/acknowledge'),
+    '/api/jobs/:jobId/reconciliation/acknowledge',
+  );
+  assert.equal(requestLogPath('/api/%65ncoded-private'), '/api/<unknown>');
+  assert.equal(requestLogPath('/%65ncoded-private'), '<unknown-path>');
 });
 
 test('Phase3 failures persist only bounded reconciliation metadata', () => {
@@ -223,6 +412,97 @@ test('HTTP limits treat blank values as defaults and clamp explicit bounds', () 
       if (previous[name] === undefined) delete process.env[name];
       else process.env[name] = previous[name];
     }
+  }
+});
+
+test('HTTP responses hide unknown exceptions and lifecycle logs template request paths', async () => {
+  const previous = {
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  const records = [];
+  const readMarker = 'private-read-exception-marker';
+  const writeMarker = 'private-write-exception-marker';
+  const encodedPathMarker = '%2565ncoded-route-private';
+  const queryMarker = 'query-private-marker';
+  const logger = {
+    requestId: () => 'public-error-boundary-test',
+    info(event, fields) { records.push({ event, ...fields }); },
+    warn(event, fields) { records.push({ event, ...fields }); },
+    error(event, fields) { records.push({ event, ...fields }); },
+    probe() { return true; },
+  };
+  const db = {
+    dbPath: '/tmp/unused-public-error-boundary.sqlite3',
+    async getJob() { return null; },
+    async listJobsPage() {
+      const hostileError = {};
+      Object.defineProperty(hostileError, 'code', {
+        get() { throw new Error('MALICIOUS_READ_ERROR_CODE'); },
+      });
+      Object.defineProperty(hostileError, 'message', {
+        get() { throw new Error(readMarker); },
+      });
+      throw hostileError;
+    },
+    async getMutationReceipt() {
+      const error = new Error(writeMarker);
+      error.code = 'MALICIOUS_WRITE_ERROR_CODE';
+      throw error;
+    },
+  };
+  let server;
+  try {
+    process.env.PANEL_WRITE_ENABLED = '1';
+    process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+    server = createServer({ db, logger });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+
+    assert.equal((await request(
+      baseUrl,
+      '/api/' + encodedPathMarker + '?credential=' + queryMarker,
+    )).status, 404);
+    assert.equal((await request(
+      baseUrl,
+      '/api/jobs/' + encodedPathMarker,
+    )).status, 404);
+
+    const readFailure = await request(baseUrl, '/api/jobs');
+    assert.equal(readFailure.status, 500);
+    assert.deepEqual(JSON.parse(readFailure.body), {
+      error: 'internal_error',
+      message: '请求处理失败，请稍后重试',
+    });
+    assert.equal(readFailure.body.includes(readMarker), false);
+    assert.equal(readFailure.body.includes('MALICIOUS_READ_ERROR_CODE'), false);
+
+    const writeFailure = await postJson(baseUrl, '/api/sync/import', {
+      snapshotVersion: 'a'.repeat(64),
+      selectedKeys: ['token:tokens:tokens/example.json'],
+    });
+    assert.equal(writeFailure.status, 503);
+    assert.deepEqual(JSON.parse(writeFailure.body), {
+      error: 'import_failed',
+      message: '导入请求未能安全完成，请稍后重试',
+    });
+    assert.equal(writeFailure.body.includes(writeMarker), false);
+    assert.equal(writeFailure.body.includes('MALICIOUS_WRITE_ERROR_CODE'), false);
+
+    const serializedPaths = JSON.stringify(records.map((record) => record.path));
+    assert.equal(serializedPaths.includes(encodedPathMarker), false);
+    assert.equal(serializedPaths.includes(queryMarker), false);
+    assert.ok(records.some((record) => record.path === '/api/<unknown>'));
+    assert.ok(records.some((record) => record.path === '/api/jobs/:jobId'));
+  } finally {
+    await closeHttpServer(server);
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
   }
 });
 
@@ -1456,7 +1736,7 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     const incompleteSourcePreview = await postJson(baseUrl, '/api/sync/preview', {
       selectedKeys: [],
     });
-    assert.equal(incompleteSourcePreview.status, 400);
+    assert.equal(incompleteSourcePreview.status, 503);
     assert.equal(
       JSON.parse(incompleteSourcePreview.body).error,
       'GPT_REGISTER_SOURCE_MISSING',

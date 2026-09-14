@@ -256,16 +256,173 @@ function sendMutationReceipt(response, receipt, replayed = false) {
   jsonResponse(response, receipt.statusCode, receipt.response);
 }
 
-function mutationRequestStatus(error, fallback = 400) {
-  if (error?.code === 'IDEMPOTENCY_KEY_REUSED') return 409;
-  if (['IDEMPOTENCY_CAPACITY_EXCEEDED', 'IDEMPOTENCY_RECEIPT_INVALID',
-    'IDEMPOTENCY_STORE_UNAVAILABLE', 'CONTROL_PLANE_LOCK_RELEASE_FAILED',
-    'JOB_ADMISSION_RECOVERY_FAILED'].includes(error?.code)) return 503;
-  if (['IDEMPOTENCY_KEY_REQUIRED', 'IDEMPOTENCY_KEY_INVALID',
-    'IDEMPOTENCY_REQUEST_INVALID', 'IDEMPOTENCY_WORKFLOW_INVALID',
-    'IDEMPOTENCY_SCOPE_INVALID', 'IDEMPOTENCY_RESPONSE_INVALID',
-    'IDEMPOTENCY_JOBS_INVALID'].includes(error?.code)) return 400;
-  return fallback;
+const PUBLIC_BAD_REQUEST_ERRORS = new Set([
+  'INVALID_JSON_BODY',
+  'INVALID_REQUEST_BODY',
+  'IDEMPOTENCY_KEY_REQUIRED',
+  'IDEMPOTENCY_KEY_INVALID',
+  'SNAPSHOT_VERSION_REQUIRED',
+  'IMPORT_SELECTION_REQUIRED',
+  'IMPORT_SELECTION_INVALID',
+  'IMPORT_SELECTION_MISMATCH',
+  'PHASE3_BATCH_INVALID',
+  'PHASE3_SELECTION_INVALID',
+  'PHASE3_ACCOUNT_INVALID',
+  'PHASE3_TARGET_REVISION_INVALID',
+  'PHASE3_BATCH_EMPTY',
+  'ACCOUNT_TEST_REQUEST_INVALID',
+  'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
+  'ACCOUNT_TEST_SELECTION_INVALID',
+  'ACCOUNT_TEST_TARGET_INVALID',
+  'ACCOUNT_TEST_ACCOUNT_ID_INVALID',
+  'ACCOUNT_TEST_TARGET_DUPLICATE',
+  'ACCOUNT_TEST_TARGET_REVISION_INVALID',
+  'ACCOUNT_TEST_MODEL_INVALID',
+  'ACCOUNT_TEST_PROMPT_INVALID',
+  'TOKEN_CLEANUP_CONFIRMATION_REQUIRED',
+  'TOKEN_CLEANUP_VERSION_REQUIRED',
+  'JOB_RECONCILIATION_JOB_ID_INVALID',
+  'JOB_RECONCILIATION_REQUEST_INVALID',
+  'JOB_RECONCILIATION_JOB_ID_MISMATCH',
+  'JOB_RECONCILIATION_CONFIRMATION_INVALID',
+  'JOB_RECONCILIATION_RESOLUTION_INVALID',
+  'JOB_RECONCILIATION_DIGEST_INVALID',
+]);
+const PUBLIC_CONFLICT_ERRORS = new Set([
+  'IDEMPOTENCY_KEY_REUSED',
+  'PHASE3_DUPLICATE',
+  'JOB_ALREADY_CLAIMED',
+  'JOB_QUEUE_FULL',
+  'JOB_RECONCILIATION_REQUIRED',
+  'JOB_BLOCKED_BY_RECONCILIATION',
+  'JOB_BLOCKED_BY_RUNNING_MUTATION',
+  'ACCOUNT_TEST_TARGET_REVISION_STALE',
+  'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS',
+  'TOKEN_CLEANUP_STALE',
+  'TOKEN_CLEANUP_RECOVERY_REQUIRED',
+  'JOB_RECONCILIATION_NOT_HELD',
+  'JOB_RECONCILIATION_ACK_CONFLICT',
+  'JOB_RECONCILIATION_DIGEST_MISMATCH',
+  'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+]);
+const PUBLIC_FORBIDDEN_ERRORS = new Set([
+  'PHASE3_DISABLED',
+  'WRITE_DISABLED',
+]);
+const PUBLIC_BAD_GATEWAY_ERRORS = new Set([
+  'SUB2API_READ_FAILED',
+  'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
+  'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
+  'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+]);
+const PUBLIC_SERVICE_ERRORS = new Set([
+  'REQUEST_ABORTED',
+  'JOB_INTERRUPTED',
+  'IDEMPOTENCY_REQUEST_INVALID',
+  'IDEMPOTENCY_WORKFLOW_INVALID',
+  'IDEMPOTENCY_SCOPE_INVALID',
+  'IDEMPOTENCY_RESPONSE_INVALID',
+  'IDEMPOTENCY_JOBS_INVALID',
+  'IDEMPOTENCY_CAPACITY_EXCEEDED',
+  'IDEMPOTENCY_RECEIPT_INVALID',
+  'IDEMPOTENCY_STORE_UNAVAILABLE',
+  'CONTROL_PLANE_LOCK_RELEASE_FAILED',
+  'JOB_ADMISSION_RECOVERY_FAILED',
+  'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+  'JOB_CLAIM_INTEGRITY_INVALID',
+  'AUDIT_LOG_UNAVAILABLE',
+  'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
+  'ACCOUNT_TEST_BASELINE_INVALID',
+  'GPT_REGISTER_SOURCE_MISSING',
+]);
+const PUBLIC_ERROR_MESSAGES = Object.freeze({
+  REQUEST_BODY_TOO_LARGE: '请求体超过允许的大小上限',
+  INVALID_JSON_BODY: '请求体不是有效的 JSON',
+  INVALID_REQUEST_BODY: '请求体必须是 JSON 对象',
+  IDEMPOTENCY_KEY_REQUIRED: '写请求必须提供 Idempotency-Key',
+  IDEMPOTENCY_KEY_INVALID: 'Idempotency-Key 格式无效',
+  IDEMPOTENCY_KEY_REUSED: '该 Idempotency-Key 已用于不同请求',
+  JOB_ALREADY_CLAIMED: '该操作目标已有任务排队或运行中',
+  JOB_RECONCILIATION_REQUIRED: '存在需要人工核对的任务，已阻止继续写入',
+  ACCOUNT_TEST_TARGET_REVISION_STALE: '账号状态已变化，请刷新后重新选择',
+  ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS: '没有可测试的上游账号',
+  ACCOUNT_TEST_BASELINE_INVALID: '无法安全确认账号测试基线，请稍后重试',
+  PHASE3_DISABLED: 'Phase 3 未启用',
+  WRITE_DISABLED: '写操作未启用',
+  SUB2API_READ_FAILED: '无法确认 Sub2API 当前账号列表',
+  TOKEN_CLEANUP_STALE: '过期 token 清单已变化，请重新扫描',
+  TOKEN_CLEANUP_RECOVERY_REQUIRED: '过期 token 清理存在待恢复状态，已阻止继续删除',
+  JOB_RECONCILIATION_NOT_FOUND: '待对账任务不存在',
+  JOB_RECONCILIATION_ADMIN_REQUIRED: '只允许经过认证的面板管理员执行该操作',
+  AUDIT_LOG_UNAVAILABLE: '审计日志不可用，已拒绝写操作',
+});
+
+function storedErrorCode(error) {
+  try {
+    return typeof error?.code === 'string' ? error.code : '';
+  } catch {
+    return '';
+  }
+}
+
+function safeHttpErrorMessage(error) {
+  try {
+    return safeErrorMessage(error);
+  } catch {
+    return 'unknown error';
+  }
+}
+
+function publicApiError(error, options = {}) {
+  const code = storedErrorCode(error);
+  let statusCode = null;
+  if (code === 'REQUEST_BODY_TOO_LARGE') statusCode = 413;
+  else if (PUBLIC_BAD_GATEWAY_ERRORS.has(code)) statusCode = 502;
+  else if (code === 'JOB_RECONCILIATION_NOT_FOUND') statusCode = 404;
+  else if (code === 'JOB_RECONCILIATION_ADMIN_REQUIRED'
+      || PUBLIC_FORBIDDEN_ERRORS.has(code)) statusCode = 403;
+  else if (PUBLIC_BAD_REQUEST_ERRORS.has(code)) statusCode = 400;
+  else if (PUBLIC_CONFLICT_ERRORS.has(code)) statusCode = 409;
+  else if (PUBLIC_SERVICE_ERRORS.has(code)) statusCode = 503;
+  if (statusCode !== null) {
+    const defaultMessage = statusCode === 400
+      ? '请求参数无效，请检查后重试'
+      : statusCode === 409
+        ? '请求与当前状态冲突，请刷新后重试'
+        : statusCode === 502
+          ? '上游服务响应无效'
+          : statusCode === 503
+            ? '服务暂时无法安全完成请求'
+            : statusCode === 404
+              ? '请求的资源不存在'
+              : '当前身份不允许执行该操作';
+    return {
+      statusCode,
+      body: {
+        error: code,
+        message: PUBLIC_ERROR_MESSAGES[code] || defaultMessage,
+      },
+    };
+  }
+  const write = options.write === true;
+  return {
+    statusCode: write ? 503 : 500,
+    body: {
+      error: options.fallbackCode || (write ? 'write_request_failed' : 'internal_error'),
+      message: options.fallbackMessage || (write
+        ? '写请求未能安全完成，请稍后重试'
+        : '请求处理失败，请稍后重试'),
+    },
+  };
+}
+
+function sendPublicApiError(response, error, options = {}) {
+  const output = publicApiError(error, options);
+  jsonResponse(response, output.statusCode, {
+    ...output.body,
+    ...(options.extraFields ? options.extraFields(output.body.error, error) : {}),
+  });
+  return output;
 }
 
 function configuredPanelToken() {
@@ -638,6 +795,41 @@ function reconciliationReviewPath(pathname) {
   try { jobId = decodeURIComponent(encoded); } catch {}
   if (!/^job_[a-f0-9]{24}$/.test(String(jobId || ''))) jobId = null;
   return { matched: true, jobId };
+}
+
+const HTTP_LOG_FIXED_PATHS = new Set([
+  '/',
+  ...STATIC_ALLOWLIST,
+  '/api/health',
+  '/api/snapshot',
+  '/api/sync/preview',
+  '/api/sync/import',
+  '/api/phase3',
+  '/api/account-tests',
+  '/api/account-tests/models',
+  '/api/tokens/expired',
+  '/api/tokens/expired/delete',
+  '/api/jobs',
+  '/api/audit',
+  '/api/logs',
+]);
+
+function requestLogPath(pathname) {
+  if (typeof pathname !== 'string') return '<unknown-path>';
+  if (HTTP_LOG_FIXED_PATHS.has(pathname)) return pathname;
+  const jobPrefix = '/api/jobs/';
+  if (pathname.startsWith(jobPrefix)) {
+    const suffix = pathname.slice(jobPrefix.length).split('/');
+    if (suffix.length === 1 && suffix[0]) return '/api/jobs/:jobId';
+    if (suffix.length === 2 && suffix[0] && suffix[1] === 'reconciliation') {
+      return '/api/jobs/:jobId/reconciliation';
+    }
+    if (suffix.length === 3 && suffix[0]
+        && suffix[1] === 'reconciliation' && suffix[2] === 'acknowledge') {
+      return '/api/jobs/:jobId/reconciliation/acknowledge';
+    }
+  }
+  return pathname.startsWith('/api/') ? '/api/<unknown>' : '<unknown-path>';
 }
 
 const UNSAFE_REVIEW_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
@@ -1195,6 +1387,33 @@ function boundedCleanupCount(value) {
   return Number.isSafeInteger(number) && number >= 0 && number <= 1_000_000
     ? number
     : 0;
+}
+
+function publicTokenCleanupErrorFields(publicCode, error) {
+  if (publicCode === 'TOKEN_CLEANUP_STALE') {
+    let currentVersion = null;
+    try {
+      if (typeof error?.currentVersion === 'string'
+          && /^[a-f0-9]{64}$/.test(error.currentVersion)) {
+        currentVersion = error.currentVersion;
+      }
+    } catch {}
+    return currentVersion ? { currentVersion } : {};
+  }
+  if (publicCode === 'TOKEN_CLEANUP_RECOVERY_REQUIRED') {
+    let recoveryRequired = false;
+    let claimCount = 0;
+    let claimCountTruncated = false;
+    try {
+      recoveryRequired = error?.recoveryRequired === true;
+      claimCount = boundedCleanupCount(error?.claimCount);
+      claimCountTruncated = error?.claimCountTruncated === true;
+    } catch {}
+    return recoveryRequired
+      ? { recoveryRequired, claimCount, claimCountTruncated }
+      : {};
+  }
+  return {};
 }
 
 function tokenCleanupReviewTarget(item) {
@@ -2151,7 +2370,7 @@ function createServer(options = {}) {
       : crypto.randomUUID();
     const actor = requestActor(request);
     const startedAt = Date.now();
-    let requestPath = '/';
+    let requestPath = '<unknown-path>';
     let completed = false;
     response.setHeader('x-request-id', requestId);
     response.once('finish', () => {
@@ -2177,7 +2396,9 @@ function createServer(options = {}) {
         });
       }
     });
-    try { requestPath = new URL(request.url || '/', 'http://localhost').pathname; } catch {}
+    try {
+      requestPath = requestLogPath(new URL(request.url || '/', 'http://localhost').pathname);
+    } catch {}
     writeLog(logger, 'info', 'http.request_started', {
       requestId,
       actor,
@@ -2186,7 +2407,7 @@ function createServer(options = {}) {
     });
     try {
       const requestUrl = new URL(request.url || '/', 'http://localhost');
-      requestPath = requestUrl.pathname;
+      requestPath = requestLogPath(requestUrl.pathname);
       const reconciliationAckPath = reconciliationAcknowledgePath(requestUrl.pathname);
       const reconciliationReviewRoute = reconciliationReviewPath(requestUrl.pathname);
       if (jobManager.shuttingDown) {
@@ -2209,7 +2430,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
           statusCode: authError.status,
           error: authError.error,
         });
@@ -2224,7 +2445,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         jsonResponse(response, 415, {
           error: 'json_content_type_required',
@@ -2237,7 +2458,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         response.setHeader('allow', 'GET');
         jsonResponse(response, 405, { error: 'read_only_endpoint' });
@@ -2248,7 +2469,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         response.setHeader('allow', 'GET');
         jsonResponse(response, 405, { error: 'read_only_endpoint' });
@@ -2264,7 +2485,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         jsonResponse(response, 503, {
           error: 'audit_log_unavailable',
@@ -2279,7 +2500,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         response.setHeader('allow', 'GET');
         jsonResponse(response, 405, { error: 'read_only_endpoint' });
@@ -2304,7 +2525,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           method: request.method,
-          path: requestUrl.pathname,
+          path: requestPath,
         });
         response.setHeader('allow', 'GET');
         jsonResponse(response, 405, { error: 'read_only_endpoint' });
@@ -2316,11 +2537,11 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'http.snapshot_failed', {
           requestId,
           actor,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        jsonResponse(response, 500, {
-          error: 'snapshot_failed',
-          message: safeErrorMessage(error),
+        sendPublicApiError(response, error, {
+          fallbackCode: 'snapshot_failed',
+          fallbackMessage: '账号快照读取失败，请稍后重试',
         });
       }
       return;
@@ -2335,13 +2556,17 @@ function createServer(options = {}) {
         if (bodyError) throw bodyError;
         if (body.selectedKeys !== undefined && body.selectedKeys !== null
             && !Array.isArray(body.selectedKeys)) {
-          throw new Error('selectedKeys 必须是数组');
+          const error = new Error('selectedKeys 必须是数组');
+          error.code = 'IMPORT_SELECTION_INVALID';
+          throw error;
         }
         const selectedKeys = body.selectedKeys === undefined || body.selectedKeys === null
           ? []
           : normalizedSelectedKeys(body.selectedKeys, { allowEmpty: true });
         if (body.selectedKeys !== undefined && !selectedKeys) {
-          throw new Error('selectedKeys 必须包含有效的账号键');
+          const error = new Error('selectedKeys 必须包含有效的账号键');
+          error.code = 'IMPORT_SELECTION_INVALID';
+          throw error;
         }
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
@@ -2379,11 +2604,12 @@ function createServer(options = {}) {
           requestId,
           actor,
           durationMs: Date.now() - previewStartedAt,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-          : error?.code === 'SUB2API_READ_FAILED' ? 502 : 400;
-        jsonResponse(response, status, { error: error?.code || 'preview_failed', message: safeErrorMessage(error) });
+        sendPublicApiError(response, error, {
+          fallbackCode: 'preview_failed',
+          fallbackMessage: '差异预览未能安全完成，请稍后重试',
+        });
       }
       return;
     }
@@ -2490,13 +2716,13 @@ function createServer(options = {}) {
           requestId,
           actor,
           durationMs: Date.now() - importRequestStartedAt,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
-          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-          : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409 : 400;
-        const status = mutationRequestStatus(error, fallbackStatus);
-        jsonResponse(response, status, { error: error?.code || 'import_failed', message: safeErrorMessage(error) });
+        sendPublicApiError(response, error, {
+          write: true,
+          fallbackCode: 'import_failed',
+          fallbackMessage: '导入请求未能安全完成，请稍后重试',
+        });
       }
       return;
     }
@@ -2693,13 +2919,13 @@ function createServer(options = {}) {
           requestId,
           actor,
           durationMs: Date.now() - phase3RequestStartedAt,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
-          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-            : error?.code === 'JOB_RECONCILIATION_REQUIRED' ? 409 : 400;
-        const status = mutationRequestStatus(error, fallbackStatus);
-        jsonResponse(response, status, { error: error?.code || 'phase3_failed', message: safeErrorMessage(error) });
+        sendPublicApiError(response, error, {
+          write: true,
+          fallbackCode: 'phase3_failed',
+          fallbackMessage: 'Phase 3 请求未能安全完成，请稍后重试',
+        });
       }
       return;
     }
@@ -2731,11 +2957,11 @@ function createServer(options = {}) {
           actor,
           accountId,
           durationMs: Date.now() - modelStartedAt,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        jsonResponse(response, 502, {
-          error: 'ACCOUNT_TEST_MODELS_FAILED',
-          message: safeErrorMessage(error),
+        sendPublicApiError(response, error, {
+          fallbackCode: 'ACCOUNT_TEST_MODELS_FAILED',
+          fallbackMessage: '测试模型列表读取失败，请稍后重试',
         });
       }
       return;
@@ -2912,19 +3138,13 @@ function createServer(options = {}) {
           requestId,
           actor,
           durationMs: Date.now() - accountTestRequestStartedAt,
-          code: error?.code || null,
-          error: safeErrorMessage(error),
+          code: storedErrorCode(error) || null,
+          error: safeHttpErrorMessage(error),
         });
-        const fallbackStatus = error?.code === 'JOB_INTERRUPTED' ? 503
-          : error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-          : error?.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE' ? 409
-          : error?.code === 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS' ? 409
-            : ['JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
-            : error?.message?.includes('required') ? 503 : 400;
-        const status = mutationRequestStatus(error, fallbackStatus);
-        jsonResponse(response, status, {
-          error: error?.code || 'account_test_failed',
-          message: safeErrorMessage(error),
+        sendPublicApiError(response, error, {
+          write: true,
+          fallbackCode: 'account_test_failed',
+          fallbackMessage: '账号测试请求未能安全完成，请稍后重试',
         });
       }
       return;
@@ -2946,9 +3166,12 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'token_cleanup.scan_failed', {
           requestId,
           actor,
-          error: safeErrorMessage(error),
+          error: safeHttpErrorMessage(error),
         });
-        jsonResponse(response, 500, { error: 'token_cleanup_scan_failed', message: safeErrorMessage(error) });
+        sendPublicApiError(response, error, {
+          fallbackCode: 'token_cleanup_scan_failed',
+          fallbackMessage: '过期 token 扫描失败，请稍后重试',
+        });
       }
       return;
     }
@@ -3077,28 +3300,15 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'token_cleanup.failed', {
           requestId,
           actor,
-          code: error?.code || null,
-          error: safeErrorMessage(error),
+          code: storedErrorCode(error) || null,
+          error: safeHttpErrorMessage(error),
           durationMs: Date.now() - cleanupStartedAt,
         });
-        const fallbackStatus = ['TOKEN_CLEANUP_STALE', 'TOKEN_CLEANUP_RECOVERY_REQUIRED',
-          'JOB_ALREADY_CLAIMED', 'JOB_RECONCILIATION_REQUIRED'].includes(error?.code) ? 409
-          : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
-            'JOB_RECONCILIATION_GUARD_UNAVAILABLE'].includes(error?.code)
-            ? 503
-            : 400;
-        const status = mutationRequestStatus(error, fallbackStatus);
-        jsonResponse(response, status, {
-          error: error?.code || 'token_cleanup_failed',
-          message: safeErrorMessage(error),
-          currentVersion: error?.currentVersion || undefined,
-          recoveryRequired: error?.recoveryRequired === true || undefined,
-          claimCount: error?.recoveryRequired === true
-            ? boundedCleanupCount(error?.claimCount)
-            : undefined,
-          claimCountTruncated: error?.recoveryRequired === true
-            ? error?.claimCountTruncated === true
-            : undefined,
+        sendPublicApiError(response, error, {
+          write: true,
+          fallbackCode: 'token_cleanup_failed',
+          fallbackMessage: '过期 token 删除请求未能安全完成，请稍后重试',
+          extraFields: publicTokenCleanupErrorFields,
         });
       }
       return;
@@ -3170,35 +3380,14 @@ function createServer(options = {}) {
           requestId,
           actor,
           jobId: reconciliationAckPath.jobId,
-          code: error?.code || null,
-          error: safeErrorMessage(error),
+          code: storedErrorCode(error) || null,
+          error: safeHttpErrorMessage(error),
           durationMs: Date.now() - acknowledgeStartedAt,
         });
-        const status = error?.code === 'REQUEST_BODY_TOO_LARGE' ? 413
-          : error?.code === 'JOB_RECONCILIATION_NOT_FOUND' ? 404
-            : error?.code === 'JOB_RECONCILIATION_ADMIN_REQUIRED' ? 403
-              : [
-                  'JOB_RECONCILIATION_NOT_HELD',
-                  'JOB_RECONCILIATION_ACK_CONFLICT',
-                  'JOB_RECONCILIATION_DIGEST_MISMATCH',
-                ].includes(error?.code) ? 409
-                : [
-                    'INVALID_JSON_BODY',
-                    'INVALID_REQUEST_BODY',
-                    'JOB_RECONCILIATION_JOB_ID_INVALID',
-                    'JOB_RECONCILIATION_REQUEST_INVALID',
-                    'JOB_RECONCILIATION_JOB_ID_MISMATCH',
-                    'JOB_RECONCILIATION_CONFIRMATION_INVALID',
-                    'JOB_RECONCILIATION_RESOLUTION_INVALID',
-                    'JOB_RECONCILIATION_DIGEST_INVALID',
-                  ].includes(error?.code) ? 400
-                  // Persistence, integrity, audit and interruption failures
-                  // are service failures. Do not mislabel an unknown internal
-                  // failure as a request the administrator can fix by retrying.
-                  : 503;
-        jsonResponse(response, status, {
-          error: error?.code || 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED',
-          message: safeErrorMessage(error),
+        sendPublicApiError(response, error, {
+          write: true,
+          fallbackCode: 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED',
+          fallbackMessage: '人工对账确认未能安全完成，请稍后重试',
         });
       }
       return;
@@ -3223,13 +3412,9 @@ function createServer(options = {}) {
         const job = await db.getJob(reconciliationReviewRoute.jobId);
         jsonResponse(response, 200, reconciliationReviewDetail(job));
       } catch (error) {
-        const status = error?.code === 'JOB_RECONCILIATION_NOT_FOUND' ? 404
-          : ['JOB_RECONCILIATION_NOT_HELD', 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE']
-              .includes(error?.code) ? 409
-            : 503;
-        jsonResponse(response, status, {
-          error: error?.code || 'JOB_RECONCILIATION_DETAIL_FAILED',
-          message: safeErrorMessage(error),
+        sendPublicApiError(response, error, {
+          fallbackCode: 'JOB_RECONCILIATION_DETAIL_FAILED',
+          fallbackMessage: '人工对账详情读取失败，请稍后重试',
         });
       }
       return;
@@ -3271,16 +3456,20 @@ function createServer(options = {}) {
 
     serveStatic(request, response);
     } catch (error) {
+      const publicError = publicApiError(error, {
+        write: request.method !== 'GET',
+        fallbackCode: request.method === 'GET' ? 'internal_error' : 'write_request_failed',
+      });
       writeLog(logger, 'error', 'http.request_failed', {
         requestId,
         actor,
         method: request.method,
         path: requestPath,
-        statusCode: 500,
-        error: safeErrorMessage(error),
+        statusCode: publicError.statusCode,
+        error: safeHttpErrorMessage(error),
       });
       if (!response.headersSent) {
-        jsonResponse(response, 500, { error: 'internal_error', message: safeErrorMessage(error) });
+        jsonResponse(response, publicError.statusCode, publicError.body);
       } else if (!response.writableEnded) {
         response.end();
       }
@@ -3472,7 +3661,10 @@ module.exports = {
   validateListenConfiguration,
   normalizedSelectedKeys,
   openVerifiedStaticFile,
+  publicApiError,
+  publicTokenCleanupErrorFields,
   requestBodyObjectError,
+  requestLogPath,
   resetAuthFailureBuckets,
   safeStaticPath,
   tokenImportJobStatus,

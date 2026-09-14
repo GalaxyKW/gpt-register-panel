@@ -324,8 +324,9 @@ test('Phase3 route keeps an already registered observer when a later batch begin
       })),
       selectedKeys,
     }, 'phase3_partial_' + crypto.randomUUID());
-    assert.equal(response.status, 400);
-    assert.equal(response.json.error, 'OBSERVER_SETUP_FAILED');
+    assert.equal(response.status, 503);
+    assert.equal(response.json.error, 'phase3_failed');
+    assert.equal(JSON.stringify(response.json).includes('OBSERVER_SETUP_FAILED'), false);
     assert.equal(begins, 2);
 
     let jobs = await db.listJobs(20);
