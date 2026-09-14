@@ -131,6 +131,34 @@ function normalizedDateAliases(...values) {
     : { value: unique[0], status: 'valid', conflict: false };
 }
 
+function normalizedCredentialsStatus(account) {
+  const aliases = [account?.credentials_status, account?.credentialsStatus]
+    .filter((value) => value !== undefined && value !== null);
+  if (aliases.length === 0) return { provided: false, value: null, valid: true };
+  if (aliases.length !== 1) return { provided: true, value: null, valid: false };
+  const value = aliases[0];
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { provided: true, value: null, valid: false };
+  }
+  const valid = Object.entries(value).every(([key, present]) => (
+    /^has_[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(key) && typeof present === 'boolean'
+  ));
+  return { provided: true, value: valid ? value : null, valid };
+}
+
+function credentialPresence(status, statusKey, rawField, storedFingerprintField = null) {
+  const localEvidence = Boolean(rawField?.value || storedFingerprintField?.value);
+  if (!status.valid) return { value: 'unknown', conflict: false };
+  if (!status.provided) {
+    return { value: localEvidence ? 'present' : 'unknown', conflict: false };
+  }
+  const declaredPresent = status.value[statusKey] === true;
+  return {
+    value: declaredPresent ? 'present' : 'absent',
+    conflict: !declaredPresent && localEvidence,
+  };
+}
+
 function safeAccount(account) {
   const id = positiveAccountId(account?.id);
   if (!id) return null;
@@ -183,15 +211,45 @@ function safeAccount(account) {
     extra.access_token_sha256,
     credentials.access_token_sha256,
   ], 128, { normalize: storedFingerprint });
+  const storedRefreshFingerprintField = scalarAliases([
+    extra.refresh_token_sha256,
+    credentials.refresh_token_sha256,
+  ], 128, { normalize: storedFingerprint });
   const computedAccessFingerprint = tokenFingerprint(accessField.value);
-  const fingerprintConflict = Boolean(
+  const computedRefreshFingerprint = tokenFingerprint(refreshField.value);
+  const accessFingerprintConflict = Boolean(
     storedFingerprintField.value
       && computedAccessFingerprint
       && storedFingerprintField.value !== computedAccessFingerprint,
   );
+  const refreshFingerprintConflict = Boolean(
+    storedRefreshFingerprintField.value
+      && computedRefreshFingerprint
+      && storedRefreshFingerprintField.value !== computedRefreshFingerprint,
+  );
+  const credentialsStatus = normalizedCredentialsStatus(account);
+  const accessPresence = credentialPresence(
+    credentialsStatus,
+    'has_access_token',
+    accessField,
+    storedFingerprintField,
+  );
+  const refreshPresence = credentialPresence(
+    credentialsStatus,
+    'has_refresh_token',
+    refreshField,
+    storedRefreshFingerprintField,
+  );
+  const idPresence = credentialPresence(credentialsStatus, 'has_id_token', idTokenField);
+  const credentialsStatusConflict = accessPresence.conflict
+    || refreshPresence.conflict
+    || idPresence.conflict;
+  const fingerprintConflict = accessFingerprintConflict || refreshFingerprintConflict;
   const identityConflict = accountField.conflict || userField.conflict;
   const scalarSchemaValid = credentialsShapeValid
     && extraShapeValid
+    && credentialsStatus.valid
+    && !credentialsStatusConflict
     && !identityConflict
     && !fingerprintConflict
     && ![
@@ -202,6 +260,7 @@ function safeAccount(account) {
       refreshField,
       idTokenField,
       storedFingerprintField,
+      storedRefreshFingerprintField,
     ].some((field) => field.invalid || field.conflict);
   const email = emailField.value;
   const accountId = accountField.value;
@@ -275,6 +334,12 @@ function safeAccount(account) {
     schemaValid,
     identityConflict,
     fingerprintConflict,
+    credentialsStatusConflict,
+    credentialPresence: {
+      access: accessPresence.value,
+      refresh: refreshPresence.value,
+      id: idPresence.value,
+    },
     expiresAt: accountExpiry.value,
     expiryStatus: accountExpiry.status,
     credentialExpiresAt: credentialExpiry.value,
@@ -288,10 +353,12 @@ function safeAccount(account) {
     overloadUntil: overload.value,
     overloadUntilStatus: overload.status,
     tokenFingerprints: {
-      access: fingerprintConflict
+      access: accessFingerprintConflict
         ? null
         : storedFingerprintField.value || computedAccessFingerprint,
-      refresh: refreshField.conflict ? null : tokenFingerprint(refreshField.value),
+      refresh: refreshField.conflict || refreshFingerprintConflict
+        ? null
+        : storedRefreshFingerprintField.value || computedRefreshFingerprint,
       id: idTokenField.conflict ? null : tokenFingerprint(idTokenField.value),
     },
     groupIds,

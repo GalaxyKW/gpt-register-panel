@@ -81,6 +81,24 @@ function isExpiryInvalid(record) {
   return record?.expiryStatus === 'invalid';
 }
 
+function accountCredentialPresence(account, field) {
+  const explicit = account?.credentialPresence?.[field];
+  if (['present', 'absent', 'unknown'].includes(explicit)) return explicit;
+  return account?.tokenFingerprints?.[field] ? 'present' : 'unknown';
+}
+
+function credentialsInSync(token, account) {
+  const sourceAccess = token?.fingerprints?.access || null;
+  const remoteAccess = account?.tokenFingerprints?.access || null;
+  if (!sourceAccess || !remoteAccess || sourceAccess !== remoteAccess
+      || accountCredentialPresence(account, 'access') === 'absent') return false;
+  const sourceRefresh = token?.fingerprints?.refresh || null;
+  if (!sourceRefresh) return true;
+  return accountCredentialPresence(account, 'refresh') === 'present'
+    && Boolean(account?.tokenFingerprints?.refresh)
+    && sourceRefresh === account.tokenFingerprints.refresh;
+}
+
 function normalizedIdentityKey(key) {
   const raw = String(key || '').trim();
   const separator = raw.indexOf(':');
@@ -247,13 +265,13 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     const issues = [];
     if (isExpiryInvalid(token)) issues.push('expiry_invalid');
     else if (isExpired(token, nowMs)) issues.push('expired');
-    const tokenAccess = token.fingerprints?.access || null;
-    const accountAccess = account.tokenFingerprints?.access || null;
-    if (tokenAccess && accountAccess && tokenAccess !== accountAccess) {
-      issues.push('token_changed');
-    }
-    if (!token.fingerprints?.refresh && !account.tokenFingerprints?.refresh) {
-      issues.push('missing_refresh_token');
+    if (!credentialsInSync(token, account)) {
+      if (token.fingerprints?.refresh
+          && accountCredentialPresence(account, 'refresh') === 'absent') {
+        issues.push('missing_refresh_token');
+      } else {
+        issues.push('token_changed');
+      }
     }
     items.push({
       kind: issues[0] || 'in_sync',
@@ -334,6 +352,7 @@ function toSafeDiff(diff) {
             expiresAt: item.account.expiresAt,
             credentialExpiresAt: item.account.credentialExpiresAt,
             tokenFingerprints: item.account.tokenFingerprints,
+            credentialPresence: item.account.credentialPresence,
             groupIds: item.account.groupIds,
           }
         : null,
@@ -348,6 +367,8 @@ module.exports = {
   identitiesCompatible,
   isExpired,
   isExpiryInvalid,
+  accountCredentialPresence,
+  credentialsInSync,
   buildDiff,
   toSafeDiff,
 };

@@ -399,7 +399,7 @@ test('links duplicate source rows to their unique Sub2API account', () => {
   assert.notEqual(duplicates[0].relativePath, duplicates[1].relativePath);
 });
 
-test('uses Sub2API stored access token fingerprint without reading raw credentials', () => {
+test('uses Sub2API stored token fingerprints and credential-presence metadata without reading raw credentials', () => {
   const safe = safeAccount({
     id: 19,
     name: 'free00003',
@@ -410,12 +410,132 @@ test('uses Sub2API stored access token fingerprint without reading raw credentia
       email: 'fingerprint@example.test',
       chatgpt_account_id: 'account-3',
     },
+    credentials_status: {
+      has_access_token: true,
+      has_refresh_token: true,
+    },
     extra: {
       access_token_sha256: '1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef',
+      refresh_token_sha256: 'abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890',
     },
   });
   assert.equal(safe.tokenFingerprints.access, '1234567890abcdef');
+  assert.equal(safe.tokenFingerprints.refresh, 'abcdef1234567890');
+  assert.deepEqual(safe.credentialPresence, {
+    access: 'present',
+    refresh: 'present',
+    id: 'absent',
+  });
   assert.equal(Object.prototype.hasOwnProperty.call(safe, 'credentials'), false);
+});
+
+test('credential-presence metadata is tri-state and malformed metadata fails closed', () => {
+  const absent = safeAccount({
+    id: 190,
+    credentials_status: { has_access_token: true },
+    extra: { access_token_sha256: '1'.repeat(64) },
+  });
+  assert.equal(absent.schemaValid, true);
+  assert.deepEqual(absent.credentialPresence, {
+    access: 'present',
+    refresh: 'absent',
+    id: 'absent',
+  });
+
+  const legacy = safeAccount({ id: 191 });
+  assert.deepEqual(legacy.credentialPresence, {
+    access: 'unknown',
+    refresh: 'unknown',
+    id: 'unknown',
+  });
+
+  const supportedProviderKeys = safeAccount({
+    id: 192,
+    credentials_status: {
+      has_clearTextPassword: true,
+      'has_sso-rw': true,
+    },
+  });
+  assert.equal(supportedProviderKeys.schemaValid, true);
+
+  for (const credentialsStatus of [
+    [],
+    { has_refresh_token: 'true' },
+    { refresh_token: true },
+    { '': true },
+    { ['has_' + 'a'.repeat(129)]: true },
+    { 'has_access\ntoken': true },
+  ]) {
+    const malformed = safeAccount({ id: 192, credentials_status: credentialsStatus });
+    assert.equal(malformed.schemaValid, false);
+    assert.equal(malformed.credentialPresence.refresh, 'unknown');
+  }
+
+  const contradictory = safeAccount({
+    id: 193,
+    credentials_status: { has_access_token: true },
+    extra: {
+      access_token_sha256: '2'.repeat(64),
+      refresh_token_sha256: '3'.repeat(64),
+    },
+  });
+  assert.equal(contradictory.schemaValid, false);
+  assert.equal(contradictory.credentialsStatusConflict, true);
+});
+
+test('diff requires a matching remote refresh fingerprint when the source can refresh', () => {
+  const fixture = fixtureRoot();
+  const sources = readGptRegisterSources({ rootDirectory: fixture.root });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const base = {
+    id: 194,
+    name: 'free00194',
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: token.fingerprints.access, refresh: null },
+  };
+  let diff = buildDiff(sources.tokens, [{
+    ...base,
+    credentialPresence: { access: 'present', refresh: 'absent', id: 'unknown' },
+  }]);
+  assert.equal(diff.counts.missing_refresh_token, 1);
+
+  diff = buildDiff(sources.tokens, [{
+    ...base,
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  }]);
+  assert.equal(diff.counts.token_changed, 1);
+
+  diff = buildDiff(sources.tokens, [{
+    ...base,
+    tokenFingerprints: { ...token.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  }]);
+  assert.equal(diff.counts.in_sync, 1);
+});
+
+test('diff does not claim a refresh token is missing when the source has none', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/access-only.json',
+    fileName: 'access-only.json',
+    parseStatus: 'ok',
+    identityKeys: ['account:access-only-account'],
+    fingerprints: { access: 'same-access-fingerprint', refresh: null },
+    expiryStatus: 'missing',
+  };
+  const account = {
+    id: 195,
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: token.fingerprints.access, refresh: null },
+  };
+  for (const refresh of ['unknown', 'absent']) {
+    const diff = buildDiff([token], [{
+      ...account,
+      credentialPresence: { access: 'present', refresh, id: 'unknown' },
+    }]);
+    assert.equal(diff.counts.in_sync, 1);
+    assert.equal(diff.counts.missing_refresh_token, undefined);
+  }
 });
 
 test('preserves explicit zero usage values and rejects invalid account ids', () => {

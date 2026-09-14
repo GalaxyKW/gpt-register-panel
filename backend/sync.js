@@ -13,6 +13,8 @@ const {
   identitiesStronglyCompatible,
   hasStrongIdentity,
   accountKeys,
+  accountCredentialPresence,
+  credentialsInSync,
 } = require('./diff');
 const {
   buildRows,
@@ -102,6 +104,7 @@ function safeVersionInput(snapshot) {
       schemaValid: account.schemaValid,
       identityConflict: account.identityConflict,
       fingerprintConflict: account.fingerprintConflict,
+      credentialsStatusConflict: account.credentialsStatusConflict,
       statusKnown: account.statusKnown,
       schedulable: account.schedulable,
       schedulableKnown: account.schedulableKnown,
@@ -119,6 +122,7 @@ function safeVersionInput(snapshot) {
       credentialExpiryStatus: account.credentialExpiryStatus,
       identityKeys: account.identityKeys,
       tokenFingerprints: account.tokenFingerprints,
+      credentialPresence: account.credentialPresence,
       groupIds: account.groupIds,
     })),
   };
@@ -163,6 +167,7 @@ function safeAccountForSnapshot(account) {
     schemaValid: account.schemaValid,
     identityConflict: account.identityConflict,
     fingerprintConflict: account.fingerprintConflict,
+    credentialsStatusConflict: account.credentialsStatusConflict,
     statusKnown: account.statusKnown,
     schedulable: account.schedulable,
     schedulableKnown: account.schedulableKnown,
@@ -185,6 +190,7 @@ function safeAccountForSnapshot(account) {
     credentialExpiresAt: account.credentialExpiresAt || null,
     credentialExpiryStatus: account.credentialExpiryStatus || null,
     tokenFingerprints: account.tokenFingerprints,
+    credentialPresence: account.credentialPresence,
     groupIds: account.groupIds,
     usage: account.usage || null,
     usageError: safeRemoteError(account.usageError),
@@ -689,8 +695,6 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   for (const entry of entries) {
     const { candidate, matches, ambiguousHints, account } = entry;
     if (!selectedCandidate(candidate, selectedKeys, account)) continue;
-    const accessFingerprint = candidate.record.fingerprints?.access || null;
-    const refreshFingerprint = candidate.record.fingerprints?.refresh || null;
     const terminalStatus = sourceTerminalStatus(sources, candidate.record);
     let action = 'create';
     let reason = 'token_only';
@@ -732,15 +736,6 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       } else if (superseded) {
         action = 'skip';
         reason = 'superseded_by_newer_source';
-      } else if (accessFingerprint && accessFingerprint === account.tokenFingerprints?.access
-          // The Sub2API lite account listing intentionally omits refresh
-          // credentials. An absent remote fingerprint means "unknown", not
-          // a mismatch; compare it only when both sides provide one.
-          && (!refreshFingerprint
-            || !account.tokenFingerprints?.refresh
-            || refreshFingerprint === account.tokenFingerprints.refresh)) {
-        action = 'skip';
-        reason = 'already_in_sync';
       } else if (availability.key === 'available') {
         action = 'skip';
         reason = 'sub2api_available';
@@ -750,6 +745,9 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       } else if (isExpired(candidate.record, nowMs)) {
         action = 'skip';
         reason = 'source_token_expired';
+      } else if (credentialsInSync(candidate.record, account)) {
+        action = 'skip';
+        reason = 'already_in_sync';
       } else {
         action = 'update';
         reason = 'token_changed';
@@ -972,19 +970,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {})
     error.code = 'SUB2API_IMPORT_VERIFY_IDENTITY_MISMATCH';
     throw error;
   }
-  const expectedFingerprint = item.fingerprints?.access || null;
-  const actualFingerprint = account.tokenFingerprints?.access || null;
-  if (!expectedFingerprint || !actualFingerprint) {
-    const error = new Error('导入后无法取得 access token 指纹');
-    error.code = 'SUB2API_IMPORT_VERIFY_FINGERPRINT_MISSING';
-    throw error;
-  }
-  if (expectedFingerprint !== actualFingerprint) {
-    const error = new Error('导入后 access token 指纹不一致');
-    error.code = 'SUB2API_IMPORT_VERIFY_FINGERPRINT_MISMATCH';
-    error.details = { expectedFingerprint, actualFingerprint };
-    throw error;
-  }
+  const actualFingerprint = verifyTargetFingerprint(item, account);
   writeLog(logger, 'info', 'import.account_verified', {
     ...context,
     accountId: account.id,
@@ -1042,12 +1028,41 @@ function verifyPlannedTargetIdentity(item, account) {
     : accountKeys(account);
   for (const prefix of ['account:', 'user:']) {
     const plannedValues = identityValues(plannedIdentity, prefix);
-    if (plannedValues.size === 0) continue;
     const actualValues = identityValues(actualIdentity, prefix);
     if (plannedValues.size !== actualValues.size
         || [...plannedValues].some((value) => !actualValues.has(value))) {
       throw targetVerificationError(
         'Sub2API 目标账号强身份与计划快照不一致',
+        'SUB2API_TARGET_CHANGED',
+      );
+    }
+  }
+}
+
+function verifyUpdatedTargetIdentity(item, account) {
+  const verifiedAccount = item?._verifiedAccount || item?._account;
+  const verifiedIdentity = verifiedAccount?.identityKeys?.length
+    ? verifiedAccount.identityKeys
+    : accountKeys(verifiedAccount);
+  const actualIdentity = account?.identityKeys?.length
+    ? account.identityKeys
+    : accountKeys(account);
+  for (const prefix of ['account:', 'user:']) {
+    const sourceValues = identityValues(item?.sourceIdentityKeys || [], prefix);
+    if (sourceValues.size > 1) {
+      throw targetVerificationError(
+        '更新来源的强身份字段存在冲突',
+        'SOURCE_IDENTITY_CONFLICT',
+      );
+    }
+    const expectedValues = sourceValues.size === 1
+      ? sourceValues
+      : identityValues(verifiedIdentity, prefix);
+    const actualValues = identityValues(actualIdentity, prefix);
+    if (expectedValues.size !== actualValues.size
+        || [...expectedValues].some((value) => !actualValues.has(value))) {
+      throw targetVerificationError(
+        'Sub2API 更新后的强身份与已验证目标不一致',
         'SUB2API_TARGET_CHANGED',
       );
     }
@@ -1063,7 +1078,30 @@ function verifyTargetFingerprint(item, account) {
   if (expectedFingerprint !== actualFingerprint) {
     throw targetVerificationError('更新后 access token 指纹不一致', 'SUB2API_IMPORT_VERIFY_FINGERPRINT_MISMATCH');
   }
+  const expectedRefreshFingerprint = item.fingerprints?.refresh || null;
+  if (expectedRefreshFingerprint) {
+    const actualRefreshFingerprint = account?.tokenFingerprints?.refresh || null;
+    if (accountCredentialPresence(account, 'refresh') !== 'present' || !actualRefreshFingerprint) {
+      throw targetVerificationError('更新后无法确认 refresh token', 'SUB2API_IMPORT_VERIFY_REFRESH_FINGERPRINT_MISSING');
+    }
+    if (expectedRefreshFingerprint !== actualRefreshFingerprint) {
+      throw targetVerificationError('更新后 refresh token 指纹不一致', 'SUB2API_IMPORT_VERIFY_REFRESH_FINGERPRINT_MISMATCH');
+    }
+  }
   return actualFingerprint;
+}
+
+function plannedCredentialStateMatches(plannedAccount, account) {
+  if (!plannedAccount) return false;
+  for (const field of ['access', 'refresh']) {
+    const expectedFingerprint = plannedAccount.tokenFingerprints?.[field] || null;
+    const actualFingerprint = account?.tokenFingerprints?.[field] || null;
+    if (expectedFingerprint && expectedFingerprint !== actualFingerprint) return false;
+    const expectedPresence = accountCredentialPresence(plannedAccount, field);
+    const actualPresence = accountCredentialPresence(account, field);
+    if (expectedPresence !== 'unknown' && expectedPresence !== actualPresence) return false;
+  }
+  return true;
 }
 
 function sourceCredentialValue(raw, snakeKey, camelKey, maximumLength = 1024) {
@@ -1085,6 +1123,31 @@ function sourceTokenValue(raw, snakeKey, camelKey, maximumLength) {
   return value.trim();
 }
 
+function verifiedIdentityValue(item, recordKey, prefix) {
+  const recordValue = sourceCredentialValue(item?._record || {}, recordKey, recordKey, 512);
+  if (recordValue) return recordValue;
+  const sourceValues = identityValues(item?.sourceIdentityKeys || [], prefix);
+  if (sourceValues.size === 1) return [...sourceValues][0];
+  const account = item?._verifiedAccount || item?._account;
+  const directValue = sourceCredentialValue(account || {}, recordKey, recordKey, 512);
+  if (directValue) return directValue;
+  const values = identityValues(account?.identityKeys || accountKeys(account), prefix);
+  return values.size === 1 ? [...values][0] : '';
+}
+
+function credentialFingerprintExtra(raw) {
+  const accessToken = sourceTokenValue(raw, 'access_token', 'accessToken', 2 * 1024 * 1024);
+  const refreshToken = sourceTokenValue(raw, 'refresh_token', 'refreshToken', 256 * 1024);
+  return {
+    ...(accessToken ? {
+      access_token_sha256: crypto.createHash('sha256').update(accessToken).digest('hex'),
+    } : {}),
+    ...(refreshToken ? {
+      refresh_token_sha256: crypto.createHash('sha256').update(refreshToken).digest('hex'),
+    } : {}),
+  };
+}
+
 function buildOAuthUpdatePayload(item) {
   const raw = item?._raw && typeof item._raw === 'object' ? item._raw : {};
   const record = item?._record || {};
@@ -1103,8 +1166,10 @@ function buildOAuthUpdatePayload(item) {
   credentials.client_id = OPENAI_CODEX_OAUTH_CLIENT_ID;
   if (idToken) credentials.id_token = idToken;
   if (record.email || item.email) credentials.email = record.email || item.email;
-  if (record.accountId) credentials.chatgpt_account_id = record.accountId;
-  if (record.userId) credentials.chatgpt_user_id = record.userId;
+  const accountId = verifiedIdentityValue(item, 'accountId', 'account:');
+  const userId = verifiedIdentityValue(item, 'userId', 'user:');
+  if (accountId) credentials.chatgpt_account_id = accountId;
+  if (userId) credentials.chatgpt_user_id = userId;
   if (item.expiresAt) credentials.expires_at = item.expiresAt;
   for (const [key, maximumLength] of [['token_type', 64], ['scope', 4096], ['last_refresh', 64]]) {
     const value = sourceCredentialValue(raw, key, key, maximumLength);
@@ -1129,9 +1194,7 @@ function buildOAuthUpdatePayload(item) {
   return {
     type: 'oauth',
     credentials,
-    extra: {
-      access_token_sha256: crypto.createHash('sha256').update(accessToken).digest('hex'),
-    },
+    extra: credentialFingerprintExtra(raw),
   };
 }
 
@@ -1214,20 +1277,19 @@ async function preflightUpdateAccount(client, item, nowMs = Date.now()) {
   const account = await client.getAccount(expectedId);
   verifyTargetIdentity(item, account, expectedId);
   verifyPlannedTargetIdentity(item, account);
-  const expectedBefore = item?._account?.tokenFingerprints?.access || null;
-  const actualBefore = account.tokenFingerprints?.access || null;
-  if (actualBefore && actualBefore === item.fingerprints?.access) {
-    return { account, skipReason: 'already_in_sync' };
-  }
-  if (expectedBefore && actualBefore && expectedBefore !== actualBefore) {
-    throw targetVerificationError('Sub2API 目标账号在写入前已变化', 'SUB2API_TARGET_CHANGED');
-  }
   const availability = getAccountAvailability(account, nowMs);
   if (availability.key !== 'unavailable') {
     return { account, skipReason: availability.reason || 'sub2api_availability_unknown' };
   }
   if (isExpiryInvalid(item?._record) || isExpired(item?._record, nowMs)) {
     return { account, skipReason: isExpiryInvalid(item?._record) ? 'source_expiry_invalid' : 'source_token_expired' };
+  }
+  const sourceRecord = item?._record || { fingerprints: item?.fingerprints || {} };
+  if (credentialsInSync(sourceRecord, account)) {
+    return { account, skipReason: 'already_in_sync' };
+  }
+  if (!plannedCredentialStateMatches(item?._account, account)) {
+    throw targetVerificationError('Sub2API 目标账号在写入前已变化', 'SUB2API_TARGET_CHANGED');
   }
   return { account, skipReason: null };
 }
@@ -1307,10 +1369,15 @@ async function executeImportPlanItem({
         return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
       }
     }
-    const writeItem = freshRecord ? { ...item, _record: freshRecord, _raw: freshRecord.raw } : item;
+    const writeItem = {
+      ...item,
+      ...(freshRecord ? { _record: freshRecord, _raw: freshRecord.raw } : {}),
+      _verifiedAccount: preflight.account,
+    };
     await client.applyOAuthCredentials(item.accountId, buildOAuthUpdatePayload(writeItem));
     const account = await client.getAccount(item.accountId);
     const accountId = verifyTargetIdentity(item, account, item.accountId);
+    verifyUpdatedTargetIdentity(writeItem, account);
     const fingerprint = verifyTargetFingerprint(item, account);
     const verification = {
       accountId,
@@ -1349,6 +1416,7 @@ async function executeImportPlanItem({
     // Only the validated Codex fields cross the adapter boundary. Unknown
     // nested source objects must never be forwarded as import credentials.
     content: JSON.stringify(buildCodexSessionDocument(writeItem)),
+    extra: credentialFingerprintExtra(writeItem._raw || {}),
     name: item.accountName || undefined,
     group_ids: groups,
     // If an identity appears after preflight, fail instead of silently

@@ -116,6 +116,21 @@ test('snapshot CAS distinguishes omitted, failed, and confirmed-empty remote rea
     _internal: { ...base, sub2apiRead: true, apiError: null },
     sub2api: { apiError: 'inconsistent public failure' },
   }), false);
+
+  const account = {
+    id: 1,
+    tokenFingerprints: { access: 'same-fingerprint', refresh: null },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+  };
+  const unknownPresence = snapshotVersion({ ...base, accounts: [account] });
+  const absentPresence = snapshotVersion({
+    ...base,
+    accounts: [{
+      ...account,
+      credentialPresence: { ...account.credentialPresence, refresh: 'absent' },
+    }],
+  });
+  assert.notEqual(unknownPresence, absentPresence);
 });
 
 test('PanelDb persists jobs and audit rows in an independent SQLite file', async () => {
@@ -854,6 +869,12 @@ test('import plan never updates an available Sub2API account', () => {
   const plan = buildImportPlan(sources, [account]);
   assert.equal(plan[0].action, 'skip');
   assert.equal(plan[0].reason, 'sub2api_available');
+
+  account.tokenFingerprints = { ...token.fingerprints };
+  account.credentialPresence = { access: 'present', refresh: 'present', id: 'unknown' };
+  const matchingPlan = buildImportPlan(sources, [account]);
+  assert.equal(matchingPlan[0].action, 'skip');
+  assert.equal(matchingPlan[0].reason, 'sub2api_available');
 });
 
 test('import plan skips an explicitly disabled source token', () => {
@@ -887,7 +908,7 @@ test('import plan updates only an unavailable account with a fresh source token'
   assert.equal(plan[0].reason, 'token_changed');
 });
 
-test('import plan treats a missing remote refresh fingerprint as unknown', () => {
+test('import plan updates when a source refresh fingerprint cannot be verified remotely', () => {
   const { root } = fixture();
   const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
   const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
@@ -900,12 +921,17 @@ test('import plan treats a missing remote refresh fingerprint as unknown', () =>
     status: 'error',
     schedulable: false,
     identityKeys: token.identityKeys,
-    // Sub2API's lite listing exposes access fingerprint but not refresh.
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
     tokenFingerprints: { access: token.fingerprints.access, refresh: null },
   };
   const plan = buildImportPlan(sources, [account]);
-  assert.equal(plan[0].action, 'skip');
-  assert.equal(plan[0].reason, 'already_in_sync');
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].reason, 'token_changed');
+
+  account.tokenFingerprints.refresh = token.fingerprints.refresh;
+  const matchingPlan = buildImportPlan(sources, [account]);
+  assert.equal(matchingPlan[0].action, 'skip');
+  assert.equal(matchingPlan[0].reason, 'already_in_sync');
 });
 
 test('import plan writes only the freshest candidate when one account has duplicate sources', () => {
@@ -1311,6 +1337,9 @@ test('OAuth update payload preserves refresh metadata without exposing it in sum
   assert.equal(Object.hasOwn(payload.credentials, 'token_type'), false);
   assert.equal(payload.credentials.plan_type, 'free');
   assert.equal(payload.credentials.organization_id, 'organization-a');
+  assert.match(payload.extra.access_token_sha256, /^[a-f0-9]{64}$/);
+  assert.match(payload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
+  assert.notEqual(payload.extra.access_token_sha256, payload.extra.refresh_token_sha256);
 });
 
 test('update plan uses the ID-scoped OAuth endpoint and rechecks availability', async () => {
@@ -1400,6 +1429,65 @@ test('update plan uses the ID-scoped OAuth endpoint and rechecks availability', 
   assert.equal(identityUpdateCalls, 0);
 });
 
+test('update preflight does not treat matching access with an unverified refresh as synchronized', async () => {
+  const identityKeys = ['account:refresh-account', 'user:refresh-user'];
+  const source = syntheticToken('tokens/refresh-update.json', identityKeys, {
+    accountId: 'refresh-account',
+    userId: 'refresh-user',
+    accessFingerprint: 'same-access-fingerprint',
+    refreshFingerprint: 'new-refresh-fingerprint',
+    accessToken: 'same-access-value',
+    refreshToken: 'new-refresh-value',
+  });
+  const before = {
+    id: 120,
+    name: 'free00120',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys,
+    tokenFingerprints: { access: source.fingerprints.access, refresh: null },
+    credentialPresence: { access: 'present', refresh: 'absent', id: 'unknown' },
+  };
+  const after = {
+    ...before,
+    tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
+  assert.equal(item.action, 'update');
+  let reads = 0;
+  let mutations = 0;
+  const outcome = await executeImportPlanItem({
+    item,
+    client: {
+      async getAccount() {
+        reads += 1;
+        return reads === 1 ? before : after;
+      },
+      async applyOAuthCredentials(id, payload) {
+        assert.equal(id, 120);
+        assert.equal(payload.credentials.refresh_token, 'new-refresh-value');
+        assert.match(payload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
+        mutations += 1;
+      },
+    },
+  });
+  assert.equal(outcome.skipped, false);
+  assert.equal(mutations, 1);
+
+  const raced = await executeImportPlanItem({
+    item,
+    client: {
+      async getAccount() { return after; },
+      async applyOAuthCredentials() { throw new Error('already synchronized target must not be mutated'); },
+    },
+  });
+  assert.equal(raced.skipped, true);
+  assert.equal(raced.reason, 'already_in_sync');
+});
+
 test('update preflight binds every strong identity dimension from the planned remote row', async () => {
   const source = syntheticToken(
     'tokens/account-only.json',
@@ -1438,6 +1526,178 @@ test('update preflight binds every strong identity dimension from the planned re
     (error) => error.code === 'SUB2API_TARGET_CHANGED',
   );
   assert.equal(mutations, 0);
+});
+
+test('partial source identities preserve verified remote dimensions and verify them after writing', async () => {
+  const source = syntheticToken(
+    'tokens/partial-account.json',
+    ['account:partial-account'],
+    { accountId: 'partial-account', accessFingerprint: 'partial-new-fingerprint' },
+  );
+  const before = {
+    id: 121,
+    name: 'free00121',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    accountId: 'partial-account',
+    userId: 'remote-user-to-preserve',
+    identityKeys: ['account:partial-account', 'user:remote-user-to-preserve'],
+    tokenFingerprints: { access: 'partial-old-fingerprint' },
+  };
+  const after = {
+    ...before,
+    tokenFingerprints: { access: source.fingerprints.access },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
+  let reads = 0;
+  let payload = null;
+  const outcome = await executeImportPlanItem({
+    item,
+    client: {
+      async getAccount() {
+        reads += 1;
+        return reads === 1 ? before : after;
+      },
+      async applyOAuthCredentials(id, value) {
+        assert.equal(id, 121);
+        payload = value;
+      },
+    },
+  });
+  assert.equal(outcome.skipped, false);
+  assert.equal(payload.credentials.chatgpt_account_id, 'partial-account');
+  assert.equal(payload.credentials.chatgpt_user_id, 'remote-user-to-preserve');
+
+  reads = 0;
+  let mutations = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async getAccount() {
+          reads += 1;
+          return reads === 1
+            ? before
+            : {
+                ...after,
+                userId: '',
+                identityKeys: ['account:partial-account'],
+              };
+        },
+        async applyOAuthCredentials() { mutations += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+  );
+  assert.equal(mutations, 1);
+});
+
+test('update preflight rejects a strong identity dimension added after planning', async () => {
+  const source = syntheticToken(
+    'tokens/planned-account-only.json',
+    ['account:planned-account-only'],
+    { accountId: 'planned-account-only', accessFingerprint: 'planned-new-fingerprint' },
+  );
+  const planned = {
+    id: 122,
+    name: 'free00122',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    accountId: 'planned-account-only',
+    identityKeys: ['account:planned-account-only'],
+    tokenFingerprints: { access: 'planned-old-fingerprint' },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [planned])[0];
+  let mutations = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async getAccount() {
+          return {
+            ...planned,
+            userId: 'identity-added-after-plan',
+            identityKeys: [
+              'account:planned-account-only',
+              'user:identity-added-after-plan',
+            ],
+          };
+        },
+        async applyOAuthCredentials() { mutations += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+  );
+  assert.equal(mutations, 0);
+});
+
+test('freshest partial token carries a unique identity dimension from its older version', async () => {
+  const freshest = syntheticToken(
+    'tokens/freshest-partial.json',
+    ['account:aggregate-account'],
+    {
+      accountId: 'aggregate-account',
+      accessFingerprint: 'aggregate-new-fingerprint',
+      mtimeMs: 20,
+    },
+  );
+  const older = syntheticToken(
+    'use_token/older-complete.json',
+    ['account:aggregate-account', 'user:aggregate-user'],
+    {
+      source: 'use_token',
+      accountId: 'aggregate-account',
+      userId: 'aggregate-user',
+      accessFingerprint: 'aggregate-old-fingerprint',
+      mtimeMs: 10,
+    },
+  );
+  const before = {
+    id: 123,
+    name: 'free00123',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    accountId: 'aggregate-account',
+    identityKeys: ['account:aggregate-account'],
+    tokenFingerprints: { access: 'remote-old-fingerprint' },
+  };
+  const after = {
+    ...before,
+    userId: 'aggregate-user',
+    identityKeys: ['account:aggregate-account', 'user:aggregate-user'],
+    tokenFingerprints: { access: freshest.fingerprints.access },
+  };
+  const plan = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [before]);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].relativePath, freshest.relativePath);
+  assert.deepEqual(plan[0].sourceIdentityKeys, [
+    'account:aggregate-account',
+    'user:aggregate-user',
+  ]);
+  let reads = 0;
+  let payload = null;
+  const outcome = await executeImportPlanItem({
+    item: plan[0],
+    client: {
+      async getAccount() {
+        reads += 1;
+        return reads === 1 ? before : after;
+      },
+      async applyOAuthCredentials(id, value) {
+        assert.equal(id, 123);
+        payload = value;
+      },
+    },
+  });
+  assert.equal(outcome.skipped, false);
+  assert.equal(payload.credentials.chatgpt_account_id, 'aggregate-account');
+  assert.equal(payload.credentials.chatgpt_user_id, 'aggregate-user');
 });
 
 test('source token changes after remote preflight block every mutation', async () => {
@@ -1542,6 +1802,8 @@ test('create verification consumes the nested Codex import account ID', async ()
     accountId: 'new-account',
     userId: 'new-user',
     accessFingerprint: 'new-create-fp',
+    refreshFingerprint: 'new-create-refresh-fp',
+    refreshToken: 'new-create-refresh-value',
   });
   const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
   source.raw.credentials = { access_token: 'nested-import-value' };
@@ -1572,7 +1834,8 @@ test('create verification consumes the nested Codex import account ID', async ()
         status: 'active',
         schedulable: true,
         identityKeys,
-        tokenFingerprints: { access: source.fingerprints.access },
+        tokenFingerprints: { ...source.fingerprints },
+        credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
       };
     },
     async applyOAuthCredentials() { throw new Error('create must not use ID-scoped update'); },
@@ -1582,6 +1845,7 @@ test('create verification consumes the nested Codex import account ID', async ()
   assert.equal(importPayload.update_existing, false);
   assert.equal(importPayload.content.includes('nested-import-value'), false);
   assert.equal(importPayload.content.includes('nested-unknown-value'), false);
+  assert.match(importPayload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
   assert.equal(outcome.result.accountId, 42);
   assert.equal(outcome.verification.accountId, 42);
 
