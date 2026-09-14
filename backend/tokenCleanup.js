@@ -13,6 +13,7 @@ const SOURCES = new Set(['tokens', 'use_token']);
 const CLAIM_PREFIX = '.panel-token-cleanup-claim-';
 const CLAIM_PREFIX_V1 = '.panel-token-cleanup-claim-v1-';
 const CLAIM_PREFIX_V2 = '.panel-token-cleanup-claim-v2-';
+const CROSS_FILESYSTEM_MARKER_PREFIX = CLAIM_PREFIX + 'crossfs-v1-';
 const MAX_REPORTED_CLEANUP_CLAIMS = 1000;
 const MAX_RECOVERABLE_CLEANUP_CLAIMS = 1000;
 const DEFAULT_CLEANUP_DIRECTORY_ENTRIES = 20_000;
@@ -276,6 +277,63 @@ function rollbackOwnedPath(filePath, expectedStat) {
   } catch (error) {
     return error?.code === 'ENOENT';
   }
+}
+
+function createCrossFilesystemMoveMarker(sourcePath) {
+  const directory = path.dirname(sourcePath);
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    const markerPath = path.join(
+      directory,
+      CROSS_FILESYSTEM_MARKER_PREFIX + process.pid + '-' + crypto.randomBytes(8).toString('hex'),
+    );
+    let descriptor;
+    let identity = null;
+    let created = false;
+    try {
+      descriptor = fs.openSync(
+        markerPath,
+        fs.constants.O_WRONLY
+          | fs.constants.O_CREAT
+          | fs.constants.O_EXCL
+          | (fs.constants.O_NOFOLLOW || 0),
+        0o600,
+      );
+      created = true;
+      identity = fs.fstatSync(descriptor);
+      const currentUid = cleanupProcessUid();
+      if (!identity.isFile() || identity.nlink !== 1
+          || (currentUid !== null && identity.uid !== currentUid)
+          || (identity.mode & 0o077) !== 0) {
+        throw new Error('跨文件系统隔离恢复标记无效');
+      }
+      fs.fsyncSync(descriptor);
+      fs.closeSync(descriptor);
+      descriptor = undefined;
+      syncCleanupDirectory(directory);
+      const published = fs.lstatSync(markerPath);
+      if (published.isSymbolicLink() || !published.isFile()
+          || published.nlink !== 1 || !sameInode(published, identity)
+          || (currentUid !== null && published.uid !== currentUid)
+          || (published.mode & 0o077) !== 0) {
+        throw new Error('跨文件系统隔离恢复标记发布后发生变化');
+      }
+      return { path: markerPath, identity: published };
+    } catch (error) {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+      if (!created && error?.code === 'EEXIST') continue;
+      if (created && (!identity || !rollbackOwnedPath(markerPath, identity))) {
+        throw cleanupWriteOutcomeUnknown(error, {
+          code: 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN',
+          message: 'token 跨文件系统隔离标记结果无法确认；请人工对账，禁止自动重试',
+          reason: 'quarantine_rollback_outcome_unknown',
+        });
+      }
+      throw error;
+    }
+  }
+  throw new Error('无法创建唯一的跨文件系统隔离恢复标记');
 }
 
 function cleanupRoot(options = {}) {
@@ -680,7 +738,14 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
   let publishedIdentity = null;
   let temporaryIdentity = null;
   let copiedSourceRemoved = false;
+  let crossFilesystemMarker = null;
   try {
+    // A copied target is a different inode from the source claim. Without a
+    // durable marker, a crash after target publication but before source
+    // unlink would make recovery restore the claim while retaining the target,
+    // silently creating two copies. Any interrupted cross-filesystem move must
+    // therefore fail closed instead of being treated as an ordinary claim.
+    crossFilesystemMarker = createCrossFilesystemMoveMarker(sourcePath);
     sourceDescriptor = fs.openSync(
       sourcePath,
       fs.constants.O_RDONLY
@@ -761,6 +826,10 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
         || !sameCleanupContentSnapshot(publishedContent, sourceContentBeforeLink)) {
       throw new Error('跨文件系统隔离目标内容在来源移除后发生变化');
     }
+    if (!rollbackOwnedPath(crossFilesystemMarker.path, crossFilesystemMarker.identity)) {
+      throw new Error('跨文件系统隔离恢复标记清理失败');
+    }
+    crossFilesystemMarker = null;
   } catch (error) {
     let rollbackUnconfirmed = temporaryIdentity
       ? !rollbackOwnedPath(temporaryPath, temporaryIdentity)
@@ -775,6 +844,16 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
     if (published
         && (!publishedIdentity || !rollbackOwnedPath(targetPath, publishedIdentity))) {
       rollbackUnconfirmed = true;
+    }
+    // Retain the marker whenever either copied namespace entry cannot be
+    // confidently rolled back. It is the recovery barrier that prevents a
+    // surviving target from being duplicated back into the source directory.
+    if (!rollbackUnconfirmed && crossFilesystemMarker) {
+      if (rollbackOwnedPath(crossFilesystemMarker.path, crossFilesystemMarker.identity)) {
+        crossFilesystemMarker = null;
+      } else {
+        rollbackUnconfirmed = true;
+      }
     }
     if (rollbackUnconfirmed) {
       throw cleanupWriteOutcomeUnknown(error, {
@@ -1156,6 +1235,9 @@ function recoverTokenCleanupClaimsFromDirectories(rootDirectory, options = {}) {
     try {
       forEachBoundedCleanupDirectoryEntry(directory, (fileName) => {
         if (!fileName.startsWith(CLAIM_PREFIX)) return;
+        if (fileName.startsWith(CROSS_FILESYSTEM_MARKER_PREFIX)) {
+          throw cleanupRecoveryInvalid('cross_filesystem_move_incomplete');
+        }
         const claim = parseClaimName(fileName);
         if (!claim) throw cleanupRecoveryInvalid('claim_name_invalid');
         const claimPath = safeAbsolutePath(directory, fileName);

@@ -1424,10 +1424,97 @@ test('cross-filesystem cleanup never unlinks a newly reusable original source pa
       'expired-tokens',
       result.deleted[0].quarantinePath,
     )), true);
+    assert.equal(fs.readdirSync(path.join(root, 'tokens')).some(
+      (name) => name.startsWith('.panel-token-cleanup-claim-'),
+    ), false);
   } finally {
     fs.linkSync = originalLinkSync;
     fs.unlinkSync = originalUnlinkSync;
   }
+});
+
+test('cross-filesystem crash after publishing quarantine never restores a duplicate source', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'cross-device-crash.json');
+  const targetDirectory = path.join(root, 'quarantine-target');
+  const targetPath = path.join(targetDirectory, 'cross-device-crash.json');
+  const content = JSON.stringify({
+    access_token: jwt('cross-device-crash@example.test', { suffix: '-cross-device-crash' }),
+    email: 'cross-device-crash@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, content, { mode: 0o600 });
+
+  const cleanupModule = require.resolve('../backend/tokenCleanup');
+  const childSource = [
+    "const crypto = require('node:crypto');",
+    "const fs = require('node:fs');",
+    "const { claimSourcePath, moveToQuarantine } = require(process.argv[1]);",
+    'const sourcePath = process.argv[2];',
+    'const targetPath = process.argv[3];',
+    "const content = fs.readFileSync(sourcePath);",
+    "const hash = crypto.createHash('sha256').update(content).digest('hex');",
+    'const claimPath = claimSourcePath(sourcePath, hash);',
+    'const originalLinkSync = fs.linkSync;',
+    'let forcedCrossDevice = false;',
+    'fs.linkSync = function forceCrossDeviceOnce(from, to) {',
+    '  if (!forcedCrossDevice && from === claimPath && to === targetPath) {',
+    '    forcedCrossDevice = true;',
+    "    const error = new Error('simulated cross-device link');",
+    "    error.code = 'EXDEV';",
+    '    throw error;',
+    '  }',
+    '  return originalLinkSync.call(fs, from, to);',
+    '};',
+    'const originalUnlinkSync = fs.unlinkSync;',
+    'fs.unlinkSync = function crashBeforeClaimUnlink(filePath) {',
+    '  if (filePath === claimPath && fs.existsSync(targetPath)) process.exit(73);',
+    '  return originalUnlinkSync.call(fs, filePath);',
+    '};',
+    'moveToQuarantine(claimPath, targetPath);',
+    'process.exit(74);',
+  ].join('\n');
+  const child = spawnSync(process.execPath, [
+    '-e',
+    childSource,
+    cleanupModule,
+    sourcePath,
+    targetPath,
+  ], { encoding: 'utf8' });
+
+  assert.equal(child.status, 73, child.stderr);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), content);
+  const sourceEntriesBeforeRecovery = fs.readdirSync(path.join(root, 'tokens')).sort();
+  assert.equal(sourceEntriesBeforeRecovery.filter(
+    (name) => name.startsWith('.panel-token-cleanup-claim-v2-'),
+  ).length, 1);
+  assert.equal(sourceEntriesBeforeRecovery.filter(
+    (name) => name.startsWith('.panel-token-cleanup-claim-crossfs-v1-'),
+  ).length, 1);
+
+  let failure;
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => {
+      failure = error;
+      return error.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+        && error.recoveryReason === 'cross_filesystem_move_incomplete';
+    },
+  );
+  assert.equal(failure.recoveryRequired, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.blockedBeforeStart, true);
+  assert.equal(failure.executionOutcome, 'not_started');
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.readFileSync(targetPath, 'utf8'), content);
+  assert.deepEqual(
+    fs.readdirSync(path.join(root, 'tokens')).sort(),
+    sourceEntriesBeforeRecovery,
+  );
 });
 
 test('cleanup leaves an unverified claim untouched when its first snapshot fails', () => {
