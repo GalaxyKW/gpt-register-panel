@@ -70,6 +70,14 @@ const PHASE3_TERMINATION_MAX_TOTAL_MS = PHASE3_TERMINATION_GRACE_MAX_MS
 const PHASE3_DESCENDANT_LIMIT = 4096;
 const PHASE3_PROC_ENV_MAX_BYTES = 64 * 1024;
 const PHASE3_PROC_ENV_SCAN_MAX_BYTES = 8 * 1024 * 1024;
+// `/proc` is kernel-controlled but can still contain enough entries to make a
+// synchronous full-directory materialization unsafe for the panel process.
+// Stream every directory and refuse to confirm termination if a complete scan
+// cannot be performed within these process-local ceilings.
+const PHASE3_PROC_DIRECTORY_ENTRY_LIMIT = 65_536;
+const PHASE3_PROC_TASK_ENTRY_LIMIT = 4096;
+const PHASE3_PROC_CHILDREN_MAX_BYTES = 64 * 1024;
+const PHASE3_PROC_CHILDREN_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 const PHASE3_SUPERVISION_ENV_NAME = 'GPT_REGISTER_PANEL_SUPERVISION_ID';
 const PHASE3_SCRIPT_CHILD_FD = 3;
 const PHASE3_NODE_CHILD_FD = 4;
@@ -92,19 +100,19 @@ function phase3SupervisionError() {
   return error;
 }
 
-function linuxProcessIdentity(pid) {
+function readLinuxProcessIdentity(pid) {
   const numericPid = Number(pid);
   if (process.platform !== 'linux' || !Number.isSafeInteger(numericPid) || numericPid <= 1) {
-    return null;
+    return { status: 'gone', identity: null };
   }
   try {
     const stat = fs.readFileSync('/proc/' + String(numericPid) + '/stat', 'utf8');
     const commandEnd = stat.lastIndexOf(')');
-    if (commandEnd < 0) return null;
+    if (commandEnd < 0) return { status: 'unknown', identity: null };
     const fields = stat.slice(commandEnd + 2).trim().split(/\s+/);
-    if (fields.length < 20) return null;
+    if (fields.length < 20) return { status: 'unknown', identity: null };
     const cgroup = fs.readFileSync('/proc/' + String(numericPid) + '/cgroup', 'utf8').trim();
-    return {
+    const identity = {
       pid: numericPid,
       state: fields[0] || '',
       parentPid: Number(fields[1]),
@@ -112,16 +120,62 @@ function linuxProcessIdentity(pid) {
       startId: fields[19] || '',
       cgroup,
     };
-  } catch {
-    return null;
+    if (!identity.state || !Number.isSafeInteger(identity.parentPid)
+        || !Number.isSafeInteger(identity.processGroupId) || !identity.startId || !identity.cgroup) {
+      return { status: 'unknown', identity: null };
+    }
+    return { status: 'ok', identity };
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') {
+      return { status: 'gone', identity: null };
+    }
+    return { status: 'unknown', identity: null };
   }
 }
 
+function linuxProcessIdentity(pid) {
+  const result = readLinuxProcessIdentity(pid);
+  return result.status === 'ok' ? result.identity : null;
+}
+
+function sameLinuxPidStart(left, right) {
+  return Boolean(left && right && left.pid === right.pid && left.startId === right.startId);
+}
+
 function sameLinuxProcess(left, right) {
-  return Boolean(left && right
-    && left.pid === right.pid
-    && left.startId === right.startId
-    && left.cgroup === right.cgroup);
+  return Boolean(sameLinuxPidStart(left, right) && left.cgroup === right.cgroup);
+}
+
+function boundedNumericDirectoryEntries(directoryPath, limit, openDirectory = fs.opendirSync) {
+  let directory;
+  const values = [];
+  let complete = false;
+  try {
+    directory = openDirectory(directoryPath);
+    let entriesRead = 0;
+    while (entriesRead < limit) {
+      const entry = directory.readSync();
+      if (entry === null) {
+        complete = true;
+        break;
+      }
+      entriesRead += 1;
+      const name = typeof entry?.name === 'string' ? entry.name : '';
+      if (!/^\d+$/.test(name)) continue;
+      const value = Number(name);
+      if (Number.isSafeInteger(value) && value > 1) values.push(value);
+    }
+    // Reading one additional entry is bounded and distinguishes exactly-limit
+    // directories from a truncated scan without retaining attacker-sized data.
+    if (!complete && entriesRead === limit && directory.readSync() === null) complete = true;
+  } catch {
+    complete = false;
+  } finally {
+    if (directory) {
+      try { directory.closeSync(); } catch { complete = false; }
+    }
+  }
+  return { values, complete };
 }
 
 function procEnvironmentContains(pid, name, value, scanBudget) {
@@ -141,20 +195,25 @@ function procEnvironmentContains(pid, name, value, scanBudget) {
         scanBudget.remaining,
       ));
       const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
-      if (bytesRead <= 0) break;
+      if (bytesRead <= 0) return { matched: false, complete: true };
       chunks.push(buffer.subarray(0, bytesRead));
       total += bytesRead;
       scanBudget.remaining -= bytesRead;
+      const environment = Buffer.concat(chunks, total);
+      let offset = environment.indexOf(marker);
+      while (offset >= 0) {
+        if (offset === 0 || environment[offset - 1] === 0) {
+          return { matched: true, complete: true };
+        }
+        offset = environment.indexOf(marker, offset + 1);
+      }
     }
-    const environment = Buffer.concat(chunks, total);
-    let offset = environment.indexOf(marker);
-    while (offset >= 0) {
-      if (offset === 0 || environment[offset - 1] === 0) return true;
-      offset = environment.indexOf(marker, offset + 1);
-    }
-    return false;
+    // The marker may be beyond either byte ceiling. Treat that as an
+    // incomplete safety scan rather than silently classifying the process as
+    // unrelated.
+    return { matched: false, complete: false };
   } catch {
-    return false;
+    return { matched: false, complete: false };
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch {}
@@ -167,101 +226,289 @@ function captureLinuxSupervisedProcesses({
   expectedCgroup,
   excludedPids = new Set(),
   tracked,
+  openDirectory = fs.opendirSync,
+  directoryEntryLimit = PHASE3_PROC_DIRECTORY_ENTRY_LIMIT,
 }) {
-  if (process.platform !== 'linux' || !supervisionId || !expectedCgroup) return;
-  let processIds;
-  try {
-    processIds = fs.readdirSync('/proc')
-      .filter((value) => /^\d+$/.test(value))
-      .map(Number)
-      .filter((value) => Number.isSafeInteger(value) && value > 1)
-      // Newly spawned descendants normally have the highest PIDs. Scan them
-      // first so the aggregate environ-read ceiling cannot be consumed by
-      // unrelated long-running processes in a shared development cgroup.
-      .sort((left, right) => right - left);
-  } catch {
-    return;
-  }
+  if (process.platform !== 'linux') return { complete: true, identityDrifted: false };
+  if (!supervisionId || !expectedCgroup) return { complete: false, identityDrifted: false };
+  const enumeration = boundedNumericDirectoryEntries(
+    '/proc',
+    directoryEntryLimit,
+    openDirectory,
+  );
+  const processIds = enumeration.values
+    // Newly spawned descendants normally have the highest PIDs. Scan them
+    // first so the aggregate environ-read ceiling cannot be consumed by
+    // unrelated long-running processes in a shared development cgroup.
+    .sort((left, right) => right - left);
+  let complete = enumeration.complete;
+  let identityDrifted = false;
   const scanBudget = { remaining: PHASE3_PROC_ENV_SCAN_MAX_BYTES };
   for (const pid of processIds) {
-    if (scanBudget.remaining <= 0) break;
-    if (tracked.size >= PHASE3_DESCENDANT_LIMIT || excludedPids.has(pid)) continue;
-    const before = linuxProcessIdentity(pid);
-    if (!before || before.cgroup !== expectedCgroup || ['Z', 'X'].includes(before.state)) continue;
-    if (!procEnvironmentContains(
+    if (scanBudget.remaining <= 0) {
+      complete = false;
+      break;
+    }
+    if (excludedPids.has(pid)) continue;
+    const beforeResult = readLinuxProcessIdentity(pid);
+    if (beforeResult.status === 'gone') continue;
+    if (beforeResult.status !== 'ok') {
+      complete = false;
+      continue;
+    }
+    const before = beforeResult.identity;
+    if (before.cgroup !== expectedCgroup || ['Z', 'X'].includes(before.state)) continue;
+    const marker = procEnvironmentContains(
       pid,
       PHASE3_SUPERVISION_ENV_NAME,
       supervisionId,
       scanBudget,
-    )) continue;
+    );
+    if (!marker.complete) {
+      // A process that vanished during its environ read is no longer a live
+      // kill target. If the same pid/start-id remains, however, the failed read
+      // could have hidden the supervision marker and must block confirmation.
+      const latestResult = readLinuxProcessIdentity(pid);
+      if (latestResult.status === 'unknown') complete = false;
+      if (latestResult.status === 'ok'
+          && sameLinuxPidStart(before, latestResult.identity)
+          && !['Z', 'X'].includes(latestResult.identity.state)) complete = false;
+      continue;
+    }
+    if (!marker.matched) continue;
     // `/proc` enumeration and environ reads are not atomic. Re-read the
     // immutable process start id before retaining or signalling this PID so a
     // recycled PID can never turn into an unrelated kill target.
-    const after = linuxProcessIdentity(pid);
-    if (!sameLinuxProcess(before, after) || ['Z', 'X'].includes(after.state)) continue;
-    if (!tracked.has(pid)) tracked.set(pid, { ...after, depth: PHASE3_DESCENDANT_LIMIT });
-  }
-}
-
-function linuxChildPids(pid) {
-  const taskRoot = '/proc/' + String(pid) + '/task';
-  let taskIds;
-  try {
-    taskIds = fs.readdirSync(taskRoot).filter((value) => /^\d+$/.test(value)).slice(
-      0,
-      PHASE3_DESCENDANT_LIMIT,
-    );
-  } catch {
-    return [];
-  }
-  const children = new Set();
-  for (const taskId of taskIds) {
-    try {
-      const values = fs.readFileSync(taskRoot + '/' + taskId + '/children', 'utf8')
-        .trim().split(/\s+/).filter(Boolean).map(Number);
-      for (const value of values) {
-        if (Number.isSafeInteger(value) && value > 1) children.add(value);
+    const afterResult = readLinuxProcessIdentity(pid);
+    if (afterResult.status === 'gone') continue;
+    if (afterResult.status !== 'ok') {
+      complete = false;
+      if (!tracked.has(pid) && tracked.size < PHASE3_DESCENDANT_LIMIT) {
+        tracked.set(pid, { ...before, depth: PHASE3_DESCENDANT_LIMIT });
       }
-    } catch {}
+      continue;
+    }
+    const after = afterResult.identity;
+    if (!sameLinuxPidStart(before, after)) continue;
+    if (before.cgroup !== after.cgroup) {
+      complete = false;
+      identityDrifted = true;
+      if (!tracked.has(pid) && tracked.size < PHASE3_DESCENDANT_LIMIT) {
+        tracked.set(pid, { ...before, depth: PHASE3_DESCENDANT_LIMIT });
+      }
+      continue;
+    }
+    if (['Z', 'X'].includes(after.state)) continue;
+    if (!tracked.has(pid)) {
+      if (tracked.size >= PHASE3_DESCENDANT_LIMIT) {
+        complete = false;
+        continue;
+      }
+      tracked.set(pid, { ...after, depth: PHASE3_DESCENDANT_LIMIT });
+    }
   }
-  return [...children];
+  return { complete, identityDrifted };
 }
 
-function captureLinuxDescendants(rootPid, tracked, expectedCgroup = '') {
-  if (process.platform !== 'linux') return expectedCgroup;
-  const root = linuxProcessIdentity(rootPid);
+function parseLinuxChildPids(text, completeInput) {
+  let safeText = String(text || '');
+  if (!completeInput && safeText && !/\s$/.test(safeText)) {
+    const lastBoundary = safeText.search(/\s+\S*$/);
+    safeText = lastBoundary >= 0 ? safeText.slice(0, lastBoundary) : '';
+  }
+  safeText = safeText.trim();
+  if (!safeText) return { values: [], complete: completeInput };
+  const values = [];
+  let complete = completeInput;
+  for (const token of safeText.split(/\s+/)) {
+    if (!/^\d+$/.test(token)) {
+      complete = false;
+      continue;
+    }
+    const childPid = Number(token);
+    if (!Number.isSafeInteger(childPid) || childPid <= 1) {
+      complete = false;
+      continue;
+    }
+    if (values.length >= PHASE3_DESCENDANT_LIMIT) {
+      complete = false;
+      continue;
+    }
+    values.push(childPid);
+  }
+  return { values, complete };
+}
+
+function readLinuxChildren(pid, taskId, scanBudget) {
+  let descriptor;
+  const chunks = [];
+  let total = 0;
+  try {
+    descriptor = fs.openSync(
+      '/proc/' + String(pid) + '/task/' + String(taskId) + '/children',
+      READ_ONLY_NOFOLLOW,
+    );
+    while (total < PHASE3_PROC_CHILDREN_MAX_BYTES && scanBudget.remaining > 0) {
+      const buffer = Buffer.allocUnsafe(Math.min(
+        8 * 1024,
+        PHASE3_PROC_CHILDREN_MAX_BYTES - total,
+        scanBudget.remaining,
+      ));
+      const bytesRead = fs.readSync(descriptor, buffer, 0, buffer.length, null);
+      if (bytesRead <= 0) {
+        return parseLinuxChildPids(Buffer.concat(chunks, total).toString('utf8'), true);
+      }
+      chunks.push(buffer.subarray(0, bytesRead));
+      total += bytesRead;
+      scanBudget.remaining -= bytesRead;
+    }
+    return parseLinuxChildPids(Buffer.concat(chunks, total).toString('utf8'), false);
+  } catch (error) {
+    if ((error?.code === 'ENOENT' || error?.code === 'ESRCH') && total === 0) {
+      return { values: [], complete: true };
+    }
+    return parseLinuxChildPids(Buffer.concat(chunks, total).toString('utf8'), false);
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+  }
+}
+
+function linuxChildPids(pid, {
+  openDirectory = fs.opendirSync,
+  directoryEntryLimit = PHASE3_PROC_TASK_ENTRY_LIMIT,
+  scanBudget = { remaining: PHASE3_PROC_CHILDREN_SCAN_MAX_BYTES },
+} = {}) {
+  const taskRoot = '/proc/' + String(pid) + '/task';
+  const enumeration = boundedNumericDirectoryEntries(
+    taskRoot,
+    directoryEntryLimit,
+    openDirectory,
+  );
+  let complete = enumeration.complete;
+  const children = new Set();
+  for (const taskId of enumeration.values) {
+    const result = readLinuxChildren(pid, taskId, scanBudget);
+    if (!result.complete) complete = false;
+    for (const value of result.values) {
+      if (!children.has(value) && children.size >= PHASE3_DESCENDANT_LIMIT) {
+        complete = false;
+        continue;
+      }
+      children.add(value);
+    }
+  }
+  return { values: [...children], complete };
+}
+
+function captureLinuxDescendants(rootPid, tracked, expectedCgroup = '', scanOptions = {}) {
+  if (process.platform !== 'linux') {
+    return { cgroup: expectedCgroup, complete: true, identityDrifted: false };
+  }
+  const rootResult = readLinuxProcessIdentity(rootPid);
+  const root = rootResult.status === 'ok' ? rootResult.identity : null;
   const cgroup = expectedCgroup || root?.cgroup || '';
-  if (!root || !cgroup || root.cgroup !== cgroup) return cgroup;
+  if (rootResult.status === 'gone') {
+    return { cgroup, complete: Boolean(cgroup), identityDrifted: false };
+  }
+  if (!root) return { cgroup, complete: false, identityDrifted: false };
+  if (!cgroup || root.cgroup !== cgroup) {
+    return { cgroup, complete: false, identityDrifted: Boolean(cgroup) };
+  }
   const queue = [{ pid: root.pid, depth: 0 }];
   const visited = new Set();
-  while (queue.length > 0 && tracked.size < PHASE3_DESCENDANT_LIMIT) {
-    const current = queue.shift();
+  const childReadBudget = { remaining: PHASE3_PROC_CHILDREN_SCAN_MAX_BYTES };
+  let complete = true;
+  let cursor = 0;
+  while (cursor < queue.length && visited.size < PHASE3_DESCENDANT_LIMIT) {
+    const current = queue[cursor];
+    cursor += 1;
     if (visited.has(current.pid)) continue;
     visited.add(current.pid);
-    for (const childPid of linuxChildPids(current.pid)) {
-      if (tracked.size >= PHASE3_DESCENDANT_LIMIT) break;
-      const identity = linuxProcessIdentity(childPid);
+    const children = linuxChildPids(current.pid, {
+      openDirectory: scanOptions.openDirectory,
+      directoryEntryLimit: scanOptions.taskDirectoryEntryLimit,
+      scanBudget: childReadBudget,
+    });
+    if (!children.complete) complete = false;
+    for (const childPid of children.values) {
+      const identityResult = readLinuxProcessIdentity(childPid);
+      if (identityResult.status === 'unknown') {
+        complete = false;
+        continue;
+      }
+      const identity = identityResult.identity;
       if (!identity || identity.parentPid !== current.pid || identity.cgroup !== cgroup) continue;
       const existing = tracked.get(childPid);
-      if (!existing) tracked.set(childPid, { ...identity, depth: current.depth + 1 });
+      if (!existing) {
+        if (tracked.size >= PHASE3_DESCENDANT_LIMIT) {
+          complete = false;
+          continue;
+        }
+        tracked.set(childPid, { ...identity, depth: current.depth + 1 });
+      }
+      if (queue.length >= PHASE3_DESCENDANT_LIMIT) {
+        complete = false;
+        continue;
+      }
       queue.push({ pid: childPid, depth: current.depth + 1 });
     }
   }
-  return cgroup;
+  if (cursor < queue.length) complete = false;
+  return { cgroup, complete, identityDrifted: false };
 }
 
-function activeTrackedDescendants(tracked) {
+function activeTrackedDescendants(tracked, inspectProcess = readLinuxProcessIdentity) {
   const active = [];
+  const pidSignalTargets = [];
+  let complete = true;
+  let unresolvedCount = 0;
+  let identityDrifted = false;
   for (const expected of tracked.values()) {
-    const current = linuxProcessIdentity(expected.pid);
-    if (!current || ['Z', 'X'].includes(current.state)
-        || current.startId !== expected.startId || current.cgroup !== expected.cgroup) {
+    const currentResult = inspectProcess(expected.pid);
+    if (currentResult.status === 'gone') {
       tracked.delete(expected.pid);
+      continue;
+    }
+    if (currentResult.status !== 'ok') {
+      complete = false;
+      unresolvedCount += 1;
+      continue;
+    }
+    const current = currentResult.identity;
+    if (!sameLinuxPidStart(expected, current) || ['Z', 'X'].includes(current.state)) {
+      tracked.delete(expected.pid);
+      continue;
+    }
+    if (current.cgroup !== expected.cgroup) {
+      // A cgroup change does not prove that the pid/start-id target exited.
+      // Retain it for reconciliation and exclude it from process-group
+      // signalling. The caller may still signal this exact PID after one more
+      // start-id check.
+      complete = false;
+      unresolvedCount += 1;
+      identityDrifted = true;
+      pidSignalTargets.push({ ...expected, processGroupId: current.processGroupId });
       continue;
     }
     active.push({ ...expected, processGroupId: current.processGroupId });
   }
-  return active;
+  return { active, pidSignalTargets, complete, unresolvedCount, identityDrifted };
+}
+
+function signalVerifiedPidTargets(
+  targets,
+  signal,
+  inspectProcess = readLinuxProcessIdentity,
+  killProcess = process.kill.bind(process),
+) {
+  for (const expected of targets) {
+    const latest = inspectProcess(expected.pid);
+    if (latest.status !== 'ok' || !sameLinuxPidStart(expected, latest.identity)
+        || ['Z', 'X'].includes(latest.identity.state)) continue;
+    try { killProcess(expected.pid, signal); } catch {}
+  }
 }
 
 function sameFileIdentity(left, right) {
@@ -878,6 +1125,7 @@ function phase3ProcessSummary(details = {}) {
     requestedSignal: safeSignal(value.requestedSignal),
     observedSignal: safeSignal(value.observedSignal || value.signal),
     terminationConfirmed: value.terminationConfirmed === true,
+    processScanComplete: value.processScanComplete !== false,
     remainingDescendantCount: Number.isSafeInteger(value.remainingDescendantCount)
       ? Math.max(0, Math.min(PHASE3_DESCENDANT_LIMIT, value.remainingDescendantCount))
       : 0,
@@ -906,7 +1154,8 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
   const details = error?.details || {};
   const hasProcessDetails = details && typeof details === 'object'
     && ['code', 'signal', 'requestedSignal', 'observedSignal', 'terminationConfirmed',
-      'remainingDescendantCount', 'rootProcessRemaining', 'stdout', 'stderr', 'forcedClose',
+      'processScanComplete', 'remainingDescendantCount', 'rootProcessRemaining',
+      'stdout', 'stderr', 'forcedClose',
       'outputTruncated', 'stdoutBytes', 'stderrBytes'].some((key) => Object.hasOwn(details, key));
   const combined = [details.stdout, details.stderr, error?.message]
     .filter(Boolean)
@@ -1071,38 +1320,102 @@ function runCommand(command, args, options = {}) {
     const trackedDescendants = new Map();
     const supervisionId = crypto.randomBytes(24).toString('hex');
     let descendantCgroup = linuxProcessIdentity(process.pid)?.cgroup || '';
+    let processIdentityDriftObserved = false;
+    const procDirectoryOpener = typeof options.procDirectoryOpener === 'function'
+      ? options.procDirectoryOpener
+      : fs.opendirSync;
+    const configuredProcEntryLimit = Number(options.procDirectoryEntryLimit);
+    const procDirectoryEntryLimit = Number.isSafeInteger(configuredProcEntryLimit)
+      && configuredProcEntryLimit > 0
+      ? Math.min(configuredProcEntryLimit, PHASE3_PROC_DIRECTORY_ENTRY_LIMIT)
+      : PHASE3_PROC_DIRECTORY_ENTRY_LIMIT;
+    const configuredTaskEntryLimit = Number(options.procTaskDirectoryEntryLimit);
+    const procTaskDirectoryEntryLimit = Number.isSafeInteger(configuredTaskEntryLimit)
+      && configuredTaskEntryLimit > 0
+      ? Math.min(configuredTaskEntryLimit, PHASE3_PROC_TASK_ENTRY_LIMIT)
+      : PHASE3_PROC_TASK_ENTRY_LIMIT;
     const captureProcesses = (scanSupervision = false) => {
-      if (!child?.pid) return;
+      if (!child?.pid) return true;
       // Sequential browser helpers must not permanently consume the bounded
       // tracking table after they have exited.
-      activeTrackedDescendants(trackedDescendants);
+      const previouslyTracked = activeTrackedDescendants(trackedDescendants);
+      if (previouslyTracked.identityDrifted) processIdentityDriftObserved = true;
       const currentRoot = linuxProcessIdentity(child.pid);
       if (currentRoot && !rootIdentity) rootIdentity = currentRoot;
-      descendantCgroup = captureLinuxDescendants(
+      const descendants = captureLinuxDescendants(
         child.pid,
         trackedDescendants,
         descendantCgroup,
+        {
+          openDirectory: procDirectoryOpener,
+          taskDirectoryEntryLimit: procTaskDirectoryEntryLimit,
+        },
       );
+      descendantCgroup = descendants.cgroup;
+      if (descendants.identityDrifted) processIdentityDriftObserved = true;
+      let supervisionComplete = true;
       if (scanSupervision) {
-        captureLinuxSupervisedProcesses({
+        const supervision = captureLinuxSupervisedProcesses({
           supervisionId,
           expectedCgroup: descendantCgroup,
           excludedPids: new Set([process.pid, child.pid]),
           tracked: trackedDescendants,
+          openDirectory: procDirectoryOpener,
+          directoryEntryLimit: procDirectoryEntryLimit,
         });
+        supervisionComplete = supervision.complete;
+        if (supervision.identityDrifted) processIdentityDriftObserved = true;
       }
+      return descendants.complete && supervisionComplete && !processIdentityDriftObserved;
     };
     const currentRootProcess = () => {
-      if (!rootIdentity) return null;
-      const current = linuxProcessIdentity(rootIdentity.pid);
-      if (!sameLinuxProcess(rootIdentity, current) || ['Z', 'X'].includes(current.state)) return null;
-      return current;
+      if (!rootIdentity) {
+        const exited = closeResult || child?.exitCode !== null || child?.signalCode !== null;
+        return {
+          process: null,
+          pidSignalTarget: null,
+          complete: Boolean(exited),
+          unresolved: !exited,
+        };
+      }
+      const currentResult = readLinuxProcessIdentity(rootIdentity.pid);
+      if (currentResult.status === 'gone') {
+        return { process: null, pidSignalTarget: null, complete: true, unresolved: false };
+      }
+      if (currentResult.status !== 'ok') {
+        return { process: null, pidSignalTarget: null, complete: false, unresolved: true };
+      }
+      const current = currentResult.identity;
+      if (!sameLinuxPidStart(rootIdentity, current) || ['Z', 'X'].includes(current.state)) {
+        return { process: null, pidSignalTarget: null, complete: true, unresolved: false };
+      }
+      if (current.cgroup !== rootIdentity.cgroup) {
+        processIdentityDriftObserved = true;
+        return {
+          process: null,
+          pidSignalTarget: { ...rootIdentity, processGroupId: current.processGroupId },
+          complete: false,
+          unresolved: true,
+        };
+      }
+      return { process: current, pidSignalTarget: null, complete: true, unresolved: false };
     };
     const activeProcessState = () => {
-      captureProcesses(true);
+      const scanComplete = captureProcesses(true);
+      const rootState = currentRootProcess();
+      const trackedState = activeTrackedDescendants(trackedDescendants);
+      if (trackedState.identityDrifted) processIdentityDriftObserved = true;
       return {
-        root: currentRootProcess(),
-        descendants: activeTrackedDescendants(trackedDescendants),
+        root: rootState.process,
+        rootUnresolved: rootState.unresolved,
+        pidSignalTargets: [
+          rootState.pidSignalTarget,
+          ...trackedState.pidSignalTargets,
+        ].filter(Boolean),
+        descendants: trackedState.active,
+        unresolvedDescendantCount: trackedState.unresolvedCount,
+        processScanComplete: scanComplete && rootState.complete && trackedState.complete
+          && !processIdentityDriftObserved,
       };
     };
     const signalProcessTree = (signal) => {
@@ -1136,10 +1449,15 @@ function runCommand(command, args, options = {}) {
           try { process.kill(expected.pid, signal); } catch {}
         }
       }
+      // A verified pid/start-id may move to another cgroup. It is no longer
+      // eligible for process-group signalling, but positive-PID signalling is
+      // still safe after one final start-id check. The observed drift keeps
+      // termination unconfirmed even if this signal later succeeds.
+      signalVerifiedPidTargets(state.pidSignalTargets, signal);
       // A successfully spawned ChildProcess handle cannot refer to a recycled
       // PID before it has been reaped. This fallback covers the very small
       // window in which `/proc/<pid>/stat` is not readable yet.
-      if (!state.root && child.exitCode === null && child.signalCode === null) {
+      if (!state.root && !rootIdentity && child.exitCode === null && child.signalCode === null) {
         try { child.kill(signal); } catch {}
       }
     };
@@ -1170,8 +1488,10 @@ function runCommand(command, args, options = {}) {
       requestedSignal,
       observedSignal: closeResult?.signal || child?.signalCode || null,
       terminationConfirmed,
-      remainingDescendantCount: state?.descendants?.length || 0,
-      rootProcessRemaining: Boolean(state?.root),
+      processScanComplete: state?.processScanComplete !== false,
+      remainingDescendantCount: (state?.descendants?.length || 0)
+        + (state?.unresolvedDescendantCount || 0),
+      rootProcessRemaining: Boolean(state?.root || state?.rootUnresolved),
       stdout: readOutput('stdout'),
       stderr: readOutput('stderr'),
       forcedClose,
@@ -1182,7 +1502,7 @@ function runCommand(command, args, options = {}) {
     const settleConfirmedCommand = () => {
       if (settled || !closeResult) return false;
       const state = activeProcessState();
-      if (state.root || state.descendants.length > 0) return false;
+      if (!state.processScanComplete || state.root || state.descendants.length > 0) return false;
       settled = true;
       const result = processResult({ terminationConfirmed: true, state });
       cleanup();
@@ -1366,7 +1686,8 @@ function runCommand(command, args, options = {}) {
     child.once('exit', () => {
       if (settled || cleanupStarted) return;
       const state = activeProcessState();
-      if (state.descendants.length > 0) beginTreeCleanup();
+      if (!state.processScanComplete || state.descendants.length > 0
+          || state.unresolvedDescendantCount > 0) beginTreeCleanup();
     });
     // `exit` can fire before stdout/stderr have emitted their final chunks.
     // Wait for `close` so account-deactivation markers are available to the
@@ -2019,6 +2340,13 @@ function runPhase3Job(args = {}) {
 
 module.exports = {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
+  _testPhase3ProcessScan: Object.freeze({
+    activeTrackedDescendants,
+    boundedNumericDirectoryEntries,
+    linuxChildPids,
+    parseLinuxChildPids,
+    signalVerifiedPidTargets,
+  }),
   classifyPhase3ProcessError,
   comparePhase3TokenFreshness,
   findUsernameEntry,
