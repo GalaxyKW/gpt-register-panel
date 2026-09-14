@@ -302,6 +302,7 @@ function apiHeaders(options = {}) {
 }
 
 const API_REQUEST_TIMEOUT_MS = 45000;
+const API_RESPONSE_MAX_BYTES = 64 * 1024 * 1024;
 let adminTokenRequest = null;
 
 function requestAdminToken() {
@@ -349,6 +350,64 @@ function apiTimeoutError() {
   return error;
 }
 
+function apiResponseTooLargeError() {
+  const error = new Error('服务器响应超过浏览器安全大小上限，已停止读取。');
+  error.name = 'ResponseTooLargeError';
+  return error;
+}
+
+function normalizedApiResponseMaximum(value) {
+  if (value === undefined) return API_RESPONSE_MAX_BYTES;
+  const number = Number(value);
+  if (!Number.isSafeInteger(number) || number < 1) return API_RESPONSE_MAX_BYTES;
+  // Callers may lower the limit for a smaller endpoint, but can never raise
+  // the application-wide allocation ceiling.
+  return Math.min(number, API_RESPONSE_MAX_BYTES);
+}
+
+async function readBoundedApiResponseBody(response, maximumBytes) {
+  const declaredLength = response.headers.get('content-length');
+  if (declaredLength !== null && /^\d+$/.test(declaredLength)) {
+    const length = Number(declaredLength);
+    if (!Number.isSafeInteger(length) || length > maximumBytes) {
+      try { response.body?.cancel()?.catch?.(() => {}); } catch {}
+      throw apiResponseTooLargeError();
+    }
+  }
+  if (!response.body) return new ArrayBuffer(0);
+  if (typeof response.body.getReader !== 'function') {
+    const error = new Error('当前浏览器无法对服务器响应执行有界读取。');
+    error.name = 'ResponseStreamUnsupportedError';
+    throw error;
+  }
+
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const bytes = value instanceof Uint8Array ? value : new Uint8Array(value || 0);
+      if (bytes.byteLength > maximumBytes - total) {
+        try { reader.cancel()?.catch?.(() => {}); } catch {}
+        throw apiResponseTooLargeError();
+      }
+      chunks.push(bytes);
+      total += bytes.byteLength;
+    }
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
+  const body = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    body.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return body.buffer;
+}
+
 function sameOriginApiUrl(value) {
   const resolved = new URL(String(value), window.location.origin);
   if (resolved.origin !== window.location.origin || resolved.username || resolved.password) {
@@ -358,7 +417,12 @@ function sameOriginApiUrl(value) {
 }
 
 async function apiFetchAttempt(url, options = {}) {
-  const { timeoutMs, signal: callerSignal, ...requestOptions } = options;
+  const {
+    timeoutMs,
+    maxResponseBytes,
+    signal: callerSignal,
+    ...requestOptions
+  } = options;
   const controller = new AbortController();
   let timedOut = false;
   const abortFromCaller = () => controller.abort();
@@ -376,11 +440,16 @@ async function apiFetchAttempt(url, options = {}) {
       redirect: 'error',
       signal: controller.signal,
     });
-    // Buffer the same-origin JSON response while the deadline is active. This
-    // also bounds response.json(), rather than stopping the timer at headers.
+    // Buffer the same-origin JSON response while both the deadline and the
+    // byte ceiling are active, rather than stopping protection at headers.
     const hasBody = !['HEAD'].includes(String(requestOptions.method || 'GET').toUpperCase())
       && ![204, 205, 304].includes(response.status);
-    const body = hasBody ? await response.arrayBuffer() : null;
+    const body = hasBody
+      ? await readBoundedApiResponseBody(
+          response,
+          normalizedApiResponseMaximum(maxResponseBytes),
+        )
+      : null;
     return new Response(body, {
       status: response.status,
       statusText: response.statusText,

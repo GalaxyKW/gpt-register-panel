@@ -1696,6 +1696,47 @@ test('frontend API deadline also bounds a response body that never finishes', as
   ));
 });
 
+test('frontend aborts a response stream before it exceeds the byte ceiling', async () => {
+  const apiHeadersContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
+  const apiFetchContract = sourceSection('const API_REQUEST_TIMEOUT_MS', 'function renderSelectOptions');
+  let cancelled = false;
+  const context = {
+    AbortController,
+    ArrayBuffer,
+    Headers,
+    ReadableStream,
+    Response,
+    Uint8Array,
+    URL,
+    elements: {},
+    fetch: async () => new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new Uint8Array([1, 2, 3]));
+        controller.enqueue(new Uint8Array([4, 5]));
+      },
+      cancel() { cancelled = true; },
+    }), { status: 200 }),
+    sessionStorage: {
+      getItem: () => null,
+      setItem() {},
+      removeItem() {},
+    },
+    window: {
+      clearTimeout,
+      location: { origin: 'http://127.0.0.1:4170' },
+      setTimeout,
+    },
+  };
+  vm.runInNewContext(apiHeadersContract + '\n' + apiFetchContract + `
+    resultPromise = apiFetch('/api/snapshot', { maxResponseBytes: 4 });
+  `, context);
+  await assert.rejects(context.resultPromise, (error) => (
+    error?.name === 'ResponseTooLargeError' && /响应超过/.test(error.message)
+  ));
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(cancelled, true);
+});
+
 test('frontend keeps an in-memory token fallback when session storage is unavailable', () => {
   const tokenContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
   const context = {
