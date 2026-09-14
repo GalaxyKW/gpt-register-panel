@@ -914,16 +914,12 @@ function phase3RowRejected(row) {
 
 function phase3TargetsFromRows(rows) {
   const targets = [];
-  const seen = new Set();
   for (const row of rows || []) {
     if (phase3RowRejected(row)) continue;
     const email = phase3EmailFromRow(row);
     const phone = String(row.phone || '').trim();
     if (!email && !phone) continue;
     const phoneKey = phone.replace(/[^0-9]/g, '');
-    const keys = [email ? 'email:' + email : null, phoneKey ? 'phone:' + phoneKey : null].filter(Boolean);
-    if (keys.some((key) => seen.has(key))) continue;
-    keys.forEach((key) => seen.add(key));
     targets.push({
       email: email || '',
       phone: phoneKey || phone || '',
@@ -1463,7 +1459,8 @@ function accountTestItemNeedsReconciliation(item) {
 }
 
 function accountTestItemNotAttempted(item) {
-  return item?.outcome === 'not_attempted'
+  return item?.attempted === false
+    || item?.outcome === 'not_attempted'
     || item?.code === 'account_test_not_attempted_reconciliation';
 }
 
@@ -1695,16 +1692,25 @@ function renderJob(job) {
   const needsReconciliation = reconciliationJobs.length > 0;
   if (typeof renderReconciliationAction === 'function') renderReconciliationAction(job);
   elements.jobPanel.dataset.status = needsReconciliation ? 'partial' : (job.status || '');
-  const isPhase3 = jobs.every((item) => item.type === 'phase3');
-  const isAccountTest = jobs.every((item) => item.type === 'account_test');
-  const isTokenCleanup = jobs.every((item) => item.type === 'token_cleanup');
-  elements.jobTitle.textContent = isAccountTest
+  const hasJobs = jobs.length > 0;
+  const isPhase3 = hasJobs && jobs.every((item) => item.type === 'phase3');
+  const isAccountTest = hasJobs && jobs.every((item) => item.type === 'account_test');
+  const isTokenCleanup = hasJobs && jobs.every((item) => item.type === 'token_cleanup');
+  const isStatusCheck = ['resume-probe', 'active-list-truncated', 'hold-list-truncated']
+    .includes(String(job.id || ''));
+  elements.jobTitle.textContent = isStatusCheck
+    ? '后台任务状态检查'
+    : isAccountTest
     ? (jobs.length > 1 ? '上游账号批量测试' : '上游账号测试')
     : isPhase3
     ? (jobs.length > 1 ? 'Phase 3 批量任务' : 'Phase 3 任务')
     : isTokenCleanup
       ? '过期 Token 清理任务'
-    : (jobs.length > 1 ? '批量任务' : 'Token 导入任务');
+    : jobs.length > 1
+      ? '批量任务'
+      : jobs[0]?.type === 'token_import'
+        ? 'Token 导入任务'
+        : '后台任务';
   elements.jobStatus.className = 'badge '
     + (needsReconciliation ? 'badge-warning' : jobStatusClass(job.status));
   elements.jobStatus.textContent = needsReconciliation
@@ -2559,7 +2565,7 @@ elements.phase3Button.addEventListener('click', async () => {
     const { response, body } = await idempotentMutationFetch(
       'phase3',
       '/api/phase3',
-      { accounts: targets, selectedKeys: [...state.selected] },
+      { accounts: targets, selectedKeys: targets.map((target) => target.selectedKey) },
     );
     if (!response.ok) throw new Error(body.message || body.error || 'Phase 3 任务创建失败');
     const jobIds = Array.isArray(body.jobIds) ? body.jobIds : (body.jobId ? [body.jobId] : []);

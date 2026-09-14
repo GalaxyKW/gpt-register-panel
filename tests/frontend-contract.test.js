@@ -641,6 +641,91 @@ test('frontend renders account-test reconciliation as a separate yellow outcome 
   assert.match(context.batch.detail, /完成 2\/2/);
 });
 
+test('frontend recognizes explicitly unattempted account tests without downgrading reconciliation', () => {
+  const resultContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const context = {
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+  };
+  vm.runInNewContext(resultContract + `
+    result = accountTestResultCounts({
+      results: [
+        {
+          attempted: false,
+          status: 'skipped',
+          code: 'account_test_job_timeout',
+          interruptionReason: 'timeout',
+        },
+        {
+          attempted: false,
+          status: 'skipped',
+          code: 'account_test_not_attempted_interrupted',
+          interruptionReason: 'interrupted',
+        },
+        {
+          attempted: false,
+          status: 'skipped',
+          code: 'account_test_not_attempted_reconciliation',
+        },
+        {
+          attempted: true,
+          status: 'failed',
+          code: 'account_scheduler_reconciliation_required',
+          requiresReconciliation: true,
+        },
+      ],
+    });
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    succeeded: 0,
+    failed: 0,
+    skipped: 0,
+    reconciliation: 1,
+    notAttempted: 3,
+  });
+});
+
+test('frontend gives recovery probes and unknown jobs unambiguous titles', () => {
+  const renderContract = sourceSection('function renderJob', 'function stopJobPolling');
+  const context = {
+    elements: {
+      jobPanel: { dataset: {} },
+      jobTitle: {},
+      jobStatus: {},
+      jobMeta: {},
+    },
+    jobStatusClass: () => 'badge-neutral',
+    jobStatusLabel: () => '未知',
+    jobNeedsReconciliation: () => false,
+    formatDate: () => '现在',
+  };
+  vm.runInNewContext(renderContract + `
+    const titleFor = (job) => {
+      renderJob(job);
+      return elements.jobTitle.textContent;
+    };
+    result = {
+      resume: titleFor({ id: 'resume-probe', type: 'batch', status: 'unknown' }),
+      activeTruncated: titleFor({
+        id: 'active-list-truncated', type: 'batch', status: 'unknown', jobs: [],
+      }),
+      holdTruncated: titleFor({
+        id: 'hold-list-truncated', type: 'batch', status: 'unknown', jobs: [],
+      }),
+      emptyUnknown: titleFor({ id: 'unknown-empty', type: 'batch', status: 'unknown', jobs: [] }),
+      unknown: titleFor({ id: 'unknown-job', type: 'future_job', status: 'unknown' }),
+      tokenImport: titleFor({ id: 'known-import', type: 'token_import', status: 'running' }),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    resume: '后台任务状态检查',
+    activeTruncated: '后台任务状态检查',
+    holdTruncated: '后台任务状态检查',
+    emptyUnknown: '后台任务',
+    unknown: '后台任务',
+    tokenImport: 'Token 导入任务',
+  });
+});
+
 test('frontend renders a completed Phase3 result without bogus zero counters', () => {
   const renderJob = sourceSection('function renderJob', 'function stopJobPolling');
   const context = {
@@ -1657,6 +1742,94 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   assert.deepEqual([...context.result.legacyRemote], []);
   assert.deepEqual([...context.result.malformedEligibility], []);
   assert.match(context.result.missingRevisionProblem, /快照凭证/);
+});
+
+test('frontend Phase3 preserves every selected row when strong identities overlap', () => {
+  const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
+  const context = {};
+  vm.runInNewContext(targetContract + `
+    const revision = 'phase3-target-v1.' + 'B'.repeat(43);
+    result = phase3TargetsFromRows([
+      {
+        key: 'first-token',
+        phase3Email: 'shared@example.test',
+        phone: '+86 138-0013-8000',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      },
+      {
+        key: 'second-token',
+        phase3Email: 'shared@example.test',
+        phone: '+86 138-0013-8000',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      },
+    ]);
+  `, context);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.result)), [
+    {
+      email: 'shared@example.test',
+      phone: '8613800138000',
+      selectedKey: 'first-token',
+      phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
+    },
+    {
+      email: 'shared@example.test',
+      phone: '8613800138000',
+      selectedKey: 'second-token',
+      phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
+    },
+  ]);
+});
+
+test('frontend Phase3 submits selected keys in the same order as account targets', async () => {
+  const phase3Handler = sourceSection(
+    "elements.phase3Button.addEventListener('click'",
+    'if (elements.accountTestButton)',
+  );
+  let clickHandler;
+  let submittedBody = null;
+  const targets = [
+    { selectedKey: 'snapshot-first', email: 'first@example.test' },
+    { selectedKey: 'snapshot-second', email: 'second@example.test' },
+  ];
+  const context = {
+    elements: {
+      phase3Button: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          clickHandler = handler;
+        },
+      },
+    },
+    state: {
+      phase3RequestPending: false,
+      selected: new Set(['snapshot-second', 'snapshot-first']),
+    },
+    hiddenSelectionProblem: () => '',
+    selectedRowsFromSelection: () => [{ key: 'snapshot-first' }, { key: 'snapshot-second' }],
+    phase3TargetsFromRows: () => targets,
+    phase3SelectionProblem: () => '',
+    updateActionState() {},
+    idempotentMutationFetch: async (workflow, path, body) => {
+      assert.equal(workflow, 'phase3');
+      assert.equal(path, '/api/phase3');
+      submittedBody = body;
+      return {
+        response: { ok: true },
+        body: { jobIds: ['job_' + 'a'.repeat(24)], rejected: [] },
+      };
+    },
+    showNotice() {},
+    watchJobs: async () => {},
+    window: { confirm: () => true },
+  };
+  vm.runInNewContext(phase3Handler, context);
+  await clickHandler();
+  assert.deepEqual(JSON.parse(JSON.stringify(submittedBody)), {
+    accounts: targets,
+    selectedKeys: ['snapshot-first', 'snapshot-second'],
+  });
 });
 
 test('frontend disables Phase3 and explains a backend-rejected selected row', () => {
