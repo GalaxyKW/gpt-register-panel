@@ -10,6 +10,7 @@ require('./test-isolation');
 const { PanelDb } = require('../backend/db');
 const {
   buildImportPlan,
+  buildImportPlanIntentVersion,
   buildOAuthUpdatePayload,
   buildCodexSessionDocument,
   buildCodexImportIdempotencyKey,
@@ -20,6 +21,7 @@ const {
   buildSnapshot,
   confirmedSub2ApiRead,
   snapshotVersion,
+  importPlanIntentVersionsEqual,
   resolveGroupIds,
   writeBackup,
   assertBackupCoversUpdateTargets,
@@ -59,6 +61,15 @@ function executeImportPlanItem(options = {}) {
     logger: successfulCheckpointLogger,
     ...options,
   });
+}
+
+function importPlanIntentForSnapshot(snapshot, selectedKeys) {
+  const plan = buildImportPlan(
+    snapshot._internal.sources,
+    snapshot._internal.accounts,
+    selectedKeys,
+  );
+  return buildImportPlanIntentVersion(snapshot.version, selectedKeys, plan);
 }
 
 function processIsRunning(pid) {
@@ -2146,6 +2157,109 @@ test('sync rejects a mixed selection instead of silently importing its covered s
   assert.equal(JSON.stringify(selectionError).includes(secretMarker), false);
 });
 
+test('sync selection and plan intent preserve exact keys and bind every executable decision', () => {
+  const first = syntheticToken(
+    'tokens/intent-one.json',
+    ['account:intent-one-account', 'user:intent-one-user'],
+  );
+  const second = syntheticToken(
+    'tokens/intent-two.json',
+    ['account:intent-two-account', 'user:intent-two-user'],
+  );
+  const sources = { tokens: [first, second], usernames: [] };
+  const firstKey = 'token:tokens:tokens/intent-one.json';
+  const secondKey = 'token:tokens:tokens/intent-two.json';
+  for (const invalidSelection of [
+    [' ' + firstKey],
+    [firstKey + ' '],
+    ['', firstKey],
+    [firstKey, firstKey],
+  ]) {
+    assert.throws(
+      () => buildImportPlan(sources, [], invalidSelection),
+      (error) => error.code === 'IMPORT_SELECTION_INVALID',
+    );
+  }
+
+  const snapshot = 'a'.repeat(64);
+  const firstSelectionPlan = buildImportPlan(sources, [], [firstKey]);
+  const firstIntent = buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan);
+  assert.match(firstIntent, /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/);
+  assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent), true);
+  assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent.slice(0, -1) + '!'), false);
+
+  const changedSelectionIntent = buildImportPlanIntentVersion(
+    snapshot,
+    [secondKey],
+    buildImportPlan(sources, [], [secondKey]),
+  );
+  assert.notEqual(changedSelectionIntent, firstIntent);
+
+  const winnerIdentity = ['account:intent-winner-account', 'user:intent-winner-user'];
+  const older = syntheticToken('tokens/intent-old.json', winnerIdentity, {
+    mtimeMs: 1,
+    expiresAt: '2098-01-01T00:00:00.000Z',
+  });
+  const newer = syntheticToken('use_token/intent-new.json', winnerIdentity, {
+    source: 'use_token',
+    mtimeMs: 2,
+    expiresAt: '2099-01-01T00:00:00.000Z',
+  });
+  const selectedOlderKey = 'token:tokens:tokens/intent-old.json';
+  const newerWins = buildImportPlan(
+    { tokens: [older, newer], usernames: [] },
+    [],
+    [selectedOlderKey],
+  );
+  const olderWins = buildImportPlan(
+    {
+      tokens: [
+        { ...older, expiresAt: '2100-01-01T00:00:00.000Z' },
+        newer,
+      ],
+      usernames: [],
+    },
+    [],
+    [selectedOlderKey],
+  );
+  assert.notEqual(newerWins[0].key, olderWins[0].key);
+  assert.notEqual(
+    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], newerWins),
+    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], olderWins),
+  );
+
+  const unavailableTarget = {
+    id: 801,
+    name: 'free00801',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    schemaValid: true,
+    identityKeys: first.identityKeys,
+    tokenFingerprints: { access: 'different' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+  };
+  const updatePlan = buildImportPlan(sources, [unavailableTarget], [firstKey]);
+  const retargetedPlan = buildImportPlan(
+    sources,
+    [{ ...unavailableTarget, id: 802, name: 'free00802' }],
+    [firstKey],
+  );
+  assert.equal(updatePlan[0].action, 'update');
+  assert.equal(retargetedPlan[0].action, 'update');
+  assert.notEqual(
+    buildImportPlanIntentVersion(snapshot, [firstKey], updatePlan),
+    buildImportPlanIntentVersion(snapshot, [firstKey], retargetedPlan),
+  );
+  assert.notEqual(
+    buildImportPlanIntentVersion(snapshot, [firstKey], updatePlan),
+    buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan),
+  );
+});
+
 test('treats expired active Sub2API accounts as unavailable for replacement', () => {
   const { root } = fixture();
   const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
@@ -3527,6 +3641,7 @@ test('token import returns reconciliation details and never starts the next acco
     const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
       .map((item) => item.key);
     assert.equal(selectedKeys.length, 2);
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys);
 
     const controller = new AbortController();
     let importCalls = 0;
@@ -3565,6 +3680,7 @@ test('token import returns reconciliation details and never starts the next acco
     };
     const importRun = executeImport({
       snapshotVersion: preview.version,
+      planIntentVersion,
       selectedKeys,
       actor: 'tester',
       db: {
@@ -3608,6 +3724,7 @@ test('token import returns reconciliation details and never starts the next acco
     let failedPostflightReads = 0;
     const postflightResult = await executeImport({
       snapshotVersion: preview.version,
+      planIntentVersion,
       selectedKeys,
       actor: 'tester',
       db: {
@@ -3664,6 +3781,105 @@ test('token import returns reconciliation details and never starts the next acco
       ['SUB2API_GROUP_IDS', environment.groupIds],
       ['PANEL_BACKUP_DIR', environment.backupDirectory],
     ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('import rejects a time-only plan change before marking the job running or writing remotely', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+  ]);
+  const originalNow = Date.now;
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  try {
+    const beforeExpiry = Date.parse('2029-12-31T23:59:00.000Z');
+    const afterExpiry = Date.parse('2030-01-01T00:01:00.000Z');
+    const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+    const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+    const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+    const remote = {
+      id: 803,
+      name: 'free00803',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active',
+      statusKnown: true,
+      schedulable: true,
+      schedulableKnown: true,
+      schemaValid: true,
+      autoPauseOnExpired: true,
+      expiresAt: '2030-01-01T00:00:00.000Z',
+      expiryStatus: 'valid',
+      identityKeys: token.identityKeys,
+      tokenFingerprints: { access: 'different-access' },
+      credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+      groupIds: [],
+    };
+    Date.now = () => beforeExpiry;
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: { async listAccounts() { return [remote]; } },
+    });
+    const unfilteredPlan = buildImportPlan(
+      preview._internal.sources,
+      preview._internal.accounts,
+      [],
+    );
+    const selectedKeys = [unfilteredPlan[0].key];
+    const previewPlan = buildImportPlan(
+      preview._internal.sources,
+      preview._internal.accounts,
+      selectedKeys,
+    );
+    assert.equal(previewPlan[0].action, 'skip');
+    assert.equal(previewPlan[0].reason, 'sub2api_available');
+    const planIntentVersion = buildImportPlanIntentVersion(
+      preview.version,
+      selectedKeys,
+      previewPlan,
+    );
+
+    Date.now = () => afterExpiry;
+    let started = 0;
+    let backups = 0;
+    let writes = 0;
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        planIntentVersion,
+        selectedKeys,
+        actor: 'tester',
+        jobId: 'time-plan-stale-job',
+        db: {
+          async startMutationJob() { started += 1; },
+        },
+        client: {
+          async listAccounts() { return [remote]; },
+          async exportAccounts() { backups += 1; return { accounts: [], proxies: [] }; },
+          async applyOAuthCredentials() { writes += 1; },
+          async importCodexSession() { writes += 1; },
+        },
+      }),
+      (error) => error.code === 'IMPORT_PLAN_STALE',
+    );
+    assert.equal(started, 0);
+    assert.equal(backups, 0);
+    assert.equal(writes, 0);
+  } finally {
+    Date.now = originalNow;
+    for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
@@ -4481,11 +4697,14 @@ test('token import rejects an uncovered update backup before any remote write', 
     const plan = buildImportPlan(preview._internal.sources, [remote]);
     assert.equal(plan.length, 1);
     assert.equal(plan[0].action, 'update');
+    const selectedKeys = [plan[0].key];
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys);
     let remoteWrites = 0;
     await assert.rejects(
       executeImport({
         snapshotVersion: preview.version,
-        selectedKeys: [plan[0].key],
+        planIntentVersion,
+        selectedKeys,
         actor: 'tester',
         jobId: 'backup-coverage-job',
         db: { async startMutationJob() {} },
@@ -4540,12 +4759,15 @@ test('token import checkpoints the credential backup before creating any backup 
     const plan = buildImportPlan(preview._internal.sources, []);
     assert.equal(plan.length, 1);
     assert.equal(plan[0].action, 'create');
+    const selectedKeys = [plan[0].key];
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys);
     const checkpoints = [];
     let remoteWrites = 0;
     await assert.rejects(
       executeImport({
         snapshotVersion: preview.version,
-        selectedKeys: [plan[0].key],
+        planIntentVersion,
+        selectedKeys,
         actor: 'tester',
         jobId: 'backup-checkpoint-job',
         db: { async startMutationJob() {} },

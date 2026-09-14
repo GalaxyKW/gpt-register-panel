@@ -501,6 +501,7 @@ test('HTTP shutdown cancels a queued import admission before job creation', asyn
       request.on('error', reject);
       request.end(JSON.stringify({
         snapshotVersion: 'a'.repeat(64),
+        planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
         selectedKeys: ['account:queued-during-stop'],
       }));
     });

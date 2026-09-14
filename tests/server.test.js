@@ -20,6 +20,7 @@ const {
   phase3ClaimKeys,
   phase3FailureMetadata,
   mutationFailureMetadata,
+  normalizedSelectedKeys,
   publicApiError,
   publicTokenCleanupErrorFields,
   reconciliationReviewDetail,
@@ -36,6 +37,7 @@ const { listExpiredTokens } = require('../backend/tokenCleanup');
 const { PanelDb } = require('../backend/db');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
+const validImportPlanIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
 
 test('static routing exposes only the three declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/')), 'index.html');
@@ -43,6 +45,22 @@ test('static routing exposes only the three declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
   assert.equal(safeStaticPath('/debug.json'), null);
   assert.equal(safeStaticPath('/nested/asset.js'), null);
+});
+
+test('sync selectedKeys validation is exact and never trims or deduplicates input', () => {
+  const key = 'token:tokens:tokens/example.json';
+  assert.deepEqual(normalizedSelectedKeys([key]), [key]);
+  assert.deepEqual(normalizedSelectedKeys([], { allowEmpty: true }), []);
+  for (const invalid of [
+    [],
+    [' ' + key],
+    [key + ' '],
+    ['', key],
+    [key, key],
+  ]) {
+    assert.equal(normalizedSelectedKeys(invalid), null);
+  }
+  assert.equal(normalizedSelectedKeys([''], { allowEmpty: true }), null);
 });
 
 test('public API errors expose only fixed codes, messages, and statuses', () => {
@@ -53,6 +71,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'IDEMPOTENCY_KEY_REQUIRED',
       'IDEMPOTENCY_KEY_INVALID',
       'SNAPSHOT_VERSION_REQUIRED',
+      'IMPORT_PLAN_VERSION_REQUIRED',
       'IMPORT_SELECTION_REQUIRED',
       'IMPORT_SELECTION_INVALID',
       'IMPORT_SELECTION_MISMATCH',
@@ -87,6 +106,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
     [404, ['JOB_RECONCILIATION_NOT_FOUND']],
     [409, [
       'IDEMPOTENCY_KEY_REUSED',
+      'IMPORT_PLAN_STALE',
       'PHASE3_DUPLICATE',
       'JOB_ALREADY_CLAIMED',
       'JOB_QUEUE_FULL',
@@ -486,6 +506,7 @@ test('HTTP responses hide unknown exceptions and lifecycle logs template request
 
     const writeFailure = await postJson(baseUrl, '/api/sync/import', {
       snapshotVersion: 'a'.repeat(64),
+      planIntentVersion: validImportPlanIntentVersion,
       selectedKeys: ['token:tokens:tokens/example.json'],
     });
     assert.equal(writeFailure.status, 503);
@@ -967,6 +988,7 @@ test('all mutation routes require one strict key and replay before live validati
     const requests = [
       ['/api/sync/import', {
         snapshotVersion: 'a'.repeat(64),
+        planIntentVersion: validImportPlanIntentVersion,
         selectedKeys: ['token:tokens:tokens/missing.json'],
       }],
       ['/api/phase3', {
@@ -1093,6 +1115,7 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
     const requests = [
       ['/api/sync/import', {
         snapshotVersion: 'a'.repeat(64),
+        planIntentVersion: validImportPlanIntentVersion,
         selectedKeys: ['token:tokens:tokens/not-present.json'],
       }],
       ['/api/phase3', {
@@ -1223,6 +1246,7 @@ test('concurrent requests that both miss initially create and dispatch only once
     const baseUrl = 'http://127.0.0.1:' + server.address().port;
     const body = {
       snapshotVersion: 'a'.repeat(64),
+      planIntentVersion: validImportPlanIntentVersion,
       selectedKeys: ['token:tokens:tokens/concurrent.json'],
     };
     const key = 'idem_v1_concurrent_route_123456789012345';

@@ -13,10 +13,12 @@ const {
 const {
   buildSnapshot,
   buildImportPlan,
+  buildImportPlanIntentVersion,
   importPlanSummary,
   executeImport,
   configuredForSub2Api,
   confirmedSub2ApiRead,
+  isImportPlanIntentVersion,
   safeErrorMessage,
 } = require('./sync');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
@@ -262,6 +264,7 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'IDEMPOTENCY_KEY_REQUIRED',
   'IDEMPOTENCY_KEY_INVALID',
   'SNAPSHOT_VERSION_REQUIRED',
+  'IMPORT_PLAN_VERSION_REQUIRED',
   'IMPORT_SELECTION_REQUIRED',
   'IMPORT_SELECTION_INVALID',
   'IMPORT_SELECTION_MISMATCH',
@@ -290,6 +293,7 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
 ]);
 const PUBLIC_CONFLICT_ERRORS = new Set([
   'IDEMPOTENCY_KEY_REUSED',
+  'IMPORT_PLAN_STALE',
   'PHASE3_DUPLICATE',
   'JOB_ALREADY_CLAIMED',
   'JOB_QUEUE_FULL',
@@ -347,6 +351,8 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   ACCOUNT_TEST_TARGET_REVISION_STALE: '账号状态已变化，请刷新后重新选择',
   ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS: '没有可测试的上游账号',
   ACCOUNT_TEST_BASELINE_INVALID: '无法安全确认账号测试基线，请稍后重试',
+  IMPORT_PLAN_VERSION_REQUIRED: '缺少有效的导入计划版本，请重新检查差异',
+  IMPORT_PLAN_STALE: '导入计划已变化，请重新检查差异',
   PHASE3_DISABLED: 'Phase 3 未启用',
   WRITE_DISABLED: '写操作未启用',
   SUB2API_READ_FAILED: '无法确认 Sub2API 当前账号列表',
@@ -1278,14 +1284,16 @@ function openVerifiedStaticFile(filePath, rootDirectory = FRONTEND_ROOT) {
 function normalizedSelectedKeys(value, options = {}) {
   if (!Array.isArray(value)) return null;
   if (value.length > 500) return null;
-  if (value.some((item) => typeof item !== 'string')) return null;
-  const keys = value
-    .map((item) => item.trim())
-    .filter(Boolean);
+  if (value.some((item) => (
+    typeof item !== 'string'
+      || !item
+      || item.length > 512
+      || item.trim() !== item
+  ))) return null;
   const allowEmpty = options.allowEmpty === true;
-  if (keys.length === 0 && (!allowEmpty || value.length > 0)) return null;
-  if (keys.some((key) => key.length > 512)) return null;
-  return [...new Set(keys)];
+  if (value.length === 0 && !allowEmpty) return null;
+  if (new Set(value).size !== value.length) return null;
+  return [...value];
 }
 
 function requestBodyObjectError(body) {
@@ -2185,6 +2193,7 @@ function tokenImportJobStatus(result = {}) {
 function observeImportJob({
   job,
   snapshotVersion,
+  planIntentVersion,
   selectedKeys,
   actor,
   db,
@@ -2232,6 +2241,7 @@ function observeImportJob({
     throwIfJobInterrupted(tracked?.controller.signal);
     return executeImport({
       snapshotVersion,
+      planIntentVersion,
       selectedKeys,
       actor,
       db,
@@ -2315,6 +2325,11 @@ function importRequestError(body) {
   if (!/^[a-f0-9]{64}$/i.test(String(body.snapshotVersion || ''))) {
     const error = new Error('缺少有效的差异快照版本，请先执行“检查差异”');
     error.code = 'SNAPSHOT_VERSION_REQUIRED';
+    return error;
+  }
+  if (!isImportPlanIntentVersion(body.planIntentVersion)) {
+    const error = new Error('缺少有效的导入计划版本，请重新检查差异');
+    error.code = 'IMPORT_PLAN_VERSION_REQUIRED';
     return error;
   }
   const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
@@ -2590,12 +2605,18 @@ function createServer(options = {}) {
           throw error;
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
+        const planIntentVersion = buildImportPlanIntentVersion(
+          snapshot.version,
+          selectedKeys,
+          plan,
+        );
         const snapshotId = await db.saveSnapshot(snapshot);
         writeLog(logger, 'info', 'preview.completed', {
           requestId,
           actor,
           snapshotId,
           version: snapshot.version,
+          planIntentVersion,
           durationMs: Date.now() - previewStartedAt,
           counts: importPlanSummary(plan).counts,
         });
@@ -2603,6 +2624,7 @@ function createServer(options = {}) {
           readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
           snapshotId,
           version: snapshot.version,
+          planIntentVersion,
           generatedAt: snapshot.generatedAt,
           selectedKeys,
           ...importPlanSummary(plan),
@@ -2630,8 +2652,10 @@ function createServer(options = {}) {
         if (requestError) throw requestError;
         const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
         const normalizedSnapshotVersion = String(body.snapshotVersion).toLowerCase();
+        const planIntentVersion = body.planIntentVersion;
         const idempotency = mutationContext(request, MUTATION_WORKFLOWS.import, {
           snapshotVersion: normalizedSnapshotVersion,
+          planIntentVersion,
           selectedKeys,
         });
         const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
@@ -2663,6 +2687,7 @@ function createServer(options = {}) {
                   type: 'token_import',
                   payload: {
                     snapshotVersion: normalizedSnapshotVersion,
+                    planIntentVersion,
                     selectedKeys,
                     // Keep a separately validated, non-secret display path because
                     // generic text redaction intentionally masks `token:...` values.
@@ -2696,12 +2721,14 @@ function createServer(options = {}) {
               jobId: createdJob.id,
               actor,
               expectedVersion: normalizedSnapshotVersion,
+              planIntentVersion,
               selectedCount: selectedKeys.length,
               durationMs: Date.now() - importRequestStartedAt,
             });
             dispatch(createdJob, 'token_import', actor, (taskRecord) => observeImportJob({
               job: createdJob,
               snapshotVersion: normalizedSnapshotVersion,
+              planIntentVersion,
               selectedKeys,
               actor,
               db,

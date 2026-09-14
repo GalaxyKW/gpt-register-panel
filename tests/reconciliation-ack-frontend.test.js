@@ -184,7 +184,8 @@ test('frontend disables mutation controls while preserving read-only inspection 
   assert.match(updateContract, /phase3Button\.disabled = mutationLocked/);
   assert.match(updateContract, /accountTestButton\.disabled = mutationLocked/);
   assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked/);
-  assert.match(updateContract, /previewButton\.disabled = locked \|\| !comparisonAvailable\(\)/);
+  assert.match(updateContract, /previewButton\.disabled = locked\s*\n\s*\|\| !comparisonAvailable\(\)/);
+  assert.doesNotMatch(updateContract, /previewButton\.disabled = mutationLocked/);
 
   const context = {
     state: {

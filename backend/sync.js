@@ -225,6 +225,8 @@ function safeVersionInput(snapshot) {
     accounts: snapshot.accounts.map((account) => ({
       id: account.id,
       name: account.name,
+      platform: account.platform,
+      type: account.type,
       status: account.status,
       schemaValid: account.schemaValid,
       identityConflict: account.identityConflict,
@@ -781,7 +783,13 @@ function sourceSelectionMetadata(candidate, selectedKeys) {
 
 function assertImportSelectionCovered(candidates, selectedKeys) {
   if (!Array.isArray(selectedKeys) || selectedKeys.length > 500
-      || selectedKeys.some((key) => typeof key !== 'string' || !key || key.length > 512)) {
+      || selectedKeys.some((key) => (
+        typeof key !== 'string'
+          || !key
+          || key.length > 512
+          || key.trim() !== key
+      ))
+      || new Set(selectedKeys).size !== selectedKeys.length) {
     const error = new Error('导入选择参数无效，请刷新账号列表后重新选择');
     error.code = 'IMPORT_SELECTION_INVALID';
     throw error;
@@ -799,6 +807,161 @@ function assertImportSelectionCovered(candidates, selectedKeys) {
   error.code = 'IMPORT_SELECTION_MISMATCH';
   error.unknownSelectionCount = unknownCount;
   throw error;
+}
+
+const IMPORT_PLAN_INTENT_PATTERN = /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/;
+
+function importPlanIdentityKeys(value) {
+  return canonicalIdentitySet(Array.isArray(value) ? value : []);
+}
+
+function importPlanFingerprintState(value) {
+  const fingerprints = value && typeof value === 'object' ? value : {};
+  return {
+    access: fingerprints.access || null,
+    refresh: fingerprints.refresh || null,
+    id: fingerprints.id || null,
+  };
+}
+
+function importPlanCredentialPresence(value) {
+  const presence = value && typeof value === 'object' ? value : {};
+  return {
+    access: presence.access || null,
+    refresh: presence.refresh || null,
+    id: presence.id || null,
+  };
+}
+
+function importPlanTargetState(account) {
+  if (!account || typeof account !== 'object') return null;
+  const numericId = Number(account.id);
+  return {
+    id: Number.isSafeInteger(numericId) && numericId > 0 ? numericId : null,
+    name: typeof account.name === 'string' ? account.name : null,
+    platform: typeof account.platform === 'string' ? account.platform : null,
+    type: typeof account.type === 'string' ? account.type : null,
+    identityKeys: importPlanIdentityKeys(
+      account.identityKeys?.length ? account.identityKeys : accountKeys(account),
+    ),
+    schemaValid: account.schemaValid === true
+      ? true
+      : account.schemaValid === false ? false : null,
+    identityConflict: account.identityConflict === true,
+    fingerprintConflict: account.fingerprintConflict === true,
+    credentialsStatusConflict: account.credentialsStatusConflict === true,
+    status: typeof account.status === 'string' ? account.status : null,
+    statusKnown: account.statusKnown === true
+      ? true
+      : account.statusKnown === false ? false : null,
+    schedulable: typeof account.schedulable === 'boolean' ? account.schedulable : null,
+    schedulableKnown: account.schedulableKnown === true
+      ? true
+      : account.schedulableKnown === false ? false : null,
+    tempUnschedulableUntil: account.tempUnschedulableUntil || null,
+    tempUnschedulableUntilStatus: account.tempUnschedulableUntilStatus || null,
+    rateLimitResetAt: account.rateLimitResetAt || null,
+    rateLimitResetStatus: account.rateLimitResetStatus || null,
+    overloadUntil: account.overloadUntil || null,
+    overloadUntilStatus: account.overloadUntilStatus || null,
+    autoPauseOnExpired: typeof account.autoPauseOnExpired === 'boolean'
+      ? account.autoPauseOnExpired
+      : null,
+    expiresAt: account.expiresAt || null,
+    expiryStatus: account.expiryStatus || null,
+    credentialExpiresAt: account.credentialExpiresAt || null,
+    credentialExpiryStatus: account.credentialExpiryStatus || null,
+    tokenFingerprints: importPlanFingerprintState(account.tokenFingerprints),
+    credentialPresence: importPlanCredentialPresence(account.credentialPresence),
+    groupIds: Array.isArray(account.groupIds) ? [...account.groupIds] : [],
+  };
+}
+
+function importPlanIntentItem(item) {
+  const record = item?._record && typeof item._record === 'object' ? item._record : {};
+  const numericAccountId = Number(item?.accountId);
+  return {
+    key: typeof item?.key === 'string' ? item.key : null,
+    identityKeys: importPlanIdentityKeys(item?.sourceIdentityKeys),
+    action: typeof item?.action === 'string' ? item.action : null,
+    reason: typeof item?.reason === 'string' ? item.reason : null,
+    accountId: Number.isSafeInteger(numericAccountId) && numericAccountId > 0
+      ? numericAccountId
+      : null,
+    accountName: typeof item?.accountName === 'string' ? item.accountName : null,
+    source: typeof item?.source === 'string' ? item.source : null,
+    relativePath: typeof item?.relativePath === 'string' ? item.relativePath : null,
+    sourceContentHash: typeof record.contentHash === 'string' ? record.contentHash : null,
+    sourceMtimeMs: Number.isFinite(Number(record.mtimeMs)) ? Number(record.mtimeMs) : null,
+    sourceType: typeof record.type === 'string' ? record.type : null,
+    sourceIdentityKeys: importPlanIdentityKeys(record.identityKeys),
+    sourceFingerprints: importPlanFingerprintState(record.fingerprints),
+    expiryStatus: typeof item?.expiryStatus === 'string' ? item.expiryStatus : null,
+    expiresAt: item?.expiresAt || null,
+    sourceExpired: item?.sourceExpired === true,
+    sourceDisabled: item?.sourceDisabled === true,
+    sourceTerminalStatus: item?.sourceTerminalStatus || null,
+    conflictingVersions: item?.conflictingVersions === true,
+    identityConflict: item?.identityConflict === true,
+    supersededBy: item?.supersededBy || null,
+    selectedSourcePaths: Array.isArray(item?.selectedSourcePaths)
+      ? [...item.selectedSourcePaths]
+      : [],
+    selectedSupersededPaths: Array.isArray(item?.selectedSupersededPaths)
+      ? [...item.selectedSupersededPaths]
+      : [],
+    availability: item?.availability || null,
+    availabilityReason: item?.availabilityReason || null,
+    target: importPlanTargetState(item?._account),
+  };
+}
+
+function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan) {
+  const normalizedSnapshotVersion = typeof snapshotVersionValue === 'string'
+    ? snapshotVersionValue.toLowerCase()
+    : '';
+  if (!/^[a-f0-9]{64}$/.test(normalizedSnapshotVersion)) {
+    const error = new Error('导入计划缺少有效的快照版本');
+    error.code = 'SNAPSHOT_VERSION_REQUIRED';
+    throw error;
+  }
+  // Reuse the exact selection contract without requiring the caller to
+  // expose the source candidates again. Every key must survive byte-for-byte.
+  if (!Array.isArray(selectedKeys) || selectedKeys.length > 500
+      || selectedKeys.some((key) => (
+        typeof key !== 'string' || !key || key.length > 512 || key.trim() !== key
+      ))
+      || new Set(selectedKeys).size !== selectedKeys.length) {
+    const error = new Error('导入选择参数无效，请重新检查差异');
+    error.code = 'IMPORT_SELECTION_INVALID';
+    throw error;
+  }
+  if (!Array.isArray(plan)) {
+    const error = new Error('导入计划结构无效');
+    error.code = 'IMPORT_PLAN_INVALID';
+    throw error;
+  }
+  const material = {
+    schema: 'sync-plan-intent-v1',
+    snapshotVersion: normalizedSnapshotVersion,
+    selectedKeys: [...selectedKeys],
+    items: plan.map(importPlanIntentItem),
+  };
+  return 'sync-plan-v1.' + crypto.createHash('sha256')
+    .update(JSON.stringify(material))
+    .digest('base64url');
+}
+
+function isImportPlanIntentVersion(value) {
+  return typeof value === 'string' && IMPORT_PLAN_INTENT_PATTERN.test(value);
+}
+
+function importPlanIntentVersionsEqual(left, right) {
+  if (!isImportPlanIntentVersion(left) || !isImportPlanIntentVersion(right)) return false;
+  const leftBuffer = Buffer.from(left, 'ascii');
+  const rightBuffer = Buffer.from(right, 'ascii');
+  return leftBuffer.length === rightBuffer.length
+    && crypto.timingSafeEqual(leftBuffer, rightBuffer);
 }
 
 function dateMilliseconds(value) {
@@ -2240,6 +2403,7 @@ function assertBackupCoversUpdateTargets(payload, plan = []) {
 
 async function executeImport({
   snapshotVersion: expectedVersion,
+  planIntentVersion: expectedPlanIntentVersion,
   selectedKeys = [],
   actor = 'local',
   db,
@@ -2275,6 +2439,11 @@ async function executeImport({
       error.code = 'IMPORT_SELECTION_REQUIRED';
       throw error;
     }
+    if (!isImportPlanIntentVersion(expectedPlanIntentVersion)) {
+      const error = new Error('缺少有效的导入计划版本，请重新检查差异');
+      error.code = 'IMPORT_PLAN_VERSION_REQUIRED';
+      throw error;
+    }
     const result = await withControlPlaneLock(async () => {
       let lockedResult;
       try {
@@ -2307,6 +2476,18 @@ async function executeImport({
         throw error;
       }
       throwIfJobInterrupted(signal);
+      const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
+      const currentPlanIntentVersion = buildImportPlanIntentVersion(
+        current.version,
+        selectedKeys,
+        fullPlan,
+      );
+      if (!importPlanIntentVersionsEqual(expectedPlanIntentVersion, currentPlanIntentVersion)) {
+        const error = new Error('导入计划在确认前已变化，请重新检查差异');
+        error.code = 'IMPORT_PLAN_STALE';
+        throw error;
+      }
+      throwIfJobInterrupted(signal);
       if (db && jobId) {
         if (typeof db.startMutationJob !== 'function') {
           const error = new Error('任务执行安全检查不可用，尚未开始导入');
@@ -2316,7 +2497,6 @@ async function executeImport({
         await db.startMutationJob(jobId);
       }
       throwIfJobInterrupted(signal);
-      const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
       const fullSummary = importPlanSummary(fullPlan);
       writeLog(logger, 'info', 'import.plan_built', {
         jobId,
@@ -2686,6 +2866,7 @@ async function executeImport({
 module.exports = {
   buildSnapshot,
   buildImportPlan,
+  buildImportPlanIntentVersion,
   collectCandidates,
   compareTokenRecordFreshness,
   buildOAuthUpdatePayload,
@@ -2700,6 +2881,8 @@ module.exports = {
   resolveGroupIds,
   configuredForSub2Api,
   confirmedSub2ApiRead,
+  isImportPlanIntentVersion,
+  importPlanIntentVersionsEqual,
   snapshotVersion,
   safeErrorMessage,
   writeBackup,

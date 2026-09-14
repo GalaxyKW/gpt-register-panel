@@ -108,6 +108,7 @@ test('all mutation routes interrupt committed jobs when the admission lease rele
       pathname: '/api/sync/import',
       body: {
         snapshotVersion: 'a'.repeat(64),
+        planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
         selectedKeys: ['token:tokens:tokens/admission-import.json'],
       },
     },

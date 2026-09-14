@@ -843,6 +843,11 @@ function comparisonAvailable(snapshot = state.snapshot) {
     && (status === undefined || status === 'complete');
 }
 
+function validImportPlanIntentVersion(value) {
+  return typeof value === 'string'
+    && /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/.test(value);
+}
+
 function syncSelectionProblem(selectedKeys = state.selected) {
   const keys = selectedKeys instanceof Set ? [...selectedKeys] : [...(selectedKeys || [])];
   if (keys.length === 0) return '';
@@ -897,6 +902,7 @@ function updateImportButtonState() {
     || Boolean(selectionProblem)
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
+    || !validImportPlanIntentVersion(state.plan?.planIntentVersion)
     || state.plan.selectedKeys.length === 0
     || hasBlockingConflict
     || !items.some((item) => ['create', 'update'].includes(effectivePlanAction(item)));
@@ -2584,6 +2590,9 @@ async function previewSelection() {
     const body = await response.json();
     if (!selectionStillCurrent(selectionRevision, selectedKeys)) return false;
     if (!response.ok) throw new Error(body.message || body.error || '差异检查失败');
+    if (!validImportPlanIntentVersion(body.planIntentVersion)) {
+      throw new Error('差异预览缺少有效的导入计划版本，请刷新后重试');
+    }
     renderPlan({ ...body, selectedKeys });
     const supersededSelectionCount = (body.items || []).filter((item) => (
       item?.selectedSourceSuperseded === true
@@ -2629,6 +2638,10 @@ elements.importButton.addEventListener('click', async () => {
     showNotice('导入前请先选择账号并重新检查差异。', 'notice-warning');
     return;
   }
+  if (!validImportPlanIntentVersion(state.plan.planIntentVersion)) {
+    showNotice('导入计划版本无效，请重新检查差异。', 'notice-warning');
+    return;
+  }
   const supersededSelectionCount = (state.plan.items || []).filter((item) => (
     item?.selectedSourceSuperseded === true
   )).length;
@@ -2642,7 +2655,11 @@ elements.importButton.addEventListener('click', async () => {
     const { response, body } = await idempotentMutationFetch(
       'token_import',
       '/api/sync/import',
-      { snapshotVersion: state.plan.version, selectedKeys },
+      {
+        snapshotVersion: state.plan.version,
+        planIntentVersion: state.plan.planIntentVersion,
+        selectedKeys,
+      },
     );
     if (!response.ok) throw new Error(body.message || body.error || '导入任务创建失败');
     showNotice('导入任务已排队，正在等待执行结果。', 'notice-info');
@@ -2713,7 +2730,7 @@ if (elements.accountTestButton) {
       showNotice('请选择测试模型。', 'notice-warning');
       return;
     }
-    if (!window.confirm('确认使用 ' + accountTestModelLabel(modelId) + ' 测试已选的 ' + targets.length + ' 个上游账号？error 账号成功后会恢复并启用，其他账号只测试不修改调度设置。')) return;
+    if (!window.confirm('确认使用 ' + accountTestModelLabel(modelId) + ' 测试已选的 ' + targets.length + ' 个上游账号？error 账号成功后会尝试恢复并启用；Sub2API 测试接口本身可能依据结果更新账号状态、限流或调度信息，其他账号面板不会额外切换调度。')) return;
     state.accountTestRequestPending = true;
     updateActionState();
     try {

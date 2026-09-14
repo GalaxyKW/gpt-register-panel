@@ -121,6 +121,7 @@ test('frontend import confirmation calls out selected superseded token files', a
     state: {
       plan: {
         version: 'a'.repeat(64),
+        planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
         selectedKeys: ['token:use_token:use_token/old.json'],
         items: [{ selectedSourceSuperseded: true }],
       },
@@ -128,6 +129,7 @@ test('frontend import confirmation calls out selected superseded token files', a
       snapshot: { sub2api: { readStatus: 'ok' } },
     },
     comparisonAvailable: () => true,
+    validImportPlanIntentVersion: () => true,
     hiddenSelectionProblem: () => '',
     syncSelectionProblem: () => '',
     showNotice() {},
@@ -143,6 +145,65 @@ test('frontend import confirmation calls out selected superseded token files', a
   assert.match(confirmation, /1 个所选旧副本/);
   assert.match(confirmation, /排序首选版本/);
   assert.match(confirmation, /确认将预览中的新增\/更新写入 Sub2API/);
+});
+
+test('frontend submits the exact preview intent version with the ordered selection', async () => {
+  const importHandler = sourceSection(
+    "elements.importButton.addEventListener('click'",
+    "elements.phase3Button.addEventListener('click'",
+  );
+  let clickHandler;
+  let submitted = null;
+  const planIntentVersion = 'sync-plan-v1.' + 'B'.repeat(43);
+  const selectedKeys = [
+    'token:tokens:tokens/second.json',
+    'token:tokens:tokens/first.json',
+  ];
+  const context = {
+    elements: {
+      importButton: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          clickHandler = handler;
+        },
+      },
+    },
+    state: {
+      plan: {
+        version: 'b'.repeat(64),
+        planIntentVersion,
+        selectedKeys,
+        items: [],
+      },
+      importRequestPending: false,
+      snapshot: { sub2api: { readStatus: 'ok' } },
+    },
+    comparisonAvailable: () => true,
+    validImportPlanIntentVersion: () => true,
+    hiddenSelectionProblem: () => '',
+    syncSelectionProblem: () => '',
+    updateActionState() {},
+    renderPlan() {},
+    showNotice() {},
+    async idempotentMutationFetch(workflow, pathname, body) {
+      submitted = { workflow, pathname, body };
+      return { response: { ok: true }, body: { jobId: 'job_test' } };
+    },
+    async watchJob() {},
+    window: { confirm: () => true },
+  };
+
+  vm.runInNewContext(importHandler, context);
+  await clickHandler();
+  assert.deepEqual(JSON.parse(JSON.stringify(submitted)), {
+    workflow: 'token_import',
+    pathname: '/api/sync/import',
+    body: {
+      snapshotVersion: 'b'.repeat(64),
+      planIntentVersion,
+      selectedKeys,
+    },
+  });
 });
 
 test('frontend rejects non-importable sync selections before requesting either preview or import', async () => {
@@ -1128,6 +1189,15 @@ test('frontend difference metric excludes in-sync rows and starts imports with t
   assert.match(source, /remote_unknown:\s*'远端未知'/);
   const importHandler = sourceSection("elements.importButton.addEventListener('click'", "elements.phase3Button.addEventListener('click'");
   assert.match(importHandler, /watchJob\(body\.jobId, 'token_import'\)/);
+  assert.match(importHandler, /planIntentVersion:\s*state\.plan\.planIntentVersion/);
+  assert.match(source, /function validImportPlanIntentVersion/);
+  assert.match(source, /sync-plan-v1/);
+});
+
+test('frontend account-test confirmation describes upstream state side effects accurately', () => {
+  assert.match(source, /Sub2API 测试接口本身可能依据结果更新账号状态、限流或调度信息/);
+  assert.match(source, /其他账号面板不会额外切换调度/);
+  assert.doesNotMatch(source, /其他账号只测试不修改调度设置/);
 });
 
 test('frontend treats expired token cleanup as a durable polled task', () => {
@@ -1921,6 +1991,7 @@ test('frontend discards a preview when the selected keys or revision changes in 
     ok: true,
     json: async () => ({
       version: 'current',
+      planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
       items: [{ selectedSourceSuperseded: true }],
     }),
   });

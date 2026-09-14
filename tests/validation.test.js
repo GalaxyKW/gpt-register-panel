@@ -81,7 +81,9 @@ test('preview selection accepts an empty array but rejects blank or oversized in
   assert.equal(normalizedSelectedKeys(['   '], { allowEmpty: true }), null);
   assert.equal(normalizedSelectedKeys([], { allowEmpty: false }), null);
   assert.equal(normalizedSelectedKeys(Array.from({ length: 501 }, (_, index) => String(index)), { allowEmpty: true }), null);
-  assert.deepEqual(normalizedSelectedKeys([' account:1 ', 'account:1'], { allowEmpty: false }), ['account:1']);
+  assert.equal(normalizedSelectedKeys([' account:1 ', 'account:1'], { allowEmpty: false }), null);
+  assert.equal(normalizedSelectedKeys(['account:1', 'account:1'], { allowEmpty: false }), null);
+  assert.deepEqual(normalizedSelectedKeys(['account:1'], { allowEmpty: false }), ['account:1']);
 });
 
 test('JSON API body validation rejects scalar values', () => {
