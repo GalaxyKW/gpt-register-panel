@@ -8,7 +8,11 @@ const test = require('node:test');
 require('./test-isolation');
 
 const { readGptRegisterSources, isHistoricalTokenFile } = require('../backend/adapters/gptRegisterFs');
-const { buildIdentityKeys, tokenFingerprint } = require('../backend/lib/token');
+const {
+  buildIdentityKeys,
+  normalizeTokenDocument,
+  tokenFingerprint,
+} = require('../backend/lib/token');
 const {
   Sub2ApiAdminClient,
   safeAccount,
@@ -1071,6 +1075,35 @@ test('safe accounts reject secret-like and confusing strong identities without e
     assert.equal(serialized.includes(dangerous), false);
     assert.equal(serialized.includes('identity-leak-marker'), false);
   });
+});
+
+test('local and remote email identities reject whitespace, zero-width and bidi ambiguity', () => {
+  const unsafeEmails = [
+    'two words@example.test',
+    'zero\u200bwidth@example.test',
+    'bidi\u202e@example.test',
+    'missing-at.example.test',
+    'double@@example.test',
+  ];
+  for (const email of unsafeEmails) {
+    const token = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/ambiguous-email.json',
+      fileName: 'ambiguous-email.json',
+      mtimeMs: 1,
+      data: { access_token: 'opaque-access', account_id: 'account-safe', email },
+    });
+    const account = safeAccount({
+      id: 219,
+      account_id: 'account-safe',
+      email,
+    });
+    assert.equal(token.parseStatus, 'invalid', email);
+    assert.equal(token.email, '', email);
+    assert.equal(account.schemaValid, false, email);
+    assert.equal(account.email, '', email);
+    assert.equal(JSON.stringify(account).includes(email), false, email);
+  }
 });
 
 test('safe accounts accept only lossless safe-integer numeric strong identities', () => {

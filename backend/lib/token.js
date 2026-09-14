@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const EMAIL_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_IDENTITY_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
@@ -14,7 +15,13 @@ function asString(value) {
 
 function normalizeEmail(value) {
   const raw = value === undefined || value === null ? '' : String(value);
-  return C0_OR_DEL.test(raw) ? '' : raw.trim().toLowerCase();
+  const text = raw.trim();
+  return !text
+    || text.length > 320
+    || EMAIL_CONTROL_OR_BIDI.test(raw)
+    || !/^[^\s@]+@[^\s@]+$/.test(text)
+    ? ''
+    : text.toLowerCase();
 }
 
 function normalizeIdentityValue(prefix, value) {
@@ -146,6 +153,15 @@ function strongIdentityField(field, prefix, maximumLength = 512) {
   return { value: normalized, invalid: false };
 }
 
+function emailIdentityField(field) {
+  if (!field || field.invalid) return { value: '', invalid: true };
+  if (!field.value) return { value: '', invalid: false };
+  const value = normalizeEmail(field.value);
+  return value
+    ? { value, invalid: false }
+    : { value: '', invalid: true };
+}
+
 function expectedDateScalar(value) {
   return value === undefined || value === null || value === ''
     || typeof value === 'string'
@@ -216,7 +232,12 @@ function normalizeTokenDocument({
     512,
     { rejectControls: C0_OR_DEL },
   ), 'user:');
-  const explicitEmail = stringAliases(document, ['email'], 320, { rejectControls: C0_OR_DEL });
+  const explicitEmail = emailIdentityField(stringAliases(
+    document,
+    ['email'],
+    320,
+    { rejectControls: C0_OR_DEL },
+  ));
   const explicitTypeField = stringAliases(document, ['type'], 32, { rejectControls: C0_OR_DEL });
   const accessToken = accessField.value;
   const refreshToken = refreshField.value;
@@ -233,10 +254,10 @@ function normalizeTokenDocument({
   const idClaimChatGptUser = strongIdentityField(claimScalar(idAuth, 'chatgpt_user_id', 512), 'user:');
   const idClaimUser = strongIdentityField(claimScalar(idAuth, 'user_id', 512), 'user:');
   const idClaimSubject = strongIdentityField(claimScalar(idPayload, 'sub', 512), 'user:');
-  const claimAuthEmail = claimScalar(auth, 'email', 320, false);
-  const claimEmail = claimScalar(accessPayload, 'email', 320, false);
-  const idClaimAuthEmail = claimScalar(idAuth, 'email', 320, false);
-  const idClaimEmail = claimScalar(idPayload, 'email', 320, false);
+  const claimAuthEmail = emailIdentityField(claimScalar(auth, 'email', 320, false));
+  const claimEmail = emailIdentityField(claimScalar(accessPayload, 'email', 320, false));
+  const idClaimAuthEmail = emailIdentityField(claimScalar(idAuth, 'email', 320, false));
+  const idClaimEmail = emailIdentityField(claimScalar(idPayload, 'email', 320, false));
   const rawAuth = accessPayload?.['https://api.openai.com/auth'];
   const rawIdAuth = idPayload?.['https://api.openai.com/auth'];
   const authShapeInvalid = rawAuth !== undefined && rawAuth !== null

@@ -256,6 +256,20 @@ test('token identities reject C0 and DEL while credentials reject line controls'
       data: { access_token: 'opaque-access', email: 'safe\t@example.test' },
     },
     {
+      label: 'email bidi override',
+      data: { access_token: 'opaque-access', email: 'safe\u202e@example.test' },
+    },
+    {
+      label: 'JWT email zero-width separator',
+      data: {
+        access_token: [
+          'header',
+          Buffer.from(JSON.stringify({ email: 'safe\u200b@example.test' })).toString('base64url'),
+          'signature',
+        ].join('.'),
+      },
+    },
+    {
       label: 'JWT claim control',
       data: { access_token: jwtWithControlledIdentity },
     },
