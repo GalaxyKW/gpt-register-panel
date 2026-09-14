@@ -24,6 +24,9 @@ const {
   importPlanIntentVersionsEqual,
   resolveGroupIds,
   resolveImportGroupBinding,
+  resolveImportTargetBinding,
+  resolveImportCreatePolicy,
+  resolveImportExecutionBinding,
   writeBackup,
   assertBackupCoversUpdateTargets,
 } = require('../backend/sync');
@@ -50,16 +53,44 @@ const successfulCheckpointLogger = Object.freeze({
   checkpoint() { return true; },
 });
 
+const TEST_SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+const TEST_CREATE_POLICY = Object.freeze({
+  schema: 'sub2api-codex-create-v1',
+  mode: 'codex_session_create',
+  updateExisting: false,
+  skipDefaultGroupBind: true,
+  confirmMixedChannelRisk: false,
+});
+
+function importExecutionBindingForPlan(plan, options = {}) {
+  return resolveImportExecutionBinding(
+    { baseUrl: options.baseUrl || process.env.SUB2API_BASE_URL || TEST_SUB2API_BASE_URL },
+    plan,
+    { environment: options.environment || process.env },
+  );
+}
+
 function executeImport(options = {}) {
+  const client = options.client && typeof options.client.baseUrl !== 'string'
+    ? {
+        ...options.client,
+        baseUrl: process.env.SUB2API_BASE_URL || TEST_SUB2API_BASE_URL,
+      }
+    : options.client;
   return executeImportWithAuditCheckpoint({
     logger: successfulCheckpointLogger,
     ...options,
+    client,
   });
 }
 
 function executeImportPlanItem(options = {}) {
   return executeImportPlanItemWithAuditCheckpoint({
     logger: successfulCheckpointLogger,
+    createPolicy: TEST_CREATE_POLICY,
+    ...(options.item?.action === 'create' && options.groups === undefined
+      ? { groups: [1] }
+      : {}),
     ...options,
   });
 }
@@ -70,7 +101,13 @@ function importPlanIntentForSnapshot(snapshot, selectedKeys, groupBinding = null
     snapshot._internal.accounts,
     selectedKeys,
   );
-  return buildImportPlanIntentVersion(snapshot.version, selectedKeys, plan, groupBinding);
+  return buildImportPlanIntentVersion(
+    snapshot.version,
+    selectedKeys,
+    plan,
+    groupBinding,
+    importExecutionBindingForPlan(plan),
+  );
 }
 
 function processIsRunning(pid) {
@@ -2185,12 +2222,20 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   const snapshot = 'a'.repeat(64);
   const firstSelectionPlan = buildImportPlan(sources, [], [firstKey]);
   const groupBinding = { mode: 'explicit', groupIds: [9, 7] };
+  const intentVersion = (keys, plan, binding = null, options = {}) => (
+    buildImportPlanIntentVersion(
+      snapshot,
+      keys,
+      plan,
+      binding,
+      importExecutionBindingForPlan(plan, options),
+    )
+  );
   assert.throws(
     () => buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan),
     (error) => error.code === 'IMPORT_GROUP_BINDING_REQUIRED',
   );
-  const firstIntent = buildImportPlanIntentVersion(
-    snapshot,
+  const firstIntent = intentVersion(
     [firstKey],
     firstSelectionPlan,
     groupBinding,
@@ -2198,8 +2243,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   assert.match(firstIntent, /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/);
   assert.equal(
     firstIntent,
-    buildImportPlanIntentVersion(
-      snapshot,
+    intentVersion(
       [firstKey],
       firstSelectionPlan,
       { mode: 'explicit', groupIds: [7, 9, 7] },
@@ -2207,8 +2251,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   );
   assert.notEqual(
     firstIntent,
-    buildImportPlanIntentVersion(
-      snapshot,
+    intentVersion(
       [firstKey],
       firstSelectionPlan,
       { mode: 'explicit', groupIds: [7, 10] },
@@ -2216,8 +2259,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   );
   assert.notEqual(
     firstIntent,
-    buildImportPlanIntentVersion(
-      snapshot,
+    intentVersion(
       [firstKey],
       firstSelectionPlan,
       { mode: 'sub2api_default', groupIds: [11] },
@@ -2226,8 +2268,7 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent), true);
   assert.equal(importPlanIntentVersionsEqual(firstIntent, firstIntent.slice(0, -1) + '!'), false);
 
-  const changedSelectionIntent = buildImportPlanIntentVersion(
-    snapshot,
+  const changedSelectionIntent = intentVersion(
     [secondKey],
     buildImportPlan(sources, [], [secondKey]),
     groupBinding,
@@ -2263,8 +2304,8 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   );
   assert.notEqual(newerWins[0].key, olderWins[0].key);
   assert.notEqual(
-    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], newerWins, groupBinding),
-    buildImportPlanIntentVersion(snapshot, [selectedOlderKey], olderWins, groupBinding),
+    intentVersion([selectedOlderKey], newerWins, groupBinding),
+    intentVersion([selectedOlderKey], olderWins, groupBinding),
   );
 
   const unavailableTarget = {
@@ -2290,12 +2331,88 @@ test('sync selection and plan intent preserve exact keys and bind every executab
   assert.equal(updatePlan[0].action, 'update');
   assert.equal(retargetedPlan[0].action, 'update');
   assert.notEqual(
-    buildImportPlanIntentVersion(snapshot, [firstKey], updatePlan),
-    buildImportPlanIntentVersion(snapshot, [firstKey], retargetedPlan),
+    intentVersion([firstKey], updatePlan),
+    intentVersion([firstKey], retargetedPlan),
   );
   assert.notEqual(
-    buildImportPlanIntentVersion(snapshot, [firstKey], updatePlan),
-    buildImportPlanIntentVersion(snapshot, [firstKey], firstSelectionPlan, groupBinding),
+    intentVersion([firstKey], updatePlan),
+    intentVersion([firstKey], firstSelectionPlan, groupBinding),
+  );
+});
+
+test('import intent binds a canonical target and the exact create policy without exposing the URL', () => {
+  const source = syntheticToken(
+    'tokens/target-binding.json',
+    ['account:target-binding-account', 'user:target-binding-user'],
+  );
+  const selectedKeys = ['token:tokens:tokens/target-binding.json'];
+  const plan = buildImportPlan({ tokens: [source], usernames: [] }, [], selectedKeys);
+  const groupBinding = { mode: 'explicit', groupIds: [7] };
+  const canonicalTarget = resolveImportTargetBinding({
+    baseUrl: 'https://SUB2API.EXAMPLE.test:443/admin',
+  });
+  const equivalentTarget = resolveImportTargetBinding({
+    baseUrl: 'https://sub2api.example.test/admin',
+  });
+  const otherTarget = resolveImportTargetBinding({
+    baseUrl: 'https://sub2api.example.test/other',
+  });
+  assert.deepEqual(canonicalTarget, equivalentTarget);
+  assert.notDeepEqual(
+    canonicalTarget,
+    resolveImportTargetBinding({ baseUrl: 'https://sub2api.example.test/admin/' }),
+  );
+  assert.notDeepEqual(canonicalTarget, otherTarget);
+  assert.equal(JSON.stringify(canonicalTarget).includes('sub2api.example.test'), false);
+  for (const baseUrl of [
+    '',
+    'file:///tmp/sub2api',
+    'https://user:password@sub2api.example.test',
+    'https://sub2api.example.test?tenant=other',
+  ]) {
+    assert.throws(
+      () => resolveImportTargetBinding({ baseUrl }),
+      (error) => error.code === 'IMPORT_TARGET_BINDING_INVALID',
+    );
+  }
+
+  const safePolicy = resolveImportCreatePolicy(plan, {
+    SUB2API_CONFIRM_MIXED_CHANNEL_RISK: '0',
+  });
+  const confirmedPolicy = resolveImportCreatePolicy(plan, {
+    SUB2API_CONFIRM_MIXED_CHANNEL_RISK: '1',
+  });
+  assert.deepEqual(safePolicy, {
+    schema: 'sub2api-codex-create-v1',
+    mode: 'codex_session_create',
+    updateExisting: false,
+    skipDefaultGroupBind: true,
+    confirmMixedChannelRisk: false,
+  });
+  assert.equal(confirmedPolicy.confirmMixedChannelRisk, true);
+  assert.throws(
+    () => resolveImportCreatePolicy(plan, { SUB2API_CONFIRM_MIXED_CHANNEL_RISK: 'true' }),
+    (error) => error.code === 'IMPORT_CREATE_POLICY_INVALID',
+  );
+
+  const buildIntent = (target, createPolicy) => buildImportPlanIntentVersion(
+    'b'.repeat(64),
+    selectedKeys,
+    plan,
+    groupBinding,
+    { target, createPolicy },
+  );
+  const reviewed = buildIntent(canonicalTarget, safePolicy);
+  assert.notEqual(reviewed, buildIntent(otherTarget, safePolicy));
+  assert.notEqual(reviewed, buildIntent(canonicalTarget, confirmedPolicy));
+  assert.throws(
+    () => buildImportPlanIntentVersion(
+      'b'.repeat(64),
+      selectedKeys,
+      plan,
+      groupBinding,
+    ),
+    (error) => error.code === 'IMPORT_EXECUTION_BINDING_REQUIRED',
   );
 });
 
@@ -2936,6 +3053,7 @@ test('import rejects a named-group retarget before starting the job, backup, or 
       selectedKeys,
       buildImportPlan(preview._internal.sources, [], selectedKeys),
       previewBinding,
+      importExecutionBindingForPlan(plan),
     );
 
     let started = 0;
@@ -3016,6 +3134,7 @@ test('import revalidates explicit groups before starting the job, backup, or wri
       selectedKeys,
       previewPlan,
       previewBinding,
+      importExecutionBindingForPlan(previewPlan),
     );
 
     let started = 0;
@@ -3040,6 +3159,95 @@ test('import revalidates explicit groups before starting the job, backup, or wri
         },
       }),
       (error) => error.code === 'SUB2API_GROUP_NOT_ACTIVE',
+    );
+    assert.equal(started, 0);
+    assert.equal(backups, 0);
+    assert.equal(writes, 0);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('import rejects a target or create-policy switch before starting the job, backup, or write', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+    ['SUB2API_CONFIRM_MIXED_CHANNEL_RISK', process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = TEST_SUB2API_BASE_URL;
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.SUB2API_GROUP_IDS = '7';
+  delete process.env.SUB2API_GROUP_NAME;
+  process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK = '0';
+  try {
+    const previewClient = {
+      baseUrl: TEST_SUB2API_BASE_URL,
+      async listAccounts() { return []; },
+      async listGroups() {
+        return [{ id: 7, name: 'reviewed', platform: 'openai', status: 'active' }];
+      },
+    };
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: previewClient,
+    });
+    const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
+      .map((item) => item.key);
+    const previewPlan = buildImportPlan(preview._internal.sources, [], selectedKeys);
+    const groupBinding = await resolveImportGroupBinding(previewClient, previewPlan);
+    const executionBinding = resolveImportExecutionBinding(previewClient, previewPlan);
+    const planIntentVersion = buildImportPlanIntentVersion(
+      preview.version,
+      selectedKeys,
+      previewPlan,
+      groupBinding,
+      executionBinding,
+    );
+
+    let started = 0;
+    let backups = 0;
+    let writes = 0;
+    const executionClient = (baseUrl) => ({
+      baseUrl,
+      async listAccounts() { return []; },
+      async listGroups() {
+        return [{ id: 7, name: 'reviewed', platform: 'openai', status: 'active' }];
+      },
+      async exportAccounts() { backups += 1; return { accounts: [] }; },
+      async importCodexSession() { writes += 1; },
+      async applyOAuthCredentials() { writes += 1; },
+    });
+    const run = (client, jobId) => executeImport({
+      snapshotVersion: preview.version,
+      planIntentVersion,
+      selectedKeys,
+      actor: 'tester',
+      jobId,
+      db: { async startMutationJob() { started += 1; } },
+      client,
+    });
+
+    await assert.rejects(
+      run(executionClient('http://127.0.0.1:18081'), 'target-switch-job'),
+      (error) => error.code === 'IMPORT_PLAN_STALE',
+    );
+    process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK = '1';
+    await assert.rejects(
+      run(executionClient(TEST_SUB2API_BASE_URL), 'create-policy-switch-job'),
+      (error) => error.code === 'IMPORT_PLAN_STALE',
     );
     assert.equal(started, 0);
     assert.equal(backups, 0);
@@ -4258,6 +4466,8 @@ test('import rejects a time-only plan change before marking the job running or w
       preview.version,
       selectedKeys,
       previewPlan,
+      null,
+      importExecutionBindingForPlan(previewPlan),
     );
 
     Date.now = () => afterExpiry;
@@ -4305,6 +4515,19 @@ test('create verification consumes the nested Codex import account ID', async ()
     refreshToken: 'new-create-refresh-value',
   });
   const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  let missingGroupWrites = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      groups: [],
+      client: {
+        async listAccounts() { throw new Error('group validation must run first'); },
+        async importCodexSession() { missingGroupWrites += 1; },
+      },
+    }),
+    (error) => error.code === 'IMPORT_GROUP_BINDING_INVALID',
+  );
+  assert.equal(missingGroupWrites, 0);
   source.raw.credentials = { access_token: 'nested-import-value' };
   source.raw.unknown = { credential: 'nested-unknown-value' };
   let genericCalls = 0;
@@ -4356,11 +4579,16 @@ test('create verification consumes the nested Codex import account ID', async ()
     client,
     item,
     groups: [3],
+    createPolicy: resolveImportCreatePolicy([item], {
+      SUB2API_CONFIRM_MIXED_CHANNEL_RISK: '1',
+    }),
     context: { jobId: 'create-verification-job' },
   });
   assert.equal(genericCalls, 1);
   assert.equal(listCalls, 2);
   assert.equal(importPayload.update_existing, false);
+  assert.equal(importPayload.skip_default_group_bind, true);
+  assert.equal(importPayload.confirm_mixed_channel_risk, true);
   assert.equal(importPayload.content.includes('nested-import-value'), false);
   assert.equal(importPayload.content.includes('nested-unknown-value'), false);
   const importDocument = JSON.parse(importPayload.content);

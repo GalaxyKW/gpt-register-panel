@@ -1751,6 +1751,7 @@ test('sync preview binds the resolved create group IDs with one consistent clien
     let accountReads = 0;
     let groupReads = 0;
     const client = {
+      baseUrl: 'http://127.0.0.1:18080',
       async listAccounts() { accountReads += 1; return []; },
       async listGroups() {
         groupReads += 1;

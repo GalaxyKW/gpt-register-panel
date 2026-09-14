@@ -50,6 +50,9 @@ const POSTFLIGHT_RETRY_DELAY_MS = 25;
 const BACKUP_DIRECTORY_SCAN_LIMIT = 20_000;
 const MAX_IMPORT_GROUP_IDS = 1_000;
 const IMPORT_GROUP_ELIGIBILITY_POLICY = 'active-openai-v1';
+const IMPORT_TARGET_BINDING_SCHEMA = 'sub2api-admin-target-v1';
+const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
+const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
 
 function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
@@ -954,6 +957,150 @@ function importPlanHasCreates(plan) {
   return Array.isArray(plan) && plan.some((item) => item?.action === 'create');
 }
 
+function importBindingError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function resolveImportTargetBinding(client) {
+  const configuredBaseUrl = typeof client?.baseUrl === 'string'
+    ? client.baseUrl
+    : '';
+  let parsed;
+  try {
+    parsed = new URL(configuredBaseUrl);
+  } catch {
+    throw importBindingError(
+      'IMPORT_TARGET_BINDING_INVALID',
+      '无法绑定 Sub2API 导入目标，请重新检查差异',
+    );
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol)
+      || !parsed.hostname
+      || parsed.username
+      || parsed.password
+      || parsed.search
+      || parsed.hash) {
+    throw importBindingError(
+      'IMPORT_TARGET_BINDING_INVALID',
+      '无法绑定 Sub2API 导入目标，请重新检查差异',
+    );
+  }
+  if (typeof client?.baseOrigin === 'string' && client.baseOrigin !== parsed.origin) {
+    throw importBindingError(
+      'IMPORT_TARGET_BINDING_INVALID',
+      'Sub2API 客户端目标状态不一致，请重新检查差异',
+    );
+  }
+  // Preserve a non-root trailing slash: request paths are appended to the
+  // client's exact base path, so `/admin` and `/admin/` would dispatch to
+  // different URLs. URL canonicalization still normalizes scheme, host and
+  // default port without collapsing that meaningful path distinction.
+  const canonicalBaseUrl = parsed.origin + parsed.pathname;
+  return {
+    schema: IMPORT_TARGET_BINDING_SCHEMA,
+    // Never expose an internal hostname or path through the plan response or
+    // logs. The digest is only committed into the already-opaque plan token.
+    fingerprint: 'sha256.' + crypto.createHash('sha256')
+      .update(canonicalBaseUrl, 'utf8')
+      .digest('base64url'),
+  };
+}
+
+function normalizeImportTargetBinding(binding) {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)
+      || binding.schema !== IMPORT_TARGET_BINDING_SCHEMA
+      || !IMPORT_TARGET_FINGERPRINT_PATTERN.test(String(binding.fingerprint || ''))) {
+    throw importBindingError(
+      'IMPORT_TARGET_BINDING_INVALID',
+      '导入计划缺少有效的 Sub2API 目标绑定',
+    );
+  }
+  return {
+    schema: IMPORT_TARGET_BINDING_SCHEMA,
+    fingerprint: binding.fingerprint,
+  };
+}
+
+function resolveImportCreatePolicy(plan, environment = process.env) {
+  if (!importPlanHasCreates(plan)) {
+    return { schema: IMPORT_CREATE_POLICY_SCHEMA, mode: 'not_applicable' };
+  }
+  const configured = environment?.SUB2API_CONFIRM_MIXED_CHANNEL_RISK;
+  if (configured !== undefined && configured !== '0' && configured !== '1') {
+    throw importBindingError(
+      'IMPORT_CREATE_POLICY_INVALID',
+      'Sub2API 混合渠道确认配置无效，请重新检查差异',
+    );
+  }
+  return {
+    schema: IMPORT_CREATE_POLICY_SCHEMA,
+    mode: 'codex_session_create',
+    // These values are both hashed into the reviewed intent and passed to the
+    // adapter verbatim. `true` makes the concrete group IDs authoritative and
+    // prevents an implicit, mutable default-group decision upstream.
+    updateExisting: false,
+    skipDefaultGroupBind: true,
+    confirmMixedChannelRisk: configured === '1',
+  };
+}
+
+function normalizeImportCreatePolicy(plan, policy) {
+  if (!policy || typeof policy !== 'object' || Array.isArray(policy)
+      || policy.schema !== IMPORT_CREATE_POLICY_SCHEMA) {
+    throw importBindingError(
+      'IMPORT_CREATE_POLICY_INVALID',
+      '导入计划缺少有效的新建账号策略绑定',
+    );
+  }
+  if (!importPlanHasCreates(plan)) {
+    if (policy.mode !== 'not_applicable') {
+      throw importBindingError(
+        'IMPORT_CREATE_POLICY_INVALID',
+        '导入计划的新建账号策略不适用',
+      );
+    }
+    return { schema: IMPORT_CREATE_POLICY_SCHEMA, mode: 'not_applicable' };
+  }
+  if (policy.mode !== 'codex_session_create'
+      || policy.updateExisting !== false
+      || policy.skipDefaultGroupBind !== true
+      || typeof policy.confirmMixedChannelRisk !== 'boolean') {
+    throw importBindingError(
+      'IMPORT_CREATE_POLICY_INVALID',
+      '导入计划的新建账号策略无效',
+    );
+  }
+  return {
+    schema: IMPORT_CREATE_POLICY_SCHEMA,
+    mode: 'codex_session_create',
+    updateExisting: false,
+    skipDefaultGroupBind: true,
+    confirmMixedChannelRisk: policy.confirmMixedChannelRisk,
+  };
+}
+
+function resolveImportExecutionBinding(client, plan, options = {}) {
+  return {
+    target: resolveImportTargetBinding(client),
+    createPolicy: resolveImportCreatePolicy(plan, options.environment),
+  };
+}
+
+function normalizeImportExecutionBinding(plan, binding) {
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)) {
+    throw importBindingError(
+      'IMPORT_EXECUTION_BINDING_REQUIRED',
+      '导入计划缺少执行目标与策略绑定',
+    );
+  }
+  return {
+    target: normalizeImportTargetBinding(binding.target),
+    createPolicy: normalizeImportCreatePolicy(plan, binding.createPolicy),
+  };
+}
+
 function normalizeImportGroupBinding(plan, binding) {
   if (!importPlanHasCreates(plan)) {
     return { mode: 'not_applicable', groupIds: [] };
@@ -973,7 +1120,13 @@ function normalizeImportGroupBinding(plan, binding) {
   return { mode: binding.mode, groupIds };
 }
 
-function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan, groupBinding = null) {
+function buildImportPlanIntentVersion(
+  snapshotVersionValue,
+  selectedKeys,
+  plan,
+  groupBinding = null,
+  executionBinding = null,
+) {
   const normalizedSnapshotVersion = typeof snapshotVersionValue === 'string'
     ? snapshotVersionValue.toLowerCase()
     : '';
@@ -999,10 +1152,15 @@ function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan, 
     throw error;
   }
   const createGroupBinding = normalizeImportGroupBinding(plan, groupBinding);
+  const normalizedExecutionBinding = normalizeImportExecutionBinding(plan, executionBinding);
   const material = {
-    schema: 'sync-plan-intent-v1',
+    // The public `sync-plan-v1` prefix describes the digest wire format. This
+    // inner schema versions the hashed fields, so old previews fail closed
+    // without forcing every client-side format validator to accept two forms.
+    schema: 'sync-plan-intent-v2',
     snapshotVersion: normalizedSnapshotVersion,
     selectedKeys: [...selectedKeys],
+    executionBinding: normalizedExecutionBinding,
     // A named Sub2API group is mutable remote state. Commit the exact IDs
     // observed during preview, or explicitly commit to Sub2API's default
     // binding when no group is configured, so execution cannot silently
@@ -1991,6 +2149,7 @@ async function executeImportPlanItem({
   client,
   item,
   groups = [],
+  createPolicy = null,
   logger = null,
   context = {},
   sourceRoot = null,
@@ -2087,6 +2246,14 @@ async function executeImportPlanItem({
   if (item.action !== 'create') {
     throw targetVerificationError('不支持的导入计划动作', 'IMPORT_ACTION_INVALID');
   }
+  const boundCreatePolicy = normalizeImportCreatePolicy([item], createPolicy);
+  const boundGroups = normalizedImportGroupIds(groups);
+  if (boundGroups.length === 0) {
+    throw importBindingError(
+      'IMPORT_GROUP_BINDING_INVALID',
+      '新建账号缺少已确认的 Sub2API 分组绑定',
+    );
+  }
   if (isExpiryInvalid(item?._record) || isExpired(item?._record, Date.now())) {
     return {
       skipped: true,
@@ -2111,12 +2278,12 @@ async function executeImportPlanItem({
     content: JSON.stringify(buildCodexSessionDocument(writeItem)),
     extra: credentialFingerprintExtra(writeItem._raw || {}),
     name: item.accountName || undefined,
-    group_ids: groups,
+    group_ids: boundGroups,
     // If an identity appears after preflight, fail instead of silently
     // updating that potentially available account.
-    update_existing: false,
-    skip_default_group_bind: false,
-    confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
+    update_existing: boundCreatePolicy.updateExisting,
+    skip_default_group_bind: boundCreatePolicy.skipDefaultGroupBind,
+    confirm_mixed_channel_risk: boundCreatePolicy.confirmMixedChannelRisk,
   };
   const idempotencyKey = buildCodexImportIdempotencyKey(writeItem);
   throwIfJobInterrupted(signal);
@@ -2650,12 +2817,14 @@ async function executeImport({
       throwIfJobInterrupted(signal);
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
       const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
+      const executionBinding = resolveImportExecutionBinding(client, fullPlan);
       throwIfJobInterrupted(signal);
       const currentPlanIntentVersion = buildImportPlanIntentVersion(
         current.version,
         selectedKeys,
         fullPlan,
         groupBinding,
+        executionBinding,
       );
       if (!importPlanIntentVersionsEqual(expectedPlanIntentVersion, currentPlanIntentVersion)) {
         const error = new Error('导入计划在确认前已变化，请重新检查差异');
@@ -2783,6 +2952,7 @@ async function executeImport({
             client,
             item,
             groups,
+            createPolicy: executionBinding.createPolicy,
             logger,
             context: baseFields,
             sourceRoot: current._internal.sources.rootDirectory,
@@ -3055,6 +3225,9 @@ module.exports = {
   safeImportResult,
   resolveGroupIds,
   resolveImportGroupBinding,
+  resolveImportTargetBinding,
+  resolveImportCreatePolicy,
+  resolveImportExecutionBinding,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,

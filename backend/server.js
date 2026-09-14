@@ -17,6 +17,7 @@ const {
   importPlanSummary,
   executeImport,
   resolveImportGroupBinding,
+  resolveImportExecutionBinding,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,
@@ -2629,15 +2630,15 @@ function createServer(options = {}) {
           throw error;
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
-        const groupBinding = await resolveImportGroupBinding(
-          getSyncClient({ logger, logContext: { requestId, actor } }),
-          plan,
-        );
+        const client = getSyncClient({ logger, logContext: { requestId, actor } });
+        const groupBinding = await resolveImportGroupBinding(client, plan);
+        const executionBinding = resolveImportExecutionBinding(client, plan);
         const planIntentVersion = buildImportPlanIntentVersion(
           snapshot.version,
           selectedKeys,
           plan,
           groupBinding,
+          executionBinding,
         );
         const snapshotId = await db.saveSnapshot(snapshot);
         writeLog(logger, 'info', 'preview.completed', {
