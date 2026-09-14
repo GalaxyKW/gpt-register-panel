@@ -205,6 +205,8 @@ function normalizeTokenDocument({
   const idClaimSubject = claimScalar(idPayload, 'sub', 512);
   const claimAuthEmail = claimScalar(auth, 'email', 320, false);
   const claimEmail = claimScalar(accessPayload, 'email', 320, false);
+  const idClaimAuthEmail = claimScalar(idAuth, 'email', 320, false);
+  const idClaimEmail = claimScalar(idPayload, 'email', 320, false);
   const rawAuth = accessPayload?.['https://api.openai.com/auth'];
   const rawIdAuth = idPayload?.['https://api.openai.com/auth'];
   const authShapeInvalid = rawAuth !== undefined && rawAuth !== null
@@ -223,7 +225,14 @@ function normalizeTokenDocument({
   const userId = primaryUserFields.find((field) => field.value)?.value
     || subjectFields.find((field) => field.value)?.value
     || '';
-  const email = normalizeEmail(explicitEmail.value || claimAuthEmail.value || claimEmail.value);
+  const emailFields = [
+    explicitEmail,
+    claimAuthEmail,
+    claimEmail,
+    idClaimAuthEmail,
+    idClaimEmail,
+  ];
+  const email = normalizeEmail(emailFields.find((field) => field.value)?.value || '');
   const strongIdentityConflict = identityDimensionConflict('account:', [
     explicitAccount,
     claimAccount,
@@ -234,6 +243,7 @@ function normalizeTokenDocument({
     // OpenAI's chatgpt_user_id.  Compare access/id subjects with each other,
     // but never collapse them into the business-user identity dimension.
     || identityDimensionConflict('user:', subjectFields);
+  const emailIdentityConflict = identityDimensionConflict('email:', emailFields);
   const expiryValues = [document.expired, document.expires_at, document.expiresAt, accessPayload?.exp]
     .filter((value) => value !== undefined && value !== null && value !== '');
   const parsedExpiryValues = expiryValues.map(parseDateValue);
@@ -287,9 +297,13 @@ function normalizeTokenDocument({
       idClaimSubject,
       claimAuthEmail,
       claimEmail,
+      idClaimAuthEmail,
+      idClaimEmail,
     ].some((field) => field.invalid);
   const semanticError = strongIdentityConflict
     ? 'token 强身份字段互相矛盾'
+    : emailIdentityConflict
+    ? 'token email 字段互相矛盾'
     : schemaInvalid
     ? 'token 字段类型或长度无效'
     : !accessToken

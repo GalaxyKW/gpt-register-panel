@@ -74,6 +74,48 @@ test('reads token directories in deterministic order and redacts username passwo
   assert.equal(serialized.includes('refresh-1'), false);
 });
 
+test('token parsing rejects contradictory email evidence across files and JWT claims', () => {
+  const fixture = fixtureRoot();
+  const tokenPath = path.join(fixture.root, 'tokens', 'b.json');
+  const variants = [
+    {
+      email: 'first@example.test',
+      access_token: makeJwt({ email: 'second@example.test' }),
+    },
+    {
+      access_token: makeJwt({
+        email: 'first@example.test',
+        'https://api.openai.com/auth': { email: 'second@example.test' },
+      }),
+    },
+    {
+      email: 'first@example.test',
+      access_token: makeJwt({ email: 'first@example.test' }),
+      id_token: makeJwt({ email: 'second@example.test' }),
+    },
+  ];
+  for (const document of variants) {
+    fs.writeFileSync(tokenPath, JSON.stringify(document));
+    const record = readGptRegisterSources({ rootDirectory: fixture.root }).tokens
+      .find((item) => item.relativePath === 'tokens/b.json');
+    assert.equal(record.parseStatus, 'invalid');
+    assert.equal(record.parseError, 'token email 字段互相矛盾');
+  }
+
+  fs.writeFileSync(tokenPath, JSON.stringify({
+    email: 'First@Example.test',
+    access_token: makeJwt({
+      email: 'first@example.test',
+      'https://api.openai.com/auth': { email: 'FIRST@EXAMPLE.TEST' },
+    }),
+    id_token: makeJwt({ email: 'first@example.test' }),
+  }));
+  const equivalent = readGptRegisterSources({ rootDirectory: fixture.root }).tokens
+    .find((item) => item.relativePath === 'tokens/b.json');
+  assert.equal(equivalent.parseStatus, 'ok');
+  assert.equal(equivalent.email, 'first@example.test');
+});
+
 test('case-insensitive filename ties have a stable total order', () => {
   const fixture = fixtureRoot();
   fs.writeFileSync(path.join(fixture.root, 'tokens', 'A.json'), JSON.stringify({
