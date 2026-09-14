@@ -38,6 +38,12 @@ const MAX_RECONCILIATION_LIST_JOBS = 100;
 const MAX_MUTATION_RECEIPT_RESPONSE_BYTES = 64 * 1024;
 const MAX_MUTATION_RECEIPT_JOBS = 100;
 const MAX_MUTATION_RECEIPT_JOB_IDS_BYTES = 8 * 1024;
+const MAX_MUTATION_RECEIPT_WORKFLOW_BYTES = 64;
+const MAX_MUTATION_RECEIPT_JOB_ID_BYTES = 28;
+const MAX_MUTATION_RECEIPT_JOB_STATUS_BYTES = 16;
+const MAX_RECONCILIATION_SCOPE_BYTES = 6;
+const MAX_RECONCILIATION_RESOLUTION_BYTES = 32;
+const MAX_RECONCILIATION_ACTOR_BYTES = 32;
 const DEFAULT_MUTATION_RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MIN_MUTATION_RECEIPT_TTL_MS = 24 * 60 * 60 * 1000;
 const MAX_MUTATION_RECEIPT_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -647,6 +653,10 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
           || job.reconciliation_acknowledged_by !== null) {
         throw claimIntegrityError('活跃任务包含非法的对账确认元数据');
       }
+      // A synthetic global scope means a previous validation could not prove
+      // what the already-started legacy worker touched. Keep the recovery
+      // decision durable across a second validation in the same write path.
+      if (activeGlobal) job.force_recovery = true;
       activeJobs.push(job);
       continue;
     }
@@ -1130,6 +1140,126 @@ function mutationReceiptError(code, message, fields = {}) {
   return error;
 }
 
+function mutationReceiptSqlProjection({ includeJson = true } = {}) {
+  const responseJson = includeJson
+    ? `CASE WHEN typeof(response_json) = 'text'
+          AND length(CAST(response_json AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_RESPONSE_BYTES}
+        THEN response_json ELSE NULL END`
+    : 'NULL';
+  const jobIdsJson = includeJson
+    ? `CASE WHEN typeof(job_ids_json) = 'text'
+          AND length(CAST(job_ids_json AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_JOB_IDS_BYTES}
+        THEN job_ids_json ELSE NULL END`
+    : 'NULL';
+  return `
+    CASE WHEN typeof(key_hash) = 'text'
+        AND length(CAST(key_hash AS BLOB)) = 64 THEN key_hash ELSE NULL END AS key_hash,
+    CASE WHEN typeof(key_hash) = 'text'
+        AND length(CAST(key_hash AS BLOB)) = 64 THEN 1 ELSE 0 END AS key_hash_valid,
+    CASE WHEN typeof(workflow) = 'text'
+        AND length(CAST(workflow AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_WORKFLOW_BYTES}
+      THEN workflow ELSE NULL END AS workflow,
+    CASE WHEN typeof(workflow) = 'text'
+        AND length(CAST(workflow AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_WORKFLOW_BYTES}
+      THEN 1 ELSE 0 END AS workflow_valid,
+    CASE WHEN typeof(request_digest) = 'text'
+        AND length(CAST(request_digest AS BLOB)) = 64 THEN request_digest ELSE NULL END AS request_digest,
+    CASE WHEN typeof(request_digest) = 'text'
+        AND length(CAST(request_digest AS BLOB)) = 64 THEN 1 ELSE 0 END AS request_digest_valid,
+    CASE WHEN typeof(http_status) = 'integer' THEN http_status ELSE NULL END AS http_status,
+    CASE WHEN typeof(http_status) = 'integer' THEN 1 ELSE 0 END AS http_status_valid,
+    ${responseJson} AS response_json,
+    CASE WHEN typeof(response_json) = 'text'
+        AND length(CAST(response_json AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_RESPONSE_BYTES}
+      THEN 1 ELSE 0 END AS response_json_valid,
+    length(CAST(response_json AS BLOB)) AS response_bytes,
+    ${jobIdsJson} AS job_ids_json,
+    CASE WHEN typeof(job_ids_json) = 'text'
+        AND length(CAST(job_ids_json AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_JOB_IDS_BYTES}
+      THEN 1 ELSE 0 END AS job_ids_json_valid,
+    length(CAST(job_ids_json AS BLOB)) AS job_ids_bytes,
+    CASE WHEN typeof(created_at) = 'text'
+        AND length(CAST(created_at AS BLOB)) = 24 THEN created_at ELSE NULL END AS created_at,
+    CASE WHEN typeof(created_at) = 'text'
+        AND length(CAST(created_at AS BLOB)) = 24 THEN 1 ELSE 0 END AS created_at_valid,
+    CASE WHEN typeof(expires_at) = 'text'
+        AND length(CAST(expires_at AS BLOB)) = 24 THEN expires_at ELSE NULL END AS expires_at,
+    CASE WHEN typeof(expires_at) = 'text'
+        AND length(CAST(expires_at AS BLOB)) = 24 THEN 1 ELSE 0 END AS expires_at_valid`;
+}
+
+function mutationReceiptLinkedJobSqlProjection() {
+  return `
+    CASE WHEN typeof(id) = 'text'
+        AND length(CAST(id AS BLOB)) = ${MAX_MUTATION_RECEIPT_JOB_ID_BYTES}
+      THEN id ELSE NULL END AS id,
+    CASE WHEN typeof(id) = 'text'
+        AND length(CAST(id AS BLOB)) = ${MAX_MUTATION_RECEIPT_JOB_ID_BYTES}
+      THEN 1 ELSE 0 END AS id_valid,
+    CASE WHEN typeof(status) = 'text'
+        AND length(CAST(status AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_JOB_STATUS_BYTES}
+      THEN status ELSE NULL END AS status,
+    CASE WHEN typeof(status) = 'text'
+        AND length(CAST(status AS BLOB)) BETWEEN 1 AND ${MAX_MUTATION_RECEIPT_JOB_STATUS_BYTES}
+      THEN 1 ELSE 0 END AS status_valid,
+    CASE WHEN typeof(reconciliation_hold) = 'integer'
+      THEN reconciliation_hold ELSE NULL END AS reconciliation_hold,
+    CASE WHEN typeof(reconciliation_hold) = 'integer'
+      THEN 1 ELSE 0 END AS reconciliation_hold_valid,
+    CASE WHEN typeof(submission_key_hash) = 'text'
+        AND length(CAST(submission_key_hash AS BLOB)) = 64
+      THEN submission_key_hash ELSE NULL END AS submission_key_hash,
+    CASE WHEN typeof(submission_key_hash) = 'text'
+        AND length(CAST(submission_key_hash AS BLOB)) = 64
+      THEN 1 ELSE 0 END AS submission_key_hash_valid,
+    CASE WHEN reconciliation_scope IS NULL THEN NULL
+      WHEN typeof(reconciliation_scope) = 'text'
+        AND length(CAST(reconciliation_scope AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_SCOPE_BYTES}
+      THEN reconciliation_scope ELSE NULL END AS reconciliation_scope,
+    CASE WHEN reconciliation_scope IS NULL OR (
+        typeof(reconciliation_scope) = 'text'
+        AND length(CAST(reconciliation_scope AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_SCOPE_BYTES}
+      ) THEN 1 ELSE 0 END AS reconciliation_scope_valid,
+    CASE WHEN reconciliation_claim_digest IS NULL THEN NULL
+      WHEN typeof(reconciliation_claim_digest) = 'text'
+        AND length(CAST(reconciliation_claim_digest AS BLOB)) = 64
+      THEN reconciliation_claim_digest ELSE NULL END AS reconciliation_claim_digest,
+    CASE WHEN reconciliation_claim_digest IS NULL OR (
+        typeof(reconciliation_claim_digest) = 'text'
+        AND length(CAST(reconciliation_claim_digest AS BLOB)) = 64
+      ) THEN 1 ELSE 0 END AS reconciliation_claim_digest_valid,
+    CASE WHEN reconciliation_acknowledged_at IS NULL THEN NULL
+      WHEN typeof(reconciliation_acknowledged_at) = 'text'
+        AND length(CAST(reconciliation_acknowledged_at AS BLOB)) = 24
+      THEN reconciliation_acknowledged_at ELSE NULL END AS reconciliation_acknowledged_at,
+    CASE WHEN reconciliation_acknowledged_at IS NULL OR (
+        typeof(reconciliation_acknowledged_at) = 'text'
+        AND length(CAST(reconciliation_acknowledged_at AS BLOB)) = 24
+      ) THEN 1 ELSE 0 END AS reconciliation_acknowledged_at_valid,
+    CASE WHEN reconciliation_resolution IS NULL THEN NULL
+      WHEN typeof(reconciliation_resolution) = 'text'
+        AND length(CAST(reconciliation_resolution AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_RESOLUTION_BYTES}
+      THEN reconciliation_resolution ELSE NULL END AS reconciliation_resolution,
+    CASE WHEN reconciliation_resolution IS NULL OR (
+        typeof(reconciliation_resolution) = 'text'
+        AND length(CAST(reconciliation_resolution AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_RESOLUTION_BYTES}
+      ) THEN 1 ELSE 0 END AS reconciliation_resolution_valid,
+    CASE WHEN reconciliation_acknowledged_by IS NULL THEN NULL
+      WHEN typeof(reconciliation_acknowledged_by) = 'text'
+        AND length(CAST(reconciliation_acknowledged_by AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_ACTOR_BYTES}
+      THEN reconciliation_acknowledged_by ELSE NULL END AS reconciliation_acknowledged_by,
+    CASE WHEN reconciliation_acknowledged_by IS NULL OR (
+        typeof(reconciliation_acknowledged_by) = 'text'
+        AND length(CAST(reconciliation_acknowledged_by AS BLOB)) BETWEEN 1 AND ${MAX_RECONCILIATION_ACTOR_BYTES}
+      ) THEN 1 ELSE 0 END AS reconciliation_acknowledged_by_valid,
+    CASE WHEN reconciliation_scope IS NOT NULL
+        OR reconciliation_claim_digest IS NOT NULL
+        OR reconciliation_acknowledged_at IS NOT NULL
+        OR reconciliation_resolution IS NOT NULL
+        OR reconciliation_acknowledged_by IS NOT NULL
+      THEN 1 ELSE 0 END AS has_reconciliation_history`;
+}
+
 function receiptJobIds(row) {
   let values;
   try { values = JSON.parse(row?.job_ids_json); } catch {}
@@ -1155,10 +1285,18 @@ function mutationReceiptStoredBytes(row, field, measuredField) {
 function validateMutationReceiptMetadata(row) {
   const responseBytes = mutationReceiptStoredBytes(row, 'response_json', 'response_bytes');
   const jobIdsBytes = mutationReceiptStoredBytes(row, 'job_ids_json', 'job_ids_bytes');
-  if (!/^[a-f0-9]{64}$/.test(String(row?.key_hash || ''))
+  if (row?.key_hash_valid !== 1
+      || row?.workflow_valid !== 1
+      || row?.request_digest_valid !== 1
+      || row?.http_status_valid !== 1
+      || row?.response_json_valid !== 1
+      || row?.job_ids_json_valid !== 1
+      || row?.created_at_valid !== 1
+      || row?.expires_at_valid !== 1
+      || !/^[a-f0-9]{64}$/.test(String(row?.key_hash || ''))
       || !/^[a-z][a-z0-9_]{1,63}$/.test(String(row?.workflow || ''))
       || !/^[a-f0-9]{64}$/.test(String(row?.request_digest || ''))
-      || Number(row?.http_status) !== 202
+      || row?.http_status !== 202
       || !Number.isSafeInteger(responseBytes)
       || responseBytes <= 0 || responseBytes > MAX_MUTATION_RECEIPT_RESPONSE_BYTES
       || !Number.isSafeInteger(jobIdsBytes)
@@ -1169,6 +1307,79 @@ function validateMutationReceiptMetadata(row) {
     throw mutationReceiptError(
       'IDEMPOTENCY_RECEIPT_INVALID',
       '幂等回执元数据无效，已拒绝继续写入',
+    );
+  }
+}
+
+function validateMutationReceiptLinkedJob(row, keyHash) {
+  const nullableMetadataValid = [
+    row?.reconciliation_scope_valid,
+    row?.reconciliation_claim_digest_valid,
+    row?.reconciliation_acknowledged_at_valid,
+    row?.reconciliation_resolution_valid,
+    row?.reconciliation_acknowledged_by_valid,
+  ].every((value) => value === 1);
+  const historyFields = [
+    row?.reconciliation_scope,
+    row?.reconciliation_claim_digest,
+    row?.reconciliation_acknowledged_at,
+    row?.reconciliation_resolution,
+    row?.reconciliation_acknowledged_by,
+  ];
+  const hasHistory = historyFields.some((value) => value !== null && value !== undefined);
+  const active = ACTIVE_JOB_STATUSES.has(row?.status);
+  const terminal = TERMINAL_JOB_STATUSES.has(row?.status);
+  const hold = row?.reconciliation_hold;
+  const scope = row?.reconciliation_scope;
+  const digest = row?.reconciliation_claim_digest;
+  const acknowledgedAt = row?.reconciliation_acknowledged_at;
+  const resolution = row?.reconciliation_resolution;
+  const acknowledgedBy = row?.reconciliation_acknowledged_by;
+  const acknowledgementComplete = isCanonicalIsoTimestamp(acknowledgedAt)
+    && RECONCILIATION_ACK_RESOLUTION_SET.has(resolution)
+    && acknowledgedBy === 'panel-admin';
+  const commonValid = row?.id_valid === 1
+    && row?.status_valid === 1
+    && row?.reconciliation_hold_valid === 1
+    && row?.submission_key_hash_valid === 1
+    && nullableMetadataValid
+    && /^job_[a-f0-9]{24}$/.test(String(row?.id || ''))
+    && (active || terminal)
+    && (hold === 0 || hold === 1)
+    && row?.submission_key_hash === keyHash
+    && (row?.has_reconciliation_history === 0 || row?.has_reconciliation_history === 1)
+    && row.has_reconciliation_history === (hasHistory ? 1 : 0)
+    && (scope === null || scope === 'global' || scope === 'claims')
+    && (digest === null || /^[a-f0-9]{64}$/.test(digest))
+    && (acknowledgedAt === null || isCanonicalIsoTimestamp(acknowledgedAt))
+    && (resolution === null || RECONCILIATION_ACK_RESOLUTION_SET.has(resolution))
+    && (acknowledgedBy === null || acknowledgedBy === 'panel-admin');
+  const stateValid = active
+    ? hold === 0
+      && digest === null
+      && acknowledgedAt === null
+      && resolution === null
+      && acknowledgedBy === null
+      && (scope === null || scope === 'global')
+    : hold === 1
+      ? (scope === 'global' || scope === 'claims')
+        && /^[a-f0-9]{64}$/.test(String(digest || ''))
+        && acknowledgedAt === null
+        && resolution === null
+        && acknowledgedBy === null
+      : hasHistory
+        ? (scope === 'global' || scope === 'claims')
+          && /^[a-f0-9]{64}$/.test(String(digest || ''))
+          && acknowledgementComplete
+        : scope === null
+          && digest === null
+          && acknowledgedAt === null
+          && resolution === null
+          && acknowledgedBy === null;
+  if (!commonValid || !stateValid) {
+    throw mutationReceiptError(
+      'IDEMPOTENCY_RECEIPT_INVALID',
+      '幂等回执关联任务元数据无效，已拒绝继续写入',
     );
   }
 }
@@ -1188,11 +1399,23 @@ function readBoundStatementRows(statement, parameters, maximumRows) {
 }
 
 function mutationReceiptLinkedJobs(database, keyHash, reusableStatement) {
-  const statement = reusableStatement || database.prepare(`SELECT id, status, reconciliation_hold,
-    submission_key_hash FROM sync_jobs WHERE submission_key_hash = ?
-    ORDER BY created_at ASC, id ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
+  const statement = reusableStatement || database.prepare(`SELECT
+    ${mutationReceiptLinkedJobSqlProjection()}
+    FROM sync_jobs WHERE submission_key_hash = ?
+    ORDER BY rowid ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
   try {
     return readBoundStatementRows(statement, [keyHash], MAX_MUTATION_RECEIPT_JOBS + 1);
+  } finally {
+    if (!reusableStatement) statement.free();
+  }
+}
+
+function mutationReceiptByHash(database, keyHash, reusableStatement) {
+  const statement = reusableStatement || database.prepare(`SELECT
+    ${mutationReceiptSqlProjection()}
+    FROM mutation_receipts WHERE key_hash = ? ORDER BY rowid ASC LIMIT 1`);
+  try {
+    return readBoundStatementRows(statement, [keyHash], 1)[0] || null;
   } finally {
     if (!reusableStatement) statement.free();
   }
@@ -1241,6 +1464,9 @@ function decodeMutationReceipt(database, row, expected = {}) {
   const linkedRows = Array.isArray(expected.linkedJobs)
     ? expected.linkedJobs
     : mutationReceiptLinkedJobs(database, row.key_hash);
+  for (const linkedRow of linkedRows) {
+    validateMutationReceiptLinkedJob(linkedRow, row.key_hash);
+  }
   const linkedIds = new Set(linkedRows.map((item) => item.id));
   if (linkedIds.size !== jobIds.length || jobIds.some((id) => !linkedIds.has(id))) {
     throw mutationReceiptError(
@@ -1278,12 +1504,12 @@ function pruneExpiredMutationReceipts(database, now) {
     );
   }
 
-  const orphan = resultRows(database.exec(`SELECT jobs.id, jobs.submission_key_hash
+  const orphan = resultRows(database.exec(`SELECT 1 AS orphan
     FROM sync_jobs AS jobs
     LEFT JOIN mutation_receipts AS receipts
       ON receipts.key_hash = jobs.submission_key_hash
     WHERE jobs.submission_key_hash IS NOT NULL AND receipts.key_hash IS NULL
-    LIMIT 1`))[0];
+    ORDER BY jobs.rowid ASC LIMIT 1`))[0];
   if (orphan) {
     throw mutationReceiptError(
       'IDEMPOTENCY_RECEIPT_INVALID',
@@ -1295,36 +1521,28 @@ function pruneExpiredMutationReceipts(database, now) {
   // most 101 linked jobs. Expired candidates retain only a hash and count.
   // No durable graph row is changed until the complete first pass succeeds.
   const removable = [];
-  const receiptScan = database.prepare(`SELECT key_hash, workflow, request_digest,
-      http_status, created_at, expires_at,
-      length(CAST(response_json AS BLOB)) AS response_bytes,
-      length(CAST(job_ids_json AS BLOB)) AS job_ids_bytes
-    FROM mutation_receipts ORDER BY created_at ASC, key_hash ASC`);
-  const receiptByHash = database.prepare(
-    'SELECT * FROM mutation_receipts WHERE key_hash = ? LIMIT 1',
-  );
-  const jobsByHash = database.prepare(`SELECT id, status, reconciliation_hold,
-      submission_key_hash FROM sync_jobs WHERE submission_key_hash = ?
-      ORDER BY created_at ASC, id ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
+  const receiptScan = database.prepare(`SELECT
+    ${mutationReceiptSqlProjection({ includeJson: false })}
+    FROM mutation_receipts ORDER BY rowid ASC`);
+  const receiptByHash = database.prepare(`SELECT
+    ${mutationReceiptSqlProjection()}
+    FROM mutation_receipts WHERE key_hash = ? ORDER BY rowid ASC LIMIT 1`);
+  const jobsByHash = database.prepare(`SELECT
+    ${mutationReceiptLinkedJobSqlProjection()}
+    FROM sync_jobs WHERE submission_key_hash = ?
+    ORDER BY rowid ASC LIMIT ${MAX_MUTATION_RECEIPT_JOBS + 1}`);
   try {
     while (receiptScan.step()) {
       const metadata = receiptScan.getAsObject();
       // Reject oversized/corrupt fields before materializing them in JS.
       validateMutationReceiptMetadata(metadata);
-      const row = readBoundStatementRows(receiptByHash, [metadata.key_hash], 1)[0];
+      const row = mutationReceiptByHash(database, metadata.key_hash, receiptByHash);
       const jobs = mutationReceiptLinkedJobs(database, metadata.key_hash, jobsByHash);
       const receipt = decodeMutationReceipt(database, row, { linkedJobs: jobs });
-      for (const job of jobs) {
-        if (!JOB_STATUSES.has(job.status)
-            || ![0, 1].includes(Number(job.reconciliation_hold))) {
-          throw mutationReceiptError(
-            'IDEMPOTENCY_RECEIPT_INVALID',
-            '幂等回执关联任务状态无效，已拒绝继续写入',
-          );
-        }
-      }
       if (receipt.expiresAt <= now && jobs.every((job) => (
-        TERMINAL_JOB_STATUSES.has(job.status) && Number(job.reconciliation_hold) === 0
+        TERMINAL_JOB_STATUSES.has(job.status)
+          && job.reconciliation_hold === 0
+          && job.has_reconciliation_history === 0
       ))) {
         removable.push({ keyHash: metadata.key_hash, linkedCount: jobs.length });
       }
@@ -1670,14 +1888,16 @@ class PanelDb {
     this.database.run('CREATE INDEX IF NOT EXISTS idx_sync_jobs_submission_key_hash ON sync_jobs(submission_key_hash)');
   }
 
-  pruneRows() {
+  pruneRows({ pruneMutationReceipts = true } = {}) {
     const maxJobs = Math.max(100, Math.min(100000, Number(process.env.PANEL_MAX_JOBS) || 5000));
     const maxAudit = Math.max(100, Math.min(200000, Number(process.env.PANEL_MAX_AUDIT_EVENTS) || 20000));
     const maxSnapshots = Math.max(20, Math.min(10000, Number(process.env.PANEL_MAX_SNAPSHOTS) || 500));
     // Never prune a queued/running job: its claim is the guard that prevents
     // duplicate remote work. Terminal history is expendable; active work is
     // not, even when a burst temporarily exceeds the retention limit.
-    pruneExpiredMutationReceipts(this.database, new Date().toISOString());
+    if (pruneMutationReceipts) {
+      pruneExpiredMutationReceipts(this.database, new Date().toISOString());
+    }
     this.database.run(`DELETE FROM sync_jobs WHERE id IN (
       SELECT id FROM sync_jobs
       WHERE status NOT IN ('queued', 'running') AND reconciliation_hold = 0
@@ -1788,13 +2008,18 @@ class PanelDb {
       return this.withFileLock(async () => {
         this.loadDatabaseFromDisk();
         this.runSchema();
-        // Validate every durable idempotency boundary before an arbitrary DB
-        // mutation callback runs. This makes unrelated receipt corruption a
-        // fail-closed condition instead of allowing later capacity/pruning
-        // work to erase evidence of an unknown prior operation.
+        // Legacy unknown outcomes must become durable reconciliation history
+        // before expiry is considered. Otherwise an expired receipt could be
+        // detached first and the same key could authorize duplicate work.
+        validateJobClaims(this.database, { cleanupOrdinaryTerminalClaims: true });
+        // Validate every durable idempotency boundary exactly once before an
+        // arbitrary DB mutation callback runs. Newly-created rows are bounded
+        // by their owning APIs and are checked on the next write/restart.
         pruneExpiredMutationReceipts(this.database, new Date().toISOString());
         const result = await callback(this.database);
-        this.pruneRows();
+        // Ordinary history pruning must not run receipt expiry a second time
+        // after the callback changes a job's terminal/reconciliation state.
+        this.pruneRows({ pruneMutationReceipts: false });
         this.persistUnlocked();
         return result;
       });
@@ -1980,8 +2205,7 @@ class PanelDb {
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
-        const row = resultRows(database.exec(`SELECT * FROM mutation_receipts
-          WHERE key_hash = ${sqlString(keyHash)} LIMIT 1`))[0];
+        const row = mutationReceiptByHash(database, keyHash);
         const receipt = decodeMutationReceipt(database, row, {
           workflow: normalizedWorkflow,
           requestDigest: normalizedDigest,
@@ -2026,8 +2250,7 @@ class PanelDb {
       try {
         // A committed receipt is authoritative before current revisions,
         // claims or process-local signing keys are consulted.
-        const receiptRow = resultRows(database.exec(`SELECT * FROM mutation_receipts
-          WHERE key_hash = ${sqlString(keyHash)} LIMIT 1`))[0];
+        const receiptRow = mutationReceiptByHash(database, keyHash);
         const existingReceipt = decodeMutationReceipt(database, receiptRow, {
           workflow,
           requestDigest,

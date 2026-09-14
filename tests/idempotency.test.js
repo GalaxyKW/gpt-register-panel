@@ -6,7 +6,7 @@ const test = require('node:test');
 
 require('./test-isolation');
 
-const { PanelDb } = require('../backend/db');
+const { PanelDb, RECONCILIATION_ACK_CONFIRMATION } = require('../backend/db');
 const {
   canonicalJson,
   mutationRequestDigest,
@@ -36,6 +36,15 @@ function submissionOptions(overrides = {}) {
     }),
     ...overrides,
   };
+}
+
+function acknowledge(db, job, resolution = 'state_manually_reconciled') {
+  return db.acknowledgeJobReconciliation(job.id, {
+    actor: 'panel-admin',
+    confirmation: RECONCILIATION_ACK_CONFIRMATION,
+    resolution,
+    claimDigest: job.result.reconciliationClaimDigest,
+  });
 }
 
 test('Idempotency-Key and semantic request digests use strict canonical boundaries', () => {
@@ -282,6 +291,248 @@ test('expiry releases only ordinary terminal receipts and pins active work', asy
   assert.equal(pinned.response.jobId, active.receipt.response.jobId);
 });
 
+test('bounded receipt projections reject polluted stored fields before replay', async () => {
+  const corruptions = [
+    ['key_hash', 'k'.repeat(65)],
+    ['workflow', 'w'.repeat(65)],
+    ['request_digest', Buffer.from('a'.repeat(64))],
+    ['http_status', 'not-an-integer'],
+    ['response_json', JSON.stringify({ status: 'queued', padding: 'x'.repeat(70 * 1024) })],
+    ['job_ids_json', Buffer.from('[]')],
+    ['created_at', 'not-a-canonical-timestamp'],
+    ['expires_at', Buffer.from('2099-01-01T00:00:00.000Z')],
+  ];
+  for (const [field, value] of corruptions) {
+    const db = new PanelDb(databasePath('polluted-receipt-' + field));
+    const options = submissionOptions({
+      idempotencyKey: 'idem_v1_polluted_' + field + '_12345678901234567890',
+    });
+    await db.createMutationSubmission(options);
+    await db.write((database) => {
+      const statement = database.prepare(`UPDATE mutation_receipts SET ${field} = ?`);
+      try { statement.run([value]); } finally { statement.free(); }
+    });
+    await assert.rejects(
+      db.getMutationReceipt({
+        workflow: options.workflow,
+        requestedBy: options.requestedBy,
+        idempotencyKey: options.idempotencyKey,
+        requestDigest: options.requestDigest,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_RECEIPT_INVALID',
+      field,
+    );
+  }
+});
+
+test('linked receipt projections reject polluted identity, state and reconciliation fields', async () => {
+  const corruptions = [
+    'id',
+    'status',
+    'submission_key_hash',
+    'reconciliation_hold',
+    'reconciliation_scope',
+    'reconciliation_claim_digest',
+    'reconciliation_acknowledged_at',
+    'reconciliation_resolution',
+    'reconciliation_acknowledged_by',
+  ];
+  for (const corruption of corruptions) {
+    const db = new PanelDb(databasePath('polluted-linked-' + corruption));
+    const options = submissionOptions({
+      idempotencyKey: 'idem_v1_linked_' + corruption + '_1234567890123456789012',
+    });
+    const created = await db.createMutationSubmission(options);
+    await db.updateJob(created.createdJobs[0].job.id, {
+      status: 'succeeded',
+      result: {},
+      finishedAt: new Date().toISOString(),
+    });
+    await db.write((database) => {
+      if (corruption !== 'id') {
+        const values = {
+          status: 'terminal-but-invalid',
+          submission_key_hash: Buffer.from('f'.repeat(64)),
+          reconciliation_hold: Buffer.from([0]),
+          reconciliation_scope: Buffer.from('claims'),
+          reconciliation_claim_digest: Buffer.from('a'.repeat(64)),
+          reconciliation_acknowledged_at: Buffer.from('2099-01-01T00:00:00.000Z'),
+          reconciliation_resolution: Buffer.from('operation_applied'),
+          reconciliation_acknowledged_by: Buffer.from('panel-admin'),
+        };
+        const update = database.prepare(`UPDATE sync_jobs SET ${corruption} = ?`);
+        try { update.run([values[corruption]]); } finally { update.free(); }
+        return;
+      }
+      const invalidId = 'job_invalid';
+      const updateJob = database.prepare('UPDATE sync_jobs SET id = ?');
+      const updateReceipt = database.prepare(`UPDATE mutation_receipts
+        SET response_json = ?, job_ids_json = ?`);
+      try {
+        updateJob.run([invalidId]);
+        updateReceipt.run([
+          JSON.stringify({ jobId: invalidId, status: 'queued' }),
+          JSON.stringify([invalidId]),
+        ]);
+      } finally {
+        updateReceipt.free();
+        updateJob.free();
+      }
+    });
+    await assert.rejects(
+      db.getMutationReceipt({
+        workflow: options.workflow,
+        requestedBy: options.requestedBy,
+        idempotencyKey: options.idempotencyKey,
+        requestDigest: options.requestDigest,
+      }),
+      (error) => error.code === 'IDEMPOTENCY_RECEIPT_INVALID'
+        || error.code === 'JOB_CLAIM_INTEGRITY_INVALID',
+      corruption,
+    );
+  }
+});
+
+test('receipt graph validation rejects more linked rows than one submission can own', async () => {
+  const db = new PanelDb(databasePath('linked-row-limit'));
+  const options = submissionOptions({
+    idempotencyKey: 'idem_v1_linked_row_limit_12345678901234567890',
+  });
+  const created = await db.createMutationSubmission(options);
+  await db.updateJob(created.createdJobs[0].job.id, {
+    status: 'succeeded',
+    result: {},
+    finishedAt: new Date().toISOString(),
+  });
+  await db.write((database) => {
+    const keyHash = database.exec('SELECT key_hash FROM mutation_receipts')[0].values[0][0];
+    const insert = database.prepare(`INSERT INTO sync_jobs
+      (id, type, status, requested_by, payload_json, result_json, created_at,
+        finished_at, claim_keys_json, reconciliation_hold, submission_key_hash)
+      VALUES (?, 'phase3', 'succeeded', 'panel-admin', '{}', '{}', ?, ?, '[]', 0, ?)`);
+    try {
+      for (let index = 0; index < 100; index += 1) {
+        const id = 'job_e' + index.toString(16).padStart(23, '0');
+        const timestamp = new Date(Date.UTC(2099, 0, 1, 0, 0, index)).toISOString();
+        insert.run([id, timestamp, timestamp, keyHash]);
+      }
+    } finally {
+      insert.free();
+    }
+  });
+  await assert.rejects(
+    db.getMutationReceipt({
+      workflow: options.workflow,
+      requestedBy: options.requestedBy,
+      idempotencyKey: options.idempotencyKey,
+      requestDigest: options.requestDigest,
+    }),
+    (error) => error.code === 'IDEMPOTENCY_RECEIPT_INVALID',
+  );
+});
+
+test('an acknowledged reconciliation permanently pins exact replay and digest conflict', async () => {
+  const db = new PanelDb(databasePath('acknowledged-pin'));
+  const options = submissionOptions({
+    idempotencyKey: 'idem_v1_acknowledged_pin_12345678901234567890',
+    jobs: [{ type: 'phase3', payload: {}, claimKeys: ['phase3:acknowledged-pin'] }],
+  });
+  const created = await db.createMutationSubmission(options);
+  const jobId = created.createdJobs[0].job.id;
+  await db.updateJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+  await db.updateJob(jobId, {
+    status: 'interrupted',
+    result: {
+      code: 'REMOTE_WRITE_OUTCOME_UNKNOWN',
+      writeOutcomeUnknown: true,
+      requiresReconciliation: true,
+      retryAllowed: false,
+      doNotRetry: true,
+    },
+    finishedAt: new Date().toISOString(),
+  });
+  await db.write((database) => database.run(`UPDATE mutation_receipts
+    SET created_at = '1999-01-01T00:00:00.000Z',
+        expires_at = '2000-01-01T00:00:00.000Z'`));
+  const held = await db.getJob(jobId);
+  await acknowledge(db, held, 'operation_applied');
+
+  const exactReplay = await db.createMutationSubmission(options);
+  assert.equal(exactReplay.replayed, true);
+  assert.deepEqual(exactReplay.receipt.response, created.receipt.response);
+  await assert.rejects(
+    db.createMutationSubmission({ ...options, requestDigest: '9'.repeat(64) }),
+    (error) => error.code === 'IDEMPOTENCY_KEY_REUSED',
+  );
+  const previousMaximum = process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS;
+  process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS = '1';
+  try {
+    await assert.rejects(
+      db.createMutationSubmission(submissionOptions({
+        idempotencyKey: 'idem_v1_after_ack_capacity_123456789012345678',
+        requestDigest: '8'.repeat(64),
+        jobs: [{ type: 'phase3', payload: {}, claimKeys: ['phase3:after-ack-capacity'] }],
+      })),
+      (error) => error.code === 'IDEMPOTENCY_CAPACITY_EXCEEDED',
+    );
+  } finally {
+    if (previousMaximum === undefined) delete process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS;
+    else process.env.PANEL_IDEMPOTENCY_MAX_RECEIPTS = previousMaximum;
+  }
+  assert.equal((await db.listJobs()).length, 1);
+  assert.equal(await db.read((database) => Number(
+    database.exec('SELECT COUNT(*) FROM mutation_receipts')[0].values[0][0],
+  )), 1);
+});
+
+test('legacy reconciliation signals migrate before expired receipt pruning', async () => {
+  const db = new PanelDb(databasePath('legacy-before-prune'));
+  const options = submissionOptions({
+    idempotencyKey: 'idem_v1_legacy_before_prune_12345678901234567',
+    jobs: [{ type: 'phase3', payload: {}, claimKeys: ['phase3:legacy-before-prune'] }],
+  });
+  const created = await db.createMutationSubmission(options);
+  const jobId = created.createdJobs[0].job.id;
+  const originalPruneRows = db.pruneRows;
+  db.pruneRows = () => {};
+  try {
+    await db.write((database) => {
+      const legacyResult = JSON.stringify({
+        code: 'LEGACY_WRITE_OUTCOME_UNKNOWN',
+        writeOutcomeUnknown: true,
+        requiresReconciliation: true,
+        retryAllowed: false,
+        doNotRetry: true,
+      });
+      const update = database.prepare(`UPDATE sync_jobs
+        SET status = 'interrupted', result_json = ?, finished_at = ?,
+          reconciliation_hold = 0, reconciliation_scope = NULL,
+          reconciliation_claim_digest = NULL, reconciliation_acknowledged_at = NULL,
+          reconciliation_resolution = NULL, reconciliation_acknowledged_by = NULL
+        WHERE id = ?`);
+      try { update.run([legacyResult, new Date().toISOString(), jobId]); } finally { update.free(); }
+      database.run(`DELETE FROM job_claims WHERE job_id = '${jobId}'`);
+      database.run(`UPDATE mutation_receipts
+        SET created_at = '1999-01-01T00:00:00.000Z',
+            expires_at = '2000-01-01T00:00:00.000Z'`);
+    });
+  } finally {
+    db.pruneRows = originalPruneRows;
+  }
+
+  const receipt = await db.getMutationReceipt({
+    workflow: options.workflow,
+    requestedBy: options.requestedBy,
+    idempotencyKey: options.idempotencyKey,
+    requestDigest: options.requestDigest,
+  });
+  assert.deepEqual(receipt.response, created.receipt.response);
+  const migrated = await db.getJob(jobId);
+  assert.equal(migrated.result.requiresReconciliation, true);
+  assert.equal(migrated.result.reconciliationHold, true);
+  assert.equal(migrated.result.retryAllowed, false);
+});
+
 test('expired receipts with missing or extra linked jobs remain fail-closed across restart', async () => {
   for (const corruption of ['missing', 'extra']) {
     const file = databasePath('corrupt-' + corruption);
@@ -353,20 +604,39 @@ test('expired receipts with missing or extra linked jobs remain fail-closed acro
 
 test('receipt graph validation streams bounded rows before any expiry mutation', () => {
   const source = fs.readFileSync(path.join(__dirname, '..', 'backend', 'db.js'), 'utf8');
+  const projectionStart = source.indexOf('function mutationReceiptSqlProjection(');
   const start = source.indexOf('function pruneExpiredMutationReceipts(');
   const end = source.indexOf('\nclass PanelDb', start);
-  assert.ok(start >= 0 && end > start);
+  assert.ok(projectionStart >= 0 && start > projectionStart && end > start);
+  const projectionsAndPrune = source.slice(projectionStart, end);
   const implementation = source.slice(start, end);
-  assert.doesNotMatch(
-    implementation,
-    /resultRows\(database\.exec\([\s\S]*SELECT \* FROM mutation_receipts ORDER BY/,
-  );
+  assert.doesNotMatch(source, /SELECT \* FROM mutation_receipts/);
+  assert.match(projectionsAndPrune, /typeof\(response_json\) = 'text'/);
+  assert.match(projectionsAndPrune, /length\(CAST\(response_json AS BLOB\)\)/);
+  assert.match(projectionsAndPrune, /has_reconciliation_history/);
+  assert.match(implementation, /SELECT 1 AS orphan/);
   assert.match(implementation, /while \(receiptScan\.step\(\)\)/);
-  assert.match(implementation, /length\(CAST\(response_json AS BLOB\)\)/);
   assert.match(implementation, /LIMIT \$\{MAX_MUTATION_RECEIPT_JOBS \+ 1\}/);
+  assert.match(implementation, /FROM mutation_receipts ORDER BY rowid ASC/);
+  assert.match(implementation, /ORDER BY rowid ASC LIMIT \$\{MAX_MUTATION_RECEIPT_JOBS \+ 1\}/);
   assert.match(implementation, /No durable graph row is changed until the complete first pass succeeds/);
   assert.ok(implementation.indexOf('while (receiptScan.step())')
     < implementation.indexOf('UPDATE sync_jobs SET submission_key_hash = NULL'));
+});
+
+test('writes validate legacy claims before one receipt prune and do not prune again afterward', () => {
+  const source = fs.readFileSync(path.join(__dirname, '..', 'backend', 'db.js'), 'utf8');
+  const start = source.indexOf('  async write(callback) {');
+  const end = source.indexOf('\n  async read(callback)', start);
+  assert.ok(start >= 0 && end > start);
+  const implementation = source.slice(start, end);
+  const validation = implementation.indexOf('validateJobClaims(this.database');
+  const receiptPrune = implementation.indexOf('pruneExpiredMutationReceipts(this.database');
+  const callback = implementation.indexOf('await callback(this.database)');
+  const historyPrune = implementation.indexOf('this.pruneRows({ pruneMutationReceipts: false })');
+  assert.ok(validation >= 0 && validation < receiptPrune);
+  assert.ok(receiptPrune < callback && callback < historyPrune);
+  assert.equal(implementation.match(/pruneExpiredMutationReceipts\(/g)?.length, 1);
 });
 
 test('job history pruning retains a terminal job referenced by an unexpired receipt', async () => {
