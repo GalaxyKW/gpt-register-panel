@@ -94,6 +94,27 @@ test('account test target classification accepts non-error accounts and rejects 
   ]);
 });
 
+test('account test baseline binds normalized submission state without raw identity values', () => {
+  const account = oauthTestAccount(21, 'ACTIVE', true);
+  const baseline = accountTestTargetBaseline(account);
+  assert.deepEqual({
+    accountId: baseline.accountId,
+    status: baseline.status,
+    statusKnown: baseline.statusKnown,
+    schedulable: baseline.schedulable,
+    schedulableKnown: baseline.schedulableKnown,
+  }, {
+    accountId: 21,
+    status: 'active',
+    statusKnown: true,
+    schedulable: true,
+    schedulableKnown: true,
+  });
+  assert.match(baseline.identityDigest, /^[a-f0-9]{64}$/);
+  assert.equal(JSON.stringify(baseline).includes('test-account-21'), false);
+  assert.equal(JSON.stringify(baseline).includes('test-user-21'), false);
+});
+
 function fakeWorkerDb() {
   return {
     async updateJob() {},
@@ -236,6 +257,57 @@ test('account tests reject a numeric ID reused before the worker takes its first
   assert.match(outcome.results[0].message, /强身份/);
 });
 
+test('account tests reject submission state changes before the first worker snapshot', async () => {
+  const submitted = oauthTestAccount(22, 'active', true);
+  const changed = oauthTestAccount(22, 'error', false);
+  let getCalls = 0;
+  let testCalls = 0;
+  let schedulableCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [22],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-submitted-state-changed-before-worker-list',
+    client: {
+      async listAccounts() { return [changed]; },
+      async getAccount() { getCalls += 1; return changed; },
+      async testAccount() { testCalls += 1; return { success: true }; },
+      async setSchedulable() { schedulableCalls += 1; return changed; },
+    },
+  });
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED');
+  assert.equal(outcome.results[0].statusBefore, 'active');
+  assert.equal(testCalls, 0);
+  assert.equal(schedulableCalls, 0);
+  // A failure snapshot is allowed, but no mutating/test endpoint is called.
+  assert.equal(getCalls, 1);
+});
+
+test('account tests reject submission state changes between list and pre-test detail reads', async () => {
+  const submitted = oauthTestAccount(24, 'active', true);
+  const changed = oauthTestAccount(24, 'error', false);
+  let testCalls = 0;
+  let schedulableCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [24],
+    targetBaselines: targetBaselines(submitted),
+    db: fakeWorkerDb(),
+    jobId: 'test-submitted-state-changed-before-detail-read',
+    client: {
+      async listAccounts() { return [submitted]; },
+      async getAccount() { return changed; },
+      async testAccount() { testCalls += 1; return { success: true }; },
+      async setSchedulable() { schedulableCalls += 1; return changed; },
+    },
+  });
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED');
+  assert.equal(outcome.results[0].testSuccess, false);
+  assert.equal(testCalls, 0);
+  assert.equal(schedulableCalls, 0);
+});
+
 test('account test workers fail closed when a persisted target baseline is missing', async () => {
   const account = oauthTestAccount(20, 'active', true);
   let listCalls = 0;
@@ -245,6 +317,29 @@ test('account test workers fail closed when a persisted target baseline is missi
       targetBaselines: [],
       db: fakeWorkerDb(),
       jobId: 'test-target-baseline-missing',
+      client: {
+        async listAccounts() { listCalls += 1; return [account]; },
+      },
+    }),
+    (error) => error?.code === 'ACCOUNT_TEST_BASELINE_INVALID',
+  );
+  assert.equal(listCalls, 0);
+});
+
+test('account test workers fail closed for legacy identity-only persisted baselines', async () => {
+  const account = oauthTestAccount(23, 'active', true);
+  const legacyBaseline = accountTestTargetBaseline(account);
+  delete legacyBaseline.status;
+  delete legacyBaseline.statusKnown;
+  delete legacyBaseline.schedulable;
+  delete legacyBaseline.schedulableKnown;
+  let listCalls = 0;
+  await assert.rejects(
+    runAccountTestJobNow({
+      accountIds: [23],
+      targetBaselines: [legacyBaseline],
+      db: fakeWorkerDb(),
+      jobId: 'test-legacy-target-baseline',
       client: {
         async listAccounts() { listCalls += 1; return [account]; },
       },
@@ -593,6 +688,10 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     assert.equal(job.payload.targetBaselines.length, 1);
     assert.match(job.payload.targetBaselines[0].identityDigest, /^[a-f0-9]{64}$/);
     assert.equal(job.payload.targetBaselines[0].accountId, 4);
+    assert.equal(job.payload.targetBaselines[0].status, 'error');
+    assert.equal(job.payload.targetBaselines[0].statusKnown, true);
+    assert.equal(job.payload.targetBaselines[0].schedulable, false);
+    assert.equal(job.payload.targetBaselines[0].schedulableKnown, true);
     assert.equal(JSON.stringify(job.payload).includes('test-account-4'), false);
     assert.equal(JSON.stringify(job.payload).includes('test-user-4'), false);
     assert.equal(JSON.stringify(job.payload).includes('test-fingerprint-4'), false);

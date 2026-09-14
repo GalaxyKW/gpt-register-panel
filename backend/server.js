@@ -1505,7 +1505,7 @@ function createServer(options = {}) {
             const accountIds = classified.eligible.map((item) => item.id);
             const targetBaselines = classified.eligible.map((item) => accountTestTargetBaseline(item.account));
             if (targetBaselines.some((baseline) => !baseline)) {
-              const error = new Error('无法建立账号测试目标的强身份基线');
+              const error = new Error('无法建立账号测试目标的身份与状态基线');
               error.code = 'ACCOUNT_TEST_BASELINE_INVALID';
               throw error;
             }

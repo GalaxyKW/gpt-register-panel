@@ -101,6 +101,22 @@ function accountStatus(account) {
   return String(account?.status || '').trim().toLowerCase();
 }
 
+function accountTestState(account) {
+  const status = accountStatus(account);
+  return {
+    status,
+    statusKnown: account?.statusKnown === undefined
+      ? ['active', 'disabled', 'error'].includes(status)
+      : account.statusKnown === true,
+    schedulable: typeof account?.schedulable === 'boolean'
+      ? account.schedulable
+      : null,
+    schedulableKnown: account?.schedulableKnown === undefined
+      ? typeof account?.schedulable === 'boolean'
+      : account.schedulableKnown === true && typeof account?.schedulable === 'boolean',
+  };
+}
+
 function accountIdentityKeys(account) {
   return Array.isArray(account?.identityKeys) && account.identityKeys.length > 0
     ? account.identityKeys
@@ -128,13 +144,7 @@ function accountTestTargetError(account) {
       || String(account.type || '').trim().toLowerCase() !== 'oauth') {
     return 'account_kind_invalid';
   }
-  const status = accountStatus(account);
-  const statusKnown = account.statusKnown === undefined
-    ? ['active', 'disabled', 'error'].includes(status)
-    : account.statusKnown === true;
-  const schedulableKnown = account.schedulableKnown === undefined
-    ? typeof account.schedulable === 'boolean'
-    : account.schedulableKnown === true && typeof account.schedulable === 'boolean';
+  const { statusKnown, schedulableKnown } = accountTestState(account);
   if (!statusKnown || !schedulableKnown) return 'account_state_unknown';
   if (!hasStrongIdentity(accountIdentityKeys(account))) return 'account_identity_missing';
   return null;
@@ -145,6 +155,7 @@ function accountTestTargetBaseline(account) {
   if (!accountId || accountTestTargetError(account)) return null;
   const strongIdentityKeys = canonicalStrongIdentityKeys(account);
   if (strongIdentityKeys.length === 0) return null;
+  const state = accountTestState(account);
   return {
     accountId,
     // Persist only a one-way digest. Raw account/user IDs and credentials do
@@ -152,6 +163,13 @@ function accountTestTargetBaseline(account) {
     identityDigest: crypto.createHash('sha256')
       .update(JSON.stringify(strongIdentityKeys))
       .digest('hex'),
+    // Bind the decision to probe/recover to the state that was reviewed at
+    // submission time. These normalized fields are safe to persist and stop a
+    // queued healthy test from becoming an implicit recovery operation.
+    status: state.status,
+    statusKnown: state.statusKnown,
+    schedulable: state.schedulable,
+    schedulableKnown: state.schedulableKnown,
   };
 }
 
@@ -168,13 +186,27 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
     const identityDigest = typeof baseline?.identityDigest === 'string'
       ? baseline.identityDigest.trim().toLowerCase()
       : '';
+    const status = typeof baseline?.status === 'string'
+      ? baseline.status.trim().toLowerCase()
+      : '';
     if (!accountId || !expectedIds.has(accountId) || baselines.has(accountId)
-        || !/^[a-f0-9]{64}$/.test(identityDigest)) {
+        || !/^[a-f0-9]{64}$/.test(identityDigest)
+        || baseline?.statusKnown !== true
+        || !['active', 'disabled', 'error'].includes(status)
+        || baseline?.schedulableKnown !== true
+        || typeof baseline?.schedulable !== 'boolean') {
       const error = new Error('账号测试任务的目标身份基线无效');
       error.code = 'ACCOUNT_TEST_BASELINE_INVALID';
       throw error;
     }
-    baselines.set(accountId, { accountId, identityDigest });
+    baselines.set(accountId, {
+      accountId,
+      identityDigest,
+      status,
+      statusKnown: true,
+      schedulable: baseline.schedulable,
+      schedulableKnown: true,
+    });
   }
   if (baselines.size !== expectedIds.size) {
     const error = new Error('账号测试任务的目标身份基线不完整');
@@ -184,13 +216,39 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
   return baselines;
 }
 
-function matchesAccountTestTargetBaseline(baseline, account) {
-  const actual = accountTestTargetBaseline(account);
-  if (!baseline || !actual || actual.accountId !== baseline.accountId) return false;
+function matchesAccountTestIdentityBaseline(baseline, account) {
+  const accountId = normalizePositiveAccountId(account?.id);
+  const strongIdentityKeys = canonicalStrongIdentityKeys(account);
+  if (!baseline || accountId !== baseline.accountId || strongIdentityKeys.length === 0) return false;
+  const actualDigest = crypto.createHash('sha256')
+    .update(JSON.stringify(strongIdentityKeys))
+    .digest('hex');
   const expectedDigest = Buffer.from(baseline.identityDigest, 'hex');
-  const actualDigest = Buffer.from(actual.identityDigest, 'hex');
-  return expectedDigest.length === actualDigest.length
-    && crypto.timingSafeEqual(expectedDigest, actualDigest);
+  const actualDigestBuffer = Buffer.from(actualDigest, 'hex');
+  return expectedDigest.length === actualDigestBuffer.length
+    && crypto.timingSafeEqual(expectedDigest, actualDigestBuffer);
+}
+
+function matchesAccountTestStateBaseline(baseline, account) {
+  if (!baseline) return false;
+  const actual = accountTestState(account);
+  return actual.status === baseline.status
+    && actual.statusKnown === baseline.statusKnown
+    && actual.schedulable === baseline.schedulable
+    && actual.schedulableKnown === baseline.schedulableKnown;
+}
+
+function assertAccountTestSubmittedBaseline(baseline, account) {
+  if (!matchesAccountTestIdentityBaseline(baseline, account)) {
+    const error = new Error('账号强身份自测试任务提交后已变化，拒绝测试复用的数字 ID');
+    error.code = 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED';
+    throw error;
+  }
+  if (!matchesAccountTestStateBaseline(baseline, account)) {
+    const error = new Error('账号状态或调度设置自测试任务提交后已变化，已拒绝执行');
+    error.code = 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED';
+    throw error;
+  }
 }
 
 function sameAccountTarget(expected, actual) {
@@ -401,17 +459,15 @@ async function runAccountTestJobNow({
       continue;
     }
     let account = listedAccount;
-    let statusBefore = account?.status || null;
-    let schedulableBefore = typeof account?.schedulable === 'boolean' ? account.schedulable : null;
+    let statusBefore = submittedBaseline?.status || account?.status || null;
+    let schedulableBefore = submittedBaseline?.schedulableKnown === true
+      ? submittedBaseline.schedulable
+      : (typeof account?.schedulable === 'boolean' ? account.schedulable : null);
     let recoveryAttempted = false;
     let recoveryMutation = null;
     let testSucceeded = false;
     try {
-      if (listedAccount && !matchesAccountTestTargetBaseline(submittedBaseline, listedAccount)) {
-        const error = new Error('账号强身份自测试任务提交后已变化，拒绝测试复用的数字 ID');
-        error.code = 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED';
-        throw error;
-      }
+      if (listedAccount) assertAccountTestSubmittedBaseline(submittedBaseline, listedAccount);
       // Re-read immediately before testing so a deleted account or concurrent
       // admin change cannot turn this into a probe of the wrong account.
       const current = await client.getAccount(id, { signal });
@@ -428,9 +484,8 @@ async function runAccountTestJobNow({
         continue;
       }
       const targetError = accountTestTargetError(current);
-      if (targetError
-          || !matchesAccountTestTargetBaseline(submittedBaseline, current)
-          || (listedAccount && !sameAccountTarget(listedAccount, current))) {
+      assertAccountTestSubmittedBaseline(submittedBaseline, current);
+      if (targetError || (listedAccount && !sameAccountTarget(listedAccount, current))) {
         const error = new Error('账号身份、类型或状态在测试前无法安全确认');
         error.code = targetError || 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED';
         throw error;
@@ -756,7 +811,9 @@ async function runAccountTestJobNow({
         accountId: id,
         accountName: account?.name || null,
         status: 'failed',
-        code: recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed',
+        code: error?.code === 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED'
+          ? error.code
+          : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),
         message: safeErrorMessage(error),
         testSuccess: testSucceeded,
         enabled: sameAccountTarget(account, afterFailure) && afterFailure.schedulable === true,
