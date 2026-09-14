@@ -323,6 +323,55 @@ test('control-plane lease release failure is reported and poisons the namespace'
   }
 });
 
+test('a directory fsync release failure poisons the namespace after ticket unlink', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-release-fsync-'));
+  const lockName = 'release-fsync.lock';
+  const previousPath = process.env.PANEL_CONTROL_LOCK_PATH;
+  const originalUnlink = fs.unlinkSync;
+  const originalFsync = fs.fsyncSync;
+  let failDirectorySync = false;
+  let directorySyncFailures = 0;
+  let callbacks = 0;
+  process.env.PANEL_CONTROL_LOCK_PATH = path.join(root, lockName);
+  fs.unlinkSync = function unlinkThenFailDirectorySync(filePath) {
+    const result = originalUnlink.call(fs, filePath);
+    if (isTicketPath(filePath, lockName)) failDirectorySync = true;
+    return result;
+  };
+  fs.fsyncSync = function injectedDirectorySyncFailure(descriptor) {
+    if (failDirectorySync && fs.fstatSync(descriptor).isDirectory()) {
+      directorySyncFailures += 1;
+      const error = new Error('injected directory durability failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsync.call(fs, descriptor);
+  };
+  try {
+    await assert.rejects(
+      withControlPlaneLock(async () => { callbacks += 1; }),
+      (error) => error.code === 'CONTROL_PLANE_LOCK_RELEASE_FAILED',
+    );
+    assert.ok(directorySyncFailures >= 3);
+    assert.deepEqual(leaseEntries(root, lockName), []);
+
+    failDirectorySync = false;
+    const startedAt = Date.now();
+    await assert.rejects(
+      withControlPlaneLock(async () => { callbacks += 1; }),
+      (error) => error.code === 'CONTROL_PLANE_LOCK_RELEASE_FAILED',
+    );
+    assert.equal(callbacks, 1);
+    assert.ok(Date.now() - startedAt < 1000, 'durability failure must poison the namespace');
+  } finally {
+    fs.fsyncSync = originalFsync;
+    fs.unlinkSync = originalUnlink;
+    if (previousPath === undefined) delete process.env.PANEL_CONTROL_LOCK_PATH;
+    else process.env.PANEL_CONTROL_LOCK_PATH = previousPath;
+    cleanupLeaseEntries(root, lockName, originalUnlink);
+  }
+});
+
 test('PanelDb propagates lease release failures and fails later writes fast', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-release-fail-'));
   const file = path.join(root, 'panel.sqlite3');

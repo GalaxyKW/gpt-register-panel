@@ -1416,7 +1416,6 @@ class PanelDb {
   releaseFileLock(lease) {
     try {
       releaseBakeryLease(lease);
-      if (lease.directoryDescriptor !== undefined) fs.fsyncSync(lease.directoryDescriptor);
     } finally {
       if (lease?.directoryDescriptor !== undefined) {
         try { fs.closeSync(lease.directoryDescriptor); } catch {}

@@ -420,8 +420,19 @@ function removeLeaseEntries(entries, context, token) {
       if (!removeUniqueLeaseEntry(entry, context)) removed = false;
     }
     if (removed) {
-      clearNamespacePoison(context, token);
-      return;
+      try {
+        // Removing the unique ticket is not a durable release until its parent
+        // directory has also reached stable storage. Keep this inside the
+        // poison protocol: a caller must never observe a release failure while
+        // a later acquisition is nevertheless allowed to enter the namespace.
+        fs.fsyncSync(context.directoryDescriptor);
+        clearNamespacePoison(context, token);
+        return;
+      } catch {
+        // A transient directory-sync failure can be retried even when the
+        // unique pathname is already absent; removeUniqueLeaseEntry treats an
+        // observed missing path as successfully removed on the next attempt.
+      }
     }
   }
   namespacePoison(context, token);
