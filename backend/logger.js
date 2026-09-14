@@ -266,17 +266,38 @@ function redactValue(value, key = '', seen = new WeakSet()) {
   if (SECRET_KEY.test(normalizedKey)) return '[redacted]';
   if (typeof value === 'string') return redactText(value);
   if (typeof value === 'bigint') return String(value);
+  // Functions are not JSON data. In particular, copying an enumerable
+  // `toJSON` function into the sanitized object would let JSON.stringify call
+  // attacker-controlled code after redaction and replace the whole safe value
+  // with fresh, unredacted credentials.
+  if (typeof value === 'function' || typeof value === 'symbol') return '[unsupported]';
   if (Array.isArray(value)) {
     if (seen.has(value)) return '[circular]';
     seen.add(value);
-    return value.map((item) => redactValue(item, '', seen));
+    const output = [];
+    for (let index = 0; index < value.length; index += 1) {
+      output.push(redactValue(value[index], '', seen));
+    }
+    return output;
   }
   if (value && typeof value === 'object') {
     if (seen.has(value)) return '[circular]';
     seen.add(value);
     const output = {};
     for (const [childKey, childValue] of Object.entries(value)) {
-      output[childKey] = redactValue(childValue, childKey, seen);
+      // Treat the serialization hook itself as unsafe even when it is not a
+      // function. Define properties explicitly so a `__proto__` input key
+      // remains inert data instead of changing the sanitized object's
+      // prototype and installing an inherited serialization hook.
+      const safeChildValue = childKey === 'toJSON'
+        ? '[redacted]'
+        : redactValue(childValue, childKey, seen);
+      Object.defineProperty(output, childKey, {
+        value: safeChildValue,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
     }
     return output;
   }

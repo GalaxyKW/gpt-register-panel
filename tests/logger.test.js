@@ -473,6 +473,46 @@ test('logger handles circular and bigint fields without throwing', () => {
   assert.equal(entry.self, '[circular]');
 });
 
+test('redacted values cannot reintroduce secrets through JSON serialization hooks', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false });
+  const marker = 'opaque-serialization-hook-secret-marker';
+  let hookCalls = 0;
+  const prototypePayload = Object.create(null);
+  Object.defineProperty(prototypePayload, '__proto__', {
+    value: {
+      toJSON() {
+        hookCalls += 1;
+        return { note: marker };
+      },
+    },
+    enumerable: true,
+  });
+  const fields = {
+    ordinary: 'safe',
+    custom: {
+      toJSON() {
+        hookCalls += 1;
+        return { note: marker };
+      },
+    },
+    prototypePayload,
+  };
+
+  const safe = redactValue(fields);
+  const serialized = JSON.stringify(safe);
+  assert.equal(hookCalls, 0);
+  assert.equal(serialized.includes(marker), false);
+  assert.equal(Object.getPrototypeOf(safe.prototypePayload), Object.prototype);
+  assert.equal(Object.prototype.hasOwnProperty.call(safe.prototypePayload, '__proto__'), true);
+  logger.info('test.serialization_hook', fields);
+  const logText = fs.readFileSync(filePath, 'utf8');
+  assert.equal(hookCalls, 0);
+  assert.equal(logText.includes(marker), false);
+  assert.equal(logger.tail(1)[0].custom.toJSON, '[redacted]');
+});
+
 test('logger fields cannot override fixed metadata or leak through a dynamic event', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
   const filePath = path.join(directory, 'panel.log');

@@ -83,8 +83,9 @@ test('successful critical section plus release failure returns a safe non-retrya
     assert.equal(observed.criticalSectionResult.accountId, 42);
     assert.equal(observed.criticalSectionResult.credential, '[redacted]');
     assert.equal(observed.criticalSectionResult.nested.password, '[redacted]');
-    assert.equal(observed.criticalSectionResult.customSerialization.password, '[redacted]');
-    assert.equal(observed.criticalSectionResult.customSerialization.safeCount, 2);
+    assert.equal(observed.criticalSectionResult.customSerialization.toJSON, '[redacted]');
+    assert.equal(observed.criticalSectionResult.customSerialization.password, undefined);
+    assert.equal(observed.criticalSectionResult.customSerialization.safeCount, undefined);
     assert.doesNotMatch(JSON.stringify(observed), /highly-sensitive/);
     assert.equal(observed.releaseFailure.code, 'CONTROL_PLANE_LOCK_RELEASE_FAILED');
     assert.doesNotMatch(JSON.stringify(observed.releaseFailure), /must-not-escape/);
