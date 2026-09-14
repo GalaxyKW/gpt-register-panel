@@ -198,6 +198,8 @@ test('frontend disables mutation controls while preserving read-only inspection 
       reconciliationAckPending: false,
       snapshotRefreshPending: false,
       snapshotRequestsPending: 0,
+      jobInventoryVerified: true,
+      snapshot: { readOnly: false },
     },
     reconciliationHoldJobs: () => [],
   };
@@ -440,6 +442,6 @@ test('frontend refreshes job holds after an acknowledgement conflict', async () 
   assert.equal(context.state.reconciliationAckTarget, null);
 });
 
-test('ordinary refresh requests a synchronized jobs/hold refresh after the snapshot', () => {
+test('ordinary refresh requests an independent jobs/hold refresh', () => {
   assert.match(source, /refreshButton\.addEventListener\('click', \(\) => loadSnapshot\(\{ resumeJobs: true \}\)\)/);
 });

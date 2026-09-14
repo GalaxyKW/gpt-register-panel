@@ -40,6 +40,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
       job: null,
     },
     reconciliationHoldJobs: () => [],
+    hiddenSelectionProblem: () => '',
     escapeHtml: (value) => String(value ?? ''),
     actionLabel: (value) => value,
     formatFingerprint: (value) => value || '-',
@@ -127,6 +128,7 @@ test('frontend import confirmation calls out selected superseded token files', a
       snapshot: { sub2api: { readStatus: 'ok' } },
     },
     comparisonAvailable: () => true,
+    hiddenSelectionProblem: () => '',
     showNotice() {},
     window: {
       confirm(message) {
@@ -166,6 +168,68 @@ test('frontend polling helper keeps an unknown task locked and schedules a slowe
   assert.match(unknownBranch, /status:\s*'unknown'/);
 });
 
+test('frontend ignores an older same-id watcher after a newer generation starts', async () => {
+  const pollingSupport = sourceSection('function stopJobPolling', 'async function watchJobs');
+  const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
+  const requests = [];
+  const timers = [];
+  const rendered = [];
+  const stateForTest = {
+    jobPollTimer: null,
+    watchGeneration: 0,
+    watchIds: [],
+    jobs: [],
+    job: null,
+  };
+  const context = {
+    state: stateForTest,
+    apiFetch: (url) => new Promise((resolve) => requests.push({ url, resolve })),
+    renderJob: (job) => rendered.push(job),
+    jobNeedsReconciliation: () => false,
+    reconciliationNoticeForJobs: () => '',
+    renderPlan() {},
+    updateActionState() {},
+    loadSnapshot: async () => true,
+    showNotice() {},
+    elements: { jobMeta: {} },
+    window: {
+      clearTimeout() {},
+      setTimeout(callback, delayMs) {
+        timers.push({ callback, delayMs });
+        return timers.length;
+      },
+    },
+  };
+  vm.runInNewContext(pollingSupport + '\n' + watchContract + `
+    olderPromise = watchJobs(['same-job'], 'phase3');
+  `, context);
+  stateForTest.snapshotRefreshPending = true;
+  stateForTest.snapshotRefreshGeneration = stateForTest.watchGeneration;
+  vm.runInNewContext("newerPromise = watchJobs(['same-job'], 'phase3');", context);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0].url, requests[1].url);
+  assert.equal(stateForTest.snapshotRefreshPending, false);
+
+  requests[1].resolve({
+    ok: true,
+    json: async () => ({ id: 'same-job', type: 'phase3', status: 'running', marker: 'newer' }),
+  });
+  await context.newerPromise;
+  assert.equal(stateForTest.jobs[0].marker, 'newer');
+  assert.equal(timers.length, 1);
+
+  requests[0].resolve({
+    ok: true,
+    json: async () => ({ id: 'same-job', type: 'phase3', status: 'running', marker: 'older' }),
+  });
+  await context.olderPromise;
+  assert.equal(stateForTest.jobs[0].marker, 'newer');
+  assert.equal(rendered.at(-1).marker, 'newer');
+  assert.equal(timers.length, 1);
+  assert.match(watchContract, /watchGeneration === generation/);
+  assert.doesNotMatch(watchContract, /watchIds\.join/);
+});
+
 test('frontend locks the initial UI when active-job recovery cannot be confirmed', () => {
   const resumeContract = sourceSection('async function resumeActiveJob', 'async function loadSnapshot');
   const firstRequest = resumeContract.indexOf("apiFetch('/api/jobs?limit=200')");
@@ -183,6 +247,93 @@ test('frontend locks the initial UI when active-job recovery cannot be confirmed
   assert.match(resumeContract, /activeReturned !== activeJobs\.length/);
   assert.match(resumeContract, /id:\s*'active-list-truncated'[\s\S]*status:\s*'unknown'/);
   assert.match(resumeContract, /活跃任务列表不完整，无法安全解除操作锁/);
+  assert.match(resumeContract, /state\.jobInventoryVerified = false/);
+  assert.match(resumeContract, /holdReturned !== heldJobs\.length/);
+  assert.match(resumeContract, /holdListing\.truncated === true \|\| holdTotal > holdReturned/);
+  assert.match(resumeContract, /state\.jobInventoryVerified = true/);
+});
+
+test('frontend probes jobs independently when the first snapshot fails and stays fail-closed', async () => {
+  const lockContract = sourceSection('function actionRequestPending', 'function renderMetrics');
+  const resumeContract = sourceSection('async function resumeActiveJob', 'async function loadSnapshot');
+  const snapshotContract = sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'");
+  const calls = [];
+  let resolveJobs;
+  const notices = [];
+  const stateForTest = {
+    snapshot: null,
+    jobs: [],
+    job: null,
+    reconciliationHolds: { total: 0, returned: 0, truncated: false },
+    previewRequestPending: false,
+    importRequestPending: false,
+    phase3RequestPending: false,
+    accountTestRequestPending: false,
+    cleanupRequestPending: false,
+    reconciliationAckPending: false,
+    snapshotRefreshPending: false,
+    snapshotRequestSequence: 0,
+    snapshotRequestsPending: 0,
+    resumeJobsPending: false,
+    jobInventoryVerified: false,
+    jobInventoryProbeSequence: 0,
+  };
+  const context = {
+    URLSearchParams,
+    state: stateForTest,
+    elements: {
+      historicalToggle: { checked: false },
+      loadingLabel: {},
+      refreshButton: {},
+      statusFilter: {},
+      availabilityFilter: {},
+      diffFilter: {},
+    },
+    apiFetch(url) {
+      calls.push(url);
+      if (url === '/api/jobs?limit=200') {
+        return new Promise((resolve) => { resolveJobs = resolve; });
+      }
+      return Promise.reject(new Error('snapshot offline'));
+    },
+    renderJob() {},
+    stopJobPolling() {},
+    beginJobWatchGeneration() {},
+    updateActionState() {},
+    showNotice: (...args) => notices.push(args),
+    aggregateJobs: (jobs) => jobs[0] || null,
+    watchJobs: async () => {},
+    terminalJob: () => false,
+    jobNeedsReconciliation: () => false,
+    applyFilters() {},
+    loadAccountTestModels() {},
+    renderMetrics() {},
+    renderPlan() {},
+    renderSelectOptions() {},
+    reconciliationHoldJobs: () => [],
+    window: { setTimeout() {} },
+  };
+  vm.runInNewContext(lockContract + '\n' + resumeContract + '\n' + snapshotContract + `
+    snapshotPromise = loadSnapshot({ resumeJobs: true });
+  `, context);
+  assert.deepEqual(calls, ['/api/jobs?limit=200', '/api/snapshot?withSub2api=1']);
+  assert.equal(await context.snapshotPromise, false);
+  assert.equal(stateForTest.jobInventoryVerified, false);
+  assert.equal(context.actionsLocked(), true);
+  assert.match(notices.at(-1)[0], /snapshot offline/);
+
+  resolveJobs({
+    ok: true,
+    json: async () => ({
+      jobs: [],
+      activeJobs: { total: 0, returned: 0, truncated: false },
+      reconciliationHolds: { total: 0, returned: 0, truncated: false },
+    }),
+  });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(stateForTest.jobInventoryVerified, true);
+  assert.equal(stateForTest.snapshot, null);
+  assert.equal(context.actionsLocked(), true);
 });
 
 test('frontend restores the newest terminal reconciliation warning when no job is active', async () => {
@@ -195,8 +346,25 @@ test('frontend restores the newest terminal reconciliation warning when no job i
   const context = {
     state: stateForTest,
     finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
-    apiFetch: async () => ({ ok: true, json: async () => ({ jobs: listedJobs }) }),
+    apiFetch: async () => ({
+      ok: true,
+      json: async () => ({
+        jobs: listedJobs,
+        activeJobs: {
+          total: listedJobs.filter((job) => ['queued', 'running'].includes(job.status)).length,
+          returned: listedJobs.filter((job) => ['queued', 'running'].includes(job.status)).length,
+          truncated: false,
+        },
+        reconciliationHolds: {
+          total: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
+          returned: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
+          truncated: false,
+        },
+      }),
+    }),
     renderJob: (job) => rendered.push(job),
+    stopJobPolling() {},
+    beginJobWatchGeneration() {},
     updateActionState() {},
     showNotice: (...args) => notices.push(args),
     aggregateJobs: (jobs) => jobs[0] || null,
@@ -663,12 +831,12 @@ test('mobile layout keeps controls usable and wide tables horizontally scrollabl
 test('frontend refreshes every terminal job outcome before preserving its notice', () => {
   const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
   const terminalStart = watchContract.indexOf('if (loaded.every((job) => terminalJob(job.status)))');
-  const terminalEnd = watchContract.indexOf("state.jobPollTimer = window.setTimeout(() => poll(0), 1200)", terminalStart);
+  const terminalEnd = watchContract.indexOf('schedulePoll(() => poll(0), 1200)', terminalStart);
   const terminalBranch = watchContract.slice(terminalStart, terminalEnd);
   assert.notEqual(terminalStart, -1);
   assert.notEqual(terminalEnd, -1);
-  assert.match(terminalBranch, /snapshotRefreshPending = true;[\s\S]*const snapshotRefreshed = await loadSnapshot\(\)/);
-  assert.match(terminalBranch, /if \(!snapshotRefreshed\)[\s\S]*保持操作锁定[\s\S]*window\.setTimeout\(\(\) => poll\(0\), 5000\);\s*return;/);
+  assert.match(terminalBranch, /snapshotRefreshPending = true;[\s\S]*const snapshotRefreshed = await loadSnapshot\(\{ isCurrent: watcherIsCurrent \}\)/);
+  assert.match(terminalBranch, /if \(!snapshotRefreshed\)[\s\S]*保持操作锁定[\s\S]*schedulePoll\(\(\) => poll\(0\), 5000\);\s*return;/);
   assert.match(terminalBranch, /snapshotRefreshPending = false;\s*showNotice\(terminalNotice, terminalNoticeKind\)/);
   assert.match(sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'"), /return loaded;/);
 });
@@ -917,6 +1085,73 @@ test('frontend selection mutations are blocked while actions are locked', () => 
   assert.equal((bulkHandlers.match(/changeSelection\(/g) || []).length, 2);
 });
 
+test('frontend blocks bulk actions when a prior selection is hidden by filters', async () => {
+  const visibilityContract = sourceSection('function selectedRowsFromView', 'function selectedRowsFromSelection');
+  const selectionContract = sourceSection('function selectionsEqual', 'function rowSideData');
+  const filterContract = sourceSection('function applyFilters', 'function showNotice');
+  const previewContract = sourceSection('async function previewSelection', "elements.previewButton.addEventListener('click', previewSelection);");
+  const allBulkHandlers = sourceSection(
+    'async function previewSelection',
+    "elements.clearSelectionButton.addEventListener",
+  );
+  const cleanupHandler = sourceSection(
+    'if (elements.cleanupButton) {',
+    "elements.clearSelectionButton.addEventListener",
+  );
+  const notices = [];
+  let requests = 0;
+  const context = {
+    state: {
+      snapshot: {
+        rows: [
+          { key: 'account-a', accountName: 'Alpha' },
+          { key: 'account-b', accountName: 'Beta' },
+        ],
+      },
+      rows: [],
+      selected: new Set(['account-a']),
+      selectionRevision: 1,
+      previewRequestPending: false,
+    },
+    elements: {
+      searchInput: { value: 'Beta' },
+      statusFilter: { value: '' },
+      availabilityFilter: { value: '' },
+      sourceFilter: { value: '' },
+      diffFilter: { value: '' },
+    },
+    actionsLocked: () => false,
+    invalidatePlan() {},
+    renderRows() {},
+    comparisonAvailable: () => true,
+    apiFetch: async () => { requests += 1; throw new Error('must not request'); },
+    showNotice: (...args) => notices.push(args),
+    renderPlan() {},
+    updateActionState() {},
+  };
+  vm.runInNewContext(visibilityContract + '\n' + selectionContract + '\n' + filterContract + '\n'
+    + previewContract + `
+      applyFilters();
+      changeSelection(new Set([...state.selected, 'account-b']));
+      visibilityProblem = hiddenSelectionProblem();
+      previewPromise = previewSelection();
+    `, context);
+  assert.deepEqual(context.state.rows.map((row) => row.key), ['account-b']);
+  assert.deepEqual([...context.state.selected].sort(), ['account-a', 'account-b']);
+  assert.match(context.visibilityProblem, /1 个已选账号被当前筛选条件隐藏/);
+  assert.equal(await context.previewPromise, false);
+  assert.equal(requests, 0);
+  assert.match(notices.at(-1)[0], /请先清除选择或调整筛选/);
+  assert.equal((allBulkHandlers.match(/hiddenSelectionProblem/g) || []).length, 4);
+  assert.doesNotMatch(cleanupHandler, /hiddenSelectionProblem/);
+  assert.match(sourceSection('function updateActionState', 'function applyColumnVisibility'),
+    /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
+});
+
+test('frontend labels the remote-only source filter unambiguously', () => {
+  assert.match(htmlSource, /<option value="sub2api">仅 Sub2API（无本地 token）<\/option>/);
+});
+
 test('frontend discards a preview when the selected keys or revision changes in flight', async () => {
   const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
   const freshnessContract = sourceSection('function selectionStillCurrent', 'function renderRows');
@@ -933,6 +1168,7 @@ test('frontend discards a preview when the selected keys or revision changes in 
   const context = {
     state: stateForTest,
     apiFetch: () => new Promise((resolve) => requests.push(resolve)),
+    hiddenSelectionProblem: () => '',
     renderPlan: (plan) => plans.push(plan),
     showNotice: (...args) => notices.push(args),
     updateActionState() {},
@@ -983,6 +1219,7 @@ test('frontend refuses sync preview when remote comparison is unavailable', asyn
       previewRequestPending: false,
     },
     apiFetch: async () => { requests += 1; throw new Error('must not request'); },
+    hiddenSelectionProblem: () => '',
     renderPlan() {},
     showNotice: (...args) => notices.push(args),
     updateActionState() {},
@@ -1115,6 +1352,8 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
   const context = {
     state: {
       selected: new Set(['row-one']),
+      rows: [{ key: 'row-one' }],
+      jobInventoryVerified: true,
       snapshot: {
         readOnly: false,
         rows: [{

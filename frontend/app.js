@@ -20,6 +20,10 @@ const state = {
   snapshotRequestsPending: 0,
   selectionRevision: 0,
   resumeJobsPending: false,
+  jobInventoryVerified: false,
+  jobInventoryProbeSequence: 0,
+  watchGeneration: 0,
+  snapshotRefreshGeneration: 0,
 };
 
 const elements = {
@@ -493,6 +497,8 @@ function activeJobPending() {
 function actionsLocked() {
   return actionRequestPending()
     || activeJobPending()
+    || state.jobInventoryVerified !== true
+    || !state.snapshot
     || state.snapshotRefreshPending
     || state.snapshotRequestsPending > 0;
 }
@@ -524,9 +530,11 @@ function comparisonAvailable(snapshot = state.snapshot) {
 function updateImportButtonState() {
   const items = state.plan?.items || [];
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
+  const hiddenSelection = hiddenSelectionProblem(state.plan?.selectedKeys);
   elements.importButton.disabled = !state.plan
     || actionsLocked()
     || reconciliationWriteBlocked()
+    || Boolean(hiddenSelection)
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || state.plan.selectedKeys.length === 0
@@ -568,6 +576,15 @@ function renderMetrics(snapshot) {
 
 function selectedRowsFromView() {
   return state.rows.filter((row) => state.selected.has(row.key));
+}
+
+function hiddenSelectionProblem(selectedKeys = state.selected) {
+  const selected = selectedKeys instanceof Set ? [...selectedKeys] : [...(selectedKeys || [])];
+  if (selected.length === 0) return '';
+  const visibleKeys = new Set((state.rows || []).map((row) => row.key));
+  const hiddenCount = selected.filter((key) => !visibleKeys.has(key)).length;
+  if (hiddenCount === 0) return '';
+  return '有 ' + hiddenCount + ' 个已选账号被当前筛选条件隐藏；请先清除选择或调整筛选，使全部已选账号可见';
 }
 
 function selectedRowsFromSelection() {
@@ -896,6 +913,7 @@ function renderRows() {
   elements.tableSummary.textContent = '当前显示 ' + rows.length + ' 项 · 已选 ' + state.selected.size
     + (selectedVisible !== state.selected.size ? '（当前列表 ' + selectedVisible + '）' : '');
   elements.selectionCount.textContent = '已选 ' + state.selected.size;
+  elements.selectionCount.title = hiddenSelectionProblem();
   elements.selectAll.checked = rows.length > 0 && rows.every((row) => state.selected.has(row.key));
   elements.selectAll.indeterminate = selectedVisible > 0 && !elements.selectAll.checked;
   document.querySelectorAll('.row-check').forEach((input) => {
@@ -1730,6 +1748,15 @@ function stopJobPolling() {
   state.jobPollTimer = null;
 }
 
+function beginJobWatchGeneration() {
+  state.watchGeneration = Math.max(0, Number(state.watchGeneration) || 0) + 1;
+  if (state.snapshotRefreshPending
+      && state.snapshotRefreshGeneration !== state.watchGeneration) {
+    state.snapshotRefreshPending = false;
+  }
+  return state.watchGeneration;
+}
+
 function aggregateJobs(jobs) {
   const list = Array.isArray(jobs) ? jobs.filter(Boolean) : [];
   if (list.length === 0) return null;
@@ -1770,6 +1797,14 @@ async function watchJobs(jobIds, initialType = 'phase3') {
   const ids = [...new Set((jobIds || []).filter(Boolean).map(String))];
   if (ids.length === 0) return;
   stopJobPolling();
+  const generation = beginJobWatchGeneration();
+  const watcherIsCurrent = () => state.watchGeneration === generation;
+  const schedulePoll = (callback, delayMs) => {
+    if (!watcherIsCurrent()) return;
+    state.jobPollTimer = window.setTimeout(() => {
+      if (watcherIsCurrent()) void callback();
+    }, delayMs);
+  };
   state.watchIds = ids;
   state.jobs = ids.map((id) => ({ id, status: 'queued', type: initialType }));
   state.job = aggregateJobs(state.jobs);
@@ -1782,7 +1817,7 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         if (!response.ok) throw new Error(body.message || body.error || '任务状态读取失败');
         return body;
       }));
-      if (!state.watchIds || state.watchIds.join(',') !== ids.join(',')) return;
+      if (!watcherIsCurrent()) return;
       state.jobs = loaded;
       state.job = aggregateJobs(loaded);
       renderJob(state.job);
@@ -1816,11 +1851,13 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         // afterwards because loadSnapshot intentionally clears stale notices.
         renderPlan(null);
         state.snapshotRefreshPending = true;
+        state.snapshotRefreshGeneration = generation;
         updateActionState();
-        const snapshotRefreshed = await loadSnapshot();
+        const snapshotRefreshed = await loadSnapshot({ isCurrent: watcherIsCurrent });
+        if (!watcherIsCurrent()) return;
         if (!snapshotRefreshed) {
           showNotice('任务已结束，但账号快照刷新失败；为避免基于陈旧状态重复操作，已保持操作锁定并将在后台重试。', 'notice-warning');
-          state.jobPollTimer = window.setTimeout(() => poll(0), 5000);
+          schedulePoll(() => poll(0), 5000);
           return;
         }
         state.snapshotRefreshPending = false;
@@ -1833,17 +1870,14 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         updateActionState();
         return;
       }
-      state.jobPollTimer = window.setTimeout(() => poll(0), 1200);
+      schedulePoll(() => poll(0), 1200);
     } catch (error) {
-      if (!state.watchIds || state.watchIds.join(',') !== ids.join(',')) return;
+      if (!watcherIsCurrent()) return;
       const failureState = jobPollFailureState(attempt);
       if (!failureState.unknown) {
         elements.jobMeta.textContent = '任务状态暂时不可读，正在重试（'
           + String(failureState.nextAttempt) + '/6）';
-        state.jobPollTimer = window.setTimeout(
-          () => poll(failureState.nextAttempt),
-          failureState.delayMs,
-        );
+        schedulePoll(() => poll(failureState.nextAttempt), failureState.delayMs);
         return;
       }
       // A polling failure says nothing about the worker outcome. Keep action
@@ -1856,7 +1890,7 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         jobs: state.jobs,
       });
       showNotice('任务状态暂时无法确认；已保持操作锁定，并将在后台继续检查。', 'notice-warning');
-      state.jobPollTimer = window.setTimeout(() => poll(failureState.nextAttempt), failureState.delayMs);
+      schedulePoll(() => poll(failureState.nextAttempt), failureState.delayMs);
     }
   };
   await poll();
@@ -1867,9 +1901,14 @@ async function watchJob(jobId, type = 'phase3') {
 }
 
 async function resumeActiveJob() {
+  const previouslyWatchedTypes = new Set((state.jobs || []).map((job) => job?.type).filter(Boolean));
+  stopJobPolling();
+  beginJobWatchGeneration();
+  state.jobInventoryProbeSequence = Math.max(0, Number(state.jobInventoryProbeSequence) || 0) + 1;
+  const probeSequence = state.jobInventoryProbeSequence;
+  state.jobInventoryVerified = false;
   // Until the initial list request succeeds, absence of a rendered task is not
   // evidence that no worker is active. Lock mutations before yielding to I/O.
-  state.jobs = [];
   state.job = {
     id: 'resume-probe',
     type: 'batch',
@@ -1882,26 +1921,27 @@ async function resumeActiveJob() {
   try {
     const response = await apiFetch('/api/jobs?limit=200');
     const body = await response.json();
+    if (probeSequence !== state.jobInventoryProbeSequence) return;
     if (!response.ok) throw new Error(body.message || body.error || '任务列表读取失败');
-    const listedJobs = Array.isArray(body.jobs) ? body.jobs : [];
-    const activeListing = body.activeJobs && typeof body.activeJobs === 'object'
-      ? body.activeJobs
-      : { total: listedJobs.filter((job) => ['queued', 'running'].includes(job?.status)).length,
-          returned: listedJobs.filter((job) => ['queued', 'running'].includes(job?.status)).length,
-          truncated: false };
-    const holdListing = body.reconciliationHolds && typeof body.reconciliationHolds === 'object'
-      ? body.reconciliationHolds
-      : { total: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
-          returned: listedJobs.filter((job) => job?.result?.reconciliationHold === true).length,
-          truncated: false };
+    if (!Array.isArray(body.jobs)) throw new Error('任务列表响应格式无效');
+    const listedJobs = body.jobs;
+    if (!body.activeJobs || typeof body.activeJobs !== 'object'
+        || !body.reconciliationHolds || typeof body.reconciliationHolds !== 'object') {
+      throw new Error('任务与待对账清单缺少完整性信息');
+    }
+    const activeListing = body.activeJobs;
+    const holdListing = body.reconciliationHolds;
+    const heldJobs = listedJobs.filter((job) => job?.result?.reconciliationHold === true);
+    const holdTotal = holdListing.total;
+    const holdReturned = holdListing.returned;
     state.reconciliationHolds = {
-      total: Math.max(0, Number(holdListing.total) || 0),
-      returned: Math.max(0, Number(holdListing.returned) || 0),
+      total: Number.isSafeInteger(holdTotal) && holdTotal >= 0 ? holdTotal : 0,
+      returned: Number.isSafeInteger(holdReturned) && holdReturned >= 0 ? holdReturned : 0,
       truncated: holdListing.truncated === true,
     };
     const activeJobs = listedJobs.filter((job) => ['queued', 'running'].includes(job.status));
-    const activeTotal = Number(activeListing.total);
-    const activeReturned = Number(activeListing.returned);
+    const activeTotal = activeListing.total;
+    const activeReturned = activeListing.returned;
     const activeListingInvalid = !Number.isSafeInteger(activeTotal) || activeTotal < 0
       || !Number.isSafeInteger(activeReturned) || activeReturned < 0
       || activeReturned > activeTotal || activeReturned !== activeJobs.length
@@ -1924,6 +1964,38 @@ async function resumeActiveJob() {
       state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
       return;
     }
+    const holdListingInvalid = !Number.isSafeInteger(holdTotal) || holdTotal < 0
+      || !Number.isSafeInteger(holdReturned) || holdReturned < 0
+      || holdReturned > holdTotal || holdReturned !== heldJobs.length
+      || typeof holdListing.truncated !== 'boolean';
+    if (holdListingInvalid || holdListing.truncated === true || holdTotal > holdReturned) {
+      state.jobs = activeJobs;
+      state.job = {
+        id: 'hold-list-truncated',
+        type: 'batch',
+        status: 'unknown',
+        jobs: activeJobs,
+        error: '待对账任务列表不完整，无法安全解除操作锁',
+      };
+      renderJob(state.job);
+      updateActionState();
+      showNotice('待对账任务列表不完整；已保持操作锁定并将在后台重试。', 'notice-warning');
+      state.jobPollTimer = window.setTimeout(() => resumeActiveJob(), 15000);
+      return;
+    }
+    if (!activeJobs.some((job) => job.type === 'phase3') && previouslyWatchedTypes.has('phase3')) {
+      state.phase3RequestPending = false;
+    }
+    if (!activeJobs.some((job) => job.type === 'token_import') && previouslyWatchedTypes.has('token_import')) {
+      state.importRequestPending = false;
+    }
+    if (!activeJobs.some((job) => job.type === 'account_test') && previouslyWatchedTypes.has('account_test')) {
+      state.accountTestRequestPending = false;
+    }
+    if (!activeJobs.some((job) => job.type === 'token_cleanup') && previouslyWatchedTypes.has('token_cleanup')) {
+      state.cleanupRequestPending = false;
+    }
+    state.jobInventoryVerified = true;
     if (!activeJobs.length) {
       if (state.job?.resumeProbe) {
         const recentReconciliation = listedJobs.find((job) => (
@@ -1955,6 +2027,7 @@ async function resumeActiveJob() {
     await watchJobs(activeJobs.map((job) => job.id), activeJobs.length === 1 ? activeJobs[0].type : 'batch');
     if (state.reconciliationHolds.total > 0 && !activeJobPending()) await resumeActiveJob();
   } catch (error) {
+    if (probeSequence !== state.jobInventoryProbeSequence) return;
     // A task can still run even when the optional resume request is not
     // available. Treat the initial state as unknown and keep all mutations
     // locked until a later list request proves there is no active task.
@@ -1974,9 +2047,17 @@ async function resumeActiveJob() {
 }
 
 async function loadSnapshot(options = {}) {
+  if (options.resumeJobs && !state.resumeJobsPending) {
+    state.resumeJobsPending = true;
+    void resumeActiveJob().finally(() => {
+      state.resumeJobsPending = false;
+    });
+  }
+  const requestIsCurrent = typeof options.isCurrent === 'function'
+    ? options.isCurrent
+    : () => true;
   const requestId = ++state.snapshotRequestSequence;
   state.snapshotRequestsPending += 1;
-  if (options.resumeJobs) state.resumeJobsPending = true;
   let loaded = false;
   elements.loadingLabel.hidden = false;
   elements.refreshButton.disabled = true;
@@ -1986,7 +2067,7 @@ async function loadSnapshot(options = {}) {
     if (elements.historicalToggle?.checked) query.set('includeHistorical', '1');
     const response = await apiFetch('/api/snapshot?' + query.toString());
     const snapshot = await response.json();
-    if (requestId !== state.snapshotRequestSequence) return false;
+    if (requestId !== state.snapshotRequestSequence || !requestIsCurrent()) return false;
     if (!response.ok) throw new Error(snapshot.message || snapshot.error || '读取失败');
     state.snapshot = snapshot;
     // A stable row key does not prove that the file at that path still belongs
@@ -2032,12 +2113,10 @@ async function loadSnapshot(options = {}) {
     applyFilters();
     void loadAccountTestModels(snapshot);
     loaded = true;
-    if (requestId === state.snapshotRequestSequence && state.resumeJobsPending) {
-      state.resumeJobsPending = false;
-      await resumeActiveJob();
-    }
   } catch (error) {
-    if (requestId === state.snapshotRequestSequence) showNotice(error.message, 'notice-danger');
+    if (requestId === state.snapshotRequestSequence && requestIsCurrent()) {
+      showNotice(error.message, 'notice-danger');
+    }
   } finally {
     state.snapshotRequestsPending = Math.max(0, state.snapshotRequestsPending - 1);
     elements.loadingLabel.hidden = state.snapshotRequestsPending === 0;
@@ -2050,6 +2129,11 @@ async function loadSnapshot(options = {}) {
 elements.refreshButton.addEventListener('click', () => loadSnapshot({ resumeJobs: true }));
 async function previewSelection() {
   if (state.previewRequestPending) return;
+  const selectionVisibilityProblem = hiddenSelectionProblem();
+  if (selectionVisibilityProblem) {
+    showNotice('无法检查差异：' + selectionVisibilityProblem + '。', 'notice-warning');
+    return false;
+  }
   if (!comparisonAvailable()) {
     showNotice('Sub2API 账号尚未成功读取，无法检查同步差异。', 'notice-warning');
     return;
@@ -2094,6 +2178,11 @@ elements.previewButton.addEventListener('click', previewSelection);
 
 elements.importButton.addEventListener('click', async () => {
   if (!state.plan || state.importRequestPending) return;
+  const selectionVisibilityProblem = hiddenSelectionProblem(state.plan.selectedKeys);
+  if (selectionVisibilityProblem) {
+    showNotice('无法确认导入：' + selectionVisibilityProblem + '。', 'notice-warning');
+    return;
+  }
   if (!comparisonAvailable()) {
     showNotice('Sub2API 账号尚未成功读取，无法执行同步导入。', 'notice-warning');
     return;
@@ -2131,6 +2220,11 @@ elements.importButton.addEventListener('click', async () => {
 
 elements.phase3Button.addEventListener('click', async () => {
   if (state.phase3RequestPending) return;
+  const selectionVisibilityProblem = hiddenSelectionProblem();
+  if (selectionVisibilityProblem) {
+    showNotice('无法提交 Phase 3：' + selectionVisibilityProblem + '。', 'notice-warning');
+    return;
+  }
   const selectedRows = selectedRowsFromSelection();
   const targets = phase3TargetsFromRows(selectedRows);
   const selectionProblem = phase3SelectionProblem(selectedRows, state.selected.size);
@@ -2164,6 +2258,11 @@ elements.phase3Button.addEventListener('click', async () => {
 if (elements.accountTestButton) {
   elements.accountTestButton.addEventListener('click', async () => {
     if (state.accountTestRequestPending) return;
+    const selectionVisibilityProblem = hiddenSelectionProblem();
+    if (selectionVisibilityProblem) {
+      showNotice('无法提交账号测试：' + selectionVisibilityProblem + '。', 'notice-warning');
+      return;
+    }
     const selectedRows = selectedRowsFromSelection();
     const targets = accountTestRows(selectedRows);
     const invalidSelectedRow = selectedRows.some((row) => (
@@ -2270,6 +2369,7 @@ if (elements.historicalToggle) {
 
 function updateActionState() {
   const selectedRows = selectedRowsFromSelection();
+  const selectionVisibilityProblem = hiddenSelectionProblem();
   const phase3Targets = phase3TargetsFromRows(selectedRows);
   const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
   const testTargets = accountTestRows(selectedRows);
@@ -2277,11 +2377,13 @@ function updateActionState() {
     !Number.isSafeInteger(Number(row?.accountId)) || Number(row.accountId) <= 0
   ));
   const canRunAccountTest = state.selected.size > 0
+    && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
     && !invalidTestRow
     && testTargets.length > 0
     && !state.snapshot?.readOnly;
   const canRunPhase3 = state.selected.size > 0
+    && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
     && phase3Targets.length > 0
     && !phase3Problem
@@ -2294,8 +2396,12 @@ function updateActionState() {
     elements.accountTestButton.disabled = mutationLocked || !canRunAccountTest;
     if (writeBlocked) {
       elements.accountTestButton.title = '存在待人工对账任务，当前全部写操作已阻止';
+    } else if (state.jobInventoryVerified !== true) {
+      elements.accountTestButton.title = '正在确认后台任务和待对账项，暂不可操作';
     } else if (locked) {
       elements.accountTestButton.title = '另一个任务或请求执行中';
+    } else if (selectionVisibilityProblem) {
+      elements.accountTestButton.title = selectionVisibilityProblem;
     } else if (!canRunAccountTest) {
       elements.accountTestButton.title = '请选择已导入 Sub2API 的上游账号';
     } else {
@@ -2305,16 +2411,20 @@ function updateActionState() {
   elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
   elements.selectAll.disabled = locked;
   document.querySelectorAll('.row-check').forEach((input) => { input.disabled = locked; });
-  elements.previewButton.disabled = locked || !comparisonAvailable();
+  elements.previewButton.disabled = locked || !comparisonAvailable() || Boolean(selectionVisibilityProblem);
   updateImportButtonState();
   elements.importButton.title = writeBlocked
     ? '存在待人工对账任务，当前全部写操作已阻止'
-    : '';
+    : state.jobInventoryVerified !== true
+      ? '正在确认后台任务和待对账项，暂不可操作'
+      : hiddenSelectionProblem(state.plan?.selectedKeys);
   if (elements.cleanupButton) {
-    elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || mutationLocked;
+    elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || mutationLocked || !state.snapshot;
     elements.cleanupButton.title = writeBlocked
       ? '存在待人工对账任务，当前全部写操作已阻止'
-      : '';
+      : state.jobInventoryVerified !== true
+        ? '正在确认后台任务和待对账项，暂不可操作'
+        : '';
   }
   if (elements.reconciliationAckButton) {
     const target = reconciliationHoldTarget();
@@ -2324,16 +2434,22 @@ function updateActionState() {
   }
   if (writeBlocked) {
     elements.phase3Button.title = '存在待人工对账任务，当前全部写操作已阻止';
+  } else if (state.jobInventoryVerified !== true) {
+    elements.phase3Button.title = '正在确认后台任务和待对账项，暂不可操作';
   } else if (locked) {
     elements.phase3Button.title = '另一个任务或请求执行中';
+  } else if (selectionVisibilityProblem) {
+    elements.phase3Button.title = selectionVisibilityProblem;
   } else if (!canRunPhase3) {
     elements.phase3Button.title = phase3Problem || '请选择至少一个符合条件的账号';
   } else {
     elements.phase3Button.title = '按顺序为已选账号运行 Phase 3';
   }
-  elements.previewButton.title = comparisonAvailable()
-    ? '检查所选账号与 Sub2API 的同步差异'
-    : 'Sub2API 账号尚未成功读取，无法比较或同步';
+  elements.previewButton.title = state.jobInventoryVerified !== true
+    ? '正在确认后台任务和待对账项，暂不可操作'
+    : selectionVisibilityProblem || (comparisonAvailable()
+      ? '检查所选账号与 Sub2API 的同步差异'
+      : 'Sub2API 账号尚未成功读取，无法比较或同步');
 }
 
 function applyColumnVisibility() {
