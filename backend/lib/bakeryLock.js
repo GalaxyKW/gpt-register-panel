@@ -5,6 +5,7 @@ const path = require('node:path');
 const PROTOCOL = 'lamport-bakery';
 const PROTOCOL_VERSION = 2;
 const RELEASE_ATTEMPTS = 3;
+const MAX_DIRECTORY_ENTRIES = 20_000;
 const poisonedNamespaces = new Map();
 
 // `lockName` is an immutable namespace marker and is never removed. Each
@@ -194,26 +195,39 @@ function leaseFileName(context, token, phase) {
 }
 
 function scanLeaseEntries(context) {
-  const names = fs.readdirSync(context.accessDirectory);
   const prefix = context.lockName + '.lease-v2-';
   const groups = new Map();
-  for (const name of names) {
-    if (!name.startsWith(prefix)) continue;
-    const match = /^([a-f0-9]{32})\.(choosing|ticket)$/i.exec(name.slice(prefix.length));
-    if (!match) throw lockError(context.invalidCode, context.invalidMessage);
-    const token = match[1].toLowerCase();
-    const phase = match[2];
-    const entryPath = path.join(context.accessDirectory, name);
-    const observed = stableRecord(entryPath, context);
-    if (observed.state === 'missing') continue;
-    validateLeaseRecord(observed.record, { token, phase }, context);
-    let group = groups.get(token);
-    if (!group) {
-      group = { token, choosing: null, ticket: null };
-      groups.set(token, group);
+  let directory;
+  let observedEntries = 0;
+  try {
+    directory = fs.opendirSync(context.accessDirectory);
+    for (let entry = directory.readSync(); entry !== null; entry = directory.readSync()) {
+      observedEntries += 1;
+      if (observedEntries > context.maximumDirectoryEntries) {
+        throw lockError(context.invalidCode, '锁目录条目超过安全上限，拒绝继续扫描');
+      }
+      const name = entry.name;
+      if (!name.startsWith(prefix)) continue;
+      const match = /^([a-f0-9]{32})\.(choosing|ticket)$/i.exec(name.slice(prefix.length));
+      if (!match) throw lockError(context.invalidCode, context.invalidMessage);
+      const token = match[1].toLowerCase();
+      const phase = match[2];
+      const entryPath = path.join(context.accessDirectory, name);
+      const observed = stableRecord(entryPath, context);
+      if (observed.state === 'missing') continue;
+      validateLeaseRecord(observed.record, { token, phase }, context);
+      let group = groups.get(token);
+      if (!group) {
+        group = { token, choosing: null, ticket: null };
+        groups.set(token, group);
+      }
+      if (group[phase]) throw lockError(context.invalidCode, context.invalidMessage);
+      group[phase] = { ...observed, path: entryPath };
     }
-    if (group[phase]) throw lockError(context.invalidCode, context.invalidMessage);
-    group[phase] = { ...observed, path: entryPath };
+  } finally {
+    if (directory) {
+      try { directory.closeSync(); } catch {}
+    }
   }
 
   for (const group of groups.values()) {
@@ -352,6 +366,11 @@ function normalizeContext(options) {
   }
   const directory = fs.fstatSync(options.directoryDescriptor);
   const namespaceKey = [directory.dev, directory.ino, options.kind, options.lockName].join(':');
+  const configuredDirectoryEntries = Number(options.maximumDirectoryEntries);
+  const maximumDirectoryEntries = Number.isSafeInteger(configuredDirectoryEntries)
+      && configuredDirectoryEntries > 0
+    ? Math.min(configuredDirectoryEntries, MAX_DIRECTORY_ENTRIES)
+    : MAX_DIRECTORY_ENTRIES;
   return {
     ...options,
     namespaceKey,
@@ -367,6 +386,7 @@ function normalizeContext(options) {
     interruptedMessage: options.interruptedMessage || '面板正在停止，锁等待已中断',
     timeoutMs: Math.max(1, Number(options.timeoutMs) || 30000),
     pollMs: Math.max(1, Number(options.pollMs) || 25),
+    maximumDirectoryEntries,
   };
 }
 

@@ -191,6 +191,39 @@ test('bakery lock cancellation interrupts polling and removes only its own lease
   }
 });
 
+test('bakery lock bounds the complete directory scan before allocating an unbounded name list', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-bounded-'));
+  const lockName = 'bounded.lock';
+  fs.writeFileSync(path.join(root, 'unrelated-a'), 'a');
+  fs.writeFileSync(path.join(root, 'unrelated-b'), 'b');
+  const descriptor = fs.openSync(
+    root,
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0),
+  );
+  const accessDirectory = process.platform === 'linux'
+    ? '/proc/self/fd/' + descriptor
+    : root;
+  try {
+    await assert.rejects(acquireBakeryLease({
+      directoryDescriptor: descriptor,
+      accessDirectory,
+      lockName,
+      kind: 'test-bounded-bakery-lock',
+      owner: currentProcessOwner(),
+      isOwnerAlive: () => true,
+      timeoutMs: 1_000,
+      pollMs: 10,
+      maximumDirectoryEntries: 3,
+      invalidCode: 'TEST_LOCK_DIRECTORY_LIMIT',
+    }), (error) => error.code === 'TEST_LOCK_DIRECTORY_LIMIT'
+      && /条目超过安全上限/.test(error.message));
+    assert.deepEqual(leaseEntries(root, lockName), []);
+    assert.equal(fs.existsSync(path.join(root, lockName)), true);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+});
+
 test('control-plane in-process queue cancellation never runs the queued callback', async () => {
   let releaseFirst;
   let markFirstEntered;
