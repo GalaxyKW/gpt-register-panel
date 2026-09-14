@@ -858,24 +858,28 @@ test('token rows join one username phone without changing sync identity', () => 
     email: ' Source@Example.test ',
     parseStatus: 'ok',
     expiryStatus: 'missing',
+    contentHash: 'a'.repeat(64),
     identityKeys: ['email:source@example.test'],
     fingerprints: { access: tokenFingerprint('synthetic-access') },
     raw: {},
   };
   const usernames = [{
+    index: 0,
     email: 'source@example.test',
     phone: '+86 138-0013-8000',
+    phoneValid: true,
     hasPassword: true,
     status: 'oauth_done',
   }];
   const rows = buildRows({
     items: [{ kind: 'token_only', token, account: null, issues: [] }],
-  }, { usernames });
+  }, { usernames, usernameContentHash: 'b'.repeat(64) });
 
   assert.equal(rows[0].usernameMatch, 'unique');
   assert.equal(rows[0].phone, '+86 138-0013-8000');
   assert.equal(rows[0].phase3Email, 'source@example.test');
   assert.equal(rows[0].phase3Eligible, true);
+  assert.match(rows[0].phase3TargetRevision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
   assert.deepEqual(filterRows(rows, { search: '13800138000' }).map((row) => row.key), [rows[0].key]);
   assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'identityKeys'), false);
 

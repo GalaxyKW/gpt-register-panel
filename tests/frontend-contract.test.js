@@ -129,6 +129,7 @@ test('frontend import confirmation calls out selected superseded token files', a
     },
     comparisonAvailable: () => true,
     hiddenSelectionProblem: () => '',
+    syncSelectionProblem: () => '',
     showNotice() {},
     window: {
       confirm(message) {
@@ -142,6 +143,137 @@ test('frontend import confirmation calls out selected superseded token files', a
   assert.match(confirmation, /1 个所选旧副本/);
   assert.match(confirmation, /排序首选版本/);
   assert.match(confirmation, /确认将预览中的新增\/更新写入 Sub2API/);
+});
+
+test('frontend rejects non-importable sync selections before requesting either preview or import', async () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
+  const previewContract = sourceSection(
+    'async function previewSelection',
+    "elements.previewButton.addEventListener('click', previewSelection);",
+  );
+  const importHandler = sourceSection(
+    "elements.importButton.addEventListener('click'",
+    "elements.phase3Button.addEventListener('click'",
+  );
+  const validKey = 'token:tokens:tokens/valid.json';
+  const remoteKey = 'account:27';
+  const historicalKey = 'token:tokens:tokens/old_codex-valid.json';
+  const invalidKey = 'token:use_token:use_token/invalid.json';
+  const malformedKey = 'token:tokens:tokens/../outside.json';
+  const rows = [
+    {
+      key: validKey,
+      source: 'tokens',
+      sourceDetails: { relativePath: 'tokens/valid.json' },
+      diffKind: 'token_only',
+      historical: false,
+    },
+    {
+      key: remoteKey,
+      source: 'sub2api',
+      sourceDetails: null,
+      diffKind: 'sub2api_only',
+      historical: false,
+    },
+    {
+      key: historicalKey,
+      source: 'tokens',
+      sourceDetails: { relativePath: 'tokens/old_codex-valid.json' },
+      diffKind: 'historical_backup',
+      historical: true,
+    },
+    {
+      key: invalidKey,
+      source: 'use_token',
+      sourceDetails: { relativePath: 'use_token/invalid.json' },
+      diffKind: 'invalid_file',
+      historical: false,
+    },
+    {
+      key: malformedKey,
+      source: 'tokens',
+      sourceDetails: { relativePath: 'tokens/../outside.json' },
+      diffKind: 'token_only',
+      historical: false,
+    },
+  ];
+  const helperContext = {
+    state: { snapshot: { rows } },
+  };
+  vm.runInNewContext(comparisonContract + `
+    result = {
+      valid: syncSelectionProblem([${JSON.stringify(validKey)}]),
+      remote: syncSelectionProblem([${JSON.stringify(remoteKey)}]),
+      historical: syncSelectionProblem([${JSON.stringify(historicalKey)}]),
+      invalid: syncSelectionProblem([${JSON.stringify(invalidKey)}]),
+      malformed: syncSelectionProblem([${JSON.stringify(malformedKey)}]),
+      stale: syncSelectionProblem(['missing-row']),
+    };
+  `, helperContext);
+  assert.equal(helperContext.result.valid, '');
+  assert.match(helperContext.result.remote, /仅 Sub2API 账号/);
+  assert.match(helperContext.result.historical, /historical\/old_codex 历史备份/);
+  assert.match(helperContext.result.invalid, /无法解析的 token 文件/);
+  assert.match(helperContext.result.malformed, /活动 token 文件键/);
+  assert.match(helperContext.result.stale, /当前快照/);
+
+  let previewRequests = 0;
+  const previewNotices = [];
+  const previewContext = {
+    state: {
+      snapshot: {
+        rows,
+        sub2api: { readStatus: 'ok' },
+        diff: { comparisonStatus: 'complete' },
+      },
+      selected: new Set([remoteKey]),
+      previewRequestPending: false,
+    },
+    hiddenSelectionProblem: () => '',
+    apiFetch: async () => { previewRequests += 1; throw new Error('must not request'); },
+    showNotice: (...args) => previewNotices.push(args),
+  };
+  vm.runInNewContext(comparisonContract + '\n' + previewContract
+    + '\npreviewPromise = previewSelection();', previewContext);
+  assert.equal(await previewContext.previewPromise, false);
+  assert.equal(previewRequests, 0);
+  assert.match(previewNotices.at(-1)[0], /无法检查差异：.*仅 Sub2API 账号/);
+
+  let importRequests = 0;
+  let confirmations = 0;
+  let importClickHandler;
+  const importNotices = [];
+  const importContext = {
+    state: {
+      snapshot: {
+        rows,
+        sub2api: { readStatus: 'ok' },
+        diff: { comparisonStatus: 'complete' },
+      },
+      plan: {
+        selectedKeys: [historicalKey],
+        items: [],
+      },
+      importRequestPending: false,
+    },
+    elements: {
+      importButton: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          importClickHandler = handler;
+        },
+      },
+    },
+    hiddenSelectionProblem: () => '',
+    idempotentMutationFetch: async () => { importRequests += 1; throw new Error('must not request'); },
+    showNotice: (...args) => importNotices.push(args),
+    window: { confirm: () => { confirmations += 1; return true; } },
+  };
+  vm.runInNewContext(comparisonContract + '\n' + importHandler, importContext);
+  await importClickHandler();
+  assert.equal(importRequests, 0);
+  assert.equal(confirmations, 0);
+  assert.match(importNotices.at(-1)[0], /无法确认导入：.*historical\/old_codex 历史备份/);
 });
 
 test('frontend polling helper keeps an unknown task locked and schedules a slower retry', () => {
@@ -937,7 +1069,7 @@ test('frontend globally locks mutating actions while any request or task is unre
   assert.match(updateContract, /phase3Button\.disabled = mutationLocked/);
   assert.match(updateContract, /accountTestButton\.disabled = mutationLocked/);
   assert.match(updateContract, /previewButton\.disabled = locked/);
-  assert.match(updateContract, /previewButton\.disabled = locked \|\| !comparisonAvailable\(\)/);
+  assert.match(updateContract, /previewButton\.disabled = locked[\s\S]*!comparisonAvailable\(\)[\s\S]*Boolean\(syncProblem\)/);
   assert.match(updateContract, /phase3Button\.disabled = mutationLocked \|\| !canRunPhase3/);
   assert.match(updateContract, /clearSelectionButton\.disabled = locked/);
   assert.match(updateContract, /selectAll\.disabled = locked/);
@@ -1490,9 +1622,12 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
   assert.doesNotMatch(cleanupHandler, /hiddenSelectionProblem/);
   assert.match(cleanupHandler, /listing\.recoveryRequired === true/);
   assert.match(cleanupHandler, /未完成的过期 token 隔离 claim/);
-  assert.match(cleanupHandler, /这是全局操作，不受当前筛选和选择影响/);
+  assert.match(cleanupHandler, /这是 tokens 与 use_token 活动目录的全局操作/);
+  assert.match(cleanupHandler, /historical\/old_codex 历史备份不在扫描和隔离范围内/);
   assert.match(htmlSource, /全局维护 · 不受筛选和选择影响/);
   assert.match(htmlSource, /全局扫描并隔离过期 token/);
+  assert.match(htmlSource, /不含 historical\/old_codex 历史备份/);
+  assert.doesNotMatch(htmlSource, /所有已过期 JSON 文件/);
   assert.match(sourceSection('function updateActionState', 'function applyColumnVisibility'),
     /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
 });
@@ -1728,6 +1863,9 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
         phase3Eligible: true,
         phase3Email: 'missing-revision@example.test',
       }], 1),
+      historicalReason: phase3ReasonLabel('phase3_source_historical'),
+      invalidPhoneReason: phase3ReasonLabel('username_phone_invalid'),
+      invalidTargetReason: phase3ReasonLabel('phase3_target_invalid'),
     };
   `, context);
   assert.deepEqual(JSON.parse(JSON.stringify(context.result.eligible)), [{
@@ -1742,6 +1880,9 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   assert.deepEqual([...context.result.legacyRemote], []);
   assert.deepEqual([...context.result.malformedEligibility], []);
   assert.match(context.result.missingRevisionProblem, /快照凭证/);
+  assert.match(context.result.historicalReason, /historical\/old_codex 历史 token/);
+  assert.match(context.result.invalidPhoneReason, /手机号格式无效/);
+  assert.match(context.result.invalidTargetReason, /快照字段不完整或格式无效/);
 });
 
 test('frontend Phase3 preserves every selected row when strong identities overlap', () => {
@@ -1864,6 +2005,7 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
     accountTestTargetsFromRows: () => ({ targets: [], problem: '' }),
     actionsLocked: () => false,
     reconciliationWriteBlocked: () => false,
+    syncSelectionProblem: () => '',
     updateImportButtonState() {},
     comparisonAvailable: () => true,
   };

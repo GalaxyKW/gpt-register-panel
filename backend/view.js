@@ -35,6 +35,15 @@ function usernameAssociation(token, usernameIndex, options = {}) {
       usernameMatch: 'not_applicable',
     };
   }
+  if (token.historical === true) {
+    return {
+      phone: '',
+      phase3Email: normalizeEmail(token.email),
+      phase3Eligible: false,
+      phase3Reason: 'phase3_source_historical',
+      usernameMatch: 'not_applicable',
+    };
+  }
   const email = normalizeEmail(token.email);
   const matches = email ? (usernameIndex.get(email) || []) : [];
   if (matches.length === 0) {
@@ -58,6 +67,15 @@ function usernameAssociation(token, usernameIndex, options = {}) {
   const username = matches[0];
   const phone = String(username?.phone || '').trim();
   const status = String(username?.status || '').trim().toLowerCase();
+  if (username?.phoneValid === false) {
+    return {
+      phone: '',
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_phone_invalid',
+      usernameMatch: 'unique',
+    };
+  }
   if (username?.hasPassword !== true) {
     return {
       phone,
@@ -76,16 +94,26 @@ function usernameAssociation(token, usernameIndex, options = {}) {
       usernameMatch: 'unique',
     };
   }
+  const revision = phase3TargetRevision({
+    token,
+    username,
+    usernameContentHash: options.usernameContentHash,
+  });
+  if (!revision) {
+    return {
+      phone,
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'phase3_target_invalid',
+      usernameMatch: 'unique',
+    };
+  }
   return {
     phone,
     phase3Email: email,
     phase3Eligible: true,
     phase3Reason: null,
-    phase3TargetRevision: phase3TargetRevision({
-      token,
-      username,
-      usernameContentHash: options.usernameContentHash,
-    }),
+    phase3TargetRevision: revision,
     usernameMatch: 'unique',
   };
 }

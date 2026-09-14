@@ -232,10 +232,13 @@ function actionReasonLabel(reason) {
 function phase3ReasonLabel(reason) {
   return {
     token_missing: '该行仅来自 Sub2API，缺少对应 token 文件',
+    phase3_source_historical: '该行是 historical/old_codex 历史 token，不能用于 Phase 3',
     username_missing: 'token 邮箱在 username.json 中没有对应账号',
     username_ambiguous: 'token 邮箱在 username.json 中匹配到多个账号',
+    username_phone_invalid: 'username.json 对应账号的手机号格式无效',
     username_password_missing: 'username.json 对应账号缺少密码',
     username_terminal: 'username.json 对应账号已删除、停用或禁用',
+    phase3_target_invalid: 'token 或 username.json 的快照字段不完整或格式无效，无法生成 Phase 3 凭证',
   }[reason] || '该账号不符合 Phase 3 条件';
 }
 
@@ -836,14 +839,58 @@ function comparisonAvailable(snapshot = state.snapshot) {
     && (status === undefined || status === 'complete');
 }
 
+function syncSelectionProblem(selectedKeys = state.selected) {
+  const keys = selectedKeys instanceof Set ? [...selectedKeys] : [...(selectedKeys || [])];
+  if (keys.length === 0) return '';
+  // A pre-upgrade snapshot is allowed to reach the server for authoritative
+  // validation. Current snapshots always include rows and can reject choices
+  // that the import planner necessarily excludes before making a request.
+  if (!Array.isArray(state.snapshot?.rows)) return '';
+  const selected = new Set(keys);
+  const rows = state.snapshot.rows.filter((row) => selected.has(row?.key));
+  if (rows.length !== keys.length) {
+    return '所选项目已不在当前快照中，请刷新后重新选择';
+  }
+  if (rows.some((row) => row?.historical === true || row?.diffKind === 'historical_backup')) {
+    return '所选项目包含 historical/old_codex 历史备份；历史 token 不参与同步导入';
+  }
+  if (rows.some((row) => row?.source === 'sub2api'
+      || row?.diffKind === 'sub2api_only'
+      || row?.sourceDetails === null)) {
+    return '所选项目包含仅 Sub2API 账号；同步导入只能选择本地 token 文件';
+  }
+  if (rows.some((row) => row?.diffKind === 'invalid_file')) {
+    return '所选项目包含无法解析的 token 文件；请修复或移除后再检查差异';
+  }
+  const invalidSource = rows.some((row) => {
+    const source = String(row?.source || '');
+    const key = String(row?.key || '');
+    if (!['tokens', 'use_token'].includes(source)) return true;
+    const prefix = 'token:' + source + ':';
+    if (!key.startsWith(prefix)) return true;
+    const relativePath = key.slice(prefix.length);
+    const segments = relativePath.split('/');
+    return relativePath.includes('\\')
+      || segments.length < 2
+      || segments[0] !== source
+      || segments.some((segment) => !segment || segment === '.' || segment === '..')
+      || !segments.at(-1).toLowerCase().endsWith('.json');
+  });
+  return invalidSource
+    ? '所选项目缺少后端可接受的活动 token 文件键；请刷新后重新选择'
+    : '';
+}
+
 function updateImportButtonState() {
   const items = state.plan?.items || [];
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
   const hiddenSelection = hiddenSelectionProblem(state.plan?.selectedKeys);
+  const selectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   elements.importButton.disabled = !state.plan
     || actionsLocked()
     || reconciliationWriteBlocked()
     || Boolean(hiddenSelection)
+    || Boolean(selectionProblem)
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || state.plan.selectedKeys.length === 0
@@ -2460,6 +2507,11 @@ async function previewSelection() {
     showNotice('无法检查差异：' + selectionVisibilityProblem + '。', 'notice-warning');
     return false;
   }
+  const selectionProblem = syncSelectionProblem();
+  if (selectionProblem) {
+    showNotice('无法检查差异：' + selectionProblem + '。', 'notice-warning');
+    return false;
+  }
   if (!comparisonAvailable()) {
     showNotice('Sub2API 账号尚未成功读取，无法检查同步差异。', 'notice-warning');
     return;
@@ -2507,6 +2559,11 @@ elements.importButton.addEventListener('click', async () => {
   const selectionVisibilityProblem = hiddenSelectionProblem(state.plan.selectedKeys);
   if (selectionVisibilityProblem) {
     showNotice('无法确认导入：' + selectionVisibilityProblem + '。', 'notice-warning');
+    return;
+  }
+  const selectionProblem = syncSelectionProblem(state.plan.selectedKeys);
+  if (selectionProblem) {
+    showNotice('无法确认导入：' + selectionProblem + '。', 'notice-warning');
     return;
   }
   if (!comparisonAvailable()) {
@@ -2643,32 +2700,32 @@ if (elements.cleanupButton) {
       const expiredCount = Number(listing.count);
       if (!Number.isSafeInteger(expiredCount) || expiredCount < 0 || expiredCount > 1_000_000
           || !Array.isArray(listing.items)) {
-        throw new Error('服务器返回的过期 token 清单无效，已停止全局清理');
+        throw new Error('服务器返回的过期 token 清单无效，已停止活动目录清理');
       }
       if (listing.recoveryRequired === true) {
         const claimCount = Number.isSafeInteger(Number(listing.claimCount))
           ? Math.max(0, Number(listing.claimCount))
           : 0;
-        showNotice('检测到 ' + claimCount + ' 个未完成的过期 token 隔离 claim；请先人工核对并恢复，当前不会创建新的全局清理任务。', 'notice-danger');
+        showNotice('检测到 ' + claimCount + ' 个未完成的过期 token 隔离 claim；请先人工核对并恢复，当前不会创建新的活动目录清理任务。', 'notice-danger');
         state.cleanupRequestPending = false;
         updateActionState();
         return;
       }
       if (expiredCount === 0) {
-        showNotice('没有发现可安全删除的过期 token。', 'notice-info');
+        showNotice('tokens 与 use_token 活动目录中没有发现可安全隔离的过期 token；historical/old_codex 历史备份不在清理范围内。', 'notice-info');
         state.cleanupRequestPending = false;
         updateActionState();
         return;
       }
       if (!/^[a-f0-9]{64}$/i.test(String(listing.version || ''))) {
-        throw new Error('服务器返回的过期 token 清单版本无效，已停止全局清理');
+        throw new Error('服务器返回的过期 token 清单版本无效，已停止活动目录清理');
       }
       const preview = listing.items.slice(0, 3)
         .map((item) => String(item?.relativePath || '').slice(0, 120))
         .filter(Boolean)
         .join('、');
       const suffix = expiredCount > 3 ? ' 等' : '';
-      if (!window.confirm('这是全局操作，不受当前筛选和选择影响。将把 ' + expiredCount + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) {
+      if (!window.confirm('这是 tokens 与 use_token 活动目录的全局操作，不受当前筛选和选择影响；historical/old_codex 历史备份不在扫描和隔离范围内。将把 ' + expiredCount + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) {
         state.cleanupRequestPending = false;
         updateActionState();
         return;
@@ -2682,7 +2739,7 @@ if (elements.cleanupButton) {
       if (!/^job_[a-f0-9]{24}$/.test(String(result.jobId || ''))) {
         throw new Error('过期 token 清理未返回有效任务编号');
       }
-      showNotice('过期 token 清理任务已排队，正在等待执行结果。', 'notice-info');
+      showNotice('活动目录过期 token 清理任务已排队（不含 historical/old_codex 历史备份），正在等待执行结果。', 'notice-info');
       await watchJob(result.jobId, 'token_cleanup');
     } catch (error) {
       state.cleanupRequestPending = false;
@@ -2715,6 +2772,8 @@ if (elements.historicalToggle) {
 function updateActionState() {
   const selectedRows = selectedRowsFromSelection();
   const selectionVisibilityProblem = hiddenSelectionProblem();
+  const syncProblem = syncSelectionProblem();
+  const importSelectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   const phase3Targets = phase3TargetsFromRows(selectedRows);
   const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
   const testSelection = accountTestTargetsFromRows(selectedRows);
@@ -2762,20 +2821,23 @@ function updateActionState() {
   elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
   elements.selectAll.disabled = locked;
   document.querySelectorAll('.row-check').forEach((input) => { input.disabled = locked; });
-  elements.previewButton.disabled = locked || !comparisonAvailable() || Boolean(selectionVisibilityProblem);
+  elements.previewButton.disabled = locked
+    || !comparisonAvailable()
+    || Boolean(selectionVisibilityProblem)
+    || Boolean(syncProblem);
   updateImportButtonState();
   elements.importButton.title = writeBlocked
     ? '存在待人工对账任务，当前全部写操作已阻止'
     : state.jobInventoryVerified !== true
       ? '正在确认后台任务和待对账项，暂不可操作'
-      : hiddenSelectionProblem(state.plan?.selectedKeys);
+      : hiddenSelectionProblem(state.plan?.selectedKeys) || importSelectionProblem;
   if (elements.cleanupButton) {
     elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || mutationLocked || !state.snapshot;
     elements.cleanupButton.title = writeBlocked
       ? '存在待人工对账任务，当前全部写操作已阻止'
       : state.jobInventoryVerified !== true
         ? '正在确认后台任务和待对账项，暂不可操作'
-        : '全局扫描 tokens 和 use_token；不受当前筛选和选择影响';
+        : '全局扫描 tokens 和 use_token 活动目录；不含 historical/old_codex 历史备份，不受当前筛选和选择影响';
   }
   if (elements.reconciliationAckButton) {
     const target = reconciliationHoldTarget();
@@ -2798,7 +2860,7 @@ function updateActionState() {
   }
   elements.previewButton.title = state.jobInventoryVerified !== true
     ? '正在确认后台任务和待对账项，暂不可操作'
-    : selectionVisibilityProblem || (comparisonAvailable()
+    : selectionVisibilityProblem || syncProblem || (comparisonAvailable()
       ? '检查所选账号与 Sub2API 的同步差异'
       : 'Sub2API 账号尚未成功读取，无法比较或同步');
 }

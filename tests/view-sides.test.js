@@ -183,6 +183,65 @@ test('view rows use null for the side that does not exist', () => {
   assert.equal(remoteOnly.schedulableKnown, false);
 });
 
+test('view rows explicitly reject historical tokens and invalid username phones for Phase3', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/phase3-source.json',
+    fileName: 'phase3-source.json',
+    email: 'phase3-source@example.test',
+    parseStatus: 'ok',
+    contentHash: 'a'.repeat(64),
+    identityKeys: ['account:phase3-source-account'],
+    fingerprints: {},
+  };
+  const username = {
+    index: 0,
+    email: token.email,
+    phone: '13800138000',
+    phoneValid: true,
+    hasPassword: true,
+    status: 'oauth_done',
+  };
+  const item = { kind: 'token_only', issues: [], token, account: null };
+  const options = {
+    usernames: [username],
+    usernameContentHash: 'b'.repeat(64),
+  };
+
+  const eligible = rowFromDiffItem(item, options);
+  assert.equal(eligible.phase3Eligible, true);
+  assert.match(eligible.phase3TargetRevision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
+
+  const historical = rowFromDiffItem({
+    ...item,
+    kind: 'historical_backup',
+    token: { ...token, historical: true },
+  }, options);
+  assert.equal(historical.historical, true);
+  assert.equal(historical.phase3Eligible, false);
+  assert.equal(historical.phase3Reason, 'phase3_source_historical');
+  assert.equal(historical.phase3TargetRevision, null);
+
+  const invalidPhone = rowFromDiffItem(item, {
+    ...options,
+    usernames: [{ ...username, phone: '', phoneValid: false }],
+  });
+  assert.equal(invalidPhone.usernameMatch, 'unique');
+  assert.equal(invalidPhone.phone, '');
+  assert.equal(invalidPhone.phase3Eligible, false);
+  assert.equal(invalidPhone.phase3Reason, 'username_phone_invalid');
+  assert.equal(invalidPhone.phase3TargetRevision, null);
+
+  const invalidTarget = rowFromDiffItem({
+    ...item,
+    token: { ...token, relativePath: 'tokens/../phase3-source.json' },
+  }, options);
+  assert.equal(invalidTarget.usernameMatch, 'unique');
+  assert.equal(invalidTarget.phase3Eligible, false);
+  assert.equal(invalidTarget.phase3Reason, 'phase3_target_invalid');
+  assert.equal(invalidTarget.phase3TargetRevision, null);
+});
+
 test('view rows preserve the three-state Sub2API scheduler contract', () => {
   const enabled = rowFromDiffItem({
     kind: 'sub2api_only',
