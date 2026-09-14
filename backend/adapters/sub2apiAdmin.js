@@ -47,6 +47,86 @@ function asList(value) {
   return null;
 }
 
+const ACCOUNT_LIST_ALIASES = Object.freeze(['items', 'records', 'list', 'accounts']);
+
+function hasOwn(object, key) {
+  return Boolean(object && Object.prototype.hasOwnProperty.call(object, key));
+}
+
+function accountListRows(value, requireCanonical = false) {
+  if (Array.isArray(value)) {
+    return requireCanonical ? { rows: null, invalid: true } : { rows: value, invalid: false };
+  }
+  if (!isPlainObject(value)) return { rows: null, invalid: true };
+  const aliases = ACCOUNT_LIST_ALIASES.filter((key) => hasOwn(value, key));
+  if (aliases.length !== 1) return { rows: null, invalid: true };
+  if (requireCanonical && aliases[0] !== 'items') return { rows: null, invalid: true };
+  return Array.isArray(value[aliases[0]])
+    ? { rows: value[aliases[0]], invalid: false }
+    : { rows: null, invalid: true };
+}
+
+function canonicalPaginationInteger(value, minimum) {
+  return typeof value === 'number'
+    && Number.isSafeInteger(value)
+    && value >= minimum
+    ? value
+    : null;
+}
+
+function paginationAlias(value, directKeys, nestedKeys, parser) {
+  const entries = [];
+  for (const key of directKeys) {
+    if (hasOwn(value, key)) entries.push(value[key]);
+  }
+  const hasPagination = hasOwn(value, 'pagination')
+    && value.pagination !== undefined
+    && value.pagination !== null;
+  if (hasPagination && !isPlainObject(value.pagination)) {
+    return { provided: true, value: null, invalid: true, conflict: false };
+  }
+  if (hasPagination) {
+    for (const key of nestedKeys) {
+      if (hasOwn(value.pagination, key)) entries.push(value.pagination[key]);
+    }
+  }
+  if (entries.length === 0) {
+    return { provided: false, value: null, invalid: false, conflict: false };
+  }
+  const normalized = entries.map(parser);
+  const valid = normalized.filter((item) => item !== null);
+  return {
+    provided: true,
+    value: valid[0] ?? null,
+    invalid: valid.length !== normalized.length,
+    conflict: new Set(valid).size > 1,
+  };
+}
+
+function accountPagination(value) {
+  return {
+    total: paginationAlias(value, ['total'], ['total'], paginationTotal),
+    page: paginationAlias(
+      value,
+      ['page'],
+      ['page'],
+      (item) => canonicalPaginationInteger(item, 1),
+    ),
+    pageSize: paginationAlias(
+      value,
+      ['page_size', 'pageSize'],
+      ['page_size', 'pageSize'],
+      (item) => canonicalPaginationInteger(item, 1),
+    ),
+    pages: paginationAlias(
+      value,
+      ['pages', 'total_pages', 'totalPages'],
+      ['pages', 'total_pages', 'totalPages'],
+      (item) => canonicalPaginationInteger(item, 1),
+    ),
+  };
+}
+
 function unwrapData(value) {
   if (value && typeof value === 'object' && Object.prototype.hasOwnProperty.call(value, 'data')) {
     return value.data;
@@ -1005,7 +1085,14 @@ class Sub2ApiAdminClient {
   }
 
   async listAccounts(options = {}) {
-    const pageSize = Number(options.pageSize || 200);
+    const pageSize = options.pageSize === undefined ? 200 : options.pageSize;
+    if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 1000) {
+      const error = new Error('Sub2API 账号列表分页大小必须是 1-1000 的安全整数');
+      error.code = 'SUB2API_ACCOUNTS_PAGE_SIZE_INVALID';
+      throw error;
+    }
+    const requirePaginationMetadata = options.requirePaginationMetadata === true;
+    const requireTotal = options.requireTotal === true || requirePaginationMetadata;
     const rows = new Map();
     let expectedTotal = null;
     let page = 1;
@@ -1027,11 +1114,81 @@ class Sub2ApiAdminClient {
         undefined,
         { signal: options.signal },
       );
-      const pageRows = asList(value);
-      if (!pageRows) {
+      const listResult = accountListRows(value, requirePaginationMetadata);
+      const pageRows = listResult.rows;
+      if (listResult.invalid || !pageRows) {
         const error = new Error('Sub2API 账号列表响应结构无效');
         error.code = 'SUB2API_ACCOUNTS_SCHEMA_INVALID';
         throw error;
+      }
+      const pagination = accountPagination(value);
+      const paginationFields = [
+        pagination.total,
+        pagination.page,
+        pagination.pageSize,
+        pagination.pages,
+      ];
+      if (paginationFields.some((field) => field.invalid || field.conflict)) {
+        const error = new Error('Sub2API 账号列表分页统计无效或存在冲突');
+        error.code = 'SUB2API_ACCOUNTS_PAGINATION_INVALID';
+        throw error;
+      }
+      if (!pagination.total.provided && requireTotal) {
+        const error = new Error('Sub2API 账号列表分页缺少完整统计');
+        error.code = 'SUB2API_ACCOUNTS_TOTAL_REQUIRED';
+        throw error;
+      }
+      const hasAnyPageMetadata = [pagination.page, pagination.pageSize, pagination.pages]
+        .some((field) => field.provided);
+      const hasCompletePageMetadata = [pagination.page, pagination.pageSize, pagination.pages]
+        .every((field) => field.provided);
+      const hasCanonicalPaginationMetadata = isPlainObject(value)
+        && hasOwn(value, 'total')
+        && hasOwn(value, 'page')
+        && hasOwn(value, 'page_size')
+        && hasOwn(value, 'pages');
+      const hasNonCanonicalPaginationAliases = isPlainObject(value)
+        && (hasOwn(value, 'pagination')
+          || hasOwn(value, 'pageSize')
+          || hasOwn(value, 'total_pages')
+          || hasOwn(value, 'totalPages'));
+      if ((requirePaginationMetadata && !hasCanonicalPaginationMetadata)
+          || (hasAnyPageMetadata && !hasCompletePageMetadata)) {
+        const error = new Error('Sub2API 账号列表分页缺少规范元数据');
+        error.code = 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED';
+        throw error;
+      }
+      if (requirePaginationMetadata && hasNonCanonicalPaginationAliases) {
+        const error = new Error('Sub2API 账号列表包含非规范分页别名');
+        error.code = 'SUB2API_ACCOUNTS_PAGINATION_INVALID';
+        throw error;
+      }
+      if (hasCompletePageMetadata) {
+        const total = pagination.total.value;
+        const expectedPages = total === null
+          ? null
+          : Math.max(1, Math.ceil(total / pagination.pageSize.value));
+        const expectedPageRows = total === null
+          ? null
+          : Math.min(
+              pagination.pageSize.value,
+              Math.max(total - ((pagination.page.value - 1) * pagination.pageSize.value), 0),
+            );
+        if (total === null
+            || pagination.page.value !== page
+            || pagination.pageSize.value !== pageSize
+            || pagination.pages.value !== expectedPages
+            || pagination.page.value > pagination.pages.value
+            || (requirePaginationMetadata && pageRows.length !== expectedPageRows)) {
+          const error = new Error('Sub2API 账号列表分页元数据与请求或内容不一致');
+          error.code = 'SUB2API_ACCOUNTS_PAGINATION_INVALID';
+          throw error;
+        }
+        if (pagination.pages.value > 100) {
+          const error = new Error('Sub2API 账号列表超过分页安全上限');
+          error.code = 'SUB2API_PAGE_LIMIT';
+          throw error;
+        }
       }
       const normalizedRows = pageRows.map(safeAccount);
       if (normalizedRows.some((account) => !account)) {
@@ -1048,20 +1205,14 @@ class Sub2ApiAdminClient {
         }
         rows.set(accountKey, account);
       }
-      const rawTotal = value?.total ?? value?.pagination?.total;
-      if (rawTotal !== undefined && rawTotal !== null && rawTotal !== '') {
-        const total = paginationTotal(rawTotal);
-        if (total === null
-            || (expectedTotal !== null && expectedTotal !== total)) {
+      if (pagination.total.provided) {
+        const total = pagination.total.value;
+        if (expectedTotal !== null && expectedTotal !== total) {
           const error = new Error('Sub2API 账号列表分页统计无效或已变化');
           error.code = 'SUB2API_ACCOUNTS_PAGINATION_INVALID';
           throw error;
         }
         expectedTotal = total;
-      } else if (options.requireTotal === true) {
-        const error = new Error('Sub2API 账号列表分页缺少完整统计');
-        error.code = 'SUB2API_ACCOUNTS_TOTAL_REQUIRED';
-        throw error;
       }
       if (expectedTotal !== null) {
         if (rows.size > expectedTotal || (pageRows.length === 0 && rows.size < expectedTotal)) {

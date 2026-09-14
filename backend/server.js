@@ -277,8 +277,9 @@ function authorizationError(request, write = false) {
     if (!configuredToken && process.env.PANEL_ALLOW_INSECURE_WRITE !== '1') {
       return { status: 503, error: 'write_auth_required', message: '写操作必须配置 PANEL_ADMIN_TOKEN' };
     }
-    if (!configuredToken && process.env.PANEL_ALLOW_INSECURE_WRITE === '1' && !isLoopbackRequest(request)) {
-      return { status: 503, error: 'write_loopback_required', message: '未配置 PANEL_ADMIN_TOKEN 时，写操作只允许本机访问' };
+    if (!configuredToken && process.env.PANEL_ALLOW_INSECURE_WRITE === '1') {
+      const localWriteError = insecureLocalWriteRequestError(request);
+      if (localWriteError) return localWriteError;
     }
   }
   return null;
@@ -389,6 +390,90 @@ function validateListenConfiguration(host) {
 function isLoopbackRequest(request) {
   const address = String(request?.socket?.remoteAddress || '').replace(/^::ffff:/i, '');
   return isLoopbackAddress(address);
+}
+
+function singleRequestHeader(request, name) {
+  const normalizedName = String(name || '').toLowerCase();
+  const value = request?.headers?.[normalizedName];
+  if (value === undefined) return { present: false, valid: true, value: null };
+  if (typeof value !== 'string') return { present: true, valid: false, value: null };
+
+  // Node normally exposes only one value for Host. Check rawHeaders as well so
+  // duplicate security-sensitive headers cannot be hidden by normalization.
+  if (Array.isArray(request?.rawHeaders)) {
+    const rawValues = [];
+    for (let index = 0; index + 1 < request.rawHeaders.length; index += 2) {
+      if (String(request.rawHeaders[index]).toLowerCase() === normalizedName) {
+        rawValues.push(request.rawHeaders[index + 1]);
+      }
+    }
+    if (rawValues.length !== 1 || rawValues[0] !== value) {
+      return { present: true, valid: false, value: null };
+    }
+  }
+  return { present: true, valid: true, value };
+}
+
+function loopbackHostOrigin(request) {
+  const header = singleRequestHeader(request, 'host');
+  if (!header.present || !header.valid || header.value.length > 64
+      || header.value !== header.value.trim()) return null;
+
+  let address;
+  let port;
+  const ipv6 = /^\[(::1)\](?::(\d{1,5}))?$/i.exec(header.value);
+  if (ipv6) {
+    address = '[::1]';
+    port = ipv6[2];
+  } else {
+    const ipv4 = /^([^:]+)(?::(\d{1,5}))?$/.exec(header.value);
+    if (!ipv4 || net.isIP(ipv4[1]) !== 4 || !isLoopbackAddress(ipv4[1])) return null;
+    address = ipv4[1];
+    port = ipv4[2];
+  }
+  if (port !== undefined && (Number(port) < 1 || Number(port) > 65535)) return null;
+  try {
+    return new URL('http://' + address + (port === undefined ? '' : ':' + port)).origin;
+  } catch {
+    return null;
+  }
+}
+
+function insecureLocalWriteRequestError(request) {
+  if (!isLoopbackRequest(request)) {
+    return { status: 503, error: 'write_loopback_required', message: '未配置 PANEL_ADMIN_TOKEN 时，写操作只允许本机访问' };
+  }
+  const expectedOrigin = loopbackHostOrigin(request);
+  if (!expectedOrigin) {
+    return {
+      status: 403,
+      error: 'write_loopback_host_required',
+      message: '未配置 PANEL_ADMIN_TOKEN 时，写请求 Host 必须使用回环 IP 地址',
+    };
+  }
+  const originHeader = singleRequestHeader(request, 'origin');
+  if (!originHeader.present) return null;
+  if (!originHeader.valid || originHeader.value.length > 512
+      || originHeader.value !== originHeader.value.trim()) {
+    return {
+      status: 403,
+      error: 'write_origin_forbidden',
+      message: '未配置 PANEL_ADMIN_TOKEN 时，写请求 Origin 必须与回环 Host 同源',
+    };
+  }
+  try {
+    const origin = new URL(originHeader.value);
+    if (origin.protocol === 'http:'
+        && origin.username === ''
+        && origin.password === ''
+        && originHeader.value === origin.origin
+        && origin.origin === expectedOrigin) return null;
+  } catch {}
+  return {
+    status: 403,
+    error: 'write_origin_forbidden',
+    message: '未配置 PANEL_ADMIN_TOKEN 时，写请求 Origin 必须与回环 Host 同源',
+  };
 }
 
 
@@ -2519,6 +2604,8 @@ function createServer(options = {}) {
               platform: 'openai',
               type: 'oauth',
               pageSize: 200,
+              requireTotal: true,
+              requirePaginationMetadata: true,
               signal,
             });
             throwIfJobInterrupted(signal);

@@ -274,7 +274,11 @@ test('account test checkpoints the probe before calling Sub2API', async () => {
   const account = oauthTestAccount(10, 'active', true);
   const events = [];
   const client = {
-    async listAccounts() { return [{ ...account }]; },
+    async listAccounts(options) {
+      assert.equal(options.requireTotal, true);
+      assert.equal(options.requirePaginationMetadata, true);
+      return [{ ...account }];
+    },
     async getAccount() { return { ...account }; },
     async testAccount() {
       events.push('test');
@@ -1237,13 +1241,31 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
   const testCalls = [];
   const schedulableCalls = [];
   let replacementAfterNextList = null;
+  let omitPaginationMetadataOnce = false;
   const upstream = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://upstream.test');
     const idMatch = url.pathname.match(/^\/api\/v1\/admin\/accounts\/(\d+)(?:\/(.*))?$/);
     if (request.method === 'GET' && url.pathname === '/api/v1/admin/accounts') {
       response.setHeader('content-type', 'application/json');
-      const rows = Number(url.searchParams.get('page') || 1) === 1 ? [...accounts.values()] : [];
-      response.end(JSON.stringify({ data: rows }));
+      const page = Number(url.searchParams.get('page') || 1);
+      const pageSize = Number(url.searchParams.get('page_size') || 20);
+      const rows = page === 1 ? [...accounts.values()] : [];
+      const data = {
+        items: rows,
+        total: accounts.size,
+        page,
+        page_size: pageSize,
+        pages: Math.max(1, Math.ceil(accounts.size / pageSize)),
+      };
+      if (omitPaginationMetadataOnce) {
+        omitPaginationMetadataOnce = false;
+        delete data.pages;
+      }
+      response.end(JSON.stringify({
+        code: 0,
+        message: 'success',
+        data,
+      }));
       if (rows.length > 0 && replacementAfterNextList) {
         accounts.set(replacementAfterNextList.id, replacementAfterNextList.account);
         replacementAfterNextList = null;
@@ -1361,6 +1383,16 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     const models = await requestJson(baseUrl, '/api/account-tests/models?accountId=1', { headers });
     assert.equal(models.status, 200);
     assert.deepEqual(models.json.models, ['gpt-5', 'gpt-5-mini']);
+
+    omitPaginationMetadataOnce = true;
+    const incompleteSelection = await requestJson(baseUrl, '/api/account-tests', {
+      method: 'POST',
+      headers,
+      body: { accountIds: [2], modelId: 'gpt-5.6-luna' },
+    });
+    assert.equal(incompleteSelection.status, 400);
+    assert.equal(incompleteSelection.json.error, 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED');
+    assert.equal(testCalls.length, 0);
 
     const queued = await requestJson(baseUrl, '/api/account-tests', {
       method: 'POST',

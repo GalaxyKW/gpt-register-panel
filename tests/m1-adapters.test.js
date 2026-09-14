@@ -1148,12 +1148,165 @@ test('Sub2API account listing rejects coercible non-integer pagination totals', 
   }
 
   for (const total of [1, '1']) {
-    client.request = async () => ({ items: [{ id: 1 }], total });
+    client.request = async () => ({
+      items: [{ id: 1 }],
+      total,
+      page: 1,
+      page_size: 200,
+      pages: 1,
+    });
     assert.deepEqual(
-      (await client.listAccounts({ requireTotal: true })).map((account) => account.id),
+      (await client.listAccounts({
+        requireTotal: true,
+        requirePaginationMetadata: true,
+      })).map((account) => account.id),
       [1],
     );
   }
+});
+
+test('Sub2API strict account pagination validates the canonical envelope before trusting rows', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  client.request = async (method, pathname) => {
+    assert.equal(method, 'GET');
+    const page = Number(new URL(pathname, 'http://sub2api.test').searchParams.get('page'));
+    return page === 1
+      ? {
+          items: [{ id: 1 }, { id: 2 }],
+          total: 3,
+          page: 1,
+          page_size: 2,
+          pages: 2,
+        }
+      : {
+          items: [{ id: 3 }],
+          total: 3,
+          page: 2,
+          page_size: 2,
+          pages: 2,
+        };
+  };
+  assert.deepEqual(
+    (await client.listAccounts({
+      pageSize: 2,
+      requireTotal: true,
+      requirePaginationMetadata: true,
+    })).map((account) => account.id),
+    [1, 2, 3],
+  );
+
+  const invalidResponses = [
+    {
+      value: {
+        items: [{ id: 1 }],
+        accounts: [{ id: 2 }],
+        total: 1,
+        page: 1,
+        page_size: 200,
+        pages: 1,
+      },
+      code: 'SUB2API_ACCOUNTS_SCHEMA_INVALID',
+    },
+    {
+      value: {
+        items: [],
+        total: 0,
+        pagination: { total: 1 },
+        page: 1,
+        page_size: 200,
+        pages: 1,
+      },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: {
+        items: [],
+        total: 0,
+        pagination: { total: 0, page: 1, page_size: 200, pages: 1 },
+        page: 1,
+        page_size: 200,
+        pages: 1,
+      },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: {
+        items: [],
+        total: 0,
+        page: 1,
+        page_size: 200,
+        pageSize: 200,
+        pages: 1,
+        totalPages: 1,
+      },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: { items: [], total: 0, page: 1, page_size: 200 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
+    },
+    {
+      value: { items: [], total: 0, page_size: 200, pages: 1 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
+    },
+    {
+      value: { items: [], total: 0, page: 1, pages: 1 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
+    },
+    {
+      value: { items: [], total: 0, page: 2, page_size: 200, pages: 1 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: { items: [], total: 0, page: 1, page_size: 200, pages: 2 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: { items: [], total: 0, page: 1, page_size: '200', pages: 1 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+    {
+      value: { items: [{ id: 1 }], total: 2, page: 1, page_size: 200, pages: 1 },
+      code: 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+    },
+  ];
+  for (const { value, code } of invalidResponses) {
+    client.request = async () => value;
+    await assert.rejects(
+      client.listAccounts({ requireTotal: true, requirePaginationMetadata: true }),
+      (error) => error.code === code,
+    );
+  }
+
+  for (const pageSize of [
+    0,
+    -1,
+    1.5,
+    1001,
+    '200',
+    true,
+    null,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER,
+  ]) {
+    await assert.rejects(
+      client.listAccounts({ pageSize }),
+      (error) => error.code === 'SUB2API_ACCOUNTS_PAGE_SIZE_INVALID',
+    );
+  }
+
+  client.request = async () => ({
+    items: [],
+    total: 0,
+    page: 1,
+    page_size: 200,
+    pages: 1,
+  });
+  assert.deepEqual(await client.listAccounts({
+    requireTotal: true,
+    requirePaginationMetadata: true,
+  }), []);
 });
 
 test('Sub2API account exports require a complete supported backup envelope', async () => {
@@ -1847,8 +2000,22 @@ test('Sub2API strict postflight listings require a total on every page', async (
     client.listAccounts({ requireTotal: true }),
     (error) => error.code === 'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
   );
-  client.request = async () => ({ items: [], total: 0 });
-  assert.deepEqual(await client.listAccounts({ requireTotal: true }), []);
+  client.request = async () => ({ items: [], page: 1, page_size: 200, pages: 1 });
+  await assert.rejects(
+    client.listAccounts({ requirePaginationMetadata: true }),
+    (error) => error.code === 'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
+  );
+  client.request = async () => ({
+    items: [],
+    total: 0,
+    page: 1,
+    page_size: 200,
+    pages: 1,
+  });
+  assert.deepEqual(await client.listAccounts({
+    requireTotal: true,
+    requirePaginationMetadata: true,
+  }), []);
 });
 
 test('Sub2API batch-stat errors leave the adapter only after redaction', async () => {

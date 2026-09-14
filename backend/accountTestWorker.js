@@ -522,6 +522,8 @@ async function runAccountTestJobNow({
     platform: 'openai',
     type: 'oauth',
     pageSize: 200,
+    requireTotal: true,
+    requirePaginationMetadata: true,
     signal,
   });
   const results = [];

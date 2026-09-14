@@ -338,6 +338,8 @@ async function readSub2ApiAccounts(client, options = {}) {
     platform: 'openai',
     type: 'oauth',
     pageSize: 200,
+    requireTotal: true,
+    requirePaginationMetadata: true,
     signal,
   });
   throwIfJobInterrupted(signal);
@@ -1140,6 +1142,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
         sortBy: 'id',
         sortOrder: 'asc',
         requireTotal: true,
+        requirePaginationMetadata: true,
         signal,
       }),
       { signal },
@@ -1179,6 +1182,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
       sortBy: 'id',
       sortOrder: 'asc',
       requireTotal: true,
+      requirePaginationMetadata: true,
       signal,
     }),
     { signal },
@@ -1582,6 +1586,8 @@ async function preflightCreateAccount(client, item, options = {}) {
   }
   const accounts = await client.listAccounts({
     pageSize: 200,
+    requireTotal: true,
+    requirePaginationMetadata: true,
     signal,
   });
   throwIfJobInterrupted(signal);

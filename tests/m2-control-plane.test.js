@@ -38,6 +38,7 @@ const {
 } = require('../backend/phase3Worker');
 const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
+const { Sub2ApiAdminClient } = require('../backend/adapters/sub2apiAdmin');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 const successfulCheckpointLogger = Object.freeze({
@@ -262,6 +263,8 @@ test('snapshot propagates shutdown cancellation instead of downgrading it to a r
       client: {
         async listAccounts(options) {
           assert.equal(options.signal, controller.signal);
+          assert.equal(options.requireTotal, true);
+          assert.equal(options.requirePaginationMetadata, true);
           controller.abort();
           const error = new Error('stopped');
           error.code = 'JOB_INTERRUPTED';
@@ -2150,6 +2153,39 @@ test('create preflight requires a canonical name and rejects casefold-equivalent
   assert.equal(writes, 0);
 });
 
+test('create preflight rejects a truncated strict account page before dispatching a write', async () => {
+  const identityKeys = ['account:truncated-page-account', 'user:truncated-page-user'];
+  const source = syntheticToken('tokens/truncated-page.json', identityKeys, {
+    accountId: 'truncated-page-account',
+    userId: 'truncated-page-user',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:18080',
+    apiKey: 'test-only-key',
+  });
+  let writeCalls = 0;
+  client.request = async (method, pathname) => {
+    if (method === 'GET' && pathname.startsWith('/api/v1/admin/accounts?')) {
+      return {
+        items: [{ id: 999, name: 'free00999' }],
+        total: 2,
+        page: 1,
+        page_size: 200,
+        pages: 1,
+      };
+    }
+    writeCalls += 1;
+    throw new Error('write must not be dispatched after a truncated preflight page');
+  };
+
+  await assert.rejects(
+    executeImportPlanItem({ client, item }),
+    (error) => error.code === 'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+  );
+  assert.equal(writeCalls, 0);
+});
+
 test('Codex create documents use the current expiry field and cross-job stable secret-free keys', () => {
   const accessSecret = 'access-secret-must-not-enter-header';
   const refreshSecret = 'refresh-secret-must-not-enter-header';
@@ -3113,8 +3149,9 @@ test('import plan items pass one cancellation signal through update and create r
     client: {
       async listAccounts(options) {
         assert.equal(options.signal, signal);
+        assert.equal(options.requireTotal, true);
+        assert.equal(options.requirePaginationMetadata, true);
         createLists += 1;
-        if (createLists > 1) assert.equal(options.requireTotal, true);
         return createLists === 1 ? [] : [createdAccount];
       },
       async importCodexSession(payload, options) {
@@ -3646,13 +3683,17 @@ test('create postflight retries only bounded complete reads and never retries th
   let writeCalls = 0;
   let detailReads = 0;
   let completeLists = 0;
+  let listCalls = 0;
   const outcome = await executeImportPlanItem({
     item,
     signal: controller.signal,
     client: {
       async listAccounts(options) {
         assert.equal(options.signal, controller.signal);
-        if (options.requireTotal !== true) return [];
+        assert.equal(options.requireTotal, true);
+        assert.equal(options.requirePaginationMetadata, true);
+        listCalls += 1;
+        if (listCalls === 1) return [];
         completeLists += 1;
         if (completeLists < 3) throw new Error('temporary complete-list failure');
         return [account];

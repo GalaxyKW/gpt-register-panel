@@ -335,6 +335,121 @@ test('authentication defaults to enabled and startup validates before database a
   }
 });
 
+test('tokenless loopback writes require a literal loopback Host and same-origin Origin', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  delete process.env.PANEL_ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let server;
+  try {
+    const localRequest = (host, origin, rawHeaders) => ({
+      headers: {
+        host,
+        ...(origin === undefined ? {} : { origin }),
+      },
+      ...(rawHeaders === undefined ? {} : { rawHeaders }),
+      socket: { remoteAddress: '127.0.0.1' },
+    });
+    assert.equal(authorizationError(localRequest('127.0.0.1:4170'), true), null);
+    assert.equal(
+      authorizationError(localRequest('[::1]:4170', 'http://[::1]:4170'), true),
+      null,
+    );
+    assert.equal(authorizationError(localRequest('localhost:4170'), true).error,
+      'write_loopback_host_required');
+    assert.equal(authorizationError(localRequest('127.0.0.1:4170', 'null'), true).error,
+      'write_origin_forbidden');
+    assert.equal(
+      authorizationError(localRequest('127.0.0.1:4170', 'http://127.0.0.2:4170'), true).error,
+      'write_origin_forbidden',
+    );
+    assert.equal(
+      authorizationError(localRequest('127.0.0.1:4170', undefined, [
+        'Host', '127.0.0.1:4170', 'Host', 'attacker.example',
+      ]), true).error,
+      'write_loopback_host_required',
+    );
+    assert.equal(authorizationError({
+      headers: { host: '127.0.0.1:4170' },
+      socket: { remoteAddress: '198.51.100.12' },
+    }, true).error, 'write_loopback_required');
+    // The Host/Origin hardening is intentionally limited to tokenless writes.
+    // Reads remain available in the explicitly unauthenticated configuration.
+    assert.equal(authorizationError({
+      headers: { host: 'attacker.example' },
+      socket: { remoteAddress: '127.0.0.1' },
+    }), null);
+
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-local-origin-test.sqlite3' },
+      logger: {
+        requestId: () => 'local-origin-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const port = server.address().port;
+    const baseUrl = 'http://127.0.0.1:' + port;
+    const hostileHost = await postBody(baseUrl, '/api/phase3', '{}', 'text/plain', {
+      host: 'attacker.example',
+      'x-forwarded-host': '127.0.0.1:' + port,
+    });
+    assert.equal(hostileHost.status, 403);
+    assert.equal(JSON.parse(hostileHost.body).error, 'write_loopback_host_required');
+
+    const hostileOrigin = await postBody(baseUrl, '/api/phase3', '{}', 'text/plain', {
+      host: '127.0.0.1:' + port,
+      origin: 'https://127.0.0.1:' + port,
+      'x-forwarded-host': '127.0.0.1:' + port,
+    });
+    assert.equal(hostileOrigin.status, 403);
+    assert.equal(JSON.parse(hostileOrigin.body).error, 'write_origin_forbidden');
+
+    const sameOrigin = await postBody(baseUrl, '/api/phase3', '{}', 'text/plain', {
+      host: '127.0.0.1:' + port,
+      origin: 'http://127.0.0.1:' + port,
+    });
+    assert.equal(sameOrigin.status, 415);
+    const cliWithoutOrigin = await postBody(baseUrl, '/api/phase3', '{}', 'text/plain', {
+      host: '127.0.0.1:' + port,
+    });
+    assert.equal(cliWithoutOrigin.status, 415);
+
+    process.env.PANEL_ADMIN_TOKEN = 'local-origin-test-admin-token';
+    process.env.PANEL_REQUIRE_AUTH = '1';
+    assert.equal(authorizationError({
+      headers: {
+        host: 'attacker.example',
+        origin: 'https://attacker.example',
+        'x-panel-token': 'local-origin-test-admin-token',
+      },
+      socket: { remoteAddress: '198.51.100.12' },
+    }, true), null);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
 test('startup rejects invalid booleans before database access', async () => {
   const previous = {
     phase3: process.env.PANEL_PHASE3_ENABLED,
@@ -511,13 +626,14 @@ function postJson(baseUrl, pathname, body) {
   });
 }
 
-function postBody(baseUrl, pathname, body, contentType) {
+function postBody(baseUrl, pathname, body, contentType, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     const requestObject = http.request(baseUrl + pathname, {
       method: 'POST',
       headers: {
         ...(configuredPanelToken ? { 'x-panel-token': configuredPanelToken } : {}),
         ...(contentType ? { 'content-type': contentType } : {}),
+        ...extraHeaders,
       },
     }, (response) => {
       let responseBody = '';
