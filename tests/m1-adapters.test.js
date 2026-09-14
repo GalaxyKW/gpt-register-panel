@@ -1440,6 +1440,40 @@ test('stored token fingerprints require exact full SHA-256 values', () => {
   assert.equal(JSON.stringify(mismatch).includes(rawCredential), false);
 });
 
+test('safe accounts reject ambiguous remote credential and fingerprint characters', () => {
+  const marker = 'remote-credential-ambiguity-marker';
+  for (const credentials of [
+    { access_token: ' ' + marker + ' ' },
+    { access_token: 'bad\t' + marker },
+    { refresh_token: 'bad ' + marker },
+    { id_token: 'bad\u202e' + marker },
+    { access_token_sha256: 'a'.repeat(64) + ' ' },
+  ]) {
+    const account = safeAccount({
+      id: 218,
+      platform: 'openai',
+      type: 'oauth',
+      status: 'error',
+      schedulable: false,
+      credentials: {
+        chatgpt_account_id: 'safe-account-id',
+        ...credentials,
+      },
+    });
+    assert.equal(account.schemaValid, false);
+    assert.equal(account.tokenFingerprints.access, null);
+    assert.equal(JSON.stringify(account).includes(marker), false);
+  }
+
+  const extraFingerprint = safeAccount({
+    id: 219,
+    extra: { access_token_sha256: ' ' + 'b'.repeat(64) },
+  });
+  assert.equal(extraFingerprint.schemaValid, false);
+  assert.equal(extraFingerprint.fingerprintConflict, true);
+  assert.equal(extraFingerprint.tokenFingerprints.access, null);
+});
+
 test('full fingerprint alias conflicts cannot collapse into the same short fingerprint', () => {
   const prefix = '0123456789abcdef';
   const account = safeAccount({

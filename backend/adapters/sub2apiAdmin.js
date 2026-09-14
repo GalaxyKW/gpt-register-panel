@@ -24,6 +24,7 @@ const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
 const URL_WHITESPACE_CONTROL_OR_BIDI = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+const CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/u;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
@@ -233,7 +234,11 @@ function scalarAliases(values, maximumLength, options = {}) {
   let invalid = false;
   for (const raw of present) {
     const text = scalarText(raw, maximumLength, options.allowNumber === true);
-    if (!text) {
+    if (!text
+        || (options.rejectOuterWhitespace === true
+          && typeof raw === 'string' && raw !== text)
+        || (options.rejectPattern instanceof RegExp
+          && typeof raw === 'string' && options.rejectPattern.test(raw))) {
       invalid = true;
       continue;
     }
@@ -528,23 +533,43 @@ function safeAccount(account) {
   const accessField = scalarAliases(
     [credentials.access_token, credentials.accessToken],
     2 * 1024 * 1024,
+    {
+      rejectOuterWhitespace: true,
+      rejectPattern: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+    },
   );
   const refreshField = scalarAliases(
     [credentials.refresh_token, credentials.refreshToken],
     256 * 1024,
+    {
+      rejectOuterWhitespace: true,
+      rejectPattern: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+    },
   );
   const idTokenField = scalarAliases(
     [credentials.id_token, credentials.idToken],
     2 * 1024 * 1024,
+    {
+      rejectOuterWhitespace: true,
+      rejectPattern: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+    },
   );
   const storedFingerprintField = scalarAliases([
     extra.access_token_sha256,
     credentials.access_token_sha256,
-  ], 128, { normalize: storedFingerprint });
+  ], 128, {
+    normalize: storedFingerprint,
+    rejectOuterWhitespace: true,
+    rejectPattern: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+  });
   const storedRefreshFingerprintField = scalarAliases([
     extra.refresh_token_sha256,
     credentials.refresh_token_sha256,
-  ], 128, { normalize: storedFingerprint });
+  ], 128, {
+    normalize: storedFingerprint,
+    rejectOuterWhitespace: true,
+    rejectPattern: CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI,
+  });
   const computedAccessFingerprint = tokenFingerprint(accessField.value);
   const computedRefreshFingerprint = tokenFingerprint(refreshField.value);
   const computedAccessDigest = fullTokenFingerprint(accessField.value);
