@@ -1731,8 +1731,18 @@ test('sync selection accepts only explicit token row keys', () => {
   };
   const sources = { tokens: [token], usernames: [] };
 
-  assert.deepEqual(buildImportPlan(sources, [unrelatedRemote], ['account:77']), []);
-  assert.deepEqual(buildImportPlan(sources, [unrelatedRemote], ['user:untrusted-alias']), []);
+  for (const key of ['account:77', 'user:untrusted-alias']) {
+    let selectionError;
+    assert.throws(
+      () => buildImportPlan(sources, [unrelatedRemote], [key]),
+      (error) => {
+        selectionError = error;
+        return error.code === 'IMPORT_SELECTION_MISMATCH'
+          && error.unknownSelectionCount === 1;
+      },
+    );
+    assert.equal(selectionError.message.includes(key), false);
+  }
   const selected = buildImportPlan(
     sources,
     [unrelatedRemote],
@@ -1741,6 +1751,29 @@ test('sync selection accepts only explicit token row keys', () => {
   assert.equal(selected.length, 1);
   assert.equal(selected[0].relativePath, 'tokens/numeric-account.json');
   assert.equal(selected[0].action, 'create');
+});
+
+test('sync rejects a mixed selection instead of silently importing its covered subset', () => {
+  const token = syntheticToken('tokens/covered.json', ['account:covered'], {
+    accountId: 'covered',
+  });
+  const validKey = 'token:tokens:tokens/covered.json';
+  const secretMarker = 'token:tokens:tokens/credential-marker.json';
+  let selectionError;
+  assert.throws(
+    () => buildImportPlan(
+      { tokens: [token], usernames: [] },
+      [],
+      [validKey, secretMarker],
+    ),
+    (error) => {
+      selectionError = error;
+      return error.code === 'IMPORT_SELECTION_MISMATCH'
+        && error.unknownSelectionCount === 1;
+    },
+  );
+  assert.equal(selectionError.message.includes(secretMarker), false);
+  assert.equal(JSON.stringify(selectionError).includes(secretMarker), false);
 });
 
 test('treats expired active Sub2API accounts as unavailable for replacement', () => {

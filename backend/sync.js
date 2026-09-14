@@ -782,6 +782,28 @@ function sourceSelectionMetadata(candidate, selectedKeys) {
   };
 }
 
+function assertImportSelectionCovered(candidates, selectedKeys) {
+  if (!Array.isArray(selectedKeys) || selectedKeys.length > 500
+      || selectedKeys.some((key) => typeof key !== 'string' || !key || key.length > 512)) {
+    const error = new Error('导入选择参数无效，请刷新账号列表后重新选择');
+    error.code = 'IMPORT_SELECTION_INVALID';
+    throw error;
+  }
+  if (selectedKeys.length === 0) return;
+  const availableKeys = new Set();
+  for (const candidate of candidates) {
+    for (const record of candidate.records || []) availableKeys.add(candidateKey(record));
+  }
+  const unknownCount = selectedKeys.reduce((count, key) => (
+    typeof key === 'string' && availableKeys.has(key) ? count : count + 1
+  ), 0);
+  if (unknownCount === 0) return;
+  const error = new Error('所选项目不再对应可导入的 token，请刷新账号列表后重新选择');
+  error.code = 'IMPORT_SELECTION_MISMATCH';
+  error.unknownSelectionCount = unknownCount;
+  throw error;
+}
+
 function dateMilliseconds(value) {
   const timestamp = Date.parse(String(value || ''));
   return Number.isFinite(timestamp) ? timestamp : Number.NEGATIVE_INFINITY;
@@ -797,6 +819,11 @@ function compareCandidateFreshness(left, right, nowMs) {
 function buildImportPlan(sources, accounts, selectedKeys = []) {
   const nowMs = Date.now();
   const candidates = collectCandidates(sources, { nowMs });
+  // A mixed selection used to silently discard unknown, invalid, historical,
+  // or Sub2API-only row keys while executing the remaining writes. Require
+  // complete coverage so the reviewed selection and the executable plan are
+  // always the same set of source rows.
+  assertImportSelectionCovered(candidates, selectedKeys);
   const entries = candidates.map((candidate) => {
     const matches = accountMatches(candidate, accounts);
     return {
