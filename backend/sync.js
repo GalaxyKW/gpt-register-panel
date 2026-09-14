@@ -12,10 +12,15 @@ const {
   strongIdentityContradiction,
   identitiesCompatible,
   identitiesStronglyCompatible,
+  ambiguousAccountHints,
   hasStrongIdentity,
   accountKeys,
   accountCredentialPresence,
   credentialsInSync,
+  sourceTerminalStatus,
+  sourceStateImportDecision,
+  isExpectedSub2ApiAccount,
+  matchedAccountImportDecision,
 } = require('./diff');
 const {
   buildRows,
@@ -409,6 +414,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     const diff = buildDiff(sources.tokens, accounts, {
       includeHistorical: query.get('includeHistorical') === '1',
       sub2apiReadStatus: readStatus,
+      usernames: sources.usernames,
     });
     const allRows = buildRows(diff, { usernames: sources.usernames });
     const rows = filterRows(allRows, {
@@ -564,10 +570,6 @@ function identitySummary(keys = []) {
   };
 }
 
-function sharedValues(left, right) {
-  return [...left].some((value) => right.has(value));
-}
-
 function markIdentityConflict(candidate, reason) {
   if (!candidate.identityConflict) candidate.identityConflictReason = reason;
   candidate.identityConflict = true;
@@ -684,29 +686,6 @@ function collectCandidates(sources, options = {}) {
   ));
 }
 
-const TERMINAL_SOURCE_STATUSES = new Set([
-  'account_deleted',
-  'account_deactivated',
-  'account_disabled',
-]);
-
-function sourceTerminalStatus(sources, record) {
-  const email = String(record?.email || '').trim().toLowerCase();
-  if (!email) return null;
-  const matches = (sources?.usernames || []).filter((item) => (
-    String(item?.email || '').trim().toLowerCase() === email
-  ));
-  const terminal = matches.find((item) => TERMINAL_SOURCE_STATUSES.has(
-    String(item?.status || '').trim().toLowerCase(),
-  ));
-  return terminal ? String(terminal.status).trim().toLowerCase() : null;
-}
-
-function isExpectedSub2ApiAccount(account) {
-  return String(account?.platform || '').trim().toLowerCase() === 'openai'
-    && String(account?.type || '').trim().toLowerCase() === 'oauth';
-}
-
 function accountMatches(candidate, accounts) {
   const matches = new Map();
   for (const account of accounts || []) {
@@ -719,25 +698,6 @@ function accountMatches(candidate, accounts) {
     }
   }
   return [...matches.values()];
-}
-
-function ambiguousAccountHints(candidate, accounts) {
-  const candidateKeys = candidate.sourceIdentityKeys || [];
-  const candidateEmails = identityValues(candidateKeys, 'email:');
-  if (candidateEmails.size === 0) return [];
-  return (accounts || []).filter((account) => {
-    const keys = Array.isArray(account.identityKeys) && account.identityKeys.length > 0
-      ? account.identityKeys
-      : accountKeys(account);
-    if (!sharedValues(candidateEmails, identityValues(keys, 'email:'))) return false;
-    if (identitiesStronglyCompatible(candidateKeys, keys)) return false;
-    if (!hasStrongIdentity(keys)) return true;
-    const comparable = (identityValues(candidateKeys, 'account:').size > 0
-        && identityValues(keys, 'account:').size > 0)
-      || (identityValues(candidateKeys, 'user:').size > 0
-        && identityValues(keys, 'user:').size > 0);
-    return !comparable;
-  });
 }
 
 function nextFreeNumber(accounts) {
@@ -814,7 +774,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
         || !hasStrongIdentity(entry.candidate.sourceIdentityKeys)
         || !selectedCandidate(entry.candidate, selectedKeys, entry.account)
         || isExpiryInvalid(entry.candidate.record)
-        || sourceTerminalStatus(sources, entry.candidate.record)) continue;
+        || sourceTerminalStatus(sources?.usernames, entry.candidate.record)) continue;
     const accountId = entry.account.id;
     if (accountId === undefined || accountId === null) continue;
     const key = String(accountId);
@@ -828,7 +788,8 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   for (const entry of entries) {
     const { candidate, matches, ambiguousHints, account } = entry;
     if (!selectedCandidate(candidate, selectedKeys, account)) continue;
-    const terminalStatus = sourceTerminalStatus(sources, candidate.record);
+    const terminalStatus = sourceTerminalStatus(sources?.usernames, candidate.record);
+    const sourceDecision = sourceStateImportDecision(candidate.record, { terminalStatus });
     let action = 'create';
     let reason = 'token_only';
     let assignedName = null;
@@ -836,12 +797,9 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       ? preferredByAccount.get(String(account.id))
       : null;
     const superseded = Boolean(preferred && preferred.candidate !== candidate);
-    if (terminalStatus) {
-      action = 'skip';
-      reason = 'source_account_terminal';
-    } else if (isExpiryInvalid(candidate.record)) {
-      action = 'skip';
-      reason = 'source_expiry_invalid';
+    if (sourceDecision) {
+      action = sourceDecision.action;
+      reason = sourceDecision.reason;
     } else if (candidate.identityConflict || !hasStrongIdentity(candidate.sourceIdentityKeys)) {
       action = 'conflict';
       reason = candidate.identityConflictReason || 'source_identity_insufficient';
@@ -856,35 +814,13 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       reason = 'ambiguous_sub2api_identity';
     } else if (account) {
       assignedName = account.name;
-      const availability = getAccountAvailability(account, nowMs);
-      if (account.schemaValid === false) {
-        action = 'conflict';
-        reason = 'sub2api_account_schema_invalid';
-      } else if (!isExpectedSub2ApiAccount(account)) {
-        action = 'conflict';
-        reason = 'sub2api_target_kind_invalid';
-      } else if (candidate.record.disabled) {
-        action = 'skip';
-        reason = 'source_disabled';
-      } else if (superseded) {
-        action = 'skip';
-        reason = 'superseded_by_newer_source';
-      } else if (availability.key === 'available') {
-        action = 'skip';
-        reason = 'sub2api_available';
-      } else if (availability.key !== 'unavailable') {
-        action = 'skip';
-        reason = availability.reason || 'sub2api_availability_unknown';
-      } else if (isExpired(candidate.record, nowMs)) {
-        action = 'skip';
-        reason = 'source_token_expired';
-      } else if (credentialsInSync(candidate.record, account)) {
-        action = 'skip';
-        reason = 'already_in_sync';
-      } else {
-        action = 'update';
-        reason = 'token_changed';
-      }
+      const decision = matchedAccountImportDecision(candidate.record, account, {
+        nowMs,
+        terminalStatus,
+        superseded,
+      });
+      action = decision.action;
+      reason = decision.reason;
     } else if (candidate.record.disabled) {
       action = 'skip';
       reason = 'source_disabled';
@@ -1486,7 +1422,7 @@ function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
     throw sourceTokenChanged();
   }
   if (isExpiryInvalid(record) || isExpired(record, nowMs) || record.disabled
-      || sourceTerminalStatus(sources, record)) {
+      || sourceTerminalStatus(sources?.usernames, record)) {
     throw sourceTokenChanged('来源 token 在写入前已不可用');
   }
   return record;

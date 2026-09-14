@@ -31,7 +31,7 @@ const {
   getActivePhase3Job,
 } = require('../backend/phase3Worker');
 const { getAccountAvailability } = require('../backend/accountAvailability');
-const { buildDiff, identitiesCompatible } = require('../backend/diff');
+const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 function fixture() {
@@ -219,6 +219,30 @@ test('unavailable remote comparison preserves local duplicate-token facts', () =
   assert.deepEqual(diff.items.map((item) => item.kind), ['duplicate_identity', 'duplicate_identity']);
   assert.equal(diff.items.every((item) => item.availability === 'unknown'), true);
   assert.equal(diff.items.every((item) => item.availabilityReason === 'sub2api_read_failed'), true);
+  assert.equal(diff.items.every((item) => item.decisionAction === null), true);
+  assert.equal(diff.items.every((item) => item.decisionReason === 'sub2api_read_failed'), true);
+});
+
+test('unavailable remote comparisons expose no import action', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/unavailable.json',
+    fileName: 'unavailable.json',
+    parseStatus: 'ok',
+    identityKeys: ['account:unavailable-account', 'user:unavailable-user'],
+    fingerprints: { access: 'fingerprint-1' },
+    expiryStatus: 'missing',
+  };
+  for (const [readStatus, expectedReason] of [
+    ['failed', 'sub2api_read_failed'],
+    ['omitted', 'sub2api_not_read'],
+  ]) {
+    const item = buildDiff([token], [], { sub2apiReadStatus: readStatus }).items[0];
+    assert.equal(item.kind, 'remote_unknown');
+    assert.equal(item.observedKind, 'remote_unknown');
+    assert.equal(item.decisionAction, null);
+    assert.equal(item.decisionReason, expectedReason);
+  }
 });
 
 test('PanelDb persists jobs and audit rows in an independent SQLite file', async () => {
@@ -1077,6 +1101,181 @@ test('import plan updates when a source refresh fingerprint cannot be verified r
   const matchingPlan = buildImportPlan(sources, [account]);
   assert.equal(matchingPlan[0].action, 'skip');
   assert.equal(matchingPlan[0].reason, 'already_in_sync');
+});
+
+test('diff decision metadata and import planner share policy reasons without changing observed kinds', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const loaded = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const source = loaded.tokens.find((item) => item.parseStatus === 'ok');
+  const baseAccount = {
+    id: 12,
+    name: 'free00012',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    schedulable: false,
+    identityKeys: source.identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  };
+
+  const assertSharedDecision = ({ record = source, account = baseAccount, usernames = loaded.usernames }, expected) => {
+    // Raw credentials are intentionally non-enumerable on source records, so
+    // preserve the fixture's private value when a scenario clones metadata.
+    const planRecord = record.raw ? record : { ...record, raw: source.raw };
+    const sources = { ...loaded, tokens: [planRecord], usernames };
+    const diff = buildDiff(sources.tokens, [account], { usernames });
+    const item = diff.items.find((candidate) => candidate.token);
+    const plan = buildImportPlan(sources, [account]);
+    assert.equal(plan.length, 1);
+    assert.equal(item.kind, expected.observedKind);
+    assert.equal(item.observedKind, expected.observedKind);
+    assert.equal(item.decisionAction, expected.action);
+    assert.equal(item.decisionReason, expected.reason);
+    assert.equal(plan[0].action, expected.action);
+    assert.equal(plan[0].reason, expected.reason);
+    const safeItem = toSafeDiff(diff).items.find((candidate) => candidate.token);
+    assert.equal(safeItem.observedKind, expected.observedKind);
+    assert.equal(safeItem.decisionAction, expected.action);
+    assert.equal(safeItem.decisionReason, expected.reason);
+  };
+
+  assertSharedDecision({ record: { ...source, disabled: true } }, {
+    observedKind: 'in_sync',
+    action: 'skip',
+    reason: 'source_disabled',
+  });
+  assertSharedDecision({ account: { ...baseAccount, schemaValid: false } }, {
+    observedKind: 'in_sync',
+    action: 'conflict',
+    reason: 'sub2api_account_schema_invalid',
+  });
+  assertSharedDecision({
+    usernames: [{ ...loaded.usernames[0], status: 'account_disabled' }],
+  }, {
+    observedKind: 'in_sync',
+    action: 'skip',
+    reason: 'source_account_terminal',
+  });
+  assertSharedDecision({
+    account: {
+      ...baseAccount,
+      status: 'active',
+      schedulable: true,
+      tokenFingerprints: { access: 'different-access', refresh: 'different-refresh' },
+    },
+  }, {
+    observedKind: 'token_changed',
+    action: 'skip',
+    reason: 'sub2api_available',
+  });
+  assertSharedDecision({
+    account: {
+      ...baseAccount,
+      tokenFingerprints: { access: source.fingerprints.access, refresh: null },
+      credentialPresence: { access: 'present', refresh: 'absent', id: 'unknown' },
+    },
+  }, {
+    observedKind: 'missing_refresh_token',
+    action: 'update',
+    reason: 'missing_refresh_token',
+  });
+});
+
+test('no-remote and ambiguous diff decisions match planner blockers when they are determinable', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const loaded = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const source = loaded.tokens.find((item) => item.parseStatus === 'ok');
+  const cloneSource = (changes = {}) => ({ ...source, raw: source.raw, ...changes });
+  const assertDecision = ({ record, usernames = [], accounts = [] }, expected) => {
+    const sources = { ...loaded, tokens: [record], usernames };
+    const diffItem = buildDiff(sources.tokens, accounts, { usernames }).items.find((item) => item.token);
+    const planItem = buildImportPlan(sources, accounts)[0];
+    assert.equal(diffItem.decisionAction, expected.action);
+    assert.equal(diffItem.decisionReason, expected.reason);
+    assert.equal(planItem.action, expected.action);
+    assert.equal(planItem.reason, expected.reason);
+  };
+
+  assertDecision({
+    record: cloneSource(),
+    usernames: [{ email: source.email, status: 'account_deleted' }],
+  }, { action: 'skip', reason: 'source_account_terminal' });
+  assertDecision({
+    record: cloneSource({ expiryStatus: 'invalid', expiresAt: null }),
+  }, { action: 'skip', reason: 'source_expiry_invalid' });
+  assertDecision({
+    record: cloneSource({ disabled: true }),
+  }, { action: 'skip', reason: 'source_disabled' });
+  assertDecision({
+    record: cloneSource({ expiryStatus: 'valid', expiresAt: '2020-01-01T00:00:00.000Z' }),
+  }, { action: 'skip', reason: 'source_token_expired' });
+  assertDecision({
+    record: cloneSource({
+      accountId: '',
+      userId: '',
+      identityKeys: ['email:' + source.email],
+    }),
+  }, { action: 'conflict', reason: 'source_identity_insufficient' });
+
+  const duplicateAccounts = [21, 22].map((id) => ({
+    id,
+    name: 'free000' + id,
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    schedulable: false,
+    identityKeys: source.identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  }));
+  assertDecision({ record: cloneSource(), accounts: duplicateAccounts }, {
+    action: 'conflict',
+    reason: 'multiple_sub2api_accounts',
+  });
+
+  const first = cloneSource({
+    relativePath: 'tokens/ambiguous-one.json',
+    fileName: 'ambiguous-one.json',
+    identityKeys: ['account:a-1', 'user:ambiguous-one'],
+  });
+  const second = cloneSource({
+    relativePath: 'tokens/ambiguous-two.json',
+    fileName: 'ambiguous-two.json',
+    identityKeys: ['account:a-1', 'user:ambiguous-two'],
+  });
+  const partialRemote = {
+    id: 23,
+    name: 'free00023',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    schedulable: false,
+    identityKeys: ['account:a-1'],
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  const ambiguousDiff = buildDiff([first, second], [partialRemote]);
+  assert.equal(ambiguousDiff.items.length, 2);
+  for (const item of ambiguousDiff.items) {
+    assert.equal(item.kind, 'mapping_conflict');
+    assert.equal(item.observedKind, 'mapping_conflict');
+    assert.equal(item.decisionAction, 'conflict');
+    assert.equal(item.decisionReason, 'ambiguous_sub2api_identity');
+  }
+  const ambiguousPlan = buildImportPlan({
+    ...loaded,
+    tokens: [first, second],
+    usernames: [],
+  }, [partialRemote]);
+  assert.deepEqual(ambiguousPlan.map((item) => item.action), ['conflict', 'conflict']);
+  assert.deepEqual(ambiguousPlan.map((item) => item.reason), [
+    'ambiguous_sub2api_identity',
+    'ambiguous_sub2api_identity',
+  ]);
 });
 
 test('import plan writes only the freshest candidate when one account has duplicate sources', () => {

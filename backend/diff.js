@@ -1,4 +1,11 @@
 const { normalizeIdentityValue } = require('./lib/token');
+const { getAccountAvailability } = require('./accountAvailability');
+
+const TERMINAL_SOURCE_STATUSES = new Set([
+  'account_deleted',
+  'account_deactivated',
+  'account_disabled',
+]);
 
 function accountKeys(account) {
   if (Array.isArray(account?.identityKeys) && account.identityKeys.length > 0) {
@@ -71,6 +78,53 @@ function identitiesCompatible(leftKeys = [], rightKeys = []) {
   return false;
 }
 
+function ambiguousAccountHints(candidate, accounts) {
+  const candidateKeys = candidate?.sourceIdentityKeys || [];
+  const candidateIdentity = identityParts(candidateKeys);
+  if (candidateIdentity.email.size === 0) return [];
+  return (accounts || []).filter((account) => {
+    const keys = Array.isArray(account?.identityKeys) && account.identityKeys.length > 0
+      ? account.identityKeys
+      : accountKeys(account);
+    const remoteIdentity = identityParts(keys);
+    const sharesEmail = [...candidateIdentity.email].some((value) => (
+      remoteIdentity.email.has(value)
+    ));
+    if (!sharesEmail) return false;
+    if (identitiesStronglyCompatible(candidateKeys, keys)) return false;
+    if (remoteIdentity.account.size === 0 && remoteIdentity.user.size === 0) return true;
+    const hasComparableDimension = (candidateIdentity.account.size > 0
+        && remoteIdentity.account.size > 0)
+      || (candidateIdentity.user.size > 0 && remoteIdentity.user.size > 0);
+    return !hasComparableDimension;
+  });
+}
+
+function incomparableSourceRecords(tokenRecords = []) {
+  const emailIndex = new Map();
+  for (const record of tokenRecords || []) {
+    if (record?.parseStatus !== 'ok' || record?.historical === true) continue;
+    const identity = identityParts(record.identityKeys || []);
+    const hasAccount = identity.account.size > 0;
+    const hasUser = identity.user.size > 0;
+    // A record with both dimensions is comparable with every strong record.
+    // Only account-only versus user-only records need to fail closed.
+    if (hasAccount === hasUser) continue;
+    for (const email of identity.email) {
+      const bucket = emailIndex.get(email) || { accountOnly: [], userOnly: [] };
+      bucket[hasAccount ? 'accountOnly' : 'userOnly'].push(record);
+      emailIndex.set(email, bucket);
+    }
+  }
+  const conflicts = new Set();
+  for (const bucket of emailIndex.values()) {
+    if (bucket.accountOnly.length === 0 || bucket.userOnly.length === 0) continue;
+    for (const record of bucket.accountOnly) conflicts.add(record);
+    for (const record of bucket.userOnly) conflicts.add(record);
+  }
+  return conflicts;
+}
+
 function strongIdentityContradiction(leftKeys = [], rightKeys = []) {
   const left = identityParts(leftKeys);
   const right = identityParts(rightKeys);
@@ -109,6 +163,89 @@ function credentialsInSync(token, account) {
   return accountCredentialPresence(account, 'refresh') === 'present'
     && Boolean(account?.tokenFingerprints?.refresh)
     && sourceRefresh === account.tokenFingerprints.refresh;
+}
+
+// Keep the human-facing credential difference and the import planner reason
+// on one contract.  A remote account that explicitly lacks the refresh token
+// carried by the source needs a more useful reason than the generic
+// `token_changed`, while an access-only source must not claim that refresh is
+// missing.
+function credentialDifferenceReason(token, account) {
+  if (credentialsInSync(token, account)) return null;
+  if (token?.fingerprints?.refresh
+      && accountCredentialPresence(account, 'refresh') === 'absent') {
+    return 'missing_refresh_token';
+  }
+  return 'token_changed';
+}
+
+function sourceTerminalStatus(usernames = [], record) {
+  const email = String(record?.email || '').trim().toLowerCase();
+  if (!email) return null;
+  const terminal = (Array.isArray(usernames) ? usernames : []).find((item) => (
+    String(item?.email || '').trim().toLowerCase() === email
+      && TERMINAL_SOURCE_STATUSES.has(String(item?.status || '').trim().toLowerCase())
+  ));
+  return terminal ? String(terminal.status).trim().toLowerCase() : null;
+}
+
+function isExpectedSub2ApiAccount(account) {
+  return String(account?.platform || '').trim().toLowerCase() === 'openai'
+    && String(account?.type || '').trim().toLowerCase() === 'oauth';
+}
+
+// These checks precede identity and target policy checks in the import
+// planner. Keeping them separate preserves that precedence when callers have
+// not yet established a unique strong-identity mapping.
+function sourceStateImportDecision(token, options = {}) {
+  const terminalStatus = options.terminalStatus
+    || sourceTerminalStatus(options.usernames, token);
+  if (terminalStatus) {
+    return { action: 'skip', reason: 'source_account_terminal', terminalStatus };
+  }
+  if (isExpiryInvalid(token)) {
+    return { action: 'skip', reason: 'source_expiry_invalid', terminalStatus: null };
+  }
+  return null;
+}
+
+// This helper assumes the caller has already established one unambiguous
+// strong-identity match. It is shared by the diff metadata and the actual
+// import planner so policy blockers cannot silently appear as actionable
+// credential changes (or vice versa).
+function matchedAccountImportDecision(token, account, options = {}) {
+  const nowMs = Number(options.nowMs || Date.now());
+  const sourceDecision = sourceStateImportDecision(token, options);
+  if (sourceDecision) return sourceDecision;
+  if (account?.schemaValid === false) {
+    return { action: 'conflict', reason: 'sub2api_account_schema_invalid' };
+  }
+  if (!isExpectedSub2ApiAccount(account)) {
+    return { action: 'conflict', reason: 'sub2api_target_kind_invalid' };
+  }
+  if (token?.disabled === true) return { action: 'skip', reason: 'source_disabled' };
+  if (options.superseded === true) {
+    return { action: 'skip', reason: 'superseded_by_newer_source' };
+  }
+  const availability = getAccountAvailability(account, nowMs);
+  if (availability.key === 'available') {
+    return { action: 'skip', reason: 'sub2api_available', availability };
+  }
+  if (availability.key !== 'unavailable') {
+    return {
+      action: 'skip',
+      reason: availability.reason || 'sub2api_availability_unknown',
+      availability,
+    };
+  }
+  if (isExpired(token, nowMs)) {
+    return { action: 'skip', reason: 'source_token_expired', availability };
+  }
+  const differenceReason = credentialDifferenceReason(token, account);
+  if (!differenceReason) {
+    return { action: 'skip', reason: 'already_in_sync', availability };
+  }
+  return { action: 'update', reason: differenceReason, availability };
 }
 
 function normalizedIdentityKey(key) {
@@ -181,6 +318,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
   const activeTokenRecords = tokenRecords.filter((record) => (
     record?.historical !== true
   ));
+  const incomparableTokens = incomparableSourceRecords(activeTokenRecords);
   const tokenIndex = indexByIdentity(
     activeTokenRecords.filter((record) => record.parseStatus === 'ok'),
     (record) => Array.isArray(record.identityKeys) ? record.identityKeys : [],
@@ -263,6 +401,35 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     if (candidates.length === 0) {
       const expiryInvalid = isExpiryInvalid(token);
       const expired = isExpired(token, nowMs);
+      let decision = null;
+      if (comparisonUnavailable) {
+        decision = { action: null, reason: comparisonUnavailableReason };
+      } else {
+        decision = sourceStateImportDecision(token, {
+          nowMs,
+          usernames: options.usernames,
+        });
+        if (!decision) {
+          const identity = identityParts(token.identityKeys || []);
+          if (identity.account.size > 1 || identity.user.size > 1) {
+            decision = { action: 'conflict', reason: 'conflicting_strong_identity' };
+          } else if (!hasStrongIdentity(token.identityKeys || [])) {
+            decision = { action: 'conflict', reason: 'source_identity_insufficient' };
+          } else if (incomparableTokens.has(token)) {
+            decision = { action: 'conflict', reason: 'incomparable_strong_identity' };
+          } else if (ambiguousAccountHints({
+            sourceIdentityKeys: token.identityKeys || [],
+          }, uniqueRecords((token.identityKeys || [])
+            .filter((key) => /^email:/i.test(String(key || '')))
+            .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || []))).length > 0) {
+            decision = { action: 'conflict', reason: 'ambiguous_sub2api_identity' };
+          } else if (token.disabled === true) {
+            decision = { action: 'skip', reason: 'source_disabled' };
+          } else if (expired) {
+            decision = { action: 'skip', reason: 'source_token_expired' };
+          }
+        }
+      }
       items.push({
         kind: expiryInvalid
           ? 'expiry_invalid'
@@ -274,6 +441,8 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
         fileName: token.fileName,
         token,
         account: null,
+        decisionAction: decision?.action ?? null,
+        decisionReason: decision?.reason || null,
         issues: expiryInvalid ? ['expiry_invalid'] : expired ? ['expired'] : [],
       });
       continue;
@@ -282,6 +451,9 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       for (const candidate of candidates) matchedAccountIds.add(String(candidate.id));
       items.push({
         kind: 'mapping_conflict',
+        observedKind: 'mapping_conflict',
+        decisionAction: 'conflict',
+        decisionReason: 'multiple_sub2api_accounts',
         source: token.source,
         relativePath: token.relativePath,
         fileName: token.fileName,
@@ -297,16 +469,22 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     const issues = [];
     if (isExpiryInvalid(token)) issues.push('expiry_invalid');
     else if (isExpired(token, nowMs)) issues.push('expired');
-    if (!credentialsInSync(token, account)) {
-      if (token.fingerprints?.refresh
-          && accountCredentialPresence(account, 'refresh') === 'absent') {
-        issues.push('missing_refresh_token');
-      } else {
-        issues.push('token_changed');
-      }
-    }
+    const credentialReason = credentialDifferenceReason(token, account);
+    if (credentialReason) issues.push(credentialReason);
+    const observedKind = issues[0] || 'in_sync';
+    const decision = matchedAccountImportDecision(token, account, {
+      nowMs,
+      usernames: options.usernames,
+    });
     items.push({
-      kind: issues[0] || 'in_sync',
+      // `kind` remains the backwards-compatible observation used by the
+      // difference filters. Import policy is deliberately carried in
+      // separate fields: a matching token can still be skipped because the
+      // source is disabled or the remote account is already available.
+      kind: observedKind,
+      observedKind,
+      decisionAction: decision.action,
+      decisionReason: decision.reason,
       source: token.source,
       relativePath: token.relativePath,
       fileName: token.fileName,
@@ -342,6 +520,9 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     for (const item of bucket) {
       item.kind = 'mapping_conflict';
       item.issues = [...new Set([...(item.issues || []), 'ambiguous_sub2api_identity'])];
+      item.observedKind = 'mapping_conflict';
+      item.decisionAction = 'conflict';
+      item.decisionReason = 'ambiguous_sub2api_identity';
       // Keep the conflicting account ID only as an issue hint. Removing the
       // operational account object prevents account testing from treating a
       // partial identity match as authorization for that numeric ID.
@@ -377,10 +558,21 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     for (const item of items) {
       item.availability = 'unknown';
       item.availabilityReason = comparisonUnavailableReason;
+      if (item.token?.parseStatus === 'ok' && item.token?.historical !== true) {
+        item.decisionAction = null;
+        item.decisionReason = comparisonUnavailableReason;
+      }
     }
   }
   const counts = {};
-  for (const item of items) counts[item.kind] = (counts[item.kind] || 0) + 1;
+  for (const item of items) {
+    // Normalize the contract after mapping-conflict post-processing so
+    // callers never see a stale pre-conflict observation or decision.
+    item.observedKind = item.kind;
+    if (!Object.hasOwn(item, 'decisionAction')) item.decisionAction = null;
+    if (!Object.hasOwn(item, 'decisionReason')) item.decisionReason = null;
+    counts[item.kind] = (counts[item.kind] || 0) + 1;
+  }
   return { generatedAt: new Date(nowMs).toISOString(), comparisonStatus, items, counts };
 }
 
@@ -391,6 +583,9 @@ function toSafeDiff(diff) {
     counts: diff.counts,
     items: diff.items.map((item) => ({
       kind: item.kind,
+      observedKind: item.observedKind || item.kind,
+      decisionAction: item.decisionAction || null,
+      decisionReason: item.decisionReason || null,
       source: item.source,
       relativePath: item.relativePath,
       fileName: item.fileName,
@@ -441,10 +636,16 @@ module.exports = {
   strongIdentityContradiction,
   identitiesStronglyCompatible,
   identitiesCompatible,
+  ambiguousAccountHints,
   isExpired,
   isExpiryInvalid,
   accountCredentialPresence,
   credentialsInSync,
+  credentialDifferenceReason,
+  sourceTerminalStatus,
+  sourceStateImportDecision,
+  isExpectedSub2ApiAccount,
+  matchedAccountImportDecision,
   buildDiff,
   toSafeDiff,
 };
