@@ -481,6 +481,27 @@ function candidateKey(record) {
   return 'token:' + String(record.source) + ':' + String(record.relativePath || record.fileName);
 }
 
+function compareNaturalPath(leftValue, rightValue) {
+  const left = String(leftValue || '');
+  const right = String(rightValue || '');
+  const naturalOrder = left.localeCompare(
+    right,
+    'en',
+    { numeric: true, sensitivity: 'base' },
+  );
+  if (naturalOrder !== 0) return naturalOrder;
+  if (left === right) return 0;
+
+  // The natural collation intentionally ignores case and some Unicode
+  // distinctions. Resolve those ties using the original UTF-8 bytes so a
+  // token winner never depends on filesystem or API input order. The final
+  // code-unit comparison also keeps this a strict total order for malformed
+  // surrogate strings that UTF-8 encodes as the same replacement character.
+  const byteOrder = Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
+  if (byteOrder !== 0) return byteOrder;
+  return left < right ? -1 : 1;
+}
+
 function compareTokenRecordFreshness(leftRecord, rightRecord, nowMs = Date.now()) {
   const left = leftRecord || {};
   const right = rightRecord || {};
@@ -520,11 +541,7 @@ function compareTokenRecordFreshness(leftRecord, rightRecord, nowMs = Date.now()
   if (leftSourcePriority !== rightSourcePriority) {
     return leftSourcePriority > rightSourcePriority ? -1 : 1;
   }
-  return String(left.relativePath || '').localeCompare(
-    String(right.relativePath || ''),
-    'en',
-    { numeric: true, sensitivity: 'base' },
-  );
+  return compareNaturalPath(left.relativePath, right.relativePath);
 }
 
 function identityValues(keys = [], prefix) {
@@ -579,9 +596,7 @@ function collectCandidates(sources, options = {}) {
   const nowMs = Number(options.nowMs || Date.now());
   const records = (sources.tokens || [])
     .filter((record) => record.parseStatus === 'ok' && record.raw && record.historical !== true)
-    .sort((left, right) => String(left.relativePath || '').localeCompare(
-      String(right.relativePath || ''), 'en', { numeric: true, sensitivity: 'base' },
-    ));
+    .sort((left, right) => compareNaturalPath(left.relativePath, right.relativePath));
   const parent = records.map((_, index) => index);
   const find = (index) => {
     let root = index;
@@ -681,8 +696,9 @@ function collectCandidates(sources, options = {}) {
     }
   }
 
-  return candidates.sort((left, right) => String(left.record.relativePath).localeCompare(
-    String(right.record.relativePath), 'en', { numeric: true, sensitivity: 'base' },
+  return candidates.sort((left, right) => compareNaturalPath(
+    left.record.relativePath,
+    right.record.relativePath,
   ));
 }
 
@@ -700,11 +716,34 @@ function accountMatches(candidate, accounts) {
   return [...matches.values()];
 }
 
+function parseCanonicalFreeName(value) {
+  if (typeof value !== 'string') return null;
+  const match = /^free([0-9]{5})$/.exec(value);
+  if (!match) return null;
+  const number = Number(match[1]);
+  return Number.isSafeInteger(number) && number >= 1 && number <= 99999 ? number : null;
+}
+
+function freeNameCollisionKey(value) {
+  if (typeof value !== 'string') return null;
+  const folded = value.trim().toLowerCase();
+  return /^free[0-9]{5}$/.test(folded) ? folded : null;
+}
+
+function accountsMatchingFreeName(accounts, expectedName) {
+  const expectedNumber = parseCanonicalFreeName(expectedName);
+  if (expectedNumber === null) return [];
+  const expectedKey = freeName(expectedNumber);
+  return (accounts || []).filter((account) => (
+    freeNameCollisionKey(account?.name) === expectedKey
+  ));
+}
+
 function nextFreeNumber(accounts) {
   let maximum = 0;
   for (const account of accounts) {
-    const match = /^free(\d+)$/i.exec(String(account.name || '').trim());
-    if (match) maximum = Math.max(maximum, Number(match[1]));
+    const number = parseCanonicalFreeName(account?.name);
+    if (number !== null) maximum = Math.max(maximum, number);
   }
   return maximum + 1;
 }
@@ -854,6 +893,10 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
         action = 'conflict';
         reason = 'free_name_exhausted';
       } else {
+        if (accountsMatchingFreeName(accounts, assignedName).length > 0) {
+          action = 'conflict';
+          reason = 'free_name_conflict';
+        }
         nextNumber += 1;
       }
     }
@@ -1115,9 +1158,12 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
       'SUB2API_CREATE_RACE_IDENTITY_CONFLICT',
     );
   }
-  const expectedName = String(item?.accountName || '');
-  const nameMatches = accounts.filter((candidate) => String(candidate?.name || '') === expectedName);
-  if (!expectedName || nameMatches.length !== 1 || Number(nameMatches[0]?.id) !== Number(account.id)) {
+  const expectedName = item?.accountName;
+  const nameMatches = accountsMatchingFreeName(accounts, expectedName);
+  if (parseCanonicalFreeName(expectedName) === null
+      || String(account?.name || '') !== expectedName
+      || nameMatches.length !== 1
+      || Number(nameMatches[0]?.id) !== Number(account.id)) {
     throw targetVerificationError(
       '导入后发现 Sub2API 账号名称发生竞态或冲突',
       'SUB2API_CREATE_RACE_NAME_CONFLICT',
@@ -1490,9 +1536,13 @@ async function preflightCreateAccount(client, item, options = {}) {
   if (!hasStrongIdentity(item.sourceIdentityKeys || [])) {
     throw targetVerificationError('新建账号缺少强身份，已拒绝写入', 'SOURCE_STRONG_IDENTITY_REQUIRED');
   }
+  if (parseCanonicalFreeName(item?.accountName) === null) {
+    throw targetVerificationError(
+      '新建账号名称必须是规范的 free 五位编号',
+      'SUB2API_CREATE_NAME_INVALID',
+    );
+  }
   const accounts = await client.listAccounts({
-    platform: 'openai',
-    type: 'oauth',
     pageSize: 200,
     signal,
   });
@@ -1507,8 +1557,11 @@ async function preflightCreateAccount(client, item, options = {}) {
   if (ambiguousAccountHints({ sourceIdentityKeys: item.sourceIdentityKeys || [] }, accounts).length > 0) {
     throw targetVerificationError('写入前发现仅能通过邮箱关联的 Sub2API 账号', 'SUB2API_CREATE_IDENTITY_AMBIGUOUS');
   }
-  if (accounts.some((account) => String(account.name || '') === String(item.accountName || ''))) {
-    throw targetVerificationError('写入前发现账号名称已被占用', 'SUB2API_CREATE_NAME_TAKEN');
+  if (accountsMatchingFreeName(accounts, item.accountName).length > 0) {
+    throw targetVerificationError(
+      '写入前发现账号名称已被占用或存在大小写冲突',
+      'SUB2API_CREATE_NAME_CONFLICT',
+    );
   }
   return new Set(accounts
     .map((account) => Number(account?.id))

@@ -108,6 +108,34 @@ test('five-digit free name capacity fails closed instead of emitting a sixth dig
   assert.equal(plan[0].accountName, null);
 });
 
+test('noncanonical free-like names neither consume numbering capacity nor hide casefold collisions', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const unrelated = (id, name) => ({
+    id,
+    name,
+    identityKeys: ['user:unrelated-' + String(id)],
+    tokenFingerprints: {},
+  });
+  const ignored = [
+    unrelated(1, 'free100000'),
+    unrelated(2, 'free000001'),
+    unrelated(3, 'FREE99999'),
+    unrelated(4, ' free99998 '),
+  ];
+  const plan = buildImportPlan(sources, ignored);
+  assert.equal(plan[0].action, 'create');
+  assert.equal(plan[0].accountName, 'free00001');
+
+  for (const occupiedName of ['FREE00001', ' free00001 ']) {
+    const conflict = buildImportPlan(sources, [unrelated(5, occupiedName)])[0];
+    assert.equal(conflict.action, 'conflict');
+    assert.equal(conflict.reason, 'free_name_conflict');
+    assert.equal(conflict.accountName, 'free00001');
+  }
+});
+
 test('import plan ignores historical old_codex backups', () => {
   const { root } = fixture();
   fs.renameSync(
@@ -1808,6 +1836,78 @@ function syntheticToken(relativePath, identityKeys, options = {}) {
   };
 }
 
+test('natural path ties have a strict order and select the same token after input reversal', () => {
+  const identityKeys = ['account:natural-order-account', 'user:natural-order-user'];
+  const upper = syntheticToken('tokens/A2.json', identityKeys, {
+    accessFingerprint: 'upper-natural-fingerprint',
+  });
+  const lower = syntheticToken('tokens/a02.json', identityKeys, {
+    accessFingerprint: 'lower-natural-fingerprint',
+  });
+  assert.equal(
+    upper.relativePath.localeCompare(
+      lower.relativePath,
+      'en',
+      { numeric: true, sensitivity: 'base' },
+    ),
+    0,
+  );
+
+  const forward = collectCandidates({ tokens: [lower, upper] })[0];
+  const reversed = collectCandidates({ tokens: [upper, lower] })[0];
+  assert.equal(forward.record.relativePath, 'tokens/A2.json');
+  assert.equal(reversed.record.relativePath, forward.record.relativePath);
+  assert.deepEqual(
+    reversed.records.map((record) => record.relativePath),
+    forward.records.map((record) => record.relativePath),
+  );
+  assert.equal(
+    buildImportPlan({ tokens: [lower, upper], usernames: [] }, [])[0].fingerprints.access,
+    buildImportPlan({ tokens: [upper, lower], usernames: [] }, [])[0].fingerprints.access,
+  );
+});
+
+test('create preflight requires a canonical name and rejects casefold-equivalent occupancy', async () => {
+  const identityKeys = ['account:create-name-account', 'user:create-name-user'];
+  const source = syntheticToken('tokens/create-name.json', identityKeys);
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  let reads = 0;
+  let writes = 0;
+
+  await assert.rejects(
+    executeImportPlanItem({
+      item: { ...item, accountName: 'FREE00001' },
+      client: {
+        async listAccounts() { reads += 1; return []; },
+        async importCodexSession() { writes += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_CREATE_NAME_INVALID',
+  );
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async listAccounts() {
+          reads += 1;
+          return [{
+            id: 12,
+            name: ' FREE00001 ',
+            identityKeys: ['account:unrelated-name-account', 'user:unrelated-name-user'],
+          }];
+        },
+        async importCodexSession() { writes += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_CREATE_NAME_CONFLICT',
+  );
+  assert.equal(reads, 1);
+  assert.equal(writes, 0);
+});
+
 test('Codex create documents use the current expiry field and deterministic secret-free keys', () => {
   const accessSecret = 'access-secret-must-not-enter-header';
   const refreshSecret = 'refresh-secret-must-not-enter-header';
@@ -3302,6 +3402,7 @@ test('create postflight fails closed when the allocated free name is no longer u
                 {
                   ...created,
                   id: 62,
+                  name: item.accountName.toUpperCase(),
                   platform: 'anthropic',
                   type: 'apikey',
                   identityKeys: ['account:unrelated-account', 'user:unrelated-user'],

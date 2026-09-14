@@ -72,6 +72,7 @@ test('frontend treats every blocking plan item as a conflict and explains termin
         actionReasonLabel('incomparable_strong_identity'),
         actionReasonLabel('ambiguous_sub2api_identity'),
         actionReasonLabel('free_name_exhausted'),
+        actionReasonLabel('free_name_conflict'),
         actionReasonLabel('sub2api_account_schema_invalid'),
         actionReasonLabel('sub2api_target_kind_invalid'),
       ],

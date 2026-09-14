@@ -175,6 +175,7 @@ function actionReasonLabel(reason) {
     incomparable_strong_identity: '来源强身份无法安全比较，禁止导入',
     ambiguous_sub2api_identity: 'Sub2API 身份匹配不唯一，禁止导入',
     free_name_exhausted: 'free 五位编号已用尽，禁止导入',
+    free_name_conflict: '目标 free 编号存在大小写或空白冲突，禁止导入',
     sub2api_account_schema_invalid: 'Sub2API 账号字段不完整或相互冲突，禁止导入',
     sub2api_target_kind_invalid: 'Sub2API 目标不是 OpenAI OAuth 账号，禁止导入',
     sub2api_availability_unknown: 'Sub2API 可用性未知，跳过',
