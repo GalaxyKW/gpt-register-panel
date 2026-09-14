@@ -8,6 +8,7 @@ const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_IDENTITY_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
 const CREDENTIAL_IDENTITY_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
 const LONG_OPAQUE_IDENTITY = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
+const RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
 
 function asString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
@@ -51,8 +52,33 @@ function parseDateValue(value) {
     const date = new Date(ms);
     return Number.isFinite(date.getTime()) ? date.toISOString() : null;
   }
-  const date = new Date(text);
-  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+  // Date.parse accepts implementation-dependent forms and silently rolls some
+  // impossible civil dates (for example 2026-02-30) into the next month. Token
+  // ordering and deletion must only use an explicit, validated instant.
+  if (typeof value !== 'string' || value !== text) return null;
+  const match = RFC3339_DATE_TIME.exec(text);
+  if (!match) return null;
+  // RFC 3339 uses "-00:00" to mean that the local offset is unknown. It is
+  // not an assertion of UTC and therefore cannot safely drive expiry/deletion.
+  if (text.endsWith('-00:00')) return null;
+  const [, yearText, monthText, dayText, hourText, minuteText, secondText,
+    offsetHourText, offsetMinuteText] = match;
+  const year = Number(yearText);
+  const month = Number(monthText);
+  const day = Number(dayText);
+  const hour = Number(hourText);
+  const minute = Number(minuteText);
+  const second = Number(secondText);
+  const offsetHour = offsetHourText === undefined ? 0 : Number(offsetHourText);
+  const offsetMinute = offsetMinuteText === undefined ? 0 : Number(offsetMinuteText);
+  const leapYear = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+  const daysInMonth = [31, leapYear ? 29 : 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+  if (month < 1 || month > 12
+      || day < 1 || day > daysInMonth[month - 1]
+      || hour > 23 || minute > 59 || second > 59
+      || offsetHour > 23 || offsetMinute > 59) return null;
+  const timestamp = Date.parse(text);
+  return Number.isFinite(timestamp) ? new Date(timestamp).toISOString() : null;
 }
 
 function parseJwtPayload(token) {
