@@ -244,6 +244,42 @@ function phase3ReasonLabel(reason) {
   }[reason] || '该账号不符合 Phase 3 条件';
 }
 
+function mutationRejectionSummary(rejected, workflow) {
+  if (!Array.isArray(rejected) || rejected.length === 0) return '';
+  const labels = workflow === 'phase3'
+    ? {
+      duplicate_in_request: '请求内重复',
+      phase3_queue_full: '队列已满',
+      phase3_already_running: '已有任务运行',
+      phase3_request_invalid: '请求身份无效',
+      phase3_source_not_found: '所选 token 已不存在',
+      phase3_source_historical: '所选 token 是历史备份',
+      phase3_source_invalid: '所选 token 无效',
+      phase3_source_identity_mismatch: 'token 与账号身份不一致',
+      phase3_account_not_found: 'username.json 中账号不存在',
+      phase3_account_ambiguous: 'username.json 中账号不唯一',
+      phase3_password_missing: 'username.json 中缺少密码',
+      phase3_account_terminal: '账号已处置',
+      phase3_target_revision_changed: '目标快照已变化',
+    }
+    : {
+      account_test_already_running: '已有测试运行',
+      account_not_found: 'Sub2API 账号已不存在',
+    };
+  const fallback = workflow === 'phase3'
+    ? '其他 Phase 3 安全校验未通过'
+    : '其他账号测试安全校验未通过';
+  const counts = new Map();
+  for (const item of rejected) {
+    const rawCode = workflow === 'phase3' ? item?.error : item?.code;
+    const code = typeof rawCode === 'string' ? rawCode : '';
+    const label = Object.prototype.hasOwnProperty.call(labels, code) ? labels[code] : fallback;
+    counts.set(label, (counts.get(label) || 0) + 1);
+  }
+  const details = Array.from(counts, ([label, count]) => label + ' ' + count).join('、');
+  return '拒绝 ' + rejected.length + ' 个（' + details + '）';
+}
+
 function effectivePlanAction(item) {
   return item?.action === 'conflict' || item?.conflictingVersions === true
     ? 'conflict'
@@ -2919,12 +2955,16 @@ elements.phase3Button.addEventListener('click', async () => {
       '/api/phase3',
       { accounts: targets, selectedKeys: targets.map((target) => target.selectedKey) },
     );
-    if (!response.ok) throw new Error(body.message || body.error || 'Phase 3 任务创建失败');
+    if (!response.ok) {
+      const rejectedSummary = mutationRejectionSummary(body.rejected, 'phase3');
+      const message = body.message || body.error || 'Phase 3 任务创建失败';
+      throw new Error(message + (rejectedSummary ? '；' + rejectedSummary : ''));
+    }
     const jobIds = Array.isArray(body.jobIds) ? body.jobIds : (body.jobId ? [body.jobId] : []);
     if (!jobIds.length) throw new Error('Phase 3 未返回任务编号');
-    const rejectedCount = Array.isArray(body.rejected) ? body.rejected.length : 0;
+    const rejectedSummary = mutationRejectionSummary(body.rejected, 'phase3');
     showNotice('Phase 3 已排队 ' + jobIds.length + ' 个任务'
-      + (rejectedCount ? '，拒绝 ' + rejectedCount + ' 个重复或不符合条件的账号' : '') + '，正在等待执行结果。', 'notice-info');
+      + (rejectedSummary ? '，' + rejectedSummary : '') + '，正在等待执行结果。', 'notice-info');
     await watchJobs(jobIds);
   } catch (error) {
     state.phase3RequestPending = false;
@@ -2970,12 +3010,14 @@ if (elements.accountTestButton) {
         },
       );
       if (!response.ok) {
-        const rejected = Array.isArray(body.rejected) ? body.rejected.length : 0;
-        throw new Error(body.message || body.error || (rejected ? '没有可测试的上游账号' : '账号测试任务创建失败'));
+        const rejectedSummary = mutationRejectionSummary(body.rejected, 'account_test');
+        const message = body.message || body.error
+          || (rejectedSummary ? '没有可测试的上游账号' : '账号测试任务创建失败');
+        throw new Error(message + (rejectedSummary ? '；' + rejectedSummary : ''));
       }
-      const rejectedCount = Array.isArray(body.rejected) ? body.rejected.length : 0;
+      const rejectedSummary = mutationRejectionSummary(body.rejected, 'account_test');
       showNotice('账号测试已排队 ' + (body.accountIds?.length || targets.length) + ' 个账号'
-        + (rejectedCount ? '，拒绝 ' + rejectedCount + ' 个已在执行、不存在或状态无法安全确认的账号' : '')
+        + (rejectedSummary ? '，' + rejectedSummary : '')
         + '，正在等待结果。', 'notice-info');
       await watchJob(body.jobId, 'account_test');
     } catch (error) {

@@ -2234,6 +2234,39 @@ test('frontend identifies the local and Sub2API sides of mutation buttons', () =
   assert.match(source, /targets\.slice\(0, 10\).*target\.accountId/s);
 });
 
+test('frontend explains partial mutation rejections without rendering response identities or text', () => {
+  const rejectionContract = sourceSection(
+    'function mutationRejectionSummary',
+    'function effectivePlanAction',
+  );
+  const context = {};
+  vm.runInNewContext(rejectionContract + `
+    phase3 = mutationRejectionSummary([
+      { error: 'phase3_target_revision_changed', email: 'secret@example.test', message: 'raw secret' },
+      { error: 'phase3_target_revision_changed' },
+      { error: 'phase3_queue_full' },
+      { error: 'future_code', phone: '8613800138000' },
+    ], 'phase3');
+    accountTest = mutationRejectionSummary([
+      { code: 'account_test_already_running', accountId: 77 },
+      { code: 'account_not_found', message: 'raw upstream message' },
+      { code: 'future_code' },
+    ], 'account_test');
+    empty = mutationRejectionSummary([], 'phase3');
+  `, context);
+  assert.match(context.phase3, /拒绝 4 个/);
+  assert.match(context.phase3, /目标快照已变化 2/);
+  assert.match(context.phase3, /队列已满 1/);
+  assert.match(context.phase3, /其他 Phase 3 安全校验未通过 1/);
+  assert.doesNotMatch(context.phase3, /secret|example|13800138000|raw|future_code/);
+  assert.match(context.accountTest, /拒绝 3 个/);
+  assert.match(context.accountTest, /已有测试运行 1/);
+  assert.match(context.accountTest, /Sub2API 账号已不存在 1/);
+  assert.match(context.accountTest, /其他账号测试安全校验未通过 1/);
+  assert.doesNotMatch(context.accountTest, /77|raw|future_code/);
+  assert.equal(context.empty, '');
+});
+
 test('frontend distinguishes healthy availability and never force-adds an unsupported model', () => {
   const modelContract = sourceSection('function renderAccountTestModels', 'function accountTestRows');
   const remoteStateContract = sourceSection('function renderRemoteState', 'function renderDiffDecision');
@@ -2687,6 +2720,7 @@ test('frontend Phase3 submits selected keys in the same order as account targets
       };
     },
     showNotice() {},
+    mutationRejectionSummary: () => '',
     watchJobs: async () => {},
     window: { confirm: () => true },
   };
