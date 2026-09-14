@@ -37,6 +37,7 @@ const {
   parseJwtPayload,
   normalizeIdentityValue,
   tokenCredentialField,
+  tokenFingerprint,
 } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
@@ -2019,6 +2020,124 @@ function writeBackup(payload) {
   return logicalFilePath;
 }
 
+function backupCoverageError() {
+  const error = new Error('Sub2API 导出备份未完整覆盖待更新账号');
+  error.code = 'SUB2API_BACKUP_COVERAGE_INVALID';
+  return error;
+}
+
+function plainBackupObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  try { return Object.getPrototypeOf(value) === Object.prototype; } catch { return false; }
+}
+
+function backupIdentityField(credentials, aliases, prefix) {
+  const values = new Set();
+  let invalid = false;
+  for (const key of aliases) {
+    if (!Object.prototype.hasOwnProperty.call(credentials, key)) continue;
+    const raw = credentials[key];
+    if (raw === undefined || raw === null || raw === '') continue;
+    if (typeof raw !== 'string'
+        && !(typeof raw === 'number' && Number.isSafeInteger(raw) && !Object.is(raw, -0))) {
+      invalid = true;
+      continue;
+    }
+    const text = String(raw);
+    if (text !== text.trim() || text.length > 512
+        || /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(text)) {
+      invalid = true;
+      continue;
+    }
+    const normalized = normalizeIdentityValue(prefix, text);
+    if (!normalized) invalid = true;
+    else values.add(normalized);
+  }
+  return { values, invalid: invalid || values.size > 1 };
+}
+
+function backupAccountIdentity(account) {
+  if (!plainBackupObject(account) || !plainBackupObject(account.credentials)) {
+    return { keys: [], invalid: true };
+  }
+  const accountField = backupIdentityField(
+    account.credentials,
+    ['chatgpt_account_id', 'account_id'],
+    'account:',
+  );
+  const userField = backupIdentityField(
+    account.credentials,
+    ['chatgpt_user_id', 'user_id'],
+    'user:',
+  );
+  return {
+    keys: [
+      ...[...accountField.values].map((value) => 'account:' + value),
+      ...[...userField.values].map((value) => 'user:' + value),
+    ],
+    invalid: accountField.invalid || userField.invalid,
+  };
+}
+
+function backupCredentialStateMatches(plannedAccount, credentials) {
+  if (!plainBackupObject(credentials) || Object.keys(credentials).length === 0) return false;
+  for (const kind of ['access', 'refresh', 'id']) {
+    const field = tokenCredentialField(credentials, kind);
+    if (field.invalid) return false;
+    const present = Boolean(field.value);
+    const expectedPresence = accountCredentialPresence(plannedAccount, kind);
+    if (expectedPresence === 'present' && !present) return false;
+    if (expectedPresence === 'absent' && present) return false;
+    const expectedFingerprint = plannedAccount?.tokenFingerprints?.[kind] || null;
+    if (expectedFingerprint && (!present || tokenFingerprint(field.value) !== expectedFingerprint)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function backupAccountMatchesUpdate(account, item) {
+  const plannedAccount = item?._account;
+  if (!plannedAccount || !plainBackupObject(account)) return false;
+  const expectedName = String(plannedAccount.name || item.accountName || '');
+  if (!expectedName || account.name !== expectedName) return false;
+  if (String(account.platform || '').trim().toLowerCase() !== 'openai'
+      || String(account.type || '').trim().toLowerCase() !== 'oauth') return false;
+  const expectedIdentity = plannedAccount.identityKeys || accountKeys(plannedAccount);
+  const actualIdentity = backupAccountIdentity(account);
+  if (actualIdentity.invalid
+      || !hasStrongIdentity(expectedIdentity)
+      || !strongIdentitiesFullyMatch(expectedIdentity, actualIdentity.keys)) return false;
+  return backupCredentialStateMatches(plannedAccount, account.credentials);
+}
+
+function assertBackupCoversUpdateTargets(payload, plan = []) {
+  if (!plainBackupObject(payload) || !Array.isArray(payload.accounts)) {
+    throw backupCoverageError();
+  }
+  const updates = (Array.isArray(plan) ? plan : []).filter((item) => item?.action === 'update');
+  const targetIds = new Set();
+  const accountsByName = new Map();
+  for (const account of payload.accounts) {
+    if (!plainBackupObject(account) || typeof account.name !== 'string') continue;
+    const bucket = accountsByName.get(account.name) || [];
+    bucket.push(account);
+    accountsByName.set(account.name, bucket);
+  }
+  for (const item of updates) {
+    const targetId = Number(item?.accountId);
+    if (!Number.isSafeInteger(targetId) || targetId <= 0 || targetIds.has(targetId)) {
+      throw backupCoverageError();
+    }
+    targetIds.add(targetId);
+    const expectedName = String(item?._account?.name || item?.accountName || '');
+    const matches = (accountsByName.get(expectedName) || [])
+      .filter((account) => backupAccountMatchesUpdate(account, item));
+    if (matches.length !== 1) throw backupCoverageError();
+  }
+  return { updateTargetCount: updates.length };
+}
+
 async function executeImport({
   snapshotVersion: expectedVersion,
   selectedKeys = [],
@@ -2148,6 +2267,7 @@ async function executeImport({
       try {
         const exported = await client.exportAccounts([], { signal });
         throwIfJobInterrupted(signal);
+        assertBackupCoversUpdateTargets(exported, plan);
         backupPath = writeBackup(exported);
         writeLog(logger, 'info', 'import.backup_succeeded', { jobId, actor, backupPath });
       } catch (error) {
@@ -2160,7 +2280,11 @@ async function executeImport({
           continuedWithoutBackup: process.env.PANEL_ALLOW_UNBACKED_WRITES === '1',
         });
         if (process.env.PANEL_ALLOW_UNBACKED_WRITES !== '1') {
-          throw new Error('导入前备份失败，已停止写入：' + message);
+          const blocked = new Error('导入前备份失败，已停止写入：' + message);
+          blocked.code = 'SUB2API_BACKUP_FAILED';
+          const causeCode = String(error?.code || '');
+          if (/^[A-Z][A-Z0-9_]{0,99}$/.test(causeCode)) blocked.causeCode = causeCode;
+          throw blocked;
         }
       }
 
@@ -2474,4 +2598,5 @@ module.exports = {
   snapshotVersion,
   safeErrorMessage,
   writeBackup,
+  assertBackupCoversUpdateTargets,
 };

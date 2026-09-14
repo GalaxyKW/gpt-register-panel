@@ -22,6 +22,7 @@ const {
   snapshotVersion,
   resolveGroupIds,
   writeBackup,
+  assertBackupCoversUpdateTargets,
 } = require('../backend/sync');
 const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
@@ -39,6 +40,7 @@ const {
 const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
 const { Sub2ApiAdminClient } = require('../backend/adapters/sub2apiAdmin');
+const { tokenFingerprint } = require('../backend/lib/token');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 const successfulCheckpointLogger = Object.freeze({
@@ -4021,6 +4023,176 @@ test('credential backups require a private directory and enforce file retention'
         files: 'PANEL_BACKUP_MAX_FILES',
         bytes: 'PANEL_BACKUP_MAX_TOTAL_BYTES',
       }[key];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('credential backups uniquely cover every update target with restorable identity and tokens', () => {
+  const oldAccess = 'test-only-backup-old-access';
+  const oldRefresh = 'test-only-backup-old-refresh';
+  const plannedAccount = {
+    id: 412,
+    name: 'free00412',
+    platform: 'openai',
+    type: 'oauth',
+    identityKeys: ['account:backup-account-412', 'user:backup-user-412'],
+    tokenFingerprints: {
+      access: tokenFingerprint(oldAccess),
+      refresh: tokenFingerprint(oldRefresh),
+      id: null,
+    },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'absent' },
+  };
+  const item = {
+    action: 'update',
+    accountId: 412,
+    accountName: plannedAccount.name,
+    _account: plannedAccount,
+  };
+  const backupAccount = () => ({
+    name: plannedAccount.name,
+    platform: 'openai',
+    type: 'oauth',
+    credentials: {
+      chatgpt_account_id: 'backup-account-412',
+      chatgpt_user_id: 'backup-user-412',
+      access_token: oldAccess,
+      refresh_token: oldRefresh,
+    },
+  });
+  const payload = () => ({ accounts: [backupAccount()], proxies: [] });
+
+  assert.deepEqual(assertBackupCoversUpdateTargets(payload(), [item]), {
+    updateTargetCount: 1,
+  });
+  assert.deepEqual(assertBackupCoversUpdateTargets({ accounts: [], proxies: [] }, [{ action: 'create' }]), {
+    updateTargetCount: 0,
+  });
+
+  const malformedPayloads = [
+    { accounts: [], proxies: [] },
+    { accounts: [{ ...backupAccount(), name: 'free00413' }], proxies: [] },
+    {
+      accounts: [{
+        ...backupAccount(),
+        credentials: { ...backupAccount().credentials, chatgpt_user_id: undefined },
+      }],
+      proxies: [],
+    },
+    {
+      accounts: [{
+        ...backupAccount(),
+        credentials: { ...backupAccount().credentials, access_token: 'replacement-access' },
+      }],
+      proxies: [],
+    },
+    {
+      accounts: [{
+        ...backupAccount(),
+        credentials: { ...backupAccount().credentials, refresh_token: undefined },
+      }],
+      proxies: [],
+    },
+    { accounts: [backupAccount(), backupAccount()], proxies: [] },
+    {
+      accounts: [{
+        ...backupAccount(),
+        credentials: { ...backupAccount().credentials, account_id: 'contradictory-account' },
+      }],
+      proxies: [],
+    },
+    { accounts: [{ ...backupAccount(), type: 'api_key' }], proxies: [] },
+  ];
+  for (const exported of malformedPayloads) {
+    assert.throws(
+      () => assertBackupCoversUpdateTargets(exported, [item]),
+      (error) => error.code === 'SUB2API_BACKUP_COVERAGE_INVALID'
+        && !error.message.includes(oldAccess)
+        && !error.message.includes(oldRefresh),
+    );
+  }
+
+  assert.throws(
+    () => assertBackupCoversUpdateTargets(payload(), [item, { ...item }]),
+    (error) => error.code === 'SUB2API_BACKUP_COVERAGE_INVALID',
+  );
+});
+
+test('token import rejects an uncovered update backup before any remote write', async () => {
+  const { root } = fixture();
+  const backupRoot = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backup-coverage-')),
+    'backups',
+  );
+  fs.mkdirSync(backupRoot, { mode: 0o700 });
+  const remote = {
+    id: 413,
+    name: 'free00413',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    schemaValid: true,
+    accountId: 'a-1',
+    userId: 'u-1',
+    identityKeys: ['account:a-1', 'user:u-1', 'email:one@example.test'],
+    tokenFingerprints: {
+      access: tokenFingerprint('test-only-older-remote-access'),
+      refresh: tokenFingerprint('test-only-older-remote-refresh'),
+      id: null,
+    },
+    credentialPresence: { access: 'present', refresh: 'present', id: 'absent' },
+  };
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['PANEL_ALLOW_UNBACKED_WRITES', process.env.PANEL_ALLOW_UNBACKED_WRITES],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['PANEL_BACKUP_DIR', process.env.PANEL_BACKUP_DIR],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  delete process.env.PANEL_ALLOW_UNBACKED_WRITES;
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.PANEL_BACKUP_DIR = backupRoot;
+  try {
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      client: { async listAccounts() { return [remote]; } },
+    });
+    const plan = buildImportPlan(preview._internal.sources, [remote]);
+    assert.equal(plan.length, 1);
+    assert.equal(plan[0].action, 'update');
+    let remoteWrites = 0;
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        selectedKeys: [plan[0].key],
+        actor: 'tester',
+        jobId: 'backup-coverage-job',
+        db: { async startMutationJob() {} },
+        client: {
+          async listAccounts() { return [remote]; },
+          async exportAccounts() { return { accounts: [], proxies: [] }; },
+          async applyOAuthCredentials() { remoteWrites += 1; },
+          async importCodexSession() { remoteWrites += 1; },
+        },
+      }),
+      (error) => error.code === 'SUB2API_BACKUP_FAILED'
+        && error.causeCode === 'SUB2API_BACKUP_COVERAGE_INVALID',
+    );
+    assert.equal(remoteWrites, 0);
+    assert.deepEqual(fs.readdirSync(backupRoot), []);
+  } finally {
+    for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];
       else process.env[name] = value;
     }
