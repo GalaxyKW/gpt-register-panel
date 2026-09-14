@@ -2562,15 +2562,39 @@ test('frontend explains partial mutation rejections without rendering response i
   assert.equal(context.empty, '');
 });
 
-test('frontend distinguishes healthy availability and never force-adds an unsupported model', () => {
+test('frontend keeps luna selectable without claiming that the account supports it', () => {
   const modelContract = sourceSection('function renderAccountTestModels', 'function accountTestRows');
   const remoteStateContract = sourceSection('function renderRemoteState', 'function renderDiffDecision');
-  assert.doesNotMatch(modelContract, /values\.unshift\('gpt-5\.6-luna'\)/);
+  assert.match(modelContract, /const requiredModel = 'gpt-5\.6-luna'/);
+  assert.match(modelContract, /if \(!requiredModelReported\) values\.unshift\(requiredModel\)/);
+  assert.match(modelContract, /（手动候选）/);
+  assert.match(modelContract, /最终支持性由账号测试请求结果确认/);
   assert.match(source, /candidates\.length === 1/);
   assert.match(source, /state\.accountTestModelsPending/);
   assert.match(remoteStateContract, /availability-note-success/);
   assert.match(remoteStateContract, /availability-note-warning/);
   assert.match(stylesSource, /\.availability-note-success\s*\{[^}]*var\(--success\)/s);
+
+  const options = [];
+  const select = {
+    value: 'gpt-5',
+    options,
+    appendChild(option) { options.push(option); },
+    set innerHTML(value) {
+      assert.equal(value, '');
+      options.length = 0;
+    },
+  };
+  const context = {
+    elements: { accountTestModelSelect: select },
+    normalizeAccountTestModel(value) { return String(value || '').trim(); },
+    accountTestModelLabel(value) { return value === 'gpt-5.6-luna' ? '5.6-luna' : value; },
+    document: { createElement: () => ({ value: '', textContent: '', title: '' }) },
+  };
+  vm.runInNewContext(modelContract + "\nrenderAccountTestModels(['gpt-5']);", context);
+  assert.deepEqual(options.map((option) => option.value), ['gpt-5.6-luna', 'gpt-5']);
+  assert.match(options[0].textContent, /手动候选/);
+  assert.match(options[0].title, /最终支持性/);
 });
 
 test('frontend submits one snapshot-bound revision per unambiguous account test target', () => {

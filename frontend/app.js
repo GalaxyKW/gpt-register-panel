@@ -822,11 +822,23 @@ function renderAccountTestModels(models) {
   if (!elements.accountTestModelSelect) return;
   const current = elements.accountTestModelSelect.value;
   const values = [...new Set((models || []).map(normalizeAccountTestModel).filter(Boolean))];
+  // `gpt-5.6-luna` is an explicitly supported manual test choice in this
+  // panel. The optional per-account model endpoint is advisory and can omit a
+  // model that the caller still needs to probe, so its response must not make
+  // this choice disappear. Keep the wording honest when it was not reported:
+  // only the actual test request establishes support for that account.
+  const requiredModel = 'gpt-5.6-luna';
+  const requiredModelReported = values.includes(requiredModel);
+  if (!requiredModelReported) values.unshift(requiredModel);
   elements.accountTestModelSelect.innerHTML = '';
   for (const value of values) {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = accountTestModelLabel(value);
+    option.textContent = accountTestModelLabel(value)
+      + (value === requiredModel && !requiredModelReported ? '（手动候选）' : '');
+    if (value === requiredModel && !requiredModelReported) {
+      option.title = '当前账号模型列表未报告该候选；最终支持性由账号测试请求结果确认';
+    }
     elements.accountTestModelSelect.appendChild(option);
   }
   if ([...elements.accountTestModelSelect.options].some((option) => option.value === current)) {
