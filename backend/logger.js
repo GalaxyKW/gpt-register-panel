@@ -8,7 +8,13 @@ const MAX_LOG_BYTES = 128 * 1024 * 1024;
 const MAX_LOG_ROTATIONS = 100;
 const LOG_TAIL_BLOCK_BYTES = 64 * 1024;
 const LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024;
-const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
+const MAX_REDACTION_DEPTH = 20;
+const MAX_REDACTION_NODES = 4096;
+const MAX_REDACTION_ENTRIES = 512;
+const MAX_REDACTION_TEXT_CHARS = 128 * 1024;
+const MAX_REDACTION_TOTAL_CHARS = 256 * 1024;
+const MAX_LOG_ENTRY_BYTES = 256 * 1024;
+const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
   'state', 'states', 'expiry', 'expiries', 'expiration', 'expirations',
@@ -16,8 +22,8 @@ const NON_SECRET_METADATA_WORDS = new Set([
 ]);
 const SECRET_TEXT = [
   /-----BEGIN(?: [A-Z0-9]+)* PRIVATE KEY(?: BLOCK)?-----[\s\S]*?(?:-----END(?: [A-Z0-9]+)* PRIVATE KEY(?: BLOCK)?-----|$)/gi,
-  /Bearer\s+[A-Za-z0-9._~+/=-]+/gi,
-  /Basic\s+[A-Za-z0-9._~+/=-]+/gi,
+  /Bearer\s+[^\s,;]+/gi,
+  /Basic\s+[^\s,;]+/gi,
   /admin-[A-Za-z0-9._~-]{16,}/gi,
   /sk-[A-Za-z0-9_-]{16,}/gi,
   /eyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){2,4}/g,
@@ -50,7 +56,13 @@ function jsonRedaction(value) {
   }
 }
 
-function assignedValueSpan(text, start) {
+function secretMayContainSpaces(normalizedKey) {
+  return /(^|_)(?:passwords?|passwds?|pwds?|passphrases?|recovery_codes?|credentials?|secrets?|private_keys?)$/.test(
+    normalizedKey,
+  );
+}
+
+function assignedValueSpan(text, start, options = {}) {
   if (start >= text.length) return { end: start, replacement: '[redacted]' };
   const quote = text[start] === '"' || text[start] === "'" ? text[start] : null;
   if (quote) {
@@ -100,10 +112,10 @@ function assignedValueSpan(text, start) {
     };
   }
 
-  // Unquoted credentials are a single token. Stopping at whitespace avoids
-  // hiding the rest of an ordinary diagnostic sentence; callers can quote a
-  // credential that genuinely contains spaces.
-  const delimiterOffset = text.slice(start).search(/[\s,;}&]/);
+  // Passwords and passphrases commonly contain whitespace. For those labels,
+  // fail closed and hide the complete diagnostic segment up to punctuation.
+  const delimiters = options.allowSpaces ? /[,;}&\r\n]/ : /[\s,;}&]/;
+  const delimiterOffset = text.slice(start).search(delimiters);
   const end = delimiterOffset < 0 ? text.length : start + delimiterOffset;
   return { end, replacement: '[redacted]' };
 }
@@ -122,7 +134,10 @@ function redactMultiwordAssignments(value) {
     if (!SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
     if (match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
-    const span = assignedValueSpan(text, pattern.lastIndex);
+    const normalizedKey = normalizeSecretKey(match[3]);
+    const span = assignedValueSpan(text, pattern.lastIndex, {
+      allowSpaces: secretMayContainSpaces(normalizedKey),
+    });
     output += span.replacement;
     cursor = span.end;
     pattern.lastIndex = Math.max(span.end, pattern.lastIndex);
@@ -140,7 +155,33 @@ function redactAssignments(value) {
     if (!SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
     if (match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
-    const span = assignedValueSpan(text, pattern.lastIndex);
+    const normalizedKey = normalizeSecretKey(match[3]);
+    const span = assignedValueSpan(text, pattern.lastIndex, {
+      allowSpaces: secretMayContainSpaces(normalizedKey),
+    });
+    output += span.replacement;
+    cursor = span.end;
+    pattern.lastIndex = Math.max(span.end, pattern.lastIndex);
+  }
+  return output + text.slice(cursor);
+}
+
+function redactEncodedAssignments(value) {
+  const text = String(value || '');
+  const pattern = /(^|[^A-Za-z0-9_%])([A-Za-z_\u4e00-\u9fff%][A-Za-z0-9_\-\u4e00-\u9fff%]{0,255})([ \t]*=[ \t]*)/gi;
+  let output = '';
+  let cursor = 0;
+  let match;
+  while ((match = pattern.exec(text))) {
+    if (!match[2].includes('%')) continue;
+    let decoded;
+    try { decoded = decodeURIComponent(match[2]); } catch { continue; }
+    const normalizedKey = normalizeSecretKey(decoded);
+    if (!SECRET_KEY.test(normalizedKey) || match.index < cursor) continue;
+    output += text.slice(cursor, match.index) + match[1] + match[2] + match[3];
+    const span = assignedValueSpan(text, pattern.lastIndex, {
+      allowSpaces: secretMayContainSpaces(normalizedKey),
+    });
     output += span.replacement;
     cursor = span.end;
     pattern.lastIndex = Math.max(span.end, pattern.lastIndex);
@@ -180,7 +221,7 @@ function redactSpaceSeparatedSecrets(value) {
   // container word covers phrases such as "credential map {...}" without
   // turning ordinary "token count/status/fingerprint" diagnostics into
   // secrets. Labels and single-key forms are both length bounded.
-  const naturalPattern = /(^|[^A-Za-z0-9_])(["']?)((?:(?:access|refresh|id)[ \t]+tokens?|api[ \t]+keys?|private[ \t]+keys?|signing[ \t]+keys?|encryption[ \t]+keys?|secret[ \t]+access[ \t]+keys?|access[ \t]+key[ \t]+ids?|service[ \t]+account[ \t]+keys?|key[ \t]+materials?|mfa[ \t]+secrets?|totp[ \t]+secrets?|recovery[ \t]+codes?|authorization(?:[ \t]+codes?)?|oauth[ \t]+codes?|verification[ \t]+codes?|code[ \t]+verifiers?|client[ \t]+secrets?|secret[ \t]+keys?|passwords?|passwds?|secrets?|cookies?|tokens?|credentials?|nonces?|jwts?)(?:[ \t]+(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?)(["']?[ \t]+)/gi;
+  const naturalPattern = /(^|[^A-Za-z0-9_])(["']?)((?:(?:access|refresh|id)[ \t]+tokens?|api[ \t]+keys?|private[ \t]+keys?|signing[ \t]+keys?|encryption[ \t]+keys?|secret[ \t]+access[ \t]+keys?|access[ \t]+key[ \t]+ids?|service[ \t]+account[ \t]+keys?|key[ \t]+materials?|mfa[ \t]+secrets?|totp[ \t]+secrets?|recovery[ \t]+codes?|authorization(?:[ \t]+codes?)?|oauth[ \t]+codes?|verification[ \t]+codes?|code[ \t]+verifiers?|client[ \t]+secrets?|secret[ \t]+keys?|passwords?|passwds?|passphrases?|secrets?|cookies?|tokens?|credentials?|nonces?|jwts?|authentication|auth|sessions?)(?:[ \t]+(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?)(["']?[ \t]+)/gi;
   const singleKeyPattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_\-\u4e00-\u9fff]{0,127})(["']?[ \t]+)/gi;
   return redactSpaceSeparatedPattern(
     redactSpaceSeparatedPattern(value, naturalPattern),
@@ -197,6 +238,7 @@ function redactUrlUserinfo(value) {
 
 function redactText(value) {
   let text = String(value === undefined || value === null ? '' : value);
+  if (text.length > MAX_REDACTION_TEXT_CHARS) return '[oversized text omitted]';
   const structured = jsonRedaction(text);
   if (structured !== null) return structured;
 
@@ -208,7 +250,9 @@ function redactText(value) {
   // Assignment forms must run first: otherwise the whitespace-only matcher
   // could consume the container word in `credential payload: {...}` as if it
   // were the secret value and leave the actual payload behind.
-  return redactSpaceSeparatedSecrets(redactAssignments(redactMultiwordAssignments(text)));
+  return redactSpaceSeparatedSecrets(redactEncodedAssignments(
+    redactAssignments(redactMultiwordAssignments(text)),
+  ));
 }
 
 function readTailText(descriptor, fileSize, lineLimit) {
@@ -261,39 +305,100 @@ function readTailText(descriptor, fileSize, lineLimit) {
   return bytes.toString('utf8');
 }
 
-function redactValue(value, key = '', seen = new WeakSet()) {
+function redactionContext(candidate) {
+  if (candidate && candidate.seen instanceof WeakSet) return candidate;
+  return {
+    seen: candidate instanceof WeakSet ? candidate : new WeakSet(),
+    nodes: 0,
+    textChars: 0,
+  };
+}
+
+function safeRedactedKey(key, index) {
+  const text = String(key);
+  if (text.length > 256 || /[\u0000-\u001f\u007f\u202a-\u202e\u2066-\u2069]/u.test(text)) {
+    return '[redacted-key-' + index + ']';
+  }
+  const redacted = redactText(text);
+  return redacted === text ? text : '[redacted-key-' + index + ']';
+}
+
+function redactValueAt(value, key, context, depth) {
   const normalizedKey = normalizeSecretKey(key);
   if (SECRET_KEY.test(normalizedKey)) return '[redacted]';
-  if (typeof value === 'string') return redactText(value);
+  context.nodes += 1;
+  if (context.nodes > MAX_REDACTION_NODES) return '[redaction limit reached]';
+  if (typeof value === 'string') {
+    if (context.textChars + value.length > MAX_REDACTION_TOTAL_CHARS) {
+      return '[redaction text budget reached]';
+    }
+    context.textChars += value.length;
+    return redactText(value);
+  }
   if (typeof value === 'bigint') return String(value);
   // Functions are not JSON data. In particular, copying an enumerable
   // `toJSON` function into the sanitized object would let JSON.stringify call
   // attacker-controlled code after redaction and replace the whole safe value
   // with fresh, unredacted credentials.
   if (typeof value === 'function' || typeof value === 'symbol') return '[unsupported]';
+  if (value && (Buffer.isBuffer(value) || ArrayBuffer.isView(value)
+      || value instanceof ArrayBuffer)) return '[binary redacted]';
   if (Array.isArray(value)) {
-    if (seen.has(value)) return '[circular]';
-    seen.add(value);
-    const output = [];
-    for (let index = 0; index < value.length; index += 1) {
-      output.push(redactValue(value[index], '', seen));
+    if (context.seen.has(value)) return '[circular]';
+    if (depth >= MAX_REDACTION_DEPTH) return '[redaction depth reached]';
+    context.seen.add(value);
+    let descriptors;
+    try { descriptors = Object.getOwnPropertyDescriptors(value); } catch {
+      return '[uninspectable]';
     }
+    const indexes = Object.keys(descriptors)
+      .filter((childKey) => /^(?:0|[1-9][0-9]*)$/.test(childKey))
+      .sort((left, right) => Number(left) - Number(right));
+    const selected = indexes.slice(0, MAX_REDACTION_ENTRIES);
+    const output = [];
+    for (const childKey of selected) {
+      const descriptor = descriptors[childKey];
+      output.push(Object.prototype.hasOwnProperty.call(descriptor, 'value')
+        ? redactValueAt(descriptor.value, '', context, depth + 1)
+        : '[accessor omitted]');
+    }
+    if (indexes.length > selected.length || value.length > selected.length) output.push('[truncated]');
     return output;
   }
   if (value && typeof value === 'object') {
-    if (seen.has(value)) return '[circular]';
-    seen.add(value);
+    if (context.seen.has(value)) return '[circular]';
+    if (depth >= MAX_REDACTION_DEPTH) return '[redaction depth reached]';
+    context.seen.add(value);
+    let descriptors;
+    try { descriptors = Object.getOwnPropertyDescriptors(value); } catch {
+      return '[uninspectable]';
+    }
+    const descriptorEntries = Object.entries(descriptors);
+    const entries = descriptorEntries.slice(0, MAX_REDACTION_ENTRIES);
     const output = {};
-    for (const [childKey, childValue] of Object.entries(value)) {
+    let keyIndex = 0;
+    for (const [childKey, descriptor] of entries) {
+      keyIndex += 1;
+      const outputKey = safeRedactedKey(childKey, keyIndex);
       // Treat the serialization hook itself as unsafe even when it is not a
       // function. Define properties explicitly so a `__proto__` input key
       // remains inert data instead of changing the sanitized object's
       // prototype and installing an inherited serialization hook.
-      const safeChildValue = childKey === 'toJSON'
+      const safeChildValue = childKey === 'toJSON' || outputKey !== childKey
         ? '[redacted]'
-        : redactValue(childValue, childKey, seen);
-      Object.defineProperty(output, childKey, {
+        : Object.prototype.hasOwnProperty.call(descriptor, 'value')
+          ? redactValueAt(descriptor.value, childKey, context, depth + 1)
+          : '[accessor omitted]';
+      Object.defineProperty(output, outputKey, {
         value: safeChildValue,
+        enumerable: true,
+        configurable: true,
+        writable: true,
+      });
+    }
+    if (descriptorEntries.length > entries.length) {
+      Object.defineProperty(output, '[truncated]', {
+        value: true,
         enumerable: true,
         configurable: true,
         writable: true,
@@ -304,19 +409,61 @@ function redactValue(value, key = '', seen = new WeakSet()) {
   return value;
 }
 
+function redactValue(value, key = '', candidateContext) {
+  try { return redactValueAt(value, key, redactionContext(candidateContext), 0); } catch {
+    return '[uninspectable]';
+  }
+}
+
+function serializeLogEntry(entry, maximumBytes = MAX_LOG_ENTRY_BYTES) {
+  const safeMaximumBytes = Math.max(1024, Math.min(MAX_LOG_ENTRY_BYTES, maximumBytes));
+  let line = JSON.stringify(entry) + '\n';
+  if (Buffer.byteLength(line) <= safeMaximumBytes) return { entry, line };
+  const compact = {
+    timestamp: entry.timestamp,
+    level: entry.level,
+    event: entry.event,
+    pid: entry.pid,
+    fields: '[oversized fields omitted]',
+  };
+  line = JSON.stringify(compact) + '\n';
+  return { entry: compact, line };
+}
+
+function ownPrimitive(object, property) {
+  if (!object || (typeof object !== 'object' && typeof object !== 'function')) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(object, property);
+    if (!descriptor || !Object.prototype.hasOwnProperty.call(descriptor, 'value')) return undefined;
+    const value = descriptor.value;
+    return ['string', 'number', 'boolean', 'bigint'].includes(typeof value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeEventText(value, fallback = 'event') {
+  return ['string', 'number', 'boolean', 'bigint'].includes(typeof value)
+    ? redactText(String(value))
+    : fallback;
+}
+
 function safeErrorText(error, limit = 8192) {
   const safeLimit = Math.max(256, Math.min(64 * 1024, Number(limit) || 8192));
   let stack;
   let code;
-  try { stack = String(error?.stack || error?.message || error || 'unknown error'); } catch {
-    stack = 'unknown error';
-  }
-  try {
-    const candidate = String(error?.code || '').trim();
-    code = /^[A-Za-z0-9_.-]{1,100}$/.test(candidate) ? candidate : '';
-  } catch {
+  if (error && (typeof error === 'object' || typeof error === 'function')) {
+    stack = ownPrimitive(error, 'stack') ?? ownPrimitive(error, 'message') ?? 'unknown error';
+    code = ownPrimitive(error, 'code');
+  } else {
+    stack = ['string', 'number', 'boolean', 'bigint'].includes(typeof error)
+      ? error
+      : 'unknown error';
     code = '';
   }
+  stack = String(stack);
+  const candidate = String(code ?? '').trim();
+  code = /^[A-Za-z0-9_.-]{1,100}$/.test(candidate) ? candidate : '';
   return redactText((code ? 'code=' + code + '\n' : '') + stack).slice(0, safeLimit);
 }
 
@@ -563,19 +710,20 @@ class PanelLogger {
   checkpoint(event, fields = {}) {
     let descriptor;
     let pinnedDirectory;
-    const checkpointEvent = String(event || 'logger.audit_checkpoint');
+    const checkpointEvent = safeEventText(event, 'logger.audit_checkpoint');
     try {
       const timestamp = new Date().toISOString();
       const safeFields = fields && typeof fields === 'object' && !Array.isArray(fields)
         ? redactValue(fields)
         : {};
-      const line = JSON.stringify({
+      const serialized = serializeLogEntry({
         ...safeFields,
         timestamp,
         level: 'info',
-        event: redactText(checkpointEvent),
+        event: checkpointEvent,
         pid: this.pid,
-      }) + '\n';
+      }, this.maxBytes);
+      const line = serialized.line;
       pinnedDirectory = this.openPinnedDirectory();
       this.rotateIfNeeded(Buffer.byteLength(line), pinnedDirectory);
       descriptor = this.openValidatedFile(pinnedDirectory);
@@ -706,13 +854,14 @@ class PanelLogger {
     if (this.fallbackReports > 1 || !this.consoleEnabled) return;
     this.fallbackReports += 1;
     try {
-      process.stderr.write(JSON.stringify({
+      const serialized = serializeLogEntry({
         ...redactValue(fields),
         timestamp: new Date().toISOString(),
         level,
-        event: redactText(event),
+        event: safeEventText(event),
         pid: this.pid,
-      }) + '\n');
+      });
+      process.stderr.write(serialized.line);
     } catch {}
   }
 
@@ -726,10 +875,10 @@ class PanelLogger {
         ...redactValue(fields),
         timestamp: new Date().toISOString(),
         level: normalizedLevel,
-        event: redactText(String(event || 'event')),
+        event: safeEventText(event),
         pid: this.pid,
       };
-      line = JSON.stringify(entry) + '\n';
+      ({ entry, line } = serializeLogEntry(entry, this.maxBytes));
     } catch (error) {
       this.fallback('error', 'logger.serialize_failed', { error: error.message, originalEvent: event });
       return null;

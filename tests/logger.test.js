@@ -12,6 +12,7 @@ const {
   assertAuditLogCheckpoint,
   redactText,
   redactValue,
+  safeErrorText,
 } = require('../backend/logger');
 
 test('structured logger redacts token-like fields and process output', () => {
@@ -204,6 +205,94 @@ test('redaction covers private-key material and common cloud signing credentials
     'failure: -----BEGIN OPENSSH PRIVATE KEY-----\nfake-incomplete-private-material',
   );
   assert.equal(incompletePem.includes('fake-incomplete-private-material'), false);
+});
+
+test('redaction fails closed for encoded labels, opaque schemes, passphrases, and unsafe object shapes', () => {
+  const bearer = redactText('retry received Bearer opaque:value-with-colon');
+  assert.equal(bearer.includes('opaque:value-with-colon'), false);
+  const encoded = redactText('access%5Ftoken=fake-percent-encoded-secret&status=failed');
+  assert.equal(encoded.includes('fake-percent-encoded-secret'), false);
+  assert.match(encoded, /status=failed/);
+  const passphrase = redactText('password: correct horse battery staple; status=failed');
+  assert.equal(passphrase.includes('correct horse battery staple'), false);
+  assert.match(passphrase, /status=failed/);
+  const recoveryCode = redactText('recovery_code: alpha beta gamma; status=used');
+  assert.equal(recoveryCode.includes('alpha beta gamma'), false);
+  assert.match(recoveryCode, /status=used/);
+
+  let getterCalls = 0;
+  const hostile = {
+    buffer: Buffer.from('fake-buffer-secret'),
+    typed: new Uint8Array(Buffer.from('fake-typed-secret')),
+    'Authorization: Bearer fake-key-secret': 'fake-key-value',
+  };
+  Object.defineProperty(hostile, 'dynamic', {
+    enumerable: true,
+    get() {
+      getterCalls += 1;
+      return 'fake-getter-secret';
+    },
+  });
+  const safe = redactValue(hostile);
+  const serialized = JSON.stringify(safe);
+  assert.equal(getterCalls, 0);
+  for (const secret of [
+    'fake-buffer-secret',
+    'fake-typed-secret',
+    'fake-key-secret',
+    'fake-key-value',
+    'fake-getter-secret',
+  ]) assert.equal(serialized.includes(secret), false, secret + ' leaked');
+  assert.equal(safe.buffer, '[binary redacted]');
+  assert.equal(safe.typed, '[binary redacted]');
+  assert.equal(safe.dynamic, '[accessor omitted]');
+
+  let errorGetterCalls = 0;
+  const hostileError = {};
+  for (const property of ['stack', 'message', 'code']) {
+    Object.defineProperty(hostileError, property, {
+      get() {
+        errorGetterCalls += 1;
+        return 'fake-error-getter-secret';
+      },
+    });
+  }
+  assert.equal(safeErrorText(hostileError), 'unknown error');
+  assert.equal(errorGetterCalls, 0);
+});
+
+test('redaction and log serialization are bounded for deep, sparse, and oversized input', () => {
+  let deep = { safe: true };
+  for (let index = 0; index < 20_000; index += 1) deep = { child: deep };
+  assert.doesNotThrow(() => redactValue(deep));
+  assert.match(JSON.stringify(redactValue(deep)), /redaction depth reached/);
+
+  const sparse = [];
+  sparse.length = 0xffffffff;
+  sparse[0xfffffffe] = 'last';
+  const startedAt = Date.now();
+  const safeSparse = redactValue(sparse);
+  assert.ok(Date.now() - startedAt < 1000);
+  assert.ok(safeSparse.length <= 2);
+  assert.match(JSON.stringify(safeSparse), /truncated/);
+
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-bounded-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024 });
+  let eventStringCalls = 0;
+  const entry = logger.info({
+    toString() {
+      eventStringCalls += 1;
+      return 'fake-event-secret';
+    },
+  }, {
+    message: 'x'.repeat(2 * 1024 * 1024),
+    many: Array.from({ length: 10_000 }, (_, index) => 'value-' + index),
+  });
+  assert.equal(eventStringCalls, 0);
+  assert.equal(entry.event, 'event');
+  assert.ok(Buffer.byteLength(JSON.stringify(entry)) <= logger.maxBytes);
+  assert.ok(fs.statSync(filePath).size <= logger.maxBytes);
 });
 
 test('logger startup writes and fsyncs one valid JSONL preflight record', () => {
