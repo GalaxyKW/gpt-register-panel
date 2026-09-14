@@ -20,6 +20,7 @@ const {
   normalizeUsageStats,
   normalizeTableUsageStats,
 } = require('../backend/adapters/sub2apiAdmin');
+const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff } = require('../backend/diff');
 const { buildRows, filterRows, rowFromDiffItem } = require('../backend/view');
 const { buildImportPlan, buildSnapshot, safeErrorMessage } = require('../backend/sync');
@@ -1690,6 +1691,37 @@ test('safe accounts preserve unknown status and malformed expiry metadata', () =
   const row = rowFromDiffItem({ kind: 'sub2api_only', token: null, account: missing, issues: [] });
   assert.equal(row.schedulable, null);
   assert.equal(row.availability, 'unknown');
+});
+
+test('Sub2API inactive accounts remain known unavailable update targets', () => {
+  const fixture = fixtureRoot();
+  const sources = readGptRegisterSources({
+    rootDirectory: fixture.root,
+    includeRaw: true,
+  });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const inactive = safeAccount({
+    id: 24,
+    name: 'free00024',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'inactive',
+    schedulable: true,
+    credentials: {
+      account_id: token.accountId,
+      user_id: token.userId,
+    },
+    extra: { access_token_sha256: '0'.repeat(64) },
+  });
+
+  assert.equal(inactive.statusKnown, true);
+  assert.deepEqual(getAccountAvailability(inactive), {
+    key: 'unavailable',
+    reason: 'sub2api_status_inactive',
+  });
+  const plan = buildImportPlan(sources, [inactive]);
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].reason, 'token_changed');
 });
 
 test('safe accounts fail closed on conflicting aliases, fingerprints, and boolean metadata', () => {

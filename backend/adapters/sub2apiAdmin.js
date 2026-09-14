@@ -617,7 +617,9 @@ function safeAccount(account) {
   const name = safeRemoteText(scalarText(account.name, 256), 256);
   const rawStatus = scalarText(account.status, 64).toLowerCase();
   const status = /^[a-z0-9_-]{1,64}$/.test(rawStatus) ? rawStatus : '';
-  const statusKnown = ['active', 'disabled', 'error'].includes(status);
+  // Sub2API's account contract uses `inactive`; retain `disabled` only as a
+  // conservative compatibility value for older responses.
+  const statusKnown = ['active', 'inactive', 'disabled', 'error'].includes(status);
   const schedulableKnown = typeof account.schedulable === 'boolean';
   const tempUnschedulableReasonPresent = Boolean(firstScalar(
     [account.temp_unschedulable_reason, account.tempUnschedulableReason],
