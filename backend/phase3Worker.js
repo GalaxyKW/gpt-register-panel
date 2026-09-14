@@ -15,6 +15,7 @@ const { phase3TargetRevisionMatches } = require('./phase3TargetRevision');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
+const { compareNaturalStrings } = require('./lib/stableOrder');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 
 // Phase 3 drives a real browser and gpt_register uses a shared profile. Only
@@ -989,16 +990,7 @@ function comparePhase3TokenFreshness(left, right, nowMs = Date.now()) {
   }
   const leftPath = String(left?.relativePath || '');
   const rightPath = String(right?.relativePath || '');
-  const naturalOrder = leftPath.localeCompare(
-    rightPath,
-    'en',
-    { numeric: true, sensitivity: 'base' },
-  );
-  if (naturalOrder !== 0) return naturalOrder;
-  if (leftPath === rightPath) return 0;
-  const byteOrder = Buffer.compare(Buffer.from(leftPath, 'utf8'), Buffer.from(rightPath, 'utf8'));
-  if (byteOrder !== 0) return byteOrder;
-  return leftPath < rightPath ? -1 : 1;
+  return compareNaturalStrings(leftPath, rightPath);
 }
 
 function isUsablePhase3Token(token, nowMs = Date.now()) {

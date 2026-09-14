@@ -8,6 +8,7 @@ const {
   parseDateValue,
 } = require('../lib/token');
 const { assertDirectoryTree } = require('../lib/safeFs');
+const { compareNaturalStrings } = require('../lib/stableOrder');
 const { redactText } = require('../logger');
 
 const READ_ONLY_FLAGS = fs.constants.O_RDONLY
@@ -541,14 +542,7 @@ function readJsonArray(filePath) {
 }
 
 function sortFileNames(left, right) {
-  const naturalOrder = left.localeCompare(right, 'en', {
-    numeric: true,
-    sensitivity: 'base',
-  });
-  if (naturalOrder !== 0) return naturalOrder;
-  if (left < right) return -1;
-  if (left > right) return 1;
-  return 0;
+  return compareNaturalStrings(left, right);
 }
 
 function isHistoricalTokenFile(fileName) {

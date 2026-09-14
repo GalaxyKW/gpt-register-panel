@@ -2,6 +2,7 @@ const { getAccountAvailability } = require('./accountAvailability');
 const { accountTestTargetRevision } = require('./accountTargetRevision');
 const { phase3TargetRevision } = require('./phase3TargetRevision');
 const { normalizeEmail } = require('./lib/token');
+const { compareNaturalStrings } = require('./lib/stableOrder');
 
 const TERMINAL_USERNAME_STATUSES = new Set([
   'account_deactivated',
@@ -213,7 +214,7 @@ function buildRows(diff, options = {}) {
   return (diff?.items || []).map((item) => rowFromDiffItem(item, rowOptions)).sort((left, right) => {
     const leftName = left.accountName || left.email || left.fileName || '';
     const rightName = right.accountName || right.email || right.fileName || '';
-    return leftName.localeCompare(rightName, 'zh-CN', { numeric: true, sensitivity: 'base' });
+    return compareNaturalStrings(leftName, rightName);
   });
 }
 

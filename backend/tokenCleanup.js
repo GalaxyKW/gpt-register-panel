@@ -5,6 +5,7 @@ const path = require('node:path');
 const { readGptRegisterSources } = require('./adapters/gptRegisterFs');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
 const { assertDirectoryTree } = require('./lib/safeFs');
+const { compareNaturalStrings } = require('./lib/stableOrder');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
 
 const CONFIRMATION = 'DELETE_EXPIRED_TOKENS';
@@ -172,24 +173,7 @@ function cleanupRecoveryInvalid(reason) {
 function compareCleanupPaths(left, right) {
   const leftPath = String(left?.relativePath ?? left ?? '');
   const rightPath = String(right?.relativePath ?? right ?? '');
-  const natural = leftPath.localeCompare(
-    rightPath,
-    'en',
-    { numeric: true, sensitivity: 'base' },
-  );
-  if (natural !== 0) return natural;
-  const utf8 = Buffer.compare(Buffer.from(leftPath, 'utf8'), Buffer.from(rightPath, 'utf8'));
-  if (utf8 !== 0 || leftPath === rightPath) return utf8;
-  // Distinct unpaired UTF-16 surrogates encode to the same UTF-8 replacement
-  // byte sequence. Compare the original code units as the final deterministic
-  // tie-breaker so even malformed JS strings retain a strict total order.
-  const maximumLength = Math.max(leftPath.length, rightPath.length);
-  for (let index = 0; index < maximumLength; index += 1) {
-    const leftUnit = index < leftPath.length ? leftPath.charCodeAt(index) : -1;
-    const rightUnit = index < rightPath.length ? rightPath.charCodeAt(index) : -1;
-    if (leftUnit !== rightUnit) return leftUnit < rightUnit ? -1 : 1;
-  }
-  return 0;
+  return compareNaturalStrings(leftPath, rightPath);
 }
 
 function pathEntryExists(filePath) {

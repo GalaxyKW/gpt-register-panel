@@ -41,6 +41,7 @@ const {
 } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
+const { compareNaturalStrings } = require('./lib/stableOrder');
 
 let syncQueue = Promise.resolve();
 const OPENAI_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
@@ -495,24 +496,7 @@ function candidateKey(record) {
 }
 
 function compareNaturalPath(leftValue, rightValue) {
-  const left = String(leftValue || '');
-  const right = String(rightValue || '');
-  const naturalOrder = left.localeCompare(
-    right,
-    'en',
-    { numeric: true, sensitivity: 'base' },
-  );
-  if (naturalOrder !== 0) return naturalOrder;
-  if (left === right) return 0;
-
-  // The natural collation intentionally ignores case and some Unicode
-  // distinctions. Resolve those ties using the original UTF-8 bytes so a
-  // token winner never depends on filesystem or API input order. The final
-  // code-unit comparison also keeps this a strict total order for malformed
-  // surrogate strings that UTF-8 encodes as the same replacement character.
-  const byteOrder = Buffer.compare(Buffer.from(left, 'utf8'), Buffer.from(right, 'utf8'));
-  if (byteOrder !== 0) return byteOrder;
-  return left < right ? -1 : 1;
+  return compareNaturalStrings(leftValue, rightValue);
 }
 
 function compareTokenRecordFreshness(leftRecord, rightRecord, nowMs = Date.now()) {
@@ -575,7 +559,7 @@ function aggregateIdentityKeys(records = []) {
     for (const record of records) {
       for (const value of identityValues(record?.identityKeys || [], prefix)) values.add(value);
     }
-    for (const value of [...values].sort((left, right) => left.localeCompare(right, 'en'))) {
+    for (const value of [...values].sort(compareNaturalStrings)) {
       keys.push(prefix + value);
     }
   }
@@ -1468,7 +1452,7 @@ function buildCodexImportIdempotencyKey(item) {
       strongIdentity.push(prefix + value);
     }
   }
-  strongIdentity.sort((left, right) => left.localeCompare(right, 'en'));
+  strongIdentity.sort(compareNaturalStrings);
   const material = {
     action: 'create',
     sourceIdentityKeys: strongIdentity,
@@ -1500,7 +1484,7 @@ function canonicalIdentitySet(keys = []) {
   for (const prefix of ['account:', 'user:', 'email:']) {
     for (const value of identityValues(keys, prefix)) normalized.push(prefix + value);
   }
-  return normalized.sort((left, right) => left.localeCompare(right, 'en'));
+  return normalized.sort(compareNaturalStrings);
 }
 
 function sourceTokenChanged(message = '来源 token 在写入前已变化') {
@@ -2016,7 +2000,7 @@ function pruneBackups(pinned, newestName, policy = backupRetentionPolicy()) {
     if (left.name === newestName) return -1;
     if (right.name === newestName) return 1;
     return right.stat.mtimeMs - left.stat.mtimeMs
-      || right.name.localeCompare(left.name, 'en');
+      || compareNaturalStrings(right.name, left.name);
   });
   const newestEntry = entries.find((entry) => entry.name === newestName);
   if (!newestEntry) {

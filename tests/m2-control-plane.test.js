@@ -2231,6 +2231,35 @@ test('natural path ties have a strict order and select the same token after inpu
   assert.equal(comparePhase3TokenFreshness(lower, upper) > 0, true);
 });
 
+test('new account numbering uses a locale-independent natural source order', () => {
+  const token10 = syntheticToken(
+    'tokens/account10.json',
+    ['account:stable-order-10', 'user:stable-user-10'],
+  );
+  const token2 = syntheticToken(
+    'tokens/account2.json',
+    ['account:stable-order-2', 'user:stable-user-2'],
+  );
+  const originalLocaleCompare = String.prototype.localeCompare;
+  String.prototype.localeCompare = function localeComparisonForbidden() {
+    throw new Error('persisted import order must not depend on localeCompare');
+  };
+  try {
+    for (const tokens of [[token10, token2], [token2, token10]]) {
+      const plan = buildImportPlan({ tokens, usernames: [] }, []);
+      assert.deepEqual(
+        plan.map((item) => [item.relativePath, item.accountName]),
+        [
+          ['tokens/account2.json', 'free00001'],
+          ['tokens/account10.json', 'free00002'],
+        ],
+      );
+    }
+  } finally {
+    String.prototype.localeCompare = originalLocaleCompare;
+  }
+});
+
 test('create preflight requires a canonical name and rejects casefold-equivalent occupancy', async () => {
   const identityKeys = ['account:create-name-account', 'user:create-name-user'];
   const source = syntheticToken('tokens/create-name.json', identityKeys);
