@@ -1128,7 +1128,10 @@ function updateImportButtonState() {
     || Boolean(groupBindingProblem)
     || Boolean(planContractProblem)
     || !comparisonAvailable()
-    || Boolean(state.snapshot?.readOnly)
+    // Only an explicit boolean false is an affirmative write capability.
+    // Missing or malformed snapshot metadata must never be presented as
+    // writable during a rolling upgrade or partial response.
+    || state.snapshot?.readOnly !== false
     || !validImportPlanIntentVersion(state.plan?.planIntentVersion)
     || state.plan.selectedKeys.length === 0
     || hasBlockingConflict
@@ -1162,9 +1165,14 @@ function renderMetrics(snapshot) {
     ? (differenceEntries.map(([key, value]) => kindLabel(key) + ' ' + value).join(' · ') || '暂无差异')
     : 'Sub2API 状态未知，无法比较';
   elements.lastRead.textContent = formatDate(snapshot.generatedAt);
-  elements.modeBadge.textContent = snapshot.readOnly ? '只读模式' : '可写模式';
-  elements.modeBadge.className = 'badge ' + (snapshot.readOnly ? 'badge-neutral' : 'badge-success');
-  if (elements.cleanupButton) elements.cleanupButton.disabled = snapshot.readOnly || actionsLocked();
+  const writeMode = snapshot?.readOnly === false
+    ? 'writable'
+    : snapshot?.readOnly === true ? 'readonly' : 'unknown';
+  elements.modeBadge.textContent = writeMode === 'writable'
+    ? '可写模式'
+    : writeMode === 'readonly' ? '只读模式' : '写入状态未知';
+  elements.modeBadge.className = 'badge ' + (writeMode === 'writable' ? 'badge-success' : 'badge-neutral');
+  if (elements.cleanupButton) elements.cleanupButton.disabled = writeMode !== 'writable' || actionsLocked();
 }
 
 function selectedRowsFromView() {
@@ -1468,11 +1476,22 @@ function renderRemoteState(row, sides) {
 }
 
 function renderDiffDecision(row, sides) {
-  const action = ['create', 'update', 'skip', 'conflict'].includes(row?.decisionAction)
-    ? row.decisionAction
+  const rawAction = typeof row?.decisionAction === 'string' ? row.decisionAction : '';
+  const rawReason = typeof row?.decisionReason === 'string' ? row.decisionReason : '';
+  const action = ['create', 'update', 'skip', 'conflict'].includes(rawAction)
+    ? rawAction
     : null;
+  const invalidDecision = rawAction
+    ? (!action || Boolean(importPlanContractProblem({
+        items: [{ action, reason: rawReason }],
+      })))
+    : Boolean(rawReason && !['sub2api_read_failed', 'sub2api_not_read'].includes(rawReason));
+  if (invalidDecision) {
+    return '<small class="decision-note decision-note-danger">'
+      + '同步：不可决策 · 操作或原因无法安全识别</small>';
+  }
   if (action) {
-    const reason = actionReasonLabel(row?.decisionReason);
+    const reason = actionReasonLabel(rawReason);
     const actionClass = {
       create: 'decision-note-success',
       update: 'decision-note-warning',
@@ -1968,13 +1987,15 @@ function renderReconciliationAction(job) {
   const heldJobs = reconciliationHoldJobs(job);
   const target = heldJobs[0] || null;
   button.hidden = !target;
-  button.disabled = !target || state.reconciliationAckPending || Boolean(state.snapshot?.readOnly);
+  button.disabled = !target || state.reconciliationAckPending || state.snapshot?.readOnly !== false;
   const knownHeldCount = Math.max(heldJobs.length, Number(state.reconciliationHolds?.total) || 0);
   button.textContent = knownHeldCount > 1
     ? '逐项人工核对（待处理 ' + knownHeldCount + '）'
     : '人工核对并解除阻挡';
-  button.title = state.snapshot?.readOnly
+  button.title = state.snapshot?.readOnly === true
     ? '当前面板为只读模式，无法解除持久阻挡'
+    : state.snapshot?.readOnly !== false
+      ? '服务端未提供可信的写入模式，无法解除持久阻挡'
     : '仅在外部人工核对完成后使用；面板不会自动核对';
 }
 
@@ -3123,20 +3144,25 @@ function updateActionState() {
   const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
   const testSelection = accountTestTargetsFromRows(selectedRows);
   const testTargets = testSelection.targets;
+  const writeModeProblem = state.snapshot?.readOnly === true
+    ? '当前面板为只读模式'
+    : state.snapshot?.readOnly === false
+      ? ''
+      : '服务端未提供可信的写入模式，已阻止写操作';
   const canRunAccountTest = state.selected.size > 0
     && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
     && !testSelection.problem
     && testTargets.length > 0
     && !state.accountTestModelsPending
-    && !state.snapshot?.readOnly;
+    && state.snapshot?.readOnly === false;
   const canRunPhase3 = state.selected.size > 0
     && phase3CapabilityAvailable()
     && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
     && phase3Targets.length > 0
     && !phase3Problem
-    && !state.snapshot?.readOnly;
+    && state.snapshot?.readOnly === false;
   const locked = actionsLocked();
   const writeBlocked = reconciliationWriteBlocked();
   const mutationLocked = locked || writeBlocked;
@@ -3154,6 +3180,8 @@ function updateActionState() {
       elements.accountTestButton.title = '正在确认后台任务和待对账项，暂不可操作';
     } else if (locked) {
       elements.accountTestButton.title = '另一个任务或请求执行中';
+    } else if (writeModeProblem) {
+      elements.accountTestButton.title = writeModeProblem;
     } else if (selectionVisibilityProblem) {
       elements.accountTestButton.title = selectionVisibilityProblem;
     } else if (state.accountTestModelsPending) {
@@ -3166,8 +3194,11 @@ function updateActionState() {
   }
   if (elements.accountTestModelSelect) {
     elements.accountTestModelSelect.disabled = mutationLocked
-      || Boolean(state.snapshot?.readOnly)
+      || state.snapshot?.readOnly !== false
       || state.accountTestModelsPending;
+    if (writeModeProblem) {
+      elements.accountTestModelSelect.title = writeModeProblem;
+    }
   }
   elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
   elements.selectAll.disabled = locked;
@@ -3181,20 +3212,28 @@ function updateActionState() {
     ? '存在待人工对账任务，当前全部写操作已阻止'
     : state.jobInventoryVerified !== true
       ? '正在确认后台任务和待对账项，暂不可操作'
-      : hiddenSelectionProblem(state.plan?.selectedKeys) || importSelectionProblem;
+      : locked
+        ? '另一个任务或请求执行中'
+        : writeModeProblem
+          || hiddenSelectionProblem(state.plan?.selectedKeys)
+          || importSelectionProblem
+          || (!state.plan ? '请先选择本地 token 并执行“检查差异”' : '');
   if (elements.cleanupButton) {
-    elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || mutationLocked || !state.snapshot;
+    elements.cleanupButton.disabled = state.snapshot?.readOnly !== false || mutationLocked;
     elements.cleanupButton.title = writeBlocked
       ? '存在待人工对账任务，当前全部写操作已阻止'
       : state.jobInventoryVerified !== true
         ? '正在确认后台任务和待对账项，暂不可操作'
-        : '全局扫描 tokens 和 use_token 活动目录；不含 historical/old_codex 历史备份，不受当前筛选和选择影响';
+        : locked
+          ? '另一个任务或请求执行中'
+          : writeModeProblem
+            || '全局扫描 tokens 和 use_token 活动目录；不含 historical/old_codex 历史备份，不受当前筛选和选择影响';
   }
   if (elements.reconciliationAckButton) {
     const target = reconciliationHoldTarget();
     elements.reconciliationAckButton.disabled = !target
       || state.reconciliationAckPending
-      || Boolean(state.snapshot?.readOnly);
+      || state.snapshot?.readOnly !== false;
   }
   if (writeBlocked) {
     elements.phase3Button.title = '存在待人工对账任务，当前全部写操作已阻止';
@@ -3202,6 +3241,8 @@ function updateActionState() {
     elements.phase3Button.title = '正在确认后台任务和待对账项，暂不可操作';
   } else if (locked) {
     elements.phase3Button.title = '另一个任务或请求执行中';
+  } else if (writeModeProblem) {
+    elements.phase3Button.title = writeModeProblem;
   } else if (!phase3CapabilityAvailable()) {
     elements.phase3Button.title = '服务端未启用 Phase 3；请设置 PANEL_PHASE3_ENABLED=1 后重启面板';
   } else if (selectionVisibilityProblem) {

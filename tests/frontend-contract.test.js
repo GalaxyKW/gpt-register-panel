@@ -274,24 +274,30 @@ test('frontend rejects create previews without an exact group binding', () => {
 });
 
 test('frontend gives sync decisions distinct non-misleading visual states', () => {
+  const planContract = sourceSection('function importPlanContractProblem', 'function planItemCreatesAccount');
   const renderContract = sourceSection('function renderDiffDecision', 'function renderRows');
   const context = {
     actionReasonLabel: (reason) => reason || '-',
     actionLabel: (action) => action,
     escapeHtml: (value) => String(value ?? ''),
   };
-  vm.runInNewContext(renderContract + `
+  vm.runInNewContext(planContract + '\n' + renderContract + `
     result = {
       create: renderDiffDecision({ decisionAction: 'create', decisionReason: 'token_only' }, {}),
       update: renderDiffDecision({ decisionAction: 'update', decisionReason: 'token_changed' }, {}),
       skip: renderDiffDecision({ decisionAction: 'skip', decisionReason: 'already_in_sync' }, {}),
       conflict: renderDiffDecision({ decisionAction: 'conflict', decisionReason: 'ambiguous_sub2api_identity' }, {}),
+      unknownAction: renderDiffDecision({ decisionAction: 'future_action', decisionReason: 'token_changed' }, { source: {} }),
+      unknownReason: renderDiffDecision({ decisionAction: 'update', decisionReason: 'future_reason' }, { source: {} }),
     };
   `, context);
   assert.match(context.result.create, /decision-note-success/);
   assert.match(context.result.update, /decision-note-warning/);
   assert.match(context.result.skip, /decision-note-neutral/);
   assert.match(context.result.conflict, /decision-note-danger/);
+  assert.match(context.result.unknownAction, /decision-note-danger.*同步：不可决策/s);
+  assert.match(context.result.unknownReason, /decision-note-danger.*同步：不可决策/s);
+  assert.doesNotMatch(context.result.unknownReason, /同步：update|同步：更新/);
   assert.doesNotMatch(context.result.create, /availability-note/);
   assert.doesNotMatch(context.result.skip, /availability-note/);
   assert.match(stylesSource, /\.decision-note-success\s*\{[^}]*var\(--success\)/s);
@@ -1396,6 +1402,76 @@ test('frontend difference metric excludes in-sync rows and starts imports with t
   assert.match(source, /sync-plan-v1/);
 });
 
+test('frontend requires an explicit writable snapshot before enabling mutations', () => {
+  const actionContract = sourceSection('function effectivePlanAction', 'function statusClass');
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function renderMetrics');
+  const renderMetrics = sourceSection('function renderMetrics', 'function selectedRowsFromView');
+  const planIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
+  const stateForTest = {
+    snapshot: {
+      sub2api: { readStatus: 'ok', accountCount: 1, statsError: null },
+      diff: { comparisonStatus: 'complete' },
+    },
+    plan: {
+      planIntentVersion,
+      selectedKeys: ['token:tokens:tokens/current.json'],
+      items: [{ action: 'update', reason: 'token_changed' }],
+    },
+  };
+  const elements = {
+    importButton: {},
+    tokenCount: {},
+    tokenDetail: {},
+    accountCount: {},
+    accountDetail: {},
+    diffCount: {},
+    diffDetail: {},
+    lastRead: {},
+    modeBadge: {},
+    cleanupButton: {},
+  };
+  const context = {
+    state: stateForTest,
+    elements,
+    actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
+    hiddenSelectionProblem: () => '',
+    syncSelectionProblem: () => '',
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+    kindLabel: (value) => value,
+    formatDate: (value) => value,
+  };
+  vm.runInNewContext(actionContract + '\n' + comparisonContract + '\n' + renderMetrics + `
+    updateImportButtonState();
+    missingDisabled = elements.importButton.disabled;
+    renderMetrics({
+      sources: { summary: {} },
+      sub2api: { readStatus: 'ok', accountCount: 1, statsError: null },
+      diff: { comparisonStatus: 'complete', counts: {} },
+      generatedAt: 'now',
+    });
+    missingMode = elements.modeBadge.textContent;
+    missingCleanupDisabled = elements.cleanupButton.disabled;
+    state.snapshot.readOnly = 'false';
+    updateImportButtonState();
+    malformedDisabled = elements.importButton.disabled;
+    state.snapshot.readOnly = false;
+    updateImportButtonState();
+    writableDisabled = elements.importButton.disabled;
+  `, context);
+  assert.equal(context.missingDisabled, true);
+  assert.equal(context.malformedDisabled, true);
+  assert.equal(context.writableDisabled, false);
+  assert.equal(context.missingMode, '写入状态未知');
+  assert.equal(context.missingCleanupDisabled, true);
+
+  const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  assert.equal((updateContract.match(/state\.snapshot\?\.readOnly === false/g) || []).length >= 2, true);
+  assert.match(updateContract, /accountTestModelSelect\.disabled = mutationLocked[\s\S]*readOnly !== false/);
+  assert.match(updateContract, /reconciliationAckButton\.disabled = !target[\s\S]*readOnly !== false/);
+  assert.match(updateContract, /服务端未提供可信的写入模式，已阻止写操作/);
+});
+
 test('frontend account-test confirmation describes upstream state side effects accurately', () => {
   assert.match(source, /Sub2API 测试接口本身可能依据结果更新账号状态、限流或调度信息/);
   assert.match(source, /其他账号面板不会额外切换调度/);
@@ -1566,7 +1642,7 @@ test('frontend globally locks mutating actions while any request or task is unre
   assert.match(updateContract, /selectAll\.disabled = locked/);
   assert.match(updateContract, /input\.disabled = locked/);
   assert.match(updateContract, /updateImportButtonState\(\)/);
-  assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked/);
+  assert.match(updateContract, /cleanupButton\.disabled = state\.snapshot\?\.readOnly !== false \|\| mutationLocked/);
   assert.match(updateContract, /writeBlocked = reconciliationWriteBlocked\(\)/);
   assert.match(updateContract, /当前全部写操作已阻止/);
 });
@@ -2223,7 +2299,7 @@ test('frontend blocks bulk actions when a prior selection is hidden by filters',
   assert.match(source, /表头复选框只影响当前显示项/);
   assert.doesNotMatch(htmlSource, /所有已过期 JSON 文件/);
   assert.match(sourceSection('function updateActionState', 'function applyColumnVisibility'),
-    /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| mutationLocked \|\| !state\.snapshot/);
+    /cleanupButton\.disabled = state\.snapshot\?\.readOnly !== false \|\| mutationLocked/);
 });
 
 test('frontend identifies the local and Sub2API sides of mutation buttons', () => {
