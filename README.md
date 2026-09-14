@@ -40,11 +40,18 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 敏感配置必须位于支持 Unix 权限的文件系统，文件由启动面板的账号持有且权限不宽于 `0600`，父目录也不能由不可信用户替换。可用 `PANEL_ENV_FILE` 指定绝对路径；显式路径不存在或不安全时面板会拒绝启动。不要在 NTFS 上的项目目录中继续使用无法落实私有权限的 `.env`：
 
     sudo install -d -o root -g root -m 0700 /etc/gpt-register-panel
-    sudo install -o root -g root -m 0600 .env.example /etc/gpt-register-panel/panel.env
-    sudoedit /etc/gpt-register-panel/panel.env
+    if sudo test -L /etc/gpt-register-panel/panel.env; then
+        echo '拒绝编辑符号链接 panel.env；请先人工核验并移除异常路径' >&2
+    elif sudo test -e /etc/gpt-register-panel/panel.env; then
+        echo 'panel.env 已存在，保留原文件并用 sudoedit 更新' >&2
+        sudoedit /etc/gpt-register-panel/panel.env
+    else
+        sudo install -o root -g root -m 0600 .env.example /etc/gpt-register-panel/panel.env
+        sudoedit /etc/gpt-register-panel/panel.env
+    fi
     sudo env PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env npm start
 
-在 `panel.env` 中填写有效的 Sub2API 管理 API key 或 JWT，以及至少 16 位的随机 `PANEL_ADMIN_TOKEN`。项目本地 `.env` 只保留为开发兼容默认值，也必须满足相同权限检查；父进程已有的环境变量优先于文件中的同名配置。
+这个初始化片段只在目标不存在时复制示例；重复安装或升级不得用 `.env.example`、`cp -f` 或 `install` 覆盖现有 `panel.env`。在 `panel.env` 中填写有效的 Sub2API 管理 API key 或 JWT，以及至少 16 位的随机 `PANEL_ADMIN_TOKEN`。项目本地 `.env` 只保留为开发兼容默认值，也必须满足相同权限检查；父进程已有的环境变量优先于文件中的同名配置。配置文件必须是有效 UTF-8，不接受 NUL/其他控制字符、未闭合的引号、超过 64 KiB 的单行或超过 4096 个配置项；这些错误会在应用任何文件值前令启动失败。
 
 默认只监听 127.0.0.1:4170。在服务器本机打开 http://127.0.0.1:4170/ 即可查看账号表格；另一台电脑浏览器里的 `127.0.0.1` 指向那台电脑本身，并不是服务器。远程管理优先保持面板监听回环地址并建立 SSH 隧道：
 
@@ -56,9 +63,9 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 仓库提供 `deploy/gpt-register-panel.service`。该 unit 先在 root 管理的 `/run/gpt-register-panel` 下创建私有目录，再把项目代码只读绑定为 `code`、把 `runtime` 和 `gpt_register` 分别绑定为独立可写数据根；服务只从这些已经固定的可信别名启动。这样即使 `/mnt/nvme` 顶层可被普通本机用户写入，启动检查完成后再重命名或替换 `item`、项目目录或 `gpt_register` 的原路径，也不能把服务入口或 Phase3 重定向到替换树。启动前还会在私有挂载视图中检查关键目录和文件必须由 root 持有、类型正确、不是符号链接并且不可由组或其他用户写入，任一条件不满足都会拒绝启动。
 
-unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/backend/server.js`，并显式清空 `NODE_OPTIONS`、`NODE_PATH`，避免 system manager 默认环境或部署配置在预检及正式启动前注入 Node preload/import 或额外模块搜索路径。它通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/backend/server.js`，并显式清空 `NODE_OPTIONS`、`NODE_PATH`，避免 system manager 默认环境或部署配置在预检及正式启动前注入 Node preload/import 或额外模块搜索路径。它通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`；子进程环境使用固定白名单，不会继承 `panel.env` 中的 `CONFIG_FILE` 或 `CONFIG_PROFILE`，Linux 下只会读取已验证的 `config.json` 和 `config.server.json`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
 
-首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json` 和所需配置，并创建 unit 要求的运行目录。unit 会以最多 50000 个条目、64 层深度递归核验面板的 `backend`、`frontend`、`node_modules` 以及 gpt_register 的 `src`、`node_modules`：普通文件和目录必须由 root 持有、不可由组或其他用户写入，也不能跨入其他文件系统；相对符号链接只允许指向同一个已绑定扫描根内并且同样经过核验的普通文件，此外仅为现有 node-gyp Python 链接保留了指向真实 `/usr/bin/python3` 的精确例外。其他符号链接、特殊文件、外部目标或超限依赖树都会令服务拒绝启动。
+首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json`、`config.json` 和 `config.server.json`，并创建 unit 要求的运行目录。两个配置文件都是强制的 root 所有、单链接私有普通文件，必须可由所有者读取且权限不宽于 `0600`；缺失或不安全都会令服务拒绝启动，其他 profile 不会被 Phase3 子进程采用。unit 会以最多 50000 个条目、64 层深度递归核验面板的 `backend`、`frontend`、`node_modules` 以及 gpt_register 的 `src`、`node_modules`：普通文件和目录必须由 root 持有、不可由组或其他用户写入，也不能跨入其他文件系统；相对符号链接只允许指向同一个已绑定扫描根内并且同样经过核验的普通文件，此外仅为现有 node-gyp Python 链接保留了指向真实 `/usr/bin/python3` 的精确例外。其他符号链接、特殊文件、外部目标或超限依赖树都会令服务拒绝启动。
 
 安装前先只读列出权限异常、全部符号链接和特殊文件。第一、第三条命令的结果必须为空；第二条列出的每个链接都必须符合上述内部目标或精确 Python 例外。发现异常时，应在离线维护窗口通过可信的软件包来源重新安装依赖，或逐项核验后修正所有者和权限，不要对整个 `gpt_register` 盲目递归 `chown`，以免把 token、账号文件或浏览器状态一并扩大到错误的信任范围：
 
@@ -71,9 +78,15 @@ unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/bac
     cd /mnt/nvme/item/gpt-register-panel
     npm ci
     sudo install -d -o root -g root -m 0700 runtime /etc/gpt-register-panel
-    sudo test -d /mnt/nvme/tmp
-    sudo install -o root -g root -m 0600 .env /etc/gpt-register-panel/panel.env
-    sudoedit /etc/gpt-register-panel/panel.env
+    if sudo test -L /etc/gpt-register-panel/panel.env; then
+        echo '拒绝编辑符号链接 panel.env；请先人工核验并移除异常路径' >&2
+    elif sudo test -e /etc/gpt-register-panel/panel.env; then
+        echo 'panel.env 已存在，未用项目 .env 覆盖；请用 sudoedit 人工合并' >&2
+        sudoedit /etc/gpt-register-panel/panel.env
+    else
+        sudo install -o root -g root -m 0600 .env /etc/gpt-register-panel/panel.env
+        sudoedit /etc/gpt-register-panel/panel.env
+    fi
 
 迁移完成后应轮换其中全部秘密，并在确认新服务正常后退役项目目录中的旧 `.env`；仅在 unit 中隐藏旧文件不能阻止其他本机用户直接读取 NTFS 上的副本。确认新配置属于实际服务账号且权限为 `0600` 后，再安装并启用：
 

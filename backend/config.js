@@ -1,7 +1,10 @@
 const fs = require('node:fs');
 const path = require('node:path');
+const { TextDecoder } = require('node:util');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const MAX_ENV_BYTES = 1024 * 1024;
+const MAX_ENV_ENTRIES = 4096;
+const MAX_ENV_LINE_BYTES = 64 * 1024;
 const DEFAULT_ENV_FILE = path.resolve(__dirname, '..', '.env');
 const BOOLEAN_ENV_NAMES = Object.freeze([
   'PANEL_LOG_CONSOLE',
@@ -15,10 +18,16 @@ const BOOLEAN_ENV_NAMES = Object.freeze([
   'SUB2API_CONFIRM_MIXED_CHANNEL_RISK',
 ]);
 
-function parseValue(value) {
+function parseValue(value, lineNumber) {
   const trimmed = String(value || '').trim();
-  if ((trimmed.startsWith('"') && trimmed.endsWith('"'))
-      || (trimmed.startsWith("'") && trimmed.endsWith("'"))) {
+  if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+    const quote = trimmed[0];
+    if (trimmed.length < 2 || !trimmed.endsWith(quote)) {
+      throw envConfigurationError(
+        'ENV_SYNTAX_INVALID',
+        '.env 第 ' + lineNumber + ' 行包含未闭合的引号',
+      );
+    }
     return trimmed.slice(1, -1);
   }
   return trimmed;
@@ -57,11 +66,33 @@ function booleanEnvEnabled(name, fallback = false, environment = process.env) {
 function parseEnvContent(content) {
   const entries = [];
   const seen = new Map();
-  const lines = String(content || '').split(/\r?\n/);
+  const source = String(content || '');
+  if (source.includes('\0')) {
+    throw envConfigurationError('ENV_SYNTAX_INVALID', '.env 不能包含 NUL 字节');
+  }
+  if (/[\u0001-\u0008\u000b\u000c\u000e-\u001f\u007f]/.test(source)) {
+    throw envConfigurationError('ENV_SYNTAX_INVALID', '.env 不能包含控制字符');
+  }
+  // Accept Unix, Windows and old-style bare-CR line endings. Treating a bare
+  // CR as value data would otherwise merge the following assignment into a
+  // credential or filesystem path.
+  const lines = source.split(/\r\n|\r|\n/);
   for (const [lineIndex, line] of lines.entries()) {
     const lineNumber = lineIndex + 1;
+    if (Buffer.byteLength(line, 'utf8') > MAX_ENV_LINE_BYTES) {
+      throw envConfigurationError(
+        'ENV_LINE_TOO_LONG',
+        '.env 第 ' + lineNumber + ' 行超过允许的长度上限',
+      );
+    }
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
+    if (entries.length >= MAX_ENV_ENTRIES) {
+      throw envConfigurationError(
+        'ENV_ENTRY_LIMIT_EXCEEDED',
+        '.env 配置项数量超过允许的上限',
+      );
+    }
     const separator = trimmed.indexOf('=');
     if (separator <= 0) {
       throw envConfigurationError('ENV_SYNTAX_INVALID', '.env 包含无效配置行');
@@ -78,7 +109,7 @@ function parseEnvContent(content) {
       );
     }
     seen.set(key, lineNumber);
-    entries.push([key, parseValue(trimmed.slice(separator + 1))]);
+    entries.push([key, parseValue(trimmed.slice(separator + 1), lineNumber)]);
   }
   return entries;
 }
@@ -102,10 +133,10 @@ function envFileStatError(stat) {
   if (currentUid !== null && stat.uid !== currentUid) {
     return envPathError('ENV_FILE_OWNER_INVALID', '环境配置必须由服务账号持有');
   }
-  if ((stat.mode & 0o400) === 0 || (stat.mode & 0o077) !== 0) {
+  if ((stat.mode & 0o400) === 0 || (stat.mode & 0o7177) !== 0) {
     return envPathError(
       'ENV_FILE_PERMISSIONS_INVALID',
-      '环境配置必须可由所有者读取且不能授予组或其他用户任何权限',
+      '环境配置权限必须为 0400 或 0600 且不能设置特殊权限位',
     );
   }
   return null;
@@ -163,7 +194,11 @@ function readBoundedFile(descriptor, maximumBytes) {
   if (total > maximumBytes) {
     throw envPathError('ENV_FILE_TOO_LARGE', '环境配置超过允许的大小上限');
   }
-  return Buffer.concat(chunks, total).toString('utf8');
+  try {
+    return new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks, total));
+  } catch {
+    throw envPathError('ENV_FILE_ENCODING_INVALID', '环境配置必须是有效的 UTF-8 文本');
+  }
 }
 
 function readEnvFile(filePath) {

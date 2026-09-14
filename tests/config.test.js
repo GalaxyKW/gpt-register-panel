@@ -10,6 +10,7 @@ const {
   BOOLEAN_ENV_NAMES,
   configuredEnvFile,
   loadEnv,
+  parseEnvContent,
   readEnvFile,
   validateBooleanEnvironment,
 } = require('../backend/config');
@@ -71,6 +72,69 @@ test('loadEnv validates boolean settings before applying any values', () => {
   );
   assert.equal(environment.PANEL_CONFIG_TEST_ATOMIC, undefined);
   assert.equal(environment.PANEL_WRITE_ENABLED, undefined);
+});
+
+test('loadEnv rejects NUL bytes and unterminated quotes before applying any values', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-syntax-'));
+  const filePath = path.join(directory, '.env');
+  const environment = {};
+
+  fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_ATOMIC=must-not-apply\nBROKEN=value\0hidden\n', {
+    mode: 0o600,
+  });
+  assert.throws(
+    () => loadEnv(filePath, environment),
+    (error) => error.code === 'ENV_SYNTAX_INVALID' && !error.message.includes('hidden'),
+  );
+  assert.equal(environment.PANEL_CONFIG_TEST_ATOMIC, undefined);
+
+  fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_ATOMIC=must-not-apply\nBROKEN="unterminated\n', {
+    mode: 0o600,
+  });
+  assert.throws(
+    () => loadEnv(filePath, environment),
+    (error) => error.code === 'ENV_SYNTAX_INVALID' && /第 2 行/.test(error.message),
+  );
+  assert.equal(environment.PANEL_CONFIG_TEST_ATOMIC, undefined);
+});
+
+test('environment parser handles bare CR as a line ending and rejects other controls', () => {
+  assert.deepEqual(parseEnvContent('FIRST=value\rSECOND=other\r'), [
+    ['FIRST', 'value'],
+    ['SECOND', 'other'],
+  ]);
+  assert.throws(
+    () => parseEnvContent('BROKEN=value\u000bhidden'),
+    (error) => error.code === 'ENV_SYNTAX_INVALID' && !error.message.includes('hidden'),
+  );
+});
+
+test('environment parser bounds individual lines and the number of entries', () => {
+  assert.throws(
+    () => parseEnvContent('TOO_LONG=' + 'x'.repeat(64 * 1024)),
+    (error) => error.code === 'ENV_LINE_TOO_LONG',
+  );
+  const entries = Array.from({ length: 4097 }, (_, index) => `SAFE_${index}=1`).join('\n');
+  assert.throws(
+    () => parseEnvContent(entries),
+    (error) => error.code === 'ENV_ENTRY_LIMIT_EXCEEDED',
+  );
+});
+
+test('readEnvFile rejects malformed UTF-8 without substituting credential bytes', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-encoding-'));
+  const filePath = path.join(directory, '.env');
+  fs.writeFileSync(filePath, Buffer.from([
+    ...Buffer.from('SUB2API_ADMIN_API_KEY=', 'utf8'),
+    0xc3,
+    0x28,
+    0x0a,
+  ]), { mode: 0o600 });
+  assert.throws(
+    () => readEnvFile(filePath),
+    (error) => error.code === 'ENV_FILE_ENCODING_INVALID'
+      && !error.message.includes('SUB2API_ADMIN_API_KEY'),
+  );
 });
 
 test('every declared boolean environment setting accepts only 0 or 1', () => {
@@ -235,6 +299,14 @@ test('readEnvFile rejects any group or other access and multiply linked secret f
   fs.chmodSync(readable, 0o644);
   assert.throws(
     () => readEnvFile(readable),
+    (error) => error.code === 'ENV_FILE_PERMISSIONS_INVALID',
+  );
+
+  const executable = path.join(directory, 'executable.env');
+  fs.writeFileSync(executable, 'SAFE_VALUE=fake\n', { mode: 0o600 });
+  fs.chmodSync(executable, 0o700);
+  assert.throws(
+    () => readEnvFile(executable),
     (error) => error.code === 'ENV_FILE_PERMISSIONS_INVALID',
   );
 

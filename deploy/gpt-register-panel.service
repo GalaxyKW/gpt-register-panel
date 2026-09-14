@@ -55,9 +55,10 @@ ExecStartPre=/usr/bin/test -x /usr/bin/node
 # ExecStartPre runs inside the completed private mount namespace. Refuse a
 # source that was replaced before binding, is a symlink/wrong type, is not
 # root-owned, or is writable by a group/other user. Keep these checks inline so
-# no helper executable can itself be replaced from the data mount.
+# no helper executable can itself be replaced from the data mount. Files that
+# can contain credentials additionally require private permissions and one link.
 ExecStartPre=/usr/bin/node -e "const fs=require('node:fs');for(const p of process.argv.slice(1)){const s=fs.lstatSync(p);if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||(s.mode&0o22)!==0)throw Error('unsafe service directory: '+p)}" /run/gpt-register-panel /run/gpt-register-panel/code /run/gpt-register-panel/code/backend /run/gpt-register-panel/code/frontend /run/gpt-register-panel/code/node_modules /run/gpt-register-panel/runtime /run/gpt-register-panel/gpt_register /run/gpt-register-panel/gpt_register/src /run/gpt-register-panel/gpt_register/node_modules
-ExecStartPre=/usr/bin/node -e "const fs=require('node:fs');for(const p of process.argv.slice(1)){const s=fs.lstatSync(p);if(s.isSymbolicLink()||!s.isFile()||s.uid!==0||(s.mode&0o22)!==0)throw Error('unsafe service file: '+p)}" /etc/gpt-register-panel/panel.env /run/gpt-register-panel/code/backend/server.js /run/gpt-register-panel/code/package.json /run/gpt-register-panel/gpt_register/index.js /run/gpt-register-panel/gpt_register/package.json /run/gpt-register-panel/gpt_register/config.json
+ExecStartPre=/usr/bin/node -e "const fs=require('node:fs'),privateFiles=new Set(['/etc/gpt-register-panel/panel.env','/run/gpt-register-panel/gpt_register/config.json','/run/gpt-register-panel/gpt_register/config.server.json']);for(const p of process.argv.slice(1)){const s=fs.lstatSync(p);if(s.isSymbolicLink()||!s.isFile()||s.uid!==0||(s.mode&0o22)!==0)throw Error('unsafe service file: '+p);if(privateFiles.has(p)&&((s.mode&0o400)===0||(s.mode&0o7177)!==0||s.nlink!==1))throw Error('unsafe private service file: '+p)}" /etc/gpt-register-panel/panel.env /run/gpt-register-panel/code/backend/server.js /run/gpt-register-panel/code/package.json /run/gpt-register-panel/gpt_register/index.js /run/gpt-register-panel/gpt_register/package.json /run/gpt-register-panel/gpt_register/config.json /run/gpt-register-panel/gpt_register/config.server.json
 # Walk every module/code entry without following directory symlinks. Bound both
 # discovered entries and depth before growing the work stack, so an attacker-
 # supplied replacement tree fails without turning startup into an OOM. npm bin
@@ -104,7 +105,7 @@ ReadOnlyPaths=/run/gpt-register-panel/gpt_register/package.json
 ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/package-lock.json
 ReadOnlyPaths=/run/gpt-register-panel/gpt_register/config.json
 ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/config.local.json
-ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/config.server.json
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/config.server.json
 ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/cloudflare-email-worker.js
 ReadOnlyPaths=/etc/gpt-register-panel/panel.env
 # The legacy project-local file may live on NTFS and cannot reliably enforce

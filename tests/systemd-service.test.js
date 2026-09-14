@@ -6,6 +6,7 @@ const path = require('node:path');
 const test = require('node:test');
 
 const UNIT_PATH = path.resolve(__dirname, '..', 'deploy', 'gpt-register-panel.service');
+const README_PATH = path.resolve(__dirname, '..', 'README.md');
 
 function parseUnit(source) {
   const sections = new Map();
@@ -125,9 +126,20 @@ test('systemd unit executes only pinned sources and refuses a missing or read-on
   assert.ok(ownershipChecks.some((command) => command.includes(
     ' /run/gpt-register-panel /run/gpt-register-panel/code ',
   )));
-  assert.ok(ownershipChecks.some((command) => command.endsWith(
-    ' /run/gpt-register-panel/gpt_register/config.json',
+  assert.ok(ownershipChecks.some((command) => command.includes(
+    ' /run/gpt-register-panel/gpt_register/config.json ',
   )));
+  assert.ok(ownershipChecks.some((command) => command.endsWith(
+    ' /run/gpt-register-panel/gpt_register/config.server.json',
+  )));
+  const privateFileCheck = ownershipChecks.find((command) => command.includes('privateFiles=new Set'));
+  assert.ok(privateFileCheck);
+  assert.match(privateFileCheck, /\/etc\/gpt-register-panel\/panel\.env/);
+  assert.match(privateFileCheck, /gpt_register\/config\.json/);
+  assert.match(privateFileCheck, /gpt_register\/config\.server\.json/);
+  assert.match(privateFileCheck, /s\.mode&0o400/);
+  assert.match(privateFileCheck, /s\.mode&0o7177/);
+  assert.match(privateFileCheck, /s\.nlink!==1/);
 
   const recursiveCheck = ownershipChecks.find((command) => command.includes('MAX_ENTRIES='));
   assert.ok(recursiveCheck);
@@ -190,6 +202,7 @@ test('systemd unit limits privilege and writable scope without blocking Phase3 n
   assert.ok(protectedPhase3Paths.includes('/run/gpt-register-panel/gpt_register/src'));
   assert.ok(protectedPhase3Paths.includes('/run/gpt-register-panel/gpt_register/node_modules'));
   assert.ok(protectedPhase3Paths.includes('/run/gpt-register-panel/gpt_register/config.json'));
+  assert.ok(protectedPhase3Paths.includes('/run/gpt-register-panel/gpt_register/config.server.json'));
   assert.ok(protectedPhase3Paths.includes('/etc/gpt-register-panel/panel.env'));
   assert.ok(values(unit, 'Service', 'InaccessiblePaths')
     .includes('-/mnt/nvme/item/gpt-register-panel/.env'));
@@ -253,4 +266,18 @@ test('systemd stop policy gives the app a graceful drain window then cleans the 
   assert.equal(one(unit, 'Service', 'SendSIGKILL'), 'yes');
   assert.ok(Number.parseInt(one(unit, 'Service', 'TimeoutStopSec'), 10) >= 45);
   assert.equal(one(unit, 'Service', 'Restart'), 'on-failure');
+});
+
+test('systemd deployment instructions never overwrite an existing secret file', () => {
+  const readme = fs.readFileSync(README_PATH, 'utf8');
+  const lines = readme.split(/\r?\n/);
+  assert.equal(lines.includes(
+    '    sudo install -o root -g root -m 0600 .env.example /etc/gpt-register-panel/panel.env',
+  ), false);
+  assert.equal(lines.includes(
+    '    sudo install -o root -g root -m 0600 .env /etc/gpt-register-panel/panel.env',
+  ), false);
+  assert.ok((readme.match(/sudo test -L \/etc\/gpt-register-panel\/panel\.env/g) || []).length >= 2);
+  assert.match(readme, /重复安装或升级不得用 `\.env\.example`、`cp -f` 或 `install` 覆盖/);
+  assert.equal(readme.includes('sudo test -d /mnt/nvme/tmp'), false);
 });
