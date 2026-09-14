@@ -606,6 +606,22 @@ test('frontend difference metric excludes in-sync rows and starts imports with t
   assert.match(importHandler, /watchJob\(body\.jobId, 'token_import'\)/);
 });
 
+test('frontend treats expired token cleanup as a durable polled task', () => {
+  const cleanupHandler = sourceSection(
+    "if (elements.cleanupButton) {",
+    "elements.clearSelectionButton.addEventListener",
+  );
+  const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
+  const resumeContract = sourceSection('async function resumeActiveJob', 'async function loadSnapshot');
+  assert.match(cleanupHandler, /\^job_\[a-f0-9\]\{24\}\$/);
+  assert.match(cleanupHandler, /watchJob\(result\.jobId, 'token_cleanup'\)/);
+  assert.doesNotMatch(cleanupHandler, /已隔离 ' \+ \(result\.count/);
+  assert.match(watchContract, /job\.type === 'token_cleanup'/);
+  assert.match(watchContract, /state\.cleanupRequestPending = false/);
+  assert.match(resumeContract, /job\.type === 'token_cleanup'/);
+  assert.match(resumeContract, /state\.cleanupRequestPending = true/);
+});
+
 test('frontend globally locks mutating actions while any request or task is unresolved', () => {
   const lockContract = sourceSection('function actionRequestPending', 'function renderMetrics');
   const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');

@@ -72,6 +72,29 @@ test('reconciliation controls expose only the three operation-neutral resolution
   assert.match(styles, /@media \(max-width: 700px\)[\s\S]*\.reconciliation-ack-button/);
 });
 
+test('token cleanup reconciliation requires a path-bound content hash', () => {
+  const contracts = section(
+    'function boundedReconciliationDisplay',
+    'function reconciliationReviewDetailError',
+  );
+  const context = {};
+  vm.runInNewContext(contracts, context);
+  assert.equal(context.reconciliationTargetIsValid('token_cleanup', {
+    cleanupScope: 'expired_tokens',
+    expectedVersion: 'a'.repeat(64),
+    targetCount: 1,
+  }), true);
+  assert.equal(context.reconciliationTargetIsValid('token_cleanup', {
+    sourcePath: 'tokens/expired.json',
+    contentHash: 'b'.repeat(64),
+    accessFingerprint: 'c'.repeat(16),
+  }), true);
+  assert.equal(context.reconciliationTargetIsValid('token_cleanup', {
+    sourcePath: 'tokens/expired.json',
+    accessFingerprint: 'c'.repeat(16),
+  }), false);
+});
+
 test('frontend offers acknowledgement only for an unresolved persisted hold', () => {
   const contracts = section('function tokenImportResultCounts', 'function renderJob');
   const context = {

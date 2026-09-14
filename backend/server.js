@@ -92,6 +92,10 @@ const PHASE3_DISPOSITION_OUTCOMES = new Set([
   'unknown',
   'not_attempted',
 ]);
+const TOKEN_CLEANUP_JOB_TYPE = 'token_cleanup';
+const TOKEN_CLEANUP_CLAIM_KEY = 'token_cleanup:expired_tokens';
+// One additional summary target is included in reconciliation responses.
+const MAX_TOKEN_CLEANUP_REVIEW_TARGETS = 99;
 
 const authFailureBuckets = new Map();
 const MAX_AUTH_FAILURE_BUCKETS = 10_000;
@@ -696,6 +700,45 @@ function phase3ReviewTargets(job) {
   }];
 }
 
+function tokenCleanupReviewContext(job) {
+  const payload = job?.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)
+    ? job.payload
+    : {};
+  const expectedVersion = /^[a-f0-9]{64}$/.test(String(payload.expectedVersion || ''))
+    ? payload.expectedVersion
+    : null;
+  const targetCount = Number(payload.targetCount);
+  if (!expectedVersion || !Number.isSafeInteger(targetCount)
+      || targetCount < 0 || targetCount > 1_000_000) return null;
+  const rawTargets = Array.isArray(payload.reviewTargets)
+    ? payload.reviewTargets.slice(0, MAX_TOKEN_CLEANUP_REVIEW_TARGETS)
+    : [];
+  const targets = rawTargets.map((target) => {
+    const sourcePath = safeReviewSourcePath(target?.sourcePath);
+    const contentHash = /^[a-f0-9]{64}$/.test(String(target?.contentHash || ''))
+      ? target.contentHash
+      : null;
+    if (!sourcePath || !contentHash) return null;
+    return {
+      sourcePath,
+      contentHash,
+      accessFingerprint: safeReviewFingerprint(target?.accessFingerprint) || undefined,
+    };
+  }).filter(Boolean);
+  const complete = payload.reviewTargetsTruncated === false
+    && rawTargets.length === targetCount
+    && targets.length === targetCount;
+  return {
+    total: targetCount + 1,
+    truncated: !complete,
+    targets: [{
+      cleanupScope: 'expired_tokens',
+      expectedVersion,
+      targetCount,
+    }, ...targets],
+  };
+}
+
 function reconciliationReviewDetail(job) {
   if (!job) {
     const error = new Error('待对账任务不存在');
@@ -713,15 +756,26 @@ function reconciliationReviewDetail(job) {
     throw error;
   }
   let targets = [];
+  let targetTotal = 0;
+  let targetsAlreadyTruncated = false;
   if (job.type === 'token_import') targets = tokenImportReviewTargets(job);
   else if (job.type === 'account_test') targets = accountTestReviewTargets(job);
   else if (job.type === 'phase3') targets = phase3ReviewTargets(job);
+  else if (job.type === TOKEN_CLEANUP_JOB_TYPE) {
+    const context = tokenCleanupReviewContext(job);
+    if (context) {
+      targets = context.targets;
+      targetTotal = context.total;
+      targetsAlreadyTruncated = context.truncated;
+    }
+  }
   if (targets.length === 0) {
     const error = new Error('该任务未保留足够的安全目标信息，不能从面板确认人工对账');
     error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE';
     throw error;
   }
   const returnedTargets = targets.slice(0, 100);
+  const totalTargets = Math.max(targetTotal, targets.length);
   return {
     version: 1,
     id: job.id,
@@ -734,9 +788,9 @@ function reconciliationReviewDetail(job) {
     reconciliationBlockScope: safeReviewCode(job.result.reconciliationBlockScope) || null,
     targetContext: {
       available: true,
-      total: targets.length,
+      total: totalTargets,
       returned: returnedTargets.length,
-      truncated: targets.length > returnedTargets.length,
+      truncated: targetsAlreadyTruncated || totalTargets > returnedTargets.length,
       targets: returnedTargets,
     },
   };
@@ -979,6 +1033,138 @@ function safeExpiredTokenItem(item) {
   return output;
 }
 
+function boundedCleanupCount(value) {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 && number <= 1_000_000
+    ? number
+    : 0;
+}
+
+function tokenCleanupReviewTarget(item) {
+  const source = safeReviewCode(item?.source, new Set(['tokens', 'use_token']));
+  const sourcePath = source
+    ? normalizedReviewSourcePath(source, item?.relativePath)
+    : null;
+  const contentHash = /^[a-f0-9]{64}$/i.test(String(item?.contentHash || ''))
+    ? String(item.contentHash).toLowerCase()
+    : null;
+  if (!sourcePath || !contentHash) return null;
+  return {
+    sourcePath,
+    contentHash,
+    accessFingerprint: safeReviewFingerprint(item?.fingerprint) || undefined,
+  };
+}
+
+function tokenCleanupJobPayload(listing) {
+  const items = Array.isArray(listing?._internalItems) ? listing._internalItems : [];
+  const targets = items.map(tokenCleanupReviewTarget).filter(Boolean);
+  const targetCount = boundedCleanupCount(listing?.count);
+  return {
+    expectedVersion: /^[a-f0-9]{64}$/i.test(String(listing?.version || ''))
+      ? String(listing.version).toLowerCase()
+      : null,
+    targetCount,
+    reviewTargets: targets.slice(0, MAX_TOKEN_CLEANUP_REVIEW_TARGETS),
+    reviewTargetsTruncated: targets.length !== targetCount
+      || targets.length > MAX_TOKEN_CLEANUP_REVIEW_TARGETS,
+  };
+}
+
+function tokenCleanupResultSummary(result) {
+  const deletedCount = boundedCleanupCount(result?.count);
+  const skippedItems = Array.isArray(result?.skipped) ? result.skipped : [];
+  const skipped = boundedCleanupCount(skippedItems.length);
+  const skippedByReason = {};
+  for (const item of skippedItems.slice(0, 1_000_000)) {
+    const reason = safeReviewCode(item?.reason);
+    if (!reason || Object.keys(skippedByReason).length >= 32 && skippedByReason[reason] === undefined) {
+      continue;
+    }
+    skippedByReason[reason] = boundedCleanupCount((skippedByReason[reason] || 0) + 1);
+  }
+  return {
+    version: /^[a-f0-9]{64}$/i.test(String(result?.version || ''))
+      ? String(result.version).toLowerCase()
+      : null,
+    outcome: skipped > 0 ? 'partial' : 'succeeded',
+    succeeded: deletedCount,
+    failed: 0,
+    skipped,
+    deletedCount,
+    skippedCount: skipped,
+    skippedByReason,
+  };
+}
+
+function tokenCleanupFailureMetadata(error, completedResult = null) {
+  const output = mutationFailureMetadata(error);
+  const completedCount = completedResult
+    ? boundedCleanupCount(completedResult.count)
+    : boundedCleanupCount(error?.completedCount);
+  const skippedCount = completedResult && Array.isArray(completedResult.skipped)
+    ? boundedCleanupCount(completedResult.skipped.length)
+    : boundedCleanupCount(error?.skippedCount);
+  output.outcome = output.requiresReconciliation === true
+    ? 'requires_reconciliation'
+    : output.executionOutcome || 'failed';
+  output.succeeded = completedCount;
+  output.failed = 1;
+  output.skipped = skippedCount;
+  output.completedCount = completedCount;
+  output.skippedCount = skippedCount;
+  if (error?.reconciliationScope === 'expired_token_cleanup') {
+    output.reconciliationScope = 'expired_token_cleanup';
+  }
+  const currentSource = safeReviewCode(error?.currentItem?.source, new Set(['tokens', 'use_token']));
+  const currentSourcePath = currentSource
+    ? normalizedReviewSourcePath(currentSource, error?.currentItem?.relativePath)
+    : null;
+  if (currentSourcePath) output.currentSourcePath = currentSourcePath;
+  const recoveredCount = boundedCleanupCount(error?.recoveredCount);
+  if (recoveredCount > 0) output.recoveredCount = recoveredCount;
+  const causeCode = safePhase3FailureCode(error?.causeCode);
+  if (causeCode) output.causeCode = causeCode;
+  return output;
+}
+
+function tokenCleanupReconciliationError(
+  result,
+  reason,
+  code = 'TOKEN_CLEANUP_OUTCOME_UNKNOWN',
+  cause = null,
+) {
+  const error = new Error('过期 token 清理结果需要人工核对，禁止自动重试');
+  error.code = code;
+  error.requiresReconciliation = true;
+  error.writeOutcomeUnknown = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'expired_token_cleanup';
+  error.reconciliationReason = reason;
+  error.completedCount = result
+    ? boundedCleanupCount(result.count)
+    : boundedCleanupCount(cause?.completedCount);
+  error.skippedCount = result
+    ? boundedCleanupCount(result?.skipped?.length)
+    : boundedCleanupCount(cause?.skippedCount);
+  const causeCode = safePhase3FailureCode(cause?.code);
+  if (causeCode) error.causeCode = causeCode;
+  const currentSource = safeReviewCode(cause?.currentItem?.source, new Set(['tokens', 'use_token']));
+  const currentRelativePath = currentSource
+    ? normalizedReviewSourcePath(currentSource, cause?.currentItem?.relativePath)
+    : null;
+  if (currentRelativePath) {
+    error.currentItem = {
+      source: currentSource,
+      relativePath: currentRelativePath,
+    };
+  }
+  const recoveredCount = boundedCleanupCount(cause?.recoveredCount);
+  if (recoveredCount > 0) error.recoveredCount = recoveredCount;
+  return error;
+}
+
 function terminalUpdateOptions({ logger, event, requestId, jobId, actor }) {
   return {
     onRetry(error, attempt) {
@@ -1054,6 +1240,260 @@ function mutationFailureMetadata(error) {
     output.controlPlaneLeaseReleaseFailed = true;
   }
   return output;
+}
+
+function observeTokenCleanupJob({
+  job,
+  expectedVersion,
+  actor,
+  db,
+  logger,
+  requestId,
+  jobManager = null,
+  taskRecord = null,
+}) {
+  const tracked = taskRecord || jobManager?.begin(job, TOKEN_CLEANUP_JOB_TYPE, actor) || null;
+  let terminalPersisted = false;
+  let completedResult = null;
+  let mutationBoundaryEntered = false;
+  const terminalOptions = terminalUpdateOptions({
+    logger,
+    event: 'token_cleanup.job_update_retry',
+    requestId,
+    jobId: job.id,
+    actor,
+  });
+  const persistFailure = async (error) => {
+    const result = tokenCleanupFailureMetadata(error, completedResult);
+    const interrupted = error?.code === 'JOB_INTERRUPTED'
+      || tracked?.controller.signal.aborted === true;
+    const status = result.requiresReconciliation === true && result.completedCount > 0
+      ? 'partial'
+      : interrupted && result.requiresReconciliation !== true
+        ? 'interrupted'
+        : 'failed';
+    await updateTerminalJob(db, job.id, {
+      status,
+      error: safeErrorMessage(error),
+      result,
+      finishedAt: new Date().toISOString(),
+    }, terminalOptions);
+    terminalPersisted = true;
+    return { status, result };
+  };
+  const persistSuccess = async (result) => {
+    const status = result.skipped > 0 ? 'partial' : 'succeeded';
+    await updateTerminalJob(db, job.id, {
+      status,
+      result,
+      finishedAt: new Date().toISOString(),
+    }, terminalOptions);
+    terminalPersisted = true;
+    return status;
+  };
+
+  const observation = Promise.resolve().then(async () => {
+    let finalSummary = null;
+    try {
+      finalSummary = await withControlPlaneLock(async () => {
+        try {
+          throwIfJobInterrupted(tracked?.controller.signal);
+          if (!db || typeof db.startMutationJob !== 'function'
+              || typeof db.updateJob !== 'function'
+              || typeof db.audit !== 'function') {
+            const error = new Error('token 清理任务持久化安全检查不可用，未修改任何文件');
+            error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+            throw error;
+          }
+          await db.startMutationJob(job.id);
+          throwIfJobInterrupted(tracked?.controller.signal);
+          try {
+            await db.audit({
+              jobId: job.id,
+              actor,
+              action: 'expired_token_cleanup',
+              targetKey: 'gpt_register:expired_tokens',
+              result: 'intent',
+              details: {
+                requestId,
+                expectedVersion,
+              },
+            });
+          } catch {
+            const error = new Error('过期 token 删除审计意图无法持久化，未修改任何 token 文件');
+            error.code = 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED';
+            throw error;
+          }
+          throwIfJobInterrupted(tracked?.controller.signal);
+          const result = deleteExpiredTokens({
+            expectedVersion,
+            confirmation: TOKEN_CLEANUP_CONFIRMATION,
+            signal: tracked?.controller.signal,
+            beforeMutation() {
+              assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_checkpoint', {
+                requestId,
+                jobId: job.id,
+                actor,
+                expectedVersion,
+              });
+              mutationBoundaryEntered = true;
+            },
+          });
+          completedResult = result;
+          const summary = tokenCleanupResultSummary(result);
+          let databaseAuditFailed = false;
+          try {
+            await db.audit({
+              jobId: job.id,
+              actor,
+              action: 'expired_token_cleanup',
+              targetKey: 'gpt_register:expired_tokens',
+              result: result.skipped.length > 0 ? 'partial' : 'ok',
+              details: {
+                requestId,
+                version: summary.version,
+                deletedCount: summary.deletedCount,
+                skippedCount: summary.skippedCount,
+                skippedByReason: summary.skippedByReason,
+              },
+            });
+          } catch (auditError) {
+            databaseAuditFailed = true;
+            writeLog(logger, 'error', 'token_cleanup.audit_failed_after_mutation', {
+              requestId,
+              jobId: job.id,
+              actor,
+              error: safeErrorMessage(auditError),
+            });
+          }
+          let logCheckpointFailed = false;
+          try {
+            assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_completed', {
+              requestId,
+              jobId: job.id,
+              actor,
+              deletedCount: summary.deletedCount,
+              skippedCount: summary.skippedCount,
+              databaseAuditFailed,
+            });
+          } catch {
+            logCheckpointFailed = true;
+          }
+          if (databaseAuditFailed || logCheckpointFailed) {
+            throw tokenCleanupReconciliationError(
+              result,
+              databaseAuditFailed && logCheckpointFailed
+                ? 'completion_audit_unavailable'
+                : databaseAuditFailed
+                  ? 'completion_database_audit_unavailable'
+                  : 'completion_log_checkpoint_unavailable',
+              'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED',
+            );
+          }
+          // Keep the running claim until the cross-process lease has been
+          // released. A crash or ambiguous lease release in this narrow gap is
+          // recovered as an unknown running job, never as a retryable success.
+          return summary;
+        } catch (error) {
+          let terminalError = error;
+          if ((completedResult || mutationBoundaryEntered)
+              && error?.requiresReconciliation !== true
+              && error?.writeOutcomeUnknown !== true) {
+            terminalError = tokenCleanupReconciliationError(
+              completedResult,
+              completedResult ? 'post_mutation_failure' : 'mutation_boundary_failure',
+              'TOKEN_CLEANUP_OUTCOME_UNKNOWN',
+              error,
+            );
+          }
+          if (!terminalPersisted) {
+            try {
+              await persistFailure(terminalError);
+            } catch (jobError) {
+              writeLog(logger, 'error', 'token_cleanup.job_update_deferred', {
+                requestId,
+                jobId: job.id,
+                actor,
+                terminalOutcome: 'failed',
+                error: safeErrorMessage(jobError),
+              });
+            }
+          }
+          throw terminalError;
+        }
+      }, { signal: tracked?.controller.signal });
+
+      try {
+        const status = await persistSuccess(finalSummary);
+        writeLog(logger, status === 'succeeded' ? 'info' : 'warn', 'token_cleanup.job_completed', {
+          requestId,
+          jobId: job.id,
+          actor,
+          status,
+          deletedCount: finalSummary.deletedCount,
+          skippedCount: finalSummary.skippedCount,
+        });
+      } catch (jobError) {
+        const terminalError = tokenCleanupReconciliationError(
+          completedResult,
+          'terminal_persistence_unavailable',
+          'TOKEN_CLEANUP_TERMINAL_PERSISTENCE_UNKNOWN',
+          jobError,
+        );
+        try {
+          await persistFailure(terminalError);
+        } catch (retryError) {
+          writeLog(logger, 'error', 'token_cleanup.job_update_failed_after_completion', {
+            requestId,
+            jobId: job.id,
+            actor,
+            error: safeErrorMessage(retryError),
+          });
+        }
+        writeLog(logger, 'error', 'token_cleanup.job_completion_persistence_unknown', {
+          requestId,
+          jobId: job.id,
+          actor,
+          error: safeErrorMessage(jobError),
+        });
+      }
+    } catch (error) {
+      let terminalError = error;
+      if ((completedResult || mutationBoundaryEntered)
+          && error?.requiresReconciliation !== true
+          && error?.writeOutcomeUnknown !== true) {
+        terminalError = tokenCleanupReconciliationError(
+          completedResult,
+          completedResult ? 'control_plane_completion_unknown' : 'mutation_boundary_failure',
+          'TOKEN_CLEANUP_OUTCOME_UNKNOWN',
+          error,
+        );
+      }
+      if (!terminalPersisted) {
+        try {
+          await persistFailure(terminalError);
+        } catch (jobError) {
+          writeLog(logger, 'error', 'token_cleanup.job_update_failed', {
+            requestId,
+            jobId: job.id,
+            actor,
+            error: safeErrorMessage(jobError),
+          });
+        }
+      }
+      writeLog(logger, terminalError?.requiresReconciliation === true ? 'warn' : 'error',
+        terminalError?.requiresReconciliation === true
+          ? 'token_cleanup.job_reconciliation_required'
+          : 'token_cleanup.job_failed', {
+          requestId,
+          jobId: job.id,
+          actor,
+          code: terminalError?.code || null,
+          error: safeErrorMessage(terminalError),
+        });
+    }
+  });
+  return tracked && jobManager ? jobManager.track(tracked, observation) : observation;
 }
 
 function observePhase3Job({
@@ -2171,9 +2611,6 @@ function createServer(options = {}) {
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/tokens/expired/delete') {
       const cleanupStartedAt = Date.now();
-      // Once deleteExpiredTokens returns, retries are unsafe even if shutdown,
-      // lock release, or completion auditing fails before the HTTP response.
-      let completedMutationResult = null;
       try {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
@@ -2188,147 +2625,56 @@ function createServer(options = {}) {
           error.code = 'TOKEN_CLEANUP_VERSION_REQUIRED';
           throw error;
         }
-        const cleanup = await jobManager.withAdmission((signal) => withControlPlaneLock(async () => {
+        const expectedVersion = String(body.version).toLowerCase();
+        const { job, trackedCleanup } = await jobManager.withAdmission(async (signal) => {
+          const created = await withControlPlaneLock(async () => {
+            throwIfJobInterrupted(signal);
+            if (!db || typeof db.createJob !== 'function') {
+              const error = new Error('token 清理任务持久化安全检查不可用，未修改任何文件');
+              error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+              throw error;
+            }
+            const listing = listExpiredTokens();
+            if (listing.version.toLowerCase() !== expectedVersion) {
+              const error = new Error('过期 token 清单已变化，请重新扫描后再删除');
+              error.code = 'TOKEN_CLEANUP_STALE';
+              error.currentVersion = listing.version;
+              throw error;
+            }
+            const createdJob = await db.createJob(
+              TOKEN_CLEANUP_JOB_TYPE,
+              tokenCleanupJobPayload(listing),
+              actor,
+              { claimKeys: [TOKEN_CLEANUP_CLAIM_KEY] },
+            );
+            throwIfJobInterrupted(signal);
+            return createdJob;
+          }, { signal });
           throwIfJobInterrupted(signal);
-          if (!db || typeof db.assertNoReconciliationHold !== 'function') {
-            const error = new Error('任务对账安全检查不可用，未修改任何 token 文件');
-            error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
-            throw error;
-          }
-          await db.assertNoReconciliationHold();
-          throwIfJobInterrupted(signal);
-          try {
-            await db.audit({
-              actor,
-              action: 'expired_token_cleanup',
-              targetKey: 'gpt_register:expired_tokens',
-              result: 'intent',
-              details: {
-                requestId,
-                expectedVersion: body.version,
-              },
-            });
-          } catch {
-            const error = new Error('过期 token 删除审计意图无法持久化，未修改任何 token 文件');
-            error.code = 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED';
-            throw error;
-          }
-          throwIfJobInterrupted(signal);
-          const result = deleteExpiredTokens({
-            expectedVersion: body.version,
-            confirmation: body.confirmation,
-            signal,
-            beforeMutation() {
-              assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_checkpoint', {
-                requestId,
-                actor,
-                expectedVersion: body.version,
-              });
-            },
-          });
-          completedMutationResult = result;
-          const details = {
-            requestId,
-            count: result.count,
-            skipped: result.skipped,
-            items: result.deleted,
-          };
-          let databaseAuditFailed = false;
-          try {
-            await db.audit({
-              actor,
-              action: 'expired_token_cleanup',
-              targetKey: 'gpt_register:expired_tokens',
-              result: result.skipped.length > 0 ? 'partial' : 'ok',
-              details,
-            });
-          } catch (auditError) {
-            databaseAuditFailed = true;
-            writeLog(logger, 'error', 'token_cleanup.audit_failed_after_mutation', {
-              requestId,
-              actor,
-              error: safeErrorMessage(auditError),
-            });
-          }
-          let logCheckpointFailed = false;
-          try {
-            assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_completed', {
-              requestId,
-              actor,
-              deletedCount: result.count,
-              skippedCount: result.skipped.length,
-              databaseAuditFailed,
-            });
-          } catch {
-            logCheckpointFailed = true;
-          }
           return {
-            result,
-            auditCompletionFailed: databaseAuditFailed || logCheckpointFailed,
-            databaseAuditFailed,
-            logCheckpointFailed,
+            job: created,
+            trackedCleanup: jobManager.begin(created, TOKEN_CLEANUP_JOB_TYPE, actor),
           };
-        }, { signal }));
-        const { result } = cleanup;
-        writeLog(
+        });
+        writeLog(logger, 'info', 'token_cleanup.job_queued', {
+          requestId,
+          jobId: job.id,
+          actor,
+          expectedVersion,
+          durationMs: Date.now() - cleanupStartedAt,
+        });
+        observeTokenCleanupJob({
+          job,
+          expectedVersion,
+          actor,
+          db,
           logger,
-          cleanup.auditCompletionFailed ? 'error' : (result.skipped.length > 0 ? 'warn' : 'info'),
-          cleanup.auditCompletionFailed
-            ? 'token_cleanup.audit_reconciliation_required'
-            : 'token_cleanup.completed',
-          {
-            requestId,
-            actor,
-            deletedCount: result.count,
-            skippedCount: result.skipped.length,
-            auditCompletionFailed: cleanup.auditCompletionFailed,
-            durationMs: Date.now() - cleanupStartedAt,
-          },
-        );
-        const responseBody = {
-          status: result.skipped.length > 0 ? 'partial' : 'succeeded',
-          count: result.count,
-          deleted: result.deleted.map(safeExpiredTokenItem),
-          skipped: result.skipped.map(safeExpiredTokenItem),
-        };
-        if (cleanup.auditCompletionFailed) {
-          jsonResponse(response, 409, {
-            ...responseBody,
-            status: 'requires_reconciliation',
-            error: 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED',
-            message: '过期 token 已完成隔离，但完成审计未能全部持久化；请人工核对，禁止重试本次删除',
-            mutationCompleted: true,
-            requiresReconciliation: true,
-            retryAllowed: false,
-            doNotRetry: true,
-          });
-          return;
-        }
-        jsonResponse(response, 200, responseBody);
+          requestId,
+          jobManager,
+          taskRecord: trackedCleanup,
+        });
+        jsonResponse(response, 202, { jobId: job.id, status: 'queued' });
       } catch (error) {
-        if (completedMutationResult) {
-          writeLog(logger, 'error', 'token_cleanup.post_mutation_reconciliation_required', {
-            requestId,
-            actor,
-            deletedCount: completedMutationResult.count,
-            skippedCount: completedMutationResult.skipped.length,
-            code: error?.code || null,
-            durationMs: Date.now() - cleanupStartedAt,
-          });
-          jsonResponse(response, 409, {
-            status: 'requires_reconciliation',
-            error: 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED',
-            message: '过期 token 已完成隔离，但请求在完成确认前中断；请人工核对，禁止重试本次删除',
-            mutationCompleted: true,
-            requiresReconciliation: true,
-            retryAllowed: false,
-            doNotRetry: true,
-            count: completedMutationResult.count,
-            deleted: completedMutationResult.deleted.map(safeExpiredTokenItem),
-            skipped: completedMutationResult.skipped.map(safeExpiredTokenItem),
-          });
-          return;
-        }
         writeLog(logger, 'error', 'token_cleanup.failed', {
           requestId,
           actor,
@@ -2725,8 +3071,13 @@ module.exports = {
   normalizePhase3Requests,
   phase3FailureMetadata,
   mutationFailureMetadata,
+  observeTokenCleanupJob,
   phase3ClaimKeys,
   reconciliationAcknowledgePath,
   reconciliationAcknowledgeRequestError,
+  reconciliationReviewDetail,
   sourcePathFromSelectionKey,
+  tokenCleanupFailureMetadata,
+  tokenCleanupJobPayload,
+  tokenCleanupResultSummary,
 };

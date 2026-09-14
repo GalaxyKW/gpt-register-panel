@@ -1359,10 +1359,13 @@ function renderJob(job) {
   elements.jobPanel.dataset.status = needsReconciliation ? 'partial' : (job.status || '');
   const isPhase3 = jobs.every((item) => item.type === 'phase3');
   const isAccountTest = jobs.every((item) => item.type === 'account_test');
+  const isTokenCleanup = jobs.every((item) => item.type === 'token_cleanup');
   elements.jobTitle.textContent = isAccountTest
     ? (jobs.length > 1 ? '上游账号批量测试' : '上游账号测试')
     : isPhase3
     ? (jobs.length > 1 ? 'Phase 3 批量任务' : 'Phase 3 任务')
+    : isTokenCleanup
+      ? '过期 Token 清理任务'
     : (jobs.length > 1 ? '批量任务' : 'Token 导入任务');
   elements.jobStatus.className = 'badge '
     + (needsReconciliation ? 'badge-warning' : jobStatusClass(job.status));
@@ -1403,6 +1406,11 @@ function renderJob(job) {
       detail = needsReconciliation
         ? 'Phase 3 执行结果未知；请按账号 ID 和强身份字段人工核对，确认前勿重试'
         : 'Phase 3 已完成并检测到 token 更新';
+    } else if (job.type === 'token_cleanup') {
+      detail = needsReconciliation
+        ? '清理结果未知；请核对来源目录、隔离目录和残留 claim，确认前勿重试'
+        : '已隔离 ' + (job.result.deletedCount || 0)
+          + ' 个 · 跳过 ' + (job.result.skippedCount || 0) + ' 个';
     } else {
       detail = '成功 ' + (job.result.imported?.length || 0) + ' · 失败 ' + (job.result.failed || 0);
     }
@@ -1489,6 +1497,18 @@ function reconciliationTargetIsValid(workflow, target) {
     if (target.phone !== undefined && !phone) return false;
     return true;
   }
+  if (workflow === 'token_cleanup') {
+    if (target.cleanupScope === 'expired_tokens') {
+      const targetCount = Number(target.targetCount);
+      return /^[a-f0-9]{64}$/.test(String(target.expectedVersion || ''))
+        && Number.isSafeInteger(targetCount) && targetCount >= 0 && targetCount <= 1_000_000;
+    }
+    if (!sourcePath) return false;
+    if (!/^[a-f0-9]{64}$/.test(String(target.contentHash || ''))) return false;
+    if (target.accessFingerprint !== undefined
+        && !/^[a-f0-9]{8,128}$/.test(String(target.accessFingerprint))) return false;
+    return true;
+  }
   return false;
 }
 
@@ -1522,11 +1542,18 @@ function reconciliationTargetContextText(detail) {
     token_import: 'Token 导入',
     account_test: '账号测试',
     phase3: 'Phase 3',
+    token_cleanup: '过期 Token 清理',
   };
   const lines = ['工作流：' + workflowLabels[detail.type]];
   detail.targetContext.targets.forEach((target, index) => {
     const fields = [];
+    if (target.cleanupScope === 'expired_tokens') {
+      fields.push('范围 tokens / use_token');
+      fields.push('清单版本 ' + target.expectedVersion);
+      fields.push('目标数量 ' + target.targetCount);
+    }
     if (target.sourcePath) fields.push('文件 ' + target.sourcePath);
+    if (target.contentHash) fields.push('内容 SHA-256 ' + target.contentHash);
     if (target.remoteAccountId) fields.push('Sub2API ID ' + target.remoteAccountId);
     if (target.accountName) fields.push('名称 ' + target.accountName);
     if (target.email) fields.push('邮箱 ' + target.email);
@@ -1768,7 +1795,13 @@ async function watchJobs(jobIds, initialType = 'phase3') {
           terminalNotice = reconciliationNoticeForJobs(reconciliationJobs);
           terminalNoticeKind = 'notice-warning';
         } else if (loaded.every((job) => job.status === 'succeeded')) {
-          terminalNotice = '任务已完成，账号状态已刷新。';
+          const cleanup = loaded.length === 1 && loaded[0].type === 'token_cleanup'
+            ? loaded[0].result
+            : null;
+          terminalNotice = cleanup
+            ? '过期 token 清理已完成：隔离 ' + (cleanup.deletedCount || 0)
+              + ' 个，跳过 ' + (cleanup.skippedCount || 0) + ' 个。'
+            : '任务已完成，账号状态已刷新。';
           terminalNoticeKind = 'notice-info';
         } else if (loaded.some((job) => job.status === 'succeeded' || job.status === 'partial')) {
           terminalNotice = '任务部分成功，账号状态已刷新，请查看任务详情和日志。';
@@ -1795,6 +1828,7 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         if (loaded.some((job) => job.type === 'token_import')) state.importRequestPending = false;
         if (loaded.some((job) => job.type === 'phase3')) state.phase3RequestPending = false;
         if (loaded.some((job) => job.type === 'account_test')) state.accountTestRequestPending = false;
+        if (loaded.some((job) => job.type === 'token_cleanup')) state.cleanupRequestPending = false;
         renderPlan(state.plan);
         updateActionState();
         return;
@@ -1884,6 +1918,7 @@ async function resumeActiveJob() {
     if (activeJobs.some((job) => job.type === 'phase3')) state.phase3RequestPending = true;
     if (activeJobs.some((job) => job.type === 'token_import')) state.importRequestPending = true;
     if (activeJobs.some((job) => job.type === 'account_test')) state.accountTestRequestPending = true;
+    if (activeJobs.some((job) => job.type === 'token_cleanup')) state.cleanupRequestPending = true;
     state.jobs = activeJobs;
     state.job = aggregateJobs(activeJobs);
     renderJob(state.job);
@@ -2154,24 +2189,31 @@ if (elements.cleanupButton) {
       if (!scanResponse.ok) throw new Error(listing.message || listing.error || '过期 token 扫描失败');
       if (!listing.count) {
         showNotice('没有发现可安全删除的过期 token。', 'notice-info');
+        state.cleanupRequestPending = false;
+        updateActionState();
         return;
       }
       const preview = (listing.items || []).slice(0, 3).map((item) => item.relativePath).join('、');
       const suffix = listing.count > 3 ? ' 等' : '';
-      if (!window.confirm('将把 ' + listing.count + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) return;
+      if (!window.confirm('将把 ' + listing.count + ' 个已过期 token 文件移入隔离目录（' + preview + suffix + '），之后仍可手动恢复。确认继续？')) {
+        state.cleanupRequestPending = false;
+        updateActionState();
+        return;
+      }
       const deleteResponse = await apiFetch('/api/tokens/expired/delete', {
         method: 'POST',
         body: JSON.stringify({ version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' }),
       });
       const result = await deleteResponse.json();
       if (!deleteResponse.ok) throw new Error(result.message || result.error || '过期 token 删除失败');
-      showNotice('已隔离 ' + (result.count || 0) + ' 个过期 token。'
-        + (result.skipped?.length ? '另有 ' + result.skipped.length + ' 个文件变化，已跳过。' : ''), 'notice-info');
-      await loadSnapshot();
+      if (!/^job_[a-f0-9]{24}$/.test(String(result.jobId || ''))) {
+        throw new Error('过期 token 清理未返回有效任务编号');
+      }
+      showNotice('过期 token 清理任务已排队，正在等待执行结果。', 'notice-info');
+      await watchJob(result.jobId, 'token_cleanup');
     } catch (error) {
-      showNotice(error.message, 'notice-danger');
-    } finally {
       state.cleanupRequestPending = false;
+      showNotice(error.message, 'notice-danger');
       updateActionState();
     }
   });

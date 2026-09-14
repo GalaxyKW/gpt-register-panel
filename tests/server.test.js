@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
@@ -19,6 +20,7 @@ const {
   phase3ClaimKeys,
   phase3FailureMetadata,
   mutationFailureMetadata,
+  reconciliationReviewDetail,
   readJsonBody,
   resetAuthFailureBuckets,
   safeStaticPath,
@@ -27,6 +29,7 @@ const {
   validateRuntimeConfiguration,
 } = require('../backend/server');
 const { listExpiredTokens } = require('../backend/tokenCleanup');
+const { PanelDb } = require('../backend/db');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 
@@ -123,6 +126,54 @@ test('generic worker failures preserve only bounded reconciliation signals', () 
     reconciliationReason: 'post_write_verification',
   });
   assert.equal(JSON.stringify(metadata).includes('must-not-persist'), false);
+});
+
+test('a running token cleanup owned by a dead process recovers as an actionable hold', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-dead-owner-'));
+  const file = path.join(root, 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const expectedVersion = 'a'.repeat(64);
+  const contentHash = 'b'.repeat(64);
+  const job = await db.createJob('token_cleanup', {
+    expectedVersion,
+    targetCount: 1,
+    reviewTargets: [{
+      sourcePath: 'tokens/expired.json',
+      contentHash,
+    }],
+    reviewTargetsTruncated: false,
+  }, 'panel-admin', { claimKeys: ['token_cleanup:expired_tokens'] });
+  await db.startMutationJob(job.id);
+  await db.write((database) => {
+    const statement = database.prepare(
+      'UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?',
+    );
+    statement.run([2147483647, 'definitely-not-live', job.id]);
+    statement.free();
+  });
+
+  const restarted = new PanelDb(file);
+  const recovered = await restarted.getJob(job.id);
+  assert.equal(recovered.status, 'interrupted');
+  assert.equal(recovered.result.executionOutcome, 'unknown');
+  assert.equal(recovered.result.requiresReconciliation, true);
+  assert.equal(recovered.result.reconciliationHold, true);
+  assert.equal(recovered.result.retryAllowed, false);
+  assert.equal(recovered.result.doNotRetry, true);
+  const detail = reconciliationReviewDetail(recovered);
+  assert.equal(detail.targetContext.truncated, false);
+  assert.deepEqual(detail.targetContext.targets[1], {
+    sourcePath: 'tokens/expired.json',
+    contentHash,
+    accessFingerprint: undefined,
+  });
+  await assert.rejects(
+    restarted.createJob('token_cleanup', {}, 'panel-admin', {
+      claimKeys: ['token_cleanup:expired_tokens'],
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_REQUIRED'
+      && error.existingJobId === job.id,
+  );
 });
 
 test('HTTP server applies bounded slow-request and connection limits', () => {
@@ -894,8 +945,17 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
       version: expiredBody.version,
       confirmation: 'DELETE_EXPIRED_TOKENS',
     });
-    assert.equal(expiredDelete.status, 200);
-    assert.equal(JSON.parse(expiredDelete.body).count, 1);
+    assert.equal(expiredDelete.status, 202);
+    const cleanupSubmission = JSON.parse(expiredDelete.body);
+    const cleanupJob = await waitForTerminalJob(baseUrl, cleanupSubmission.jobId);
+    assert.equal(cleanupJob.type, 'token_cleanup');
+    assert.equal(cleanupJob.status, 'succeeded');
+    assert.equal(cleanupJob.result.deletedCount, 1);
+    assert.equal(cleanupJob.result.skippedCount, 0);
+    assert.equal(cleanupJob.result.deleted, undefined);
+    assert.equal(cleanupJob.payload.reviewTargets[0].sourcePath, 'tokens/expired.json');
+    assert.match(cleanupJob.payload.reviewTargets[0].contentHash, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(cleanupJob).includes('expired-refresh-hidden'), false);
     assert.equal(fs.existsSync(path.join(root, 'tokens', 'expired.json')), false);
   } finally {
     try {
@@ -935,16 +995,15 @@ test('expired token deletion fails closed when its durable audit intent cannot b
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
   let server;
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
   let checkpoints = 0;
   try {
+    await db.ready;
+    db.audit = async () => { throw new Error('simulated audit storage failure'); };
     const listing = listExpiredTokens();
     assert.equal(listing.count, 1);
     server = createServer({
-      db: {
-        dbPath: path.join(root, 'unused.sqlite3'),
-        async assertNoReconciliationHold() {},
-        async audit() { throw new Error('simulated audit storage failure'); },
-      },
+      db,
       logger: {
         requestId: () => 'cleanup-intent-failure',
         info() {},
@@ -963,8 +1022,14 @@ test('expired token deletion fails closed when its durable audit intent cannot b
       '/api/tokens/expired/delete',
       { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
     );
-    assert.equal(response.status, 503);
-    assert.equal(JSON.parse(response.body).error, 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED');
+    assert.equal(response.status, 202);
+    const job = await waitForTerminalJob(
+      'http://127.0.0.1:' + server.address().port,
+      JSON.parse(response.body).jobId,
+    );
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.code, 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED');
+    assert.notEqual(job.result.requiresReconciliation, true);
     assert.equal(checkpoints, 0);
     assert.equal(fs.existsSync(sourcePath), true);
     assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
@@ -1001,17 +1066,20 @@ test('expired token deletion reports reconciliation and forbids retry when compl
   let server;
   const audits = [];
   const checkpoints = [];
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
   try {
+    await db.ready;
+    const persistAudit = db.audit.bind(db);
+    db.audit = async (entry) => {
+      if (entry?.action === 'expired_token_cleanup') {
+        audits.push(entry);
+        if (audits.length === 2) throw new Error('simulated completion audit failure');
+      }
+      return persistAudit(entry);
+    };
     const listing = listExpiredTokens();
     server = createServer({
-      db: {
-        dbPath: path.join(root, 'unused.sqlite3'),
-        async assertNoReconciliationHold() {},
-        async audit(entry) {
-          audits.push(entry);
-          if (audits.length === 2) throw new Error('simulated completion audit failure');
-        },
-      },
+      db,
       logger: {
         requestId: () => 'cleanup-completion-failure',
         info() {},
@@ -1030,21 +1098,127 @@ test('expired token deletion reports reconciliation and forbids retry when compl
       '/api/tokens/expired/delete',
       { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
     );
-    const body = JSON.parse(response.body);
-    assert.equal(response.status, 409);
-    assert.equal(body.error, 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED');
-    assert.equal(body.status, 'requires_reconciliation');
-    assert.equal(body.mutationCompleted, true);
-    assert.equal(body.requiresReconciliation, true);
-    assert.equal(body.retryAllowed, false);
-    assert.equal(body.doNotRetry, true);
-    assert.equal(body.count, 1);
+    assert.equal(response.status, 202);
+    const job = await waitForTerminalJob(
+      'http://127.0.0.1:' + server.address().port,
+      JSON.parse(response.body).jobId,
+    );
+    assert.equal(job.status, 'partial');
+    assert.equal(job.result.code, 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED');
+    assert.equal(job.result.outcome, 'requires_reconciliation');
+    assert.equal(job.result.requiresReconciliation, true);
+    assert.equal(job.result.reconciliationHold, true);
+    assert.equal(job.result.retryAllowed, false);
+    assert.equal(job.result.doNotRetry, true);
+    assert.equal(job.result.completedCount, 1);
     assert.equal(fs.existsSync(sourcePath), false);
     assert.equal(audits[0].result, 'intent');
     assert.deepEqual(checkpoints, [
       'token_cleanup.mutation_checkpoint',
       'token_cleanup.mutation_completed',
     ]);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('token cleanup retains a durable hold when claim recovery is followed by a stale listing', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-boundary-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  const sourceContent = JSON.stringify({
+    access_token: 'expired-access',
+    email: 'boundary@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  fs.writeFileSync(sourcePath, sourceContent, { mode: 0o600 });
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
+  let server;
+  try {
+    await db.ready;
+    const listing = listExpiredTokens();
+    const createJob = db.createJob.bind(db);
+    let injected = false;
+    db.createJob = async (...args) => {
+      const job = await createJob(...args);
+      if (!injected && args[0] === 'token_cleanup') {
+        injected = true;
+        const contentHash = crypto.createHash('sha256').update(sourceContent).digest('hex');
+        const encodedName = Buffer.from(path.basename(sourcePath), 'utf8').toString('base64url');
+        const claimPath = path.join(
+          path.dirname(sourcePath),
+          '.panel-token-cleanup-claim-v1-999999-0-' + contentHash + '-'
+            + encodedName + '-0123456789abcdef',
+        );
+        fs.renameSync(sourcePath, claimPath);
+        fs.writeFileSync(path.join(root, 'use_token', 'new-expired.json'), JSON.stringify({
+          access_token: 'second-expired-access',
+          email: 'second-boundary@example.test',
+          expired: '2020-01-01T00:00:00.000Z',
+        }), { mode: 0o600 });
+      }
+      return job;
+    };
+    server = createServer({
+      db,
+      logger: {
+        requestId: () => 'cleanup-boundary-stale',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const response = await postJson(baseUrl, '/api/tokens/expired/delete', {
+      version: listing.version,
+      confirmation: 'DELETE_EXPIRED_TOKENS',
+    });
+    assert.equal(response.status, 202);
+    const job = await waitForTerminalJob(baseUrl, JSON.parse(response.body).jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.code, 'TOKEN_CLEANUP_OUTCOME_UNKNOWN');
+    assert.equal(job.result.causeCode, 'TOKEN_CLEANUP_STALE');
+    assert.equal(job.result.reconciliationReason, 'mutation_boundary_failure');
+    assert.equal(job.result.requiresReconciliation, true);
+    assert.equal(job.result.reconciliationHold, true);
+    assert.equal(job.result.retryAllowed, false);
+    assert.equal(job.result.doNotRetry, true);
+    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(fs.existsSync(path.join(root, 'use_token', 'new-expired.json')), true);
+    const detail = reconciliationReviewDetail(job);
+    assert.equal(detail.type, 'token_cleanup');
+    assert.equal(detail.targetContext.truncated, false);
+    assert.equal(detail.targetContext.targets[1].sourcePath, 'tokens/expired.json');
+    assert.match(detail.targetContext.targets[1].contentHash, /^[a-f0-9]{64}$/);
+    assert.equal(JSON.stringify(detail).includes('expired-access'), false);
+    const blocked = await postJson(baseUrl, '/api/tokens/expired/delete', {
+      version: listExpiredTokens().version,
+      confirmation: 'DELETE_EXPIRED_TOKENS',
+    });
+    assert.equal(blocked.status, 409);
+    assert.equal(JSON.parse(blocked.body).error, 'JOB_RECONCILIATION_REQUIRED');
   } finally {
     await closeHttpServer(server);
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
@@ -1085,15 +1259,18 @@ test('expired token deletion rechecks its log checkpoint after waiting for the c
   let server;
   let checkpointHealthy = true;
   const audits = [];
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
   try {
     await blockerEntered;
+    await db.ready;
+    const persistAudit = db.audit.bind(db);
+    db.audit = async (entry) => {
+      if (entry?.action === 'expired_token_cleanup') audits.push(entry);
+      return persistAudit(entry);
+    };
     const listing = listExpiredTokens();
     server = createServer({
-      db: {
-        dbPath: path.join(root, 'unused.sqlite3'),
-        async assertNoReconciliationHold() {},
-        async audit(entry) { audits.push(entry); },
-      },
+      db,
       logger: {
         requestId: () => 'cleanup-checkpoint-after-queue',
         info() {},
@@ -1118,8 +1295,14 @@ test('expired token deletion rechecks its log checkpoint after waiting for the c
     releaseBlocker = null;
     await blocker;
     const response = await responsePromise;
-    assert.equal(response.status, 503);
-    assert.equal(JSON.parse(response.body).error, 'AUDIT_LOG_UNAVAILABLE');
+    assert.equal(response.status, 202);
+    const job = await waitForTerminalJob(
+      'http://127.0.0.1:' + server.address().port,
+      JSON.parse(response.body).jobId,
+    );
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.code, 'AUDIT_LOG_UNAVAILABLE');
+    assert.notEqual(job.result.requiresReconciliation, true);
     assert.equal(audits.length, 1);
     assert.equal(audits[0].result, 'intent');
     assert.equal(fs.existsSync(sourcePath), true);
@@ -1225,7 +1408,7 @@ test('shutdown cancels a queued expired token deletion before any audit or file 
   }
 });
 
-test('shutdown after expired token mutation reports reconciliation instead of a retryable interruption', async () => {
+test('shutdown drains a tracked token cleanup after its file mutation', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-shutdown-after-mutation-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
@@ -1251,21 +1434,23 @@ test('shutdown after expired token mutation reports reconciliation instead of a 
   let server;
   let shutdownPromise = null;
   let auditCalls = 0;
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
   try {
+    await db.ready;
+    const persistAudit = db.audit.bind(db);
+    db.audit = async (entry) => {
+      if (entry?.action === 'expired_token_cleanup') {
+        auditCalls += 1;
+        if (auditCalls === 2) {
+          markCompletionAuditEntered();
+          await completionAuditBlocker;
+        }
+      }
+      return persistAudit(entry);
+    };
     const listing = listExpiredTokens();
     server = createServer({
-      db: {
-        dbPath: path.join(root, 'unused.sqlite3'),
-        async assertNoReconciliationHold() {},
-        async audit() {
-          auditCalls += 1;
-          if (auditCalls === 2) {
-            markCompletionAuditEntered();
-            await completionAuditBlocker;
-          }
-        },
-        async interruptOwnedActiveJobs() { return []; },
-      },
+      db,
       logger: {
         requestId: () => 'cleanup-shutdown-after-mutation',
         info() {},
@@ -1284,21 +1469,18 @@ test('shutdown after expired token mutation reports reconciliation instead of a 
       '/api/tokens/expired/delete',
       { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
     );
+    const response = await responsePromise;
+    assert.equal(response.status, 202);
+    const jobId = JSON.parse(response.body).jobId;
     await completionAuditEntered;
     assert.equal(fs.existsSync(sourcePath), false);
     shutdownPromise = shutdownServer(server, { signal: 'test', timeoutMs: 1000 });
-    const response = await responsePromise;
-    const body = JSON.parse(response.body);
-    assert.equal(response.status, 409);
-    assert.equal(body.error, 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED');
-    assert.equal(body.mutationCompleted, true);
-    assert.equal(body.requiresReconciliation, true);
-    assert.equal(body.retryAllowed, false);
-    assert.equal(body.doNotRetry, true);
-    assert.equal(body.count, 1);
     releaseCompletionAudit();
     releaseCompletionAudit = null;
     await shutdownPromise;
+    const job = await db.getJob(jobId);
+    assert.equal(job.status, 'succeeded');
+    assert.equal(job.result.deletedCount, 1);
     assert.equal(auditCalls, 2);
   } finally {
     if (releaseCompletionAudit) releaseCompletionAudit();
