@@ -390,7 +390,9 @@ test('test isolation removes inherited Sub2API credentials before snapshot code 
     '  process.stdout.write(JSON.stringify({',
     '    configured: configuredForSub2Api(),',
     '    fetchCalls,',
+    '    readStatus: snapshot.sub2api.readStatus,',
     '    accountCount: snapshot.sub2api.accountCount,',
+    '    comparisonStatus: snapshot.diff.comparisonStatus,',
     '  }));',
     '})().catch(() => { process.exitCode = 1; });',
   ].join('\n');
@@ -408,7 +410,9 @@ test('test isolation removes inherited Sub2API credentials before snapshot code 
   assert.deepEqual(JSON.parse(child.stdout), {
     configured: false,
     fetchCalls: 0,
-    accountCount: 0,
+    readStatus: 'omitted',
+    accountCount: null,
+    comparisonStatus: 'unavailable',
   });
 });
 

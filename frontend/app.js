@@ -122,6 +122,7 @@ function badgeClass(kind) {
   return {
     in_sync: 'badge-success',
     token_only: 'badge-warning',
+    remote_unknown: 'badge-neutral',
     sub2api_only: 'badge-neutral',
     token_changed: 'badge-danger',
     expired: 'badge-danger',
@@ -138,6 +139,7 @@ function kindLabel(kind) {
   return {
     in_sync: '一致',
     token_only: '仅文件',
+    remote_unknown: '远端未知',
     sub2api_only: '仅 Sub2API',
     token_changed: 'Token 不同',
     expired: '已过期',
@@ -419,7 +421,7 @@ function accountTestRows(rows) {
 async function loadAccountTestModels(snapshot) {
   renderAccountTestModels(fallbackAccountTestModels);
   const candidate = accountTestRows(snapshot?.rows || [])[0];
-  if (!candidate || snapshot?.sub2api?.apiError) return;
+  if (!candidate || sub2ApiReadStatus(snapshot) !== 'ok') return;
   try {
     const response = await apiFetch('/api/account-tests/models?accountId=' + encodeURIComponent(String(candidate.accountId)));
     const body = await response.json();
@@ -450,11 +452,30 @@ function actionsLocked() {
     || state.snapshotRequestsPending > 0;
 }
 
+function sub2ApiReadStatus(snapshot = state.snapshot) {
+  const explicit = snapshot?.sub2api?.readStatus;
+  if (['ok', 'failed', 'omitted'].includes(explicit)) return explicit;
+  if (explicit !== undefined && explicit !== null) return 'failed';
+  // Compatibility for the already-running pre-upgrade backend: its snapshot
+  // has no readStatus/comparisonStatus, but a successful read exposes an
+  // integer accountCount and failures expose apiError.
+  if (snapshot?.sub2api?.apiError) return 'failed';
+  const legacyCount = snapshot?.sub2api?.accountCount;
+  return Number.isSafeInteger(legacyCount) && legacyCount >= 0 ? 'ok' : 'omitted';
+}
+
+function comparisonAvailable(snapshot = state.snapshot) {
+  const status = snapshot?.diff?.comparisonStatus;
+  return sub2ApiReadStatus(snapshot) === 'ok'
+    && (status === undefined || status === 'complete');
+}
+
 function updateImportButtonState() {
   const items = state.plan?.items || [];
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
   elements.importButton.disabled = !state.plan
     || actionsLocked()
+    || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || state.plan.selectedKeys.length === 0
     || hasBlockingConflict
@@ -473,12 +494,20 @@ function renderMetrics(snapshot) {
   elements.tokenCount.textContent = String(activeTokenCount ?? '-');
   elements.tokenDetail.textContent = String(activeValidTokenCount ?? 0) + ' 可解析 · ' + String(activeInvalidTokenCount ?? 0) + ' 异常'
     + (historicalTokenCount ? ' · ' + historicalTokenCount + ' 个历史备份已隐藏' : '');
-  elements.accountCount.textContent = String(snapshot.sub2api.accountCount ?? 0);
-  elements.accountDetail.textContent = snapshot.sub2api.apiError
+  const canCompare = comparisonAvailable(snapshot);
+  const readStatus = sub2ApiReadStatus(snapshot);
+  elements.accountCount.textContent = readStatus === 'ok'
+    ? String(snapshot.sub2api.accountCount)
+    : '-';
+  elements.accountDetail.textContent = readStatus === 'failed'
     ? 'API 未连接'
-    : (snapshot.sub2api.statsError ? '统计暂不可用' : '管理员 API 正常');
-  elements.diffCount.textContent = String(diffCount);
-  elements.diffDetail.textContent = differenceEntries.map(([key, value]) => kindLabel(key) + ' ' + value).join(' · ') || '暂无差异';
+    : readStatus === 'omitted'
+      ? '本次未读取'
+      : (snapshot.sub2api.statsError ? '统计暂不可用' : '管理员 API 正常');
+  elements.diffCount.textContent = canCompare ? String(diffCount) : '-';
+  elements.diffDetail.textContent = canCompare
+    ? (differenceEntries.map(([key, value]) => kindLabel(key) + ' ' + value).join(' · ') || '暂无差异')
+    : 'Sub2API 状态未知，无法比较';
   elements.lastRead.textContent = formatDate(snapshot.generatedAt);
   elements.modeBadge.textContent = snapshot.readOnly ? '只读模式' : '可写模式';
   elements.modeBadge.className = 'badge ' + (snapshot.readOnly ? 'badge-neutral' : 'badge-success');
@@ -932,6 +961,7 @@ async function loadSnapshot(options = {}) {
     renderSelectOptions(elements.diffFilter, snapshot.filters.diffKinds, {
       in_sync: '一致',
       token_only: '仅文件',
+      remote_unknown: '远端未知',
       sub2api_only: '仅 Sub2API',
       token_changed: 'Token 不同',
       expired: '已过期',
@@ -942,8 +972,11 @@ async function loadSnapshot(options = {}) {
       historical_backup: '历史备份',
       missing_refresh_token: '缺少续期',
     }, '全部差异');
-    if (snapshot.sub2api.apiError) {
-      showNotice('Sub2API 管理 API 暂未连接：' + snapshot.sub2api.apiError + '。当前仍显示 gpt_register 文件来源。', 'notice-warning');
+    const readStatus = sub2ApiReadStatus(snapshot);
+    if (readStatus === 'failed') {
+      showNotice('Sub2API 管理 API 暂未连接：' + snapshot.sub2api.apiError + '。当前仍显示 gpt_register 文件来源，但无法比较或同步。', 'notice-warning');
+    } else if (readStatus === 'omitted') {
+      showNotice('本次未读取 Sub2API；当前仅显示 gpt_register 文件事实，无法比较或同步。', 'notice-warning');
     } else if (snapshot.sub2api.statsError) {
       showNotice('账号已读取，但统计接口暂不可用：' + snapshot.sub2api.statsError, 'notice-warning');
     } else if (!state.job || ['succeeded', 'partial', 'failed', 'interrupted'].includes(state.job.status)) {
@@ -970,6 +1003,10 @@ async function loadSnapshot(options = {}) {
 elements.refreshButton.addEventListener('click', loadSnapshot);
 async function previewSelection() {
   if (state.previewRequestPending) return;
+  if (!comparisonAvailable()) {
+    showNotice('Sub2API 账号尚未成功读取，无法检查同步差异。', 'notice-warning');
+    return;
+  }
   state.previewRequestPending = true;
   const selectedKeys = [...state.selected];
   const selectionRevision = state.selectionRevision;
@@ -1002,6 +1039,10 @@ elements.previewButton.addEventListener('click', previewSelection);
 
 elements.importButton.addEventListener('click', async () => {
   if (!state.plan || state.importRequestPending) return;
+  if (!comparisonAvailable()) {
+    showNotice('Sub2API 账号尚未成功读取，无法执行同步导入。', 'notice-warning');
+    return;
+  }
   const selectedKeys = [...state.plan.selectedKeys];
   if (!selectedKeys.length) {
     showNotice('导入前请先选择账号并重新检查差异。', 'notice-warning');
@@ -1192,7 +1233,7 @@ function updateActionState() {
   elements.clearSelectionButton.disabled = locked || state.selected.size === 0;
   elements.selectAll.disabled = locked;
   document.querySelectorAll('.row-check').forEach((input) => { input.disabled = locked; });
-  elements.previewButton.disabled = locked;
+  elements.previewButton.disabled = locked || !comparisonAvailable();
   updateImportButtonState();
   if (elements.cleanupButton) {
     elements.cleanupButton.disabled = Boolean(state.snapshot?.readOnly) || locked;
@@ -1206,6 +1247,9 @@ function updateActionState() {
   } else {
     elements.phase3Button.title = '按顺序为已选账号运行 Phase 3';
   }
+  elements.previewButton.title = comparisonAvailable()
+    ? '检查所选账号与 Sub2API 的同步差异'
+    : 'Sub2API 账号尚未成功读取，无法比较或同步';
 }
 
 function applyColumnVisibility() {

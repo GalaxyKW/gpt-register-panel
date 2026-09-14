@@ -76,11 +76,14 @@ function configuredForSub2Api() {
 }
 
 function safeVersionInput(snapshot) {
+  const sub2apiReadStatus = snapshot.sub2apiReadStatus
+    || (snapshot.sub2apiRead === true ? 'ok' : (snapshot.apiError ? 'failed' : 'omitted'));
   return {
     // A failed or intentionally omitted remote read must never produce the
     // same CAS token as a confirmed, genuinely empty Sub2API account list.
     sub2apiRead: snapshot.sub2apiRead === true,
     sub2apiReadFailed: Boolean(snapshot.apiError),
+    sub2apiReadStatus,
     tokens: snapshot.sources.tokens.map((token) => ({
       source: token.source,
       relativePath: token.relativePath,
@@ -139,12 +142,15 @@ function confirmedSub2ApiRead(snapshot) {
   const internal = snapshot?._internal && typeof snapshot._internal === 'object'
     ? snapshot._internal
     : snapshot;
-  return Boolean(
-    internal
-      && internal.sub2apiRead === true
-      && !internal.apiError
-      && !snapshot?.sub2api?.apiError,
-  );
+  if (!internal) return false;
+  const internalReadStatus = internal.sub2apiReadStatus
+    || (internal.sub2apiRead === true ? 'ok' : (internal.apiError ? 'failed' : 'omitted'));
+  const publicReadStatus = snapshot?.sub2api?.readStatus;
+  return internalReadStatus === 'ok'
+    && (publicReadStatus === undefined || publicReadStatus === 'ok')
+    && internal.sub2apiRead === true
+    && !internal.apiError
+    && !snapshot?.sub2api?.apiError;
 }
 
 function normalizeAccountUsage(account) {
@@ -248,6 +254,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     let accounts = [];
     let apiError = null;
     let statsError = null;
+    let readStatus = 'omitted';
 
     if (shouldReadSub2Api) {
       try {
@@ -255,7 +262,9 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
         const loaded = await readSub2ApiAccounts(client);
         accounts = loaded.accounts;
         statsError = loaded.statsError;
+        readStatus = 'ok';
       } catch (error) {
+        readStatus = 'failed';
         apiError = safeErrorMessage(error);
         writeLog(logger, 'warn', 'snapshot.sub2api_failed', { ...logContext, error: apiError });
       }
@@ -267,10 +276,12 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       accounts,
       apiError,
       statsError,
-      sub2apiRead: shouldReadSub2Api && !apiError,
+      sub2apiReadStatus: readStatus,
+      sub2apiRead: readStatus === 'ok',
     };
     const diff = buildDiff(sources.tokens, accounts, {
       includeHistorical: query.get('includeHistorical') === '1',
+      sub2apiReadStatus: readStatus,
     });
     const allRows = buildRows(diff);
     const rows = filterRows(allRows, {
@@ -287,7 +298,8 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       version,
       sources: toSafeSources(sources),
       sub2api: {
-        accountCount: accounts.length,
+        readStatus,
+        accountCount: readStatus === 'ok' ? accounts.length : null,
         apiError,
         statsError,
         statsAvailable: accounts.some((account) => account.usage?.historical || account.usage?.current),
@@ -309,7 +321,8 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       durationMs: Date.now() - startedAt,
       tokenCount: sources.summary.tokenCount,
       validTokenCount: sources.summary.validTokenCount,
-      accountCount: accounts.length,
+      sub2apiReadStatus: readStatus,
+      accountCount: readStatus === 'ok' ? accounts.length : null,
       rowCount: rows.length,
       diffCounts: diff.counts,
       apiError,

@@ -199,6 +199,7 @@ test('token import terminal status distinguishes total failure from partial succ
 });
 
 test('frontend difference metric excludes in-sync rows and starts imports with the right task type', () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
   const renderMetrics = sourceSection('function renderMetrics', 'function selectedRowsFromView');
   const context = {
     elements: {
@@ -218,17 +219,39 @@ test('frontend difference metric excludes in-sync rows and starts imports with t
     formatDate: (value) => value,
     actionsLocked: () => false,
   };
-  vm.runInNewContext(renderMetrics + `
+  vm.runInNewContext(comparisonContract + '\n' + renderMetrics + `
     renderMetrics({
       sources: { summary: { tokenCount: 4, validTokenCount: 4, invalidTokenCount: 0 } },
-      sub2api: { accountCount: 4, apiError: null, statsError: null },
-      diff: { counts: { in_sync: 3, token_only: 1 } },
+      sub2api: { readStatus: 'ok', accountCount: 4, apiError: null, statsError: null },
+      diff: { comparisonStatus: 'complete', counts: { in_sync: 3, token_only: 1 } },
       generatedAt: 'now',
       readOnly: true,
     });
-    result = { count: elements.diffCount.textContent, detail: elements.diffDetail.textContent };
+    complete = {
+      accountCount: elements.accountCount.textContent,
+      count: elements.diffCount.textContent,
+      detail: elements.diffDetail.textContent,
+    };
+    renderMetrics({
+      sources: { summary: { tokenCount: 4, validTokenCount: 4, invalidTokenCount: 0 } },
+      sub2api: { readStatus: 'failed', accountCount: null, apiError: 'offline', statsError: null },
+      diff: { comparisonStatus: 'unavailable', counts: { remote_unknown: 4 } },
+      generatedAt: 'now',
+      readOnly: true,
+    });
+    unavailable = {
+      accountCount: elements.accountCount.textContent,
+      count: elements.diffCount.textContent,
+      detail: elements.diffDetail.textContent,
+    };
   `, context);
-  assert.deepEqual({ ...context.result }, { count: '1', detail: 'token_only 1' });
+  assert.deepEqual({ ...context.complete }, { accountCount: '4', count: '1', detail: 'token_only 1' });
+  assert.deepEqual({ ...context.unavailable }, {
+    accountCount: '-',
+    count: '-',
+    detail: 'Sub2API 状态未知，无法比较',
+  });
+  assert.match(source, /remote_unknown:\s*'远端未知'/);
   const importHandler = sourceSection("elements.importButton.addEventListener('click'", "elements.phase3Button.addEventListener('click'");
   assert.match(importHandler, /watchJob\(body\.jobId, 'token_import'\)/);
 });
@@ -246,6 +269,8 @@ test('frontend globally locks mutating actions while any request or task is unre
   assert.match(updateContract, /phase3Button\.disabled = locked/);
   assert.match(updateContract, /accountTestButton\.disabled = locked/);
   assert.match(updateContract, /previewButton\.disabled = locked/);
+  assert.match(updateContract, /previewButton\.disabled = locked \|\| !comparisonAvailable\(\)/);
+  assert.match(updateContract, /phase3Button\.disabled = locked \|\| !canRunPhase3/);
   assert.match(updateContract, /clearSelectionButton\.disabled = locked/);
   assert.match(updateContract, /selectAll\.disabled = locked/);
   assert.match(updateContract, /input\.disabled = locked/);
@@ -403,6 +428,7 @@ test('frontend keeps an in-memory token fallback when session storage is unavail
 });
 
 test('frontend keeps concurrent snapshot requests locked and clears selection on replacement', async () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
   const loadSnapshotContract = sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'");
   const requests = [];
   const lockStates = [];
@@ -438,7 +464,7 @@ test('frontend keeps concurrent snapshot requests locked and clears selection on
       lockStates.push(stateForTest.snapshotRequestsPending > 0);
     },
   };
-  vm.runInNewContext(loadSnapshotContract + `
+  vm.runInNewContext(comparisonContract + '\n' + loadSnapshotContract + `
     firstPromise = loadSnapshot();
     secondPromise = loadSnapshot();
   `, context);
@@ -518,12 +544,14 @@ test('frontend selection mutations are blocked while actions are locked', () => 
 });
 
 test('frontend discards a preview when the selected keys or revision changes in flight', async () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
   const freshnessContract = sourceSection('function selectionStillCurrent', 'function renderRows');
   const previewContract = sourceSection('async function previewSelection', "elements.previewButton.addEventListener('click', previewSelection);");
   const requests = [];
   const plans = [];
   const notices = [];
   const stateForTest = {
+    snapshot: { sub2api: { readStatus: 'ok' }, diff: { comparisonStatus: 'complete' } },
     selected: new Set(['one']),
     selectionRevision: 3,
     previewRequestPending: false,
@@ -535,7 +563,7 @@ test('frontend discards a preview when the selected keys or revision changes in 
     showNotice: (...args) => notices.push(args),
     updateActionState() {},
   };
-  vm.runInNewContext(freshnessContract + '\n' + previewContract + `
+  vm.runInNewContext(comparisonContract + '\n' + freshnessContract + '\n' + previewContract + `
     changedKeysPromise = previewSelection();
   `, context);
   assert.equal(stateForTest.previewRequestPending, true);
@@ -553,6 +581,62 @@ test('frontend discards a preview when the selected keys or revision changes in 
   assert.equal(await context.changedRevisionPromise, false);
   assert.deepEqual(plans, [null, null]);
   assert.equal(notices.length, 0);
+});
+
+test('frontend refuses sync preview when remote comparison is unavailable', async () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
+  const previewContract = sourceSection('async function previewSelection', "elements.previewButton.addEventListener('click', previewSelection);");
+  let requests = 0;
+  const notices = [];
+  const context = {
+    state: {
+      snapshot: { sub2api: { readStatus: 'failed' }, diff: { comparisonStatus: 'unavailable' } },
+      selected: new Set(['one']),
+      selectionRevision: 1,
+      previewRequestPending: false,
+    },
+    apiFetch: async () => { requests += 1; throw new Error('must not request'); },
+    renderPlan() {},
+    showNotice: (...args) => notices.push(args),
+    updateActionState() {},
+  };
+  vm.runInNewContext(comparisonContract + '\n' + previewContract + '\nblocked = previewSelection();', context);
+  assert.equal(await context.blocked, undefined);
+  assert.equal(requests, 0);
+  assert.equal(context.state.previewRequestPending, false);
+  assert.match(notices[0][0], /无法检查同步差异/);
+});
+
+test('frontend keeps a successful legacy snapshot comparable during a rolling restart', () => {
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function updateImportButtonState');
+  const context = { state: { snapshot: null } };
+  vm.runInNewContext(comparisonContract + `
+    legacyOk = {
+      sub2api: { accountCount: 0, apiError: null },
+      diff: { counts: { token_only: 1 } },
+    };
+    legacyFailed = {
+      sub2api: { accountCount: 0, apiError: 'offline' },
+      diff: { counts: { token_only: 1 } },
+    };
+    result = {
+      okStatus: sub2ApiReadStatus(legacyOk),
+      okComparable: comparisonAvailable(legacyOk),
+      failedStatus: sub2ApiReadStatus(legacyFailed),
+      failedComparable: comparisonAvailable(legacyFailed),
+      invalidStatus: sub2ApiReadStatus({
+        sub2api: { readStatus: 'unexpected', accountCount: 0, apiError: null },
+        diff: { comparisonStatus: 'complete' },
+      }),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    okStatus: 'ok',
+    okComparable: true,
+    failedStatus: 'failed',
+    failedComparable: false,
+    invalidStatus: 'failed',
+  });
 });
 
 test('frontend account search includes phone numbers', () => {

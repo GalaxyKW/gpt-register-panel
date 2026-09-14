@@ -30,7 +30,7 @@ const {
   getActivePhase3Job,
 } = require('../backend/phase3Worker');
 const { getAccountAvailability } = require('../backend/accountAvailability');
-const { identitiesCompatible } = require('../backend/diff');
+const { buildDiff, identitiesCompatible } = require('../backend/diff');
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-m2-'));
@@ -133,6 +133,68 @@ test('snapshot CAS distinguishes omitted, failed, and confirmed-empty remote rea
     }],
   });
   assert.notEqual(unknownPresence, absentPresence);
+});
+
+test('snapshot distinguishes unavailable Sub2API reads from a confirmed empty account list', async () => {
+  const { root } = fixture();
+  const omitted = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+    rootDirectory: root,
+    readSub2Api: false,
+  });
+  assert.equal(omitted.sub2api.readStatus, 'omitted');
+  assert.equal(omitted.sub2api.accountCount, null);
+  assert.equal(omitted.diff.comparisonStatus, 'unavailable');
+  assert.equal(omitted.rows[0].diffKind, 'remote_unknown');
+  assert.equal(omitted.rows[0].availability, 'unknown');
+  assert.equal(omitted.rows[0].availabilityReason, 'sub2api_not_read');
+  assert.equal(omitted.rows[0].status, '未知');
+
+  const failed = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+    rootDirectory: root,
+    readSub2Api: true,
+    client: {
+      async listAccounts() { throw new Error('simulated remote failure'); },
+    },
+  });
+  assert.equal(failed.sub2api.readStatus, 'failed');
+  assert.equal(failed.sub2api.accountCount, null);
+  assert.equal(failed.diff.comparisonStatus, 'unavailable');
+  assert.equal(failed.rows[0].diffKind, 'remote_unknown');
+  assert.equal(failed.rows[0].availability, 'unknown');
+  assert.equal(failed.rows[0].availabilityReason, 'sub2api_read_failed');
+  assert.equal(failed.diff.counts.token_only, undefined);
+  assert.equal(failed.rows.some((row) => row.availability === 'not_present'), false);
+
+  const confirmedEmpty = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+    rootDirectory: root,
+    readSub2Api: true,
+    client: {
+      async listAccounts() { return []; },
+    },
+  });
+  assert.equal(confirmedEmpty.sub2api.readStatus, 'ok');
+  assert.equal(confirmedEmpty.sub2api.accountCount, 0);
+  assert.equal(confirmedEmpty.diff.comparisonStatus, 'complete');
+  assert.equal(confirmedEmpty.rows[0].diffKind, 'token_only');
+  assert.equal(confirmedEmpty.rows[0].availability, 'not_present');
+  assert.equal(confirmedEmpty.rows[0].availabilityReason, 'not_in_sub2api');
+});
+
+test('unavailable remote comparison preserves local duplicate-token facts', () => {
+  const token = {
+    source: 'tokens',
+    parseStatus: 'ok',
+    identityKeys: ['account:workspace-1', 'user:user-1'],
+    fingerprints: { access: 'fingerprint-1' },
+  };
+  const diff = buildDiff([
+    { ...token, relativePath: 'tokens/one.json', fileName: 'one.json' },
+    { ...token, relativePath: 'tokens/two.json', fileName: 'two.json' },
+  ], [], { sub2apiReadStatus: 'failed' });
+  assert.equal(diff.comparisonStatus, 'unavailable');
+  assert.deepEqual(diff.items.map((item) => item.kind), ['duplicate_identity', 'duplicate_identity']);
+  assert.equal(diff.items.every((item) => item.availability === 'unknown'), true);
+  assert.equal(diff.items.every((item) => item.availabilityReason === 'sub2api_read_failed'), true);
 });
 
 test('PanelDb persists jobs and audit rows in an independent SQLite file', async () => {

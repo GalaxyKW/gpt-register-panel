@@ -4,7 +4,9 @@ function rowFromDiffItem(item) {
   const token = item.token;
   const account = item.account;
   const source = token ? token.source : 'sub2api';
-  const availability = getAccountAvailability(account);
+  const availability = item?.availability
+    ? { key: item.availability, reason: item.availabilityReason || null }
+    : getAccountAvailability(account);
   // A partial remote identity can match more than one distinct source row.
   // Every source-backed row therefore needs a file-specific selection key;
   // only a pure Sub2API row may use its numeric account ID as the row key.
@@ -20,7 +22,10 @@ function rowFromDiffItem(item) {
     chatgptAccountId: account?.accountId || token?.accountId || '',
     platform: account?.platform || '',
     type: account?.type || token?.type || '',
-    status: account?.status || (['token_only', 'expired', 'expiry_invalid'].includes(item.kind) ? '未导入' : '未知'),
+    status: account?.status || (availability.reason === 'sub2api_read_failed'
+      || availability.reason === 'sub2api_not_read'
+      ? '未知'
+      : (['token_only', 'expired', 'expiry_invalid'].includes(item.kind) ? '未导入' : '未知')),
     availability: availability.key,
     availabilityReason: availability.reason,
     schedulable: typeof account?.schedulable === 'boolean' ? account.schedulable : null,

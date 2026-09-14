@@ -150,6 +150,18 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
   // Files prefixed with old_codex are retained as backups, but are not part
   // of the active source set. They can be included as diagnostic rows.
   const includeHistorical = options.includeHistorical === true;
+  const comparisonStatus = options.sub2apiReadStatus === 'failed'
+    || options.sub2apiReadStatus === 'omitted'
+    ? 'unavailable'
+    : 'complete';
+  const comparisonUnavailable = comparisonStatus === 'unavailable';
+  const comparisonUnavailableReason = options.sub2apiReadStatus === 'failed'
+    ? 'sub2api_read_failed'
+    : 'sub2api_not_read';
+  // Never consume a possibly partial or stale account array after the remote
+  // read was reported unavailable. Local duplicate/expiry/file checks below
+  // still run exactly as they do for a complete comparison.
+  const comparableAccountRecords = comparisonUnavailable ? [] : accountRecords;
   const activeTokenRecords = tokenRecords.filter((record) => (
     record?.historical !== true
   ));
@@ -157,7 +169,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     activeTokenRecords.filter((record) => record.parseStatus === 'ok'),
     (record) => Array.isArray(record.identityKeys) ? record.identityKeys : [],
   );
-  const accountIndex = indexByIdentity(accountRecords, accountKeys);
+  const accountIndex = indexByIdentity(comparableAccountRecords, accountKeys);
   const matchedAccountIds = new Set();
   const items = [];
 
@@ -248,7 +260,11 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       const expiryInvalid = isExpiryInvalid(token);
       const expired = isExpired(token, nowMs);
       items.push({
-        kind: expiryInvalid ? 'expiry_invalid' : expired ? 'expired' : 'token_only',
+        kind: expiryInvalid
+          ? 'expiry_invalid'
+          : expired
+            ? 'expired'
+            : comparisonUnavailable ? 'remote_unknown' : 'token_only',
         source: token.source,
         relativePath: token.relativePath,
         fileName: token.fileName,
@@ -330,7 +346,7 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     }
   }
 
-  for (const account of accountRecords) {
+  for (const account of comparableAccountRecords) {
     if (!matchedAccountIds.has(String(account.id))) {
       const keys = accountKeys(account);
       const duplicateStrongKeys = keys.filter((key) => {
@@ -353,14 +369,21 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     }
   }
 
+  if (comparisonUnavailable) {
+    for (const item of items) {
+      item.availability = 'unknown';
+      item.availabilityReason = comparisonUnavailableReason;
+    }
+  }
   const counts = {};
   for (const item of items) counts[item.kind] = (counts[item.kind] || 0) + 1;
-  return { generatedAt: new Date(nowMs).toISOString(), items, counts };
+  return { generatedAt: new Date(nowMs).toISOString(), comparisonStatus, items, counts };
 }
 
 function toSafeDiff(diff) {
   return {
     generatedAt: diff.generatedAt,
+    comparisonStatus: diff.comparisonStatus || 'complete',
     counts: diff.counts,
     items: diff.items.map((item) => ({
       kind: item.kind,
@@ -368,6 +391,8 @@ function toSafeDiff(diff) {
       relativePath: item.relativePath,
       fileName: item.fileName,
       issues: item.issues,
+      availability: item.availability || null,
+      availabilityReason: item.availabilityReason || null,
       token: item.token
         ? {
             source: item.token.source,

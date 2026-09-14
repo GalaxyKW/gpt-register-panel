@@ -21,9 +21,11 @@ async function main() {
       generatedAt: output.generatedAt,
       sourceSummary: output.sources.summary,
       sub2api: {
+        readStatus: output.sub2api.readStatus,
         accountCount: output.sub2api.accountCount,
         apiError: output.sub2api.apiError,
       },
+      comparisonStatus: output.diff?.comparisonStatus || null,
       diffCounts: output.diff?.counts || null,
     }, null, 2) + '\n');
     return;
