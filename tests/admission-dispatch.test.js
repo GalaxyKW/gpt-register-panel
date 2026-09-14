@@ -97,8 +97,10 @@ function testAccount(id = 71) {
 test('all mutation routes interrupt committed jobs when the admission lease release fails', async (t) => {
   const previousWrite = process.env.PANEL_WRITE_ENABLED;
   const previousInsecure = process.env.PANEL_ALLOW_INSECURE_WRITE;
+  const previousPhase3 = process.env.PANEL_PHASE3_ENABLED;
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  process.env.PANEL_PHASE3_ENABLED = '1';
   const version = 'b'.repeat(64);
   const account = testAccount();
   const selectedKey = 'token:tokens:tokens/admission-phase3.json';
@@ -217,6 +219,8 @@ test('all mutation routes interrupt committed jobs when the admission lease rele
     else process.env.PANEL_WRITE_ENABLED = previousWrite;
     if (previousInsecure === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
     else process.env.PANEL_ALLOW_INSECURE_WRITE = previousInsecure;
+    if (previousPhase3 === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previousPhase3;
   }
 });
 
@@ -272,8 +276,10 @@ test('dispatch guard interrupts only the undispatched remainder after a partial 
 test('Phase3 route keeps an already registered observer when a later batch begin fails', async () => {
   const previousWrite = process.env.PANEL_WRITE_ENABLED;
   const previousInsecure = process.env.PANEL_ALLOW_INSECURE_WRITE;
+  const previousPhase3 = process.env.PANEL_PHASE3_ENABLED;
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  process.env.PANEL_PHASE3_ENABLED = '1';
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-admission-phase3-partial-'));
   const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
   const underlying = createBackgroundJobManager({ db });
@@ -351,6 +357,8 @@ test('Phase3 route keeps an already registered observer when a later batch begin
     else process.env.PANEL_WRITE_ENABLED = previousWrite;
     if (previousInsecure === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
     else process.env.PANEL_ALLOW_INSECURE_WRITE = previousInsecure;
+    if (previousPhase3 === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previousPhase3;
   }
 });
 
