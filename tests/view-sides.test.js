@@ -232,6 +232,20 @@ test('view rows explicitly reject historical tokens and invalid username phones 
   assert.equal(invalidPhone.phase3Reason, 'username_phone_invalid');
   assert.equal(invalidPhone.phase3TargetRevision, null);
 
+  const terminalWithoutCredentials = rowFromDiffItem(item, {
+    ...options,
+    usernames: [{
+      ...username,
+      phone: '',
+      phoneValid: false,
+      hasPassword: false,
+      status: 'account_deleted',
+    }],
+  });
+  assert.equal(terminalWithoutCredentials.phase3Eligible, false);
+  assert.equal(terminalWithoutCredentials.phase3Reason, 'username_terminal');
+  assert.equal(terminalWithoutCredentials.phase3TargetRevision, null);
+
   const invalidTarget = rowFromDiffItem({
     ...item,
     token: { ...token, relativePath: 'tokens/../phase3-source.json' },
@@ -418,7 +432,7 @@ test('frontend separates observed differences from safe synchronization decision
   const primitives = sourceSection('function escapeHtml', 'function finiteNumber');
   const actionContracts = sourceSection('function actionLabel', 'function phase3ReasonLabel');
   const sideRenderers = sourceSection('function rowSideData', 'function renderRows');
-  const context = {};
+  const context = { importPlanContractProblem: () => '' };
   vm.runInNewContext(primitives + '\n' + actionContracts + '\n' + sideRenderers + `
     result = {
       availableChanged: renderDiffDecision({

@@ -67,6 +67,18 @@ function usernameAssociation(token, usernameIndex, options = {}) {
   const username = matches[0];
   const phone = String(username?.phone || '').trim();
   const status = String(username?.status || '').trim().toLowerCase();
+  // A terminal account can also have incomplete legacy credentials. Report
+  // the irreversible account disposition first so the operator is not led to
+  // believe that adding a phone/password would make Phase 3 safe to run.
+  if (TERMINAL_USERNAME_STATUSES.has(status)) {
+    return {
+      phone,
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_terminal',
+      usernameMatch: 'unique',
+    };
+  }
   if (username?.phoneValid === false) {
     return {
       phone: '',
@@ -82,15 +94,6 @@ function usernameAssociation(token, usernameIndex, options = {}) {
       phase3Email: email,
       phase3Eligible: false,
       phase3Reason: 'username_password_missing',
-      usernameMatch: 'unique',
-    };
-  }
-  if (TERMINAL_USERNAME_STATUSES.has(status)) {
-    return {
-      phone,
-      phase3Email: email,
-      phase3Eligible: false,
-      phase3Reason: 'username_terminal',
       usernameMatch: 'unique',
     };
   }
