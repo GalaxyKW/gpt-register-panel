@@ -231,5 +231,6 @@ module.exports = {
   controlPlaneLockPath,
   currentProcessOwner,
   isProcessOwnerAlive,
+  queueCancelableRun,
   withControlPlaneLock,
 };

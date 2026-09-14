@@ -32,6 +32,7 @@ const {
 } = require('../backend/phase3Worker');
 const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, identitiesCompatible } = require('../backend/diff');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-m2-'));
@@ -407,6 +408,63 @@ test('phase3 jobs run serially, run the main-gated entrypoint, and reject duplic
     if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
     else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
   }
+});
+
+test('Phase3 aborts promptly from its private queue without starting queued work', async () => {
+  let markEntered;
+  let releaseBlocker;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const blockerReleased = new Promise((resolve) => { releaseBlocker = resolve; });
+  const blocker = withControlPlaneLock(async () => {
+    markEntered();
+    await blockerReleased;
+  });
+  await entered;
+
+  const firstController = new AbortController();
+  const secondController = new AbortController();
+  const updates = [];
+  const db = {
+    async updateJob(id, patch) { updates.push({ id, patch }); },
+  };
+  const first = runPhase3Job({
+    email: 'lock-wait-one@example.test',
+    canonicalKeys: ['email:lock-wait-one@example.test'],
+    db,
+    jobId: 'phase3-lock-wait-one',
+    signal: firstController.signal,
+  });
+  // Let the first job occupy the Phase3 queue while it waits for the global lock.
+  await new Promise((resolve) => setImmediate(resolve));
+  const second = runPhase3Job({
+    email: 'lock-wait-two@example.test',
+    canonicalKeys: ['email:lock-wait-two@example.test'],
+    db,
+    jobId: 'phase3-lock-wait-two',
+    signal: secondController.signal,
+  });
+
+  secondController.abort();
+  const outcome = await Promise.race([
+    second.then(
+      () => ({ resolved: true }),
+      (error) => ({ error }),
+    ),
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 500)),
+  ]);
+  const secondActiveAfterAbort = getActivePhase3Job({
+    email: 'lock-wait-two@example.test',
+  });
+
+  firstController.abort();
+  releaseBlocker();
+  await blocker;
+  await Promise.allSettled([first, second]);
+
+  assert.equal(outcome.timedOut, undefined);
+  assert.equal(outcome.error?.code, 'JOB_INTERRUPTED');
+  assert.equal(secondActiveAfterAbort, null);
+  assert.deepEqual(updates, []);
 });
 
 test('Phase3 shutdown preserves success when a valid token was already published', async () => {

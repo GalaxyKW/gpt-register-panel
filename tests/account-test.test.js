@@ -12,9 +12,11 @@ const {
   classifyAccountTestTargets,
   normalizeAccountTestModelId,
   normalizeAccountTestRequest,
+  runAccountTestJob,
   runAccountTestJobNow,
 } = require('../backend/accountTestWorker');
 const { parseSseEvents } = require('../backend/adapters/sub2apiAdmin');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 function requestJson(baseUrl, pathname, options = {}) {
   return new Promise((resolve, reject) => {
@@ -57,6 +59,49 @@ function oauthTestAccount(id, status, schedulable, extra = {}) {
 function targetBaselines(...accounts) {
   return accounts.map((account) => accountTestTargetBaseline(account));
 }
+
+test('account test aborts promptly while waiting for the control-plane lock', async () => {
+  let markEntered;
+  let releaseBlocker;
+  const entered = new Promise((resolve) => { markEntered = resolve; });
+  const blockerReleased = new Promise((resolve) => { releaseBlocker = resolve; });
+  const blocker = withControlPlaneLock(async () => {
+    markEntered();
+    await blockerReleased;
+  });
+  await entered;
+
+  const controller = new AbortController();
+  let remoteCalls = 0;
+  const running = runAccountTestJob({
+    accountIds: [1],
+    targetBaselines: [],
+    jobId: 'account-test-lock-wait',
+    signal: controller.signal,
+    client: {
+      async listAccounts() {
+        remoteCalls += 1;
+        return [];
+      },
+    },
+  });
+
+  controller.abort();
+  const outcome = await Promise.race([
+    running.then(
+      () => ({ resolved: true }),
+      (error) => ({ error }),
+    ),
+    new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 500)),
+  ]);
+  releaseBlocker();
+  await blocker;
+  await Promise.allSettled([running]);
+
+  assert.equal(outcome.timedOut, undefined);
+  assert.equal(outcome.error?.code, 'JOB_INTERRUPTED');
+  assert.equal(remoteCalls, 0);
+});
 
 async function closeHttpServer(server) {
   if (!server || !server.listening) return;

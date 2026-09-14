@@ -874,7 +874,10 @@ async function runAccountTestJobNow({
 }
 
 function runAccountTestJob(args = {}) {
-  return withControlPlaneLock(() => runAccountTestJobNow(args));
+  return withControlPlaneLock(
+    () => runAccountTestJobNow(args),
+    { signal: args.signal },
+  );
 }
 
 module.exports = {

@@ -11,7 +11,7 @@ const {
 } = require('./adapters/gptRegisterFs');
 const { normalizeEmail } = require('./lib/token');
 const { redactText } = require('./logger');
-const { withControlPlaneLock } = require('./taskCoordinator');
+const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 
@@ -1256,7 +1256,7 @@ function runPhase3Job(args = {}) {
     phone: String(args.phone || '').trim() || null,
     queueWaitMs: null,
   });
-  const run = phase3Queue.then(async () => {
+  const queued = queueCancelableRun(phase3Queue, async () => {
     throwIfJobInterrupted(args.signal);
     const queueWaitMs = Date.now() - queuedAt;
     writeLog(args.logger, 'info', 'phase3.started_after_queue', {
@@ -1278,14 +1278,14 @@ function runPhase3Job(args = {}) {
       }
       throwIfJobInterrupted(args.signal);
       return runPhase3JobNow(args);
-    });
-  }).finally(() => {
+    }, { signal: args.signal });
+  }, { signal: args.signal });
+  phase3Queue = queued.run.catch(() => {});
+  return queued.result.finally(() => {
     for (const activeKey of keys) {
       if (activePhase3Jobs.get(activeKey) === activeRecord) activePhase3Jobs.delete(activeKey);
     }
   });
-  phase3Queue = run.catch(() => {});
-  return run;
 }
 
 module.exports = {
