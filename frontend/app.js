@@ -603,12 +603,167 @@ function selectionStillCurrent(revision, selectedKeys) {
   return selectedKeys.every((key) => state.selected.has(key));
 }
 
+function rowSideData(row) {
+  const splitContract = Object.prototype.hasOwnProperty.call(row || {}, 'sourceDetails')
+    || Object.prototype.hasOwnProperty.call(row || {}, 'remoteDetails');
+  if (splitContract) {
+    return {
+      source: row?.sourceDetails || null,
+      remote: row?.remoteDetails || null,
+      legacyMerged: false,
+    };
+  }
+  const legacy = {
+    email: row?.email || '',
+    chatgptAccountId: row?.chatgptAccountId || '',
+    userId: row?.userId || '',
+    expiresAt: row?.expiresAt || null,
+    fingerprints: row?.fingerprints || {},
+    relativePath: row?.relativePath || null,
+    fileName: row?.fileName || null,
+  };
+  const localSource = ['tokens', 'use_token'].includes(String(row?.source || ''));
+  const remoteId = Number(row?.accountId);
+  const hasRemote = Number.isSafeInteger(remoteId) && remoteId > 0;
+  if (localSource && hasRemote) {
+    return { source: legacy, remote: null, legacyMerged: true };
+  }
+  return {
+    source: localSource ? legacy : null,
+    remote: hasRemote || row?.source === 'sub2api' ? legacy : null,
+    legacyMerged: false,
+  };
+}
+
+function comparableText(value, options = {}) {
+  const text = String(value === undefined || value === null ? '' : value).trim();
+  return options.caseInsensitive ? text.toLowerCase() : text;
+}
+
+function comparableDate(value) {
+  if (!value) return '';
+  const time = new Date(value).getTime();
+  return Number.isFinite(time) ? String(time) : String(value);
+}
+
+function comparisonDiffers(sides, sourceValue, remoteValue, options = {}) {
+  if (sides.legacyMerged || !sides.source || !sides.remote) return false;
+  const normalize = options.date ? comparableDate : (value) => comparableText(value, options);
+  return normalize(sourceValue) !== normalize(remoteValue);
+}
+
+function comparisonLine(label, value, differs, valueClass = '') {
+  return '<div class="comparison-line' + (differs ? ' is-different' : '') + '"'
+    + (differs ? ' title="gpt_register 与 Sub2API 不同"' : '') + '>'
+    + '<span class="comparison-label">' + escapeHtml(label) + '</span>'
+    + '<span class="comparison-value ' + escapeHtml(valueClass) + '">' + escapeHtml(value || '-') + '</span>'
+    + (differs ? '<span class="comparison-marker" aria-label="不同">≠</span>' : '')
+    + '</div>';
+}
+
+function legacyComparison(value) {
+  return '<div class="legacy-comparison">'
+    + '<div class="comparison-line"><span class="comparison-label">旧快照</span>'
+    + '<span class="comparison-value">' + escapeHtml(value || '-') + '</span></div>'
+    + '<small>后端尚未提供分侧字段，请刷新服务后再比较</small></div>';
+}
+
+function renderEmailComparison(row, sides, phase3Note) {
+  if (sides.legacyMerged) return legacyComparison(row?.email || '-') + phase3Note;
+  const sourceEmail = sides.source?.email || '';
+  const remoteEmail = sides.remote?.email || '';
+  const differs = comparisonDiffers(sides, sourceEmail, remoteEmail, { caseInsensitive: true });
+  return '<div class="comparison-pair">'
+    + comparisonLine('文件', sourceEmail, differs)
+    + comparisonLine('远端', remoteEmail, differs)
+    + '</div>' + phase3Note;
+}
+
+function identityText(details) {
+  if (!details) return '-';
+  const account = details.chatgptAccountId || '-';
+  const user = details.userId || '-';
+  return 'Account ID ' + account + ' · User ID ' + user;
+}
+
+function renderIdentityComparison(row, sides) {
+  if (sides.legacyMerged) return legacyComparison(identityText({
+    chatgptAccountId: row?.chatgptAccountId,
+    userId: row?.userId,
+  }));
+  const sourceText = identityText(sides.source);
+  const remoteText = identityText(sides.remote);
+  const differs = comparisonDiffers(sides, sourceText, remoteText, { caseInsensitive: true });
+  return '<div class="comparison-pair">'
+    + comparisonLine('文件', sourceText, differs, 'identity-value')
+    + comparisonLine('远端', remoteText, differs, 'identity-value')
+    + '</div>';
+}
+
+function renderExpiryComparison(row, sides) {
+  if (sides.legacyMerged) return legacyComparison(formatDate(row?.expiresAt));
+  const sourceExpiry = sides.source?.expiresAt || null;
+  const remoteExpiry = sides.remote?.credentialExpiresAt
+    // Compatibility with a short-lived development snapshot contract that
+    // exposed only `remoteDetails.expiresAt`.
+    || sides.remote?.expiresAt
+    || null;
+  const accountExpiry = sides.remote?.accountExpiresAt || null;
+  const differs = comparisonDiffers(sides, sourceExpiry, remoteExpiry, { date: true });
+  return '<div class="comparison-pair">'
+    + comparisonLine('文件 OAuth', formatDate(sourceExpiry), differs)
+    + comparisonLine('远端 OAuth', formatDate(remoteExpiry), differs)
+    + (accountExpiry ? comparisonLine('账号期限', formatDate(accountExpiry), false) : '')
+    + '</div>';
+}
+
+function fingerprintText(details) {
+  const fingerprints = details?.fingerprints || {};
+  return 'A ' + formatFingerprint(fingerprints.access)
+    + ' · R ' + formatFingerprint(fingerprints.refresh)
+    + ' · ID ' + formatFingerprint(fingerprints.id);
+}
+
+function fingerprintComparisonKey(details) {
+  const fingerprints = details?.fingerprints || {};
+  return ['access', 'refresh', 'id']
+    .map((key) => comparableText(fingerprints[key]))
+    .join('|');
+}
+
+function renderFingerprintComparison(row, sides) {
+  if (sides.legacyMerged) return legacyComparison(fingerprintText({ fingerprints: row?.fingerprints }));
+  const sourceText = fingerprintText(sides.source);
+  const remoteText = fingerprintText(sides.remote);
+  const differs = comparisonDiffers(
+    sides,
+    fingerprintComparisonKey(sides.source),
+    fingerprintComparisonKey(sides.remote),
+  );
+  return '<div class="comparison-pair">'
+    + comparisonLine('文件', sourceText, differs, 'fingerprint-value')
+    + comparisonLine('远端', remoteText, differs, 'fingerprint-value')
+    + '</div>';
+}
+
+function renderAccountSummary(row, sides, displayName) {
+  const remoteId = sides.remote?.id ?? row?.accountId;
+  const sourcePath = sides.source?.relativePath || row?.relativePath || '';
+  const details = [];
+  if (remoteId) details.push('Sub2API ID #' + remoteId);
+  if (sourcePath) details.push('文件 ' + sourcePath);
+  if (details.length === 0) details.push('尚未关联来源文件');
+  return '<strong>' + escapeHtml(displayName) + '</strong>'
+    + details.map((detail) => '<small>' + escapeHtml(detail) + '</small>').join('');
+}
+
 function renderRows() {
   const rows = state.rows;
   const checkboxDisabled = actionsLocked() ? ' disabled' : '';
   elements.accountRows.innerHTML = rows.map((row) => {
     const checked = state.selected.has(row.key) ? ' checked' : '';
-    const displayName = row.accountName || row.fileName || '(未命名)';
+    const sides = rowSideData(row);
+    const displayName = sides.remote?.name || row.accountName || row.fileName || '(未命名)';
     const issueText = row.issues?.length ? ' title="' + escapeHtml(row.issues.join(', ')) + '"' : '';
     const usageTitle = row.usageError ? ' title="' + escapeHtml(row.usageError) + '"' : '';
     const phase3Note = row.phase3Eligible === false
@@ -616,15 +771,16 @@ function renderRows() {
       : (row.phone ? '<small>手机号 ' + escapeHtml(row.phone) + '</small>' : '');
     return '<tr class="' + (state.selected.has(row.key) ? 'is-selected' : '') + '">'
       + '<td class="check-col"><input class="row-check" data-key="' + escapeHtml(row.key) + '" type="checkbox" aria-label="选择 ' + escapeHtml(displayName) + '"' + checked + checkboxDisabled + '></td>'
-      + '<td><strong>' + escapeHtml(displayName) + '</strong><small>' + escapeHtml(row.chatgptAccountId || row.userId || row.relativePath || '-') + '</small></td>'
-      + '<td>' + escapeHtml(row.email || '-') + phase3Note + '</td>'
+      + '<td>' + renderAccountSummary(row, sides, displayName) + '</td>'
+      + '<td class="comparison-cell">' + renderEmailComparison(row, sides, phase3Note) + '</td>'
+      + '<td class="comparison-cell">' + renderIdentityComparison(row, sides) + '</td>'
       + '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(statusLabel(row.status)) + '</span>'
       + (row.availability === 'unavailable' ? '<small class="availability-note">不可用</small>'
         : row.availability === 'unknown' ? '<small class="availability-note">可用性未知</small>' : '') + '</td>'
       + '<td><span class="source-text ' + sourceClass(row.source) + '">' + escapeHtml(row.source || '-') + '</span></td>'
       + '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span></td>'
-      + '<td>' + escapeHtml(formatDate(row.expiresAt)) + '</td>'
-      + '<td><code>' + escapeHtml(formatFingerprint(row.fingerprints?.access)) + '</code></td>'
+      + '<td class="comparison-cell">' + renderExpiryComparison(row, sides) + '</td>'
+      + '<td class="comparison-cell">' + renderFingerprintComparison(row, sides) + '</td>'
       + '<td class="col-historical"' + usageTitle + '>' + escapeHtml(row.usageError ? '读取失败' : formatUsage(row.usage)) + '</td>'
       + '<td class="col-current"' + usageTitle + '>' + escapeHtml(row.usageError ? '读取失败' : formatPeriodUsage(row.usage)) + '</td>'
       + '</tr>';
@@ -692,7 +848,24 @@ function applyFilters() {
     if (elements.sourceFilter.value && row.source !== elements.sourceFilter.value) return false;
     if (elements.diffFilter.value && row.diffKind !== elements.diffFilter.value) return false;
     if (!search) return true;
-    const textMatch = [row.accountName, row.email, row.phone, row.chatgptAccountId, row.userId, row.fileName, row.relativePath]
+    const textMatch = [
+      row.accountName,
+      row.email,
+      row.phone,
+      row.chatgptAccountId,
+      row.userId,
+      row.fileName,
+      row.relativePath,
+      row.sourceDetails?.email,
+      row.sourceDetails?.chatgptAccountId,
+      row.sourceDetails?.userId,
+      row.sourceDetails?.relativePath,
+      row.remoteDetails?.name,
+      row.remoteDetails?.email,
+      row.remoteDetails?.chatgptAccountId,
+      row.remoteDetails?.userId,
+      row.remoteDetails?.id,
+    ]
       .some((value) => String(value || '').toLowerCase().includes(search));
     const phoneMatch = phoneSearch && String(row.phone || '').replace(/[^0-9]/g, '').includes(phoneSearch);
     return textMatch || Boolean(phoneMatch);

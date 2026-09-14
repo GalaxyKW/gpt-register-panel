@@ -82,6 +82,46 @@ function usernameAssociation(token, usernameIndex) {
   };
 }
 
+function fingerprintDetails(value) {
+  return {
+    access: value?.access || null,
+    refresh: value?.refresh || null,
+    id: value?.id || null,
+  };
+}
+
+function sourceDetails(token) {
+  if (!token) return null;
+  return {
+    email: token.email || '',
+    chatgptAccountId: token.accountId || '',
+    userId: token.userId || '',
+    expiresAt: token.expiresAt || null,
+    lastRefresh: token.lastRefresh || null,
+    mtimeMs: Number.isFinite(token.mtimeMs) ? token.mtimeMs : null,
+    fingerprints: fingerprintDetails(token.fingerprints),
+    relativePath: token.relativePath || null,
+    fileName: token.fileName || null,
+  };
+}
+
+function remoteDetails(account) {
+  if (!account) return null;
+  return {
+    id: account.id ?? null,
+    name: account.name || '',
+    email: account.email || '',
+    chatgptAccountId: account.accountId || '',
+    userId: account.userId || '',
+    // OAuth credential expiry and the account-level administrative expiry
+    // have different operational meanings. Never substitute one for the
+    // other in the side-by-side token comparison.
+    credentialExpiresAt: account.credentialExpiresAt || null,
+    accountExpiresAt: account.expiresAt || null,
+    fingerprints: fingerprintDetails(account.tokenFingerprints),
+  };
+}
+
 function rowFromDiffItem(item, options = {}) {
   const token = item.token;
   const account = item.account;
@@ -101,6 +141,11 @@ function rowFromDiffItem(item, options = {}) {
   const fingerprints = account?.tokenFingerprints || token?.fingerprints || {};
   return {
     key,
+    // Keep the legacy flattened fields below during the rolling upgrade. New
+    // clients must use these side-specific summaries so a remote value cannot
+    // hide a different gpt_register value.
+    sourceDetails: sourceDetails(token),
+    remoteDetails: remoteDetails(account),
     accountId: account?.id ?? null,
     accountName: account?.name || '',
     email: account?.email || token?.email || '',
@@ -166,6 +211,15 @@ function filterRows(rows, filters = {}) {
       row.userId,
       row.fileName,
       row.relativePath,
+      row.sourceDetails?.email,
+      row.sourceDetails?.chatgptAccountId,
+      row.sourceDetails?.userId,
+      row.sourceDetails?.relativePath,
+      row.remoteDetails?.name,
+      row.remoteDetails?.email,
+      row.remoteDetails?.chatgptAccountId,
+      row.remoteDetails?.userId,
+      row.remoteDetails?.id,
     ].some((value) => String(value || '').toLowerCase().includes(search));
     const phoneMatch = phoneSearch
       && String(row.phone || '').replace(/[^0-9]/g, '').includes(phoneSearch);

@@ -131,7 +131,7 @@ input[type="checkbox"] { width: 16px; min-height: 16px; margin: 0; accent-color:
 .section-heading p { margin-bottom: 0; color: var(--muted); font-size: 12px; }
 .loading-label { color: var(--muted); font-size: 12px; }
 .table-wrap, .plan-wrap { overflow: auto; }
-table { width: 100%; min-width: 1100px; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+table { width: 100%; min-width: 1500px; border-collapse: separate; border-spacing: 0; font-size: 13px; }
 th, td { padding: 11px 13px; border-bottom: 1px solid #edf1f1; text-align: left; white-space: nowrap; vertical-align: middle; }
 th { position: sticky; top: 0; z-index: 1; background: #f8faf9; color: #718085; font-size: 10px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 tbody tr:last-child td { border-bottom: 0; }
@@ -141,6 +141,17 @@ tbody tr.is-selected:hover { background: #e5f3ef; }
 td strong, td small { display: block; }
 td strong { color: var(--ink); font-weight: 700; }
 td small { max-width: 190px; margin-top: 4px; overflow: hidden; color: var(--muted); font-size: 11px; text-overflow: ellipsis; }
+.comparison-cell { min-width: 220px; }
+.comparison-pair { display: grid; gap: 5px; }
+.comparison-line { display: flex; align-items: baseline; gap: 7px; min-width: 0; }
+.comparison-label { width: 58px; flex: 0 0 58px; color: var(--muted); font-size: 10px; font-weight: 800; letter-spacing: .04em; }
+.comparison-value { min-width: 0; overflow: hidden; color: var(--ink-soft); text-overflow: ellipsis; }
+.comparison-line.is-different { color: var(--danger); }
+.comparison-line.is-different .comparison-label, .comparison-line.is-different .comparison-value { color: inherit; }
+.comparison-marker { color: var(--danger); font-size: 10px; font-weight: 800; }
+.legacy-comparison { border-left: 2px solid var(--warning); padding-left: 8px; }
+.legacy-comparison small { max-width: 240px; color: var(--warning); }
+.identity-value, .fingerprint-value { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11px; }
 .check-col { width: 44px; text-align: center; }
 .badge { display: inline-flex; align-items: center; min-height: 24px; padding: 4px 9px; border: 1px solid transparent; border-radius: 999px; font-size: 11px; font-weight: 750; }
 .badge-neutral { border-color: #d8e1e3; background: #edf2f2; color: #586970; }
@@ -186,6 +197,7 @@ code { color: #355e69; font-size: 11px; }
   h1 { font-size: 24px; }
   .toolbar { position: static; align-items: stretch; flex-direction: column; }
   .toolbar label, .toolbar .search-field { width: 100%; min-width: 0; }
+  .toolbar .search-field { flex: 0 0 auto; }
   .toolbar-actions { align-items: stretch; justify-content: flex-start; }
   .toolbar-actions .button { flex: 1 1 auto; }
   .selection-count { margin-right: auto; }

@@ -283,6 +283,7 @@ test('mobile layout keeps controls usable and wide tables horizontally scrollabl
   const mobile = stylesSource.slice(stylesSource.indexOf('@media (max-width: 700px)'));
   assert.match(mobile, /\.toolbar \{ position: static;[^}]*flex-direction: column;/);
   assert.match(mobile, /\.toolbar label, \.toolbar \.search-field \{ width: 100%; min-width: 0; \}/);
+  assert.match(mobile, /\.toolbar \.search-field \{ flex: 0 0 auto; \}/);
   assert.match(mobile, /\.job-copy p \{ white-space: normal; \}/);
 });
 
