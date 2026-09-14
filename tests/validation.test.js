@@ -1010,6 +1010,36 @@ test('job payloads, results, errors, and historical rows are redacted at the DB 
   assert.equal(audit[0].details.fingerprint, 'aaaaaaaaaaaaaaaa');
 });
 
+test('audit scalar fields are redacted both before storage and when reading legacy rows', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-audit-scalar-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const marker = 'audit-scalar-secret-marker';
+  const unsafeValues = {
+    jobId: 'Bearer ' + marker,
+    actor: 'password=' + marker,
+    action: 'api_key=' + marker,
+    targetKey: 'credential=' + marker,
+    beforeFingerprint: 'refresh_token=' + marker,
+    afterFingerprint: 'Authorization: Bearer ' + marker,
+    result: 'client_secret=' + marker,
+  };
+
+  await db.audit(unsafeValues);
+  const stored = await db.read((database) => database.exec(`SELECT
+    job_id, actor, action, target_key, before_fingerprint, after_fingerprint, result
+    FROM audit_events`));
+  assert.equal(JSON.stringify(stored).includes(marker), false);
+
+  await db.write((database) => {
+    const statement = database.prepare(`UPDATE audit_events SET
+      job_id = ?, actor = ?, action = ?, target_key = ?,
+      before_fingerprint = ?, after_fingerprint = ?, result = ?`);
+    statement.run(Object.values(unsafeValues));
+    statement.free();
+  });
+  assert.equal(JSON.stringify(await db.listAudit(10)).includes(marker), false);
+});
+
 test('malformed DB and control lock files fail closed and are never deleted as stale markers', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-invalid-lock-'));
   const dbPath = path.join(root, 'panel.sqlite3');

@@ -111,6 +111,11 @@ function boundedJsonString(field, value, maximumBytes) {
   return assertStoredByteLength(field, jsonString(redactValue(value)), maximumBytes);
 }
 
+function boundedRedactedText(field, value, maximumBytes) {
+  if (value === null || value === undefined) return value;
+  return assertStoredByteLength(field, redactText(value), maximumBytes);
+}
+
 function randomId(prefix) {
   return prefix + '_' + crypto.randomBytes(12).toString('hex');
 }
@@ -2297,7 +2302,7 @@ class PanelDb {
         'audit_events.result',
       ];
       values = values.map((value, index) => (
-        assertStoredByteLength(fields[index], value, MAX_AUDIT_TEXT_BYTES)
+        boundedRedactedText(fields[index], value, MAX_AUDIT_TEXT_BYTES)
       ));
       values.push(boundedJsonString(
         'audit_events.details_json',
@@ -2326,13 +2331,13 @@ class PanelDb {
       try { details = redactValue(JSON.parse(row.details_json || '{}')); } catch {}
       return {
         id: row.id,
-        jobId: row.job_id || null,
-        actor: row.actor,
-        action: row.action,
-        targetKey: row.target_key || null,
-        beforeFingerprint: row.before_fingerprint || null,
-        afterFingerprint: row.after_fingerprint || null,
-        result: row.result,
+        jobId: row.job_id ? redactText(row.job_id) : null,
+        actor: redactText(row.actor),
+        action: redactText(row.action),
+        targetKey: row.target_key ? redactText(row.target_key) : null,
+        beforeFingerprint: row.before_fingerprint ? redactText(row.before_fingerprint) : null,
+        afterFingerprint: row.after_fingerprint ? redactText(row.after_fingerprint) : null,
+        result: redactText(row.result),
         details,
         createdAt: row.created_at,
       };
