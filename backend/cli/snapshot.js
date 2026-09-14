@@ -1,5 +1,6 @@
-require('../config').loadEnv();
+const { loadEnv } = require('../config');
 const { buildSnapshot } = require('../sync');
+const { safeErrorText } = require('../logger');
 
 function hasFlag(name) {
   return process.argv.includes(name);
@@ -10,6 +11,7 @@ function printJson(value) {
 }
 
 async function main() {
+  loadEnv();
   const output = await buildSnapshot(new URLSearchParams(hasFlag('--with-sub2api') ? 'withSub2api=1' : ''), {
     readSub2Api: hasFlag('--with-sub2api'),
   });
@@ -30,6 +32,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  process.stderr.write(error.stack + '\n');
+  process.stderr.write(safeErrorText(error) + '\n');
   process.exitCode = 1;
 });

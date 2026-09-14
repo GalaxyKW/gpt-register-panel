@@ -1,0 +1,896 @@
+const assert = require('node:assert/strict');
+const { spawn } = require('node:child_process');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const test = require('node:test');
+
+require('./test-isolation');
+
+const {
+  normalizedSelectedKeys,
+  requestBodyObjectError,
+  normalizePhase3Requests,
+  authorizationError,
+  requestActor,
+  validateListenConfiguration,
+} = require('../backend/server');
+const { safeImportResult, buildSnapshot } = require('../backend/sync');
+const { normalizeTokenDocument } = require('../backend/lib/token');
+const { buildDiff } = require('../backend/diff');
+const { PanelDb } = require('../backend/db');
+const { findUsernameEntry, persistAccountDisposition } = require('../backend/phase3Worker');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
+
+function waitForChildMessage(child, expectedType, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('timed out waiting for child message: ' + expectedType));
+    }, timeoutMs);
+    const onMessage = (message) => {
+      if (message?.type !== expectedType) return;
+      cleanup();
+      resolve(message);
+    };
+    const onExit = (code, signal) => {
+      cleanup();
+      reject(new Error('child exited before ' + expectedType + ': ' + String(code) + '/' + String(signal)));
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off('message', onMessage);
+      child.off('exit', onExit);
+    };
+    child.on('message', onMessage);
+    child.on('exit', onExit);
+  });
+}
+
+function waitForChildExit(child, timeoutMs = 5000) {
+  if (child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
+  }
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(new Error('timed out waiting for child exit'));
+    }, timeoutMs);
+    const onExit = (code, signal) => {
+      cleanup();
+      resolve({ code, signal });
+    };
+    const cleanup = () => {
+      clearTimeout(timer);
+      child.off('exit', onExit);
+    };
+    child.on('exit', onExit);
+  });
+}
+
+test('preview selection accepts an empty array but rejects blank or oversized input', () => {
+  assert.deepEqual(normalizedSelectedKeys([], { allowEmpty: true }), []);
+  assert.equal(normalizedSelectedKeys(['   '], { allowEmpty: true }), null);
+  assert.equal(normalizedSelectedKeys([], { allowEmpty: false }), null);
+  assert.equal(normalizedSelectedKeys(Array.from({ length: 501 }, (_, index) => String(index)), { allowEmpty: true }), null);
+  assert.deepEqual(normalizedSelectedKeys([' account:1 ', 'account:1'], { allowEmpty: false }), ['account:1']);
+});
+
+test('JSON API body validation rejects scalar values', () => {
+  assert.equal(requestBodyObjectError({}), null);
+  assert.equal(requestBodyObjectError(null)?.code, 'INVALID_REQUEST_BODY');
+  assert.equal(requestBodyObjectError('body')?.code, 'INVALID_REQUEST_BODY');
+  assert.equal(requestBodyObjectError([])?.code, 'INVALID_REQUEST_BODY');
+});
+
+test('Phase 3 accepts batches and removes duplicate email/phone targets', () => {
+  const batch = normalizePhase3Requests({
+    accounts: [
+      { email: ' One@example.test ', phone: '138-0000' },
+      { email: 'one@example.test' },
+      { phone: '1380000' },
+      { email: 'two@example.test' },
+    ],
+  });
+  assert.equal(batch.requests.length, 2);
+  assert.deepEqual(batch.requests.map((item) => item.email), ['one@example.test', 'two@example.test']);
+  assert.deepEqual(batch.duplicateIndexes, [1, 2]);
+  assert.throws(
+    () => normalizePhase3Requests({ accounts: [] }),
+    (error) => error.code === 'PHASE3_BATCH_INVALID',
+  );
+});
+
+test('token documents without usable credentials or identity are invalid', () => {
+  const noAccess = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/no-access.json',
+    fileName: 'no-access.json',
+    mtimeMs: 1,
+    data: { refresh_token: 'refresh-only', email: 'one@example.test' },
+  });
+  assert.equal(noAccess.parseStatus, 'invalid');
+  assert.match(noAccess.parseError, /access_token/);
+
+  const noIdentity = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/no-identity.json',
+    fileName: 'no-identity.json',
+    mtimeMs: 1,
+    data: { access_token: 'opaque-access' },
+  });
+  assert.equal(noIdentity.parseStatus, 'invalid');
+  assert.match(noIdentity.parseError, /身份/);
+});
+
+test('token documents reject nested, oversized, and non-Codex credential fields', () => {
+  const cases = [
+    {
+      relativePath: 'tokens/nested-access.json',
+      sensitive: 'nested-access-value',
+      data: {
+        access_token: { credential: 'nested-access-value' },
+        email: 'one@example.test',
+      },
+    },
+    {
+      relativePath: 'tokens/nested-identity.json',
+      sensitive: 'nested-account-value',
+      data: {
+        access_token: 'opaque-access',
+        account_id: { credential: 'nested-account-value' },
+      },
+    },
+    {
+      relativePath: 'tokens/nested-refresh.json',
+      sensitive: 'nested-refresh-value',
+      data: {
+        access_token: 'opaque-access',
+        refresh_token: { credential: 'nested-refresh-value' },
+        email: 'one@example.test',
+      },
+    },
+    {
+      relativePath: 'tokens/nested-type.json',
+      sensitive: 'nested-type-value',
+      data: {
+        access_token: 'opaque-access',
+        email: 'one@example.test',
+        type: { credential: 'nested-type-value' },
+      },
+    },
+    {
+      relativePath: 'tokens/unsupported-type.json',
+      data: {
+        access_token: 'opaque-access',
+        email: 'one@example.test',
+        type: 'another-provider',
+      },
+    },
+    {
+      relativePath: 'tokens/oversized-email.json',
+      data: {
+        access_token: 'opaque-access',
+        email: 'x'.repeat(321),
+      },
+    },
+  ];
+  for (const item of cases) {
+    const token = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: item.relativePath,
+      fileName: path.basename(item.relativePath),
+      mtimeMs: 1,
+      data: item.data,
+    });
+    assert.equal(token.parseStatus, 'invalid', item.relativePath);
+    if (item.sensitive) {
+      assert.equal(JSON.stringify(token).includes(item.sensitive), false, item.relativePath);
+    }
+  }
+});
+
+test('invalid expiry fields are surfaced separately and never treated as expired', () => {
+  const token = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/invalid-expiry.json',
+    fileName: 'invalid-expiry.json',
+    mtimeMs: 1,
+    data: {
+      access_token: 'opaque-access',
+      email: 'invalid-expiry@example.test',
+      account_id: 'invalid-expiry-account',
+      user_id: 'invalid-expiry-user',
+      expired: 'not-a-date',
+    },
+  });
+  assert.equal(token.parseStatus, 'ok');
+  assert.equal(token.expiryStatus, 'invalid');
+  const diff = buildDiff([token], []);
+  assert.equal(diff.counts.expiry_invalid, 1);
+  assert.equal(diff.items[0].issues[0], 'expiry_invalid');
+});
+
+test('token identity, expiry, refresh, and disabled aliases fail closed', () => {
+  const jwt = (payload) => [
+    'header',
+    Buffer.from(JSON.stringify(payload)).toString('base64url'),
+    'signature',
+  ].join('.');
+  const access = jwt({
+    sub: 'issuer-subject',
+    exp: Math.floor(Date.parse('2020-01-01T00:00:00.000Z') / 1000),
+    'https://api.openai.com/auth': {
+      chatgpt_account_id: 'jwt-account',
+      chatgpt_user_id: 'jwt-user',
+    },
+  });
+
+  const distinctIssuerSubject = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/distinct-issuer-subject.json',
+    fileName: 'distinct-issuer-subject.json',
+    mtimeMs: 1,
+    data: { access_token: access },
+  });
+  assert.equal(distinctIssuerSubject.parseStatus, 'ok');
+  assert.equal(distinctIssuerSubject.userId, 'jwt-user');
+
+  const identityConflict = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/identity-conflict.json',
+    fileName: 'identity-conflict.json',
+    mtimeMs: 1,
+    data: {
+      access_token: access,
+      account_id: 'different-account',
+    },
+  });
+  assert.equal(identityConflict.parseStatus, 'invalid');
+  assert.match(identityConflict.parseError, /强身份/);
+
+  const idTokenConflict = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/id-token-conflict.json',
+    fileName: 'id-token-conflict.json',
+    mtimeMs: 1,
+    data: {
+      access_token: access,
+      id_token: jwt({ sub: 'different-user' }),
+    },
+  });
+  assert.equal(idTokenConflict.parseStatus, 'invalid');
+
+  const earliestExpiry = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/earliest-expiry.json',
+    fileName: 'earliest-expiry.json',
+    mtimeMs: 1,
+    data: {
+      access_token: access,
+      expired: '2099-01-01T00:00:00.000Z',
+    },
+  });
+  assert.equal(earliestExpiry.parseStatus, 'ok');
+  assert.equal(earliestExpiry.expiryStatus, 'valid');
+  assert.equal(earliestExpiry.expiresAt, '2020-01-01T00:00:00.000Z');
+
+  const invalidAlias = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/invalid-expiry-alias.json',
+    fileName: 'invalid-expiry-alias.json',
+    mtimeMs: 1,
+    data: {
+      access_token: jwt({ sub: 'expiry-alias-user' }),
+      expired: '2099-01-01T00:00:00.000Z',
+      expiresAt: 'invalid-date',
+    },
+  });
+  assert.equal(invalidAlias.parseStatus, 'ok');
+  assert.equal(invalidAlias.expiryStatus, 'invalid');
+
+  for (const data of [
+    {
+      access_token: jwt({ sub: 'disabled-user' }),
+      disabled: 'false',
+    },
+    {
+      access_token: jwt({ sub: 'refresh-user' }),
+      last_refresh: '2099-01-01T00:00:00.000Z',
+      lastRefresh: '2098-01-01T00:00:00.000Z',
+    },
+  ]) {
+    const token = normalizeTokenDocument({
+      source: 'tokens',
+      relativePath: 'tokens/invalid-alias.json',
+      fileName: 'invalid-alias.json',
+      mtimeMs: 1,
+      data,
+    });
+    assert.equal(token.parseStatus, 'invalid');
+  }
+});
+
+test('two PanelDb instances cannot claim the same target', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-claim-')), 'panel.sqlite3');
+  const firstDb = new PanelDb(file);
+  const secondDb = new PanelDb(file);
+  const outcomes = await Promise.all([
+    firstDb.createJob('token_import', {}, 'first', { claimKeys: ['token_import'] })
+      .then((job) => ({ ok: true, job }))
+      .catch((error) => ({ ok: false, error })),
+    secondDb.createJob('token_import', {}, 'second', { claimKeys: ['token_import'] })
+      .then((job) => ({ ok: true, job }))
+      .catch((error) => ({ ok: false, error })),
+  ]);
+  assert.equal(outcomes.filter((item) => item.ok).length, 1);
+  const rejected = outcomes.find((item) => !item.ok);
+  assert.equal(rejected.error.code, 'JOB_ALREADY_CLAIMED');
+  assert.equal((await firstDb.listJobs(10)).filter((job) => job.status === 'queued').length, 1);
+});
+
+test('PanelDb rejects oversized or multiply linked database files before loading them', async () => {
+  const previousMaximum = process.env.PANEL_DB_MAX_BYTES;
+  process.env.PANEL_DB_MAX_BYTES = String(1024 * 1024);
+  try {
+    const oversizedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-limit-'));
+    const oversizedPath = path.join(oversizedDirectory, 'oversized.sqlite3');
+    fs.writeFileSync(oversizedPath, 'x', { mode: 0o600 });
+    fs.truncateSync(oversizedPath, 1024 * 1024 + 1);
+    const oversizedDb = new PanelDb(oversizedPath);
+    await assert.rejects(
+      oversizedDb.ready,
+      (error) => error.code === 'PANEL_DB_TOO_LARGE',
+    );
+
+    const linkedDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-link-'));
+    const linkedPath = path.join(linkedDirectory, 'linked.sqlite3');
+    fs.writeFileSync(linkedPath, 'not-a-database', { mode: 0o600 });
+    fs.linkSync(linkedPath, linkedPath + '.alias');
+    const linkedDb = new PanelDb(linkedPath);
+    await assert.rejects(linkedDb.ready, /0600 非硬链接/);
+  } finally {
+    if (previousMaximum === undefined) delete process.env.PANEL_DB_MAX_BYTES;
+    else process.env.PANEL_DB_MAX_BYTES = previousMaximum;
+  }
+});
+
+test('a second process preserves jobs owned by a live panel process', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-live-owner-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const job = await db.createJob('phase3', { email: 'owner@example.test' }, 'tester', {
+    claimKeys: ['phase3:email:owner@example.test'],
+  });
+  const dbModule = require.resolve('../backend/db');
+  const source = [
+    "const { PanelDb } = require(process.argv[1]);",
+    'const db = new PanelDb(process.argv[2]);',
+    "db.getJob(process.argv[3]).then((job) => process.send({ type: 'status', status: job.status }, () => process.disconnect())).catch((error) => { process.send({ type: 'failed', message: error.message }, () => process.disconnect()); process.exitCode = 1; });",
+  ].join('\n');
+  const child = spawn(process.execPath, ['-e', source, dbModule, file, job.id], {
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+  const message = await waitForChildMessage(child, 'status');
+  assert.equal(message.status, 'queued');
+  assert.equal((await waitForChildExit(child)).code, 0);
+  await db.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+});
+
+test('PanelDb interrupts only jobs whose owner process is no longer alive', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-dead-owner-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:dead-owner'] });
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?');
+    statement.run([2147483647, 'definitely-not-live', job.id]);
+    statement.free();
+  });
+  const restarted = new PanelDb(file);
+  assert.equal((await restarted.getJob(job.id)).status, 'interrupted');
+  const replacement = await restarted.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:dead-owner'] });
+  assert.equal(replacement.status, 'queued');
+  await restarted.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
+});
+
+test('PanelDb reclaims a dead owner claim without requiring another restart', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-live-reclaim-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const claimKey = 'phase3:dead-owner-live-reclaim';
+  const abandoned = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ?, owner_start_id = ? WHERE id = ?');
+    statement.run([2147483647, 'definitely-not-live', abandoned.id]);
+    statement.free();
+  });
+
+  const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+  assert.equal((await db.getJob(abandoned.id)).status, 'interrupted');
+  assert.equal(replacement.status, 'queued');
+  await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
+});
+
+test('control-plane callbacks are mutually exclusive across processes', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-control-lock-'));
+  const coordinatorModule = require.resolve('../backend/taskCoordinator');
+  const childSource = [
+    "const { withControlPlaneLock } = require(process.env.TEST_COORDINATOR_MODULE);",
+    'withControlPlaneLock(async () => {',
+    "  if (process.send) process.send({ type: 'entered' });",
+    "  await new Promise((resolve) => process.on('message', (message) => { if (message === 'release') resolve(); }));",
+    '}).then(() => {',
+    "  if (process.send) process.send({ type: 'done' }, () => process.disconnect());",
+    '}).catch((error) => {',
+    "  if (process.send) process.send({ type: 'failed', message: error.message }, () => process.disconnect());",
+    '  process.exitCode = 1;',
+    '});',
+  ].join('\n');
+  const childOptions = {
+    env: {
+      ...process.env,
+      TEST_COORDINATOR_MODULE: coordinatorModule,
+      PANEL_CONTROL_LOCK_PATH: path.join(root, 'control.lock'),
+      PANEL_CONTROL_LOCK_TIMEOUT_MS: '5000',
+      PANEL_CONTROL_LOCK_POLL_MS: '10',
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  };
+  const first = spawn(process.execPath, ['-e', childSource], childOptions);
+  let second = null;
+  try {
+    await waitForChildMessage(first, 'entered');
+    second = spawn(process.execPath, ['-e', childSource], childOptions);
+    let secondEntered = false;
+    const secondEnteredPromise = waitForChildMessage(second, 'entered').then((message) => {
+      secondEntered = true;
+      return message;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    assert.equal(secondEntered, false);
+    const firstDone = waitForChildMessage(first, 'done');
+    first.send('release');
+    await firstDone;
+    assert.equal((await waitForChildExit(first)).code, 0);
+    await secondEnteredPromise;
+    const secondDone = waitForChildMessage(second, 'done');
+    second.send('release');
+    await secondDone;
+    assert.equal((await waitForChildExit(second)).code, 0);
+  } finally {
+    if (first.exitCode === null && first.signalCode === null) first.kill('SIGKILL');
+    if (second && second.exitCode === null && second.signalCode === null) second.kill('SIGKILL');
+  }
+});
+
+test('bakery leases never unlink the shared namespace and stay exclusive under contention', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-stress-'));
+  const lockPath = path.join(root, 'control.lock');
+  const guardPath = path.join(root, 'critical.guard');
+  const coordinatorModule = require.resolve('../backend/taskCoordinator');
+  const childSource = [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    'const originalUnlink = fs.unlinkSync;',
+    'fs.unlinkSync = (filePath) => {',
+    '  if (path.basename(String(filePath)) === path.basename(process.env.PANEL_CONTROL_LOCK_PATH)) {',
+    "    const error = new Error('attempted to unlink shared namespace'); error.code = 'SHARED_UNLINK'; throw error;",
+    '  }',
+    '  return originalUnlink.call(fs, filePath);',
+    '};',
+    "const { withControlPlaneLock } = require(process.env.TEST_COORDINATOR_MODULE);",
+    'const rounds = Number(process.env.TEST_ROUNDS);',
+    "const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));",
+    '(async () => {',
+    "  await new Promise((resolve) => process.once('message', (message) => { if (message === 'start') resolve(); }));",
+    '  for (let index = 0; index < rounds; index += 1) {',
+    '    await withControlPlaneLock(async () => {',
+    '      let descriptor;',
+    '      try {',
+    "        descriptor = fs.openSync(process.env.TEST_GUARD_PATH, 'wx', 0o600);",
+    '      } catch (error) {',
+    "        if (error.code === 'EEXIST') { const overlap = new Error('critical section overlap'); overlap.code = 'OVERLAP'; throw overlap; }",
+    '        throw error;',
+    '      }',
+    '      try { await wait(3); } finally {',
+    '        try { fs.closeSync(descriptor); } catch {}',
+    '        try { fs.unlinkSync(process.env.TEST_GUARD_PATH); } catch {}',
+    '      }',
+    '    });',
+    '  }',
+    "  process.send({ type: 'result', ok: true }, () => process.disconnect());",
+    '})().catch((error) => {',
+    "  process.send({ type: 'result', ok: false, code: error.code, message: error.message }, () => process.disconnect());",
+    '  process.exitCode = 1;',
+    '});',
+  ].join('\n');
+  const spawnContender = (rounds) => spawn(process.execPath, ['-e', childSource], {
+    env: {
+      ...process.env,
+      TEST_COORDINATOR_MODULE: coordinatorModule,
+      TEST_GUARD_PATH: guardPath,
+      TEST_ROUNDS: String(rounds),
+      PANEL_CONTROL_LOCK_PATH: lockPath,
+      PANEL_CONTROL_LOCK_TIMEOUT_MS: '30000',
+      PANEL_CONTROL_LOCK_POLL_MS: '10',
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  });
+
+  const initializer = spawnContender(1);
+  initializer.send('start');
+  assert.equal((await waitForChildMessage(initializer, 'result', 10000)).ok, true);
+  assert.equal((await waitForChildExit(initializer, 10000)).code, 0);
+  const namespaceBefore = fs.statSync(lockPath);
+
+  // A valid dead entry may be reclaimed because its unique token path can
+  // never become another contender's lease; the shared namespace is retained.
+  const deadToken = 'd'.repeat(32);
+  const deadTicketPath = lockPath + '.lease-v2-' + deadToken + '.ticket';
+  fs.writeFileSync(deadTicketPath, JSON.stringify({
+    kind: 'gpt-register-panel-control-lock',
+    protocol: 'lamport-bakery',
+    version: 2,
+    role: 'lease',
+    phase: 'ticket',
+    pid: process.pid,
+    processStartId: null,
+    processBootId: '00000000-0000-0000-0000-000000000000',
+    token: deadToken,
+    ticket: 1,
+    createdAt: new Date().toISOString(),
+  }), { mode: 0o600 });
+
+  const children = Array.from({ length: 8 }, () => spawnContender(15));
+  const readyDelay = new Promise((resolve) => setTimeout(resolve, 30));
+  await readyDelay;
+  for (const child of children) child.send('start');
+  const outcomes = await Promise.all(children.map((child) => waitForChildMessage(child, 'result', 30000)));
+  assert.equal(outcomes.every((outcome) => outcome.ok), true, JSON.stringify(outcomes));
+  const exits = await Promise.all(children.map((child) => waitForChildExit(child, 10000)));
+  assert.deepEqual(exits.map((exit) => exit.code), Array(children.length).fill(0));
+
+  const namespaceAfter = fs.statSync(lockPath);
+  assert.equal(namespaceAfter.dev, namespaceBefore.dev);
+  assert.equal(namespaceAfter.ino, namespaceBefore.ino);
+  assert.equal(fs.existsSync(deadTicketPath), false);
+  assert.equal(fs.existsSync(guardPath), false);
+  assert.deepEqual(
+    fs.readdirSync(root).filter((name) => name.includes('.lease-v2-') && !name.includes(deadToken)),
+    [],
+  );
+});
+
+test('malformed per-contender leases fail closed without deleting the namespace or entry', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-invalid-'));
+  const controlLockPath = path.join(root, 'control.lock');
+  const previousLockPath = process.env.PANEL_CONTROL_LOCK_PATH;
+  process.env.PANEL_CONTROL_LOCK_PATH = controlLockPath;
+  try {
+    await withControlPlaneLock(async () => {});
+    const namespaceBefore = fs.statSync(controlLockPath);
+    const malformedPath = controlLockPath + '.lease-v2-' + 'e'.repeat(32) + '.ticket';
+    fs.writeFileSync(malformedPath, 'unrelated-user-file', { mode: 0o600 });
+    await assert.rejects(
+      withControlPlaneLock(async () => {}),
+      (error) => error.code === 'CONTROL_PLANE_LOCK_PATH_INVALID',
+    );
+    assert.equal(fs.readFileSync(malformedPath, 'utf8'), 'unrelated-user-file');
+    const namespaceAfter = fs.statSync(controlLockPath);
+    assert.equal(namespaceAfter.dev, namespaceBefore.dev);
+    assert.equal(namespaceAfter.ino, namespaceBefore.ino);
+  } finally {
+    if (previousLockPath === undefined) delete process.env.PANEL_CONTROL_LOCK_PATH;
+    else process.env.PANEL_CONTROL_LOCK_PATH = previousLockPath;
+  }
+});
+
+test('lock namespaces reject group/world-writable parent directories before publishing files', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-lock-permissions-'));
+  const unsafeControlDirectory = path.join(root, 'unsafe-control');
+  const unsafeDbDirectory = path.join(root, 'unsafe-db');
+  fs.mkdirSync(unsafeControlDirectory, { mode: 0o777 });
+  fs.mkdirSync(unsafeDbDirectory, { mode: 0o777 });
+  fs.chmodSync(unsafeControlDirectory, 0o777);
+  fs.chmodSync(unsafeDbDirectory, 0o777);
+
+  const previousLockPath = process.env.PANEL_CONTROL_LOCK_PATH;
+  process.env.PANEL_CONTROL_LOCK_PATH = path.join(unsafeControlDirectory, 'control.lock');
+  try {
+    await assert.rejects(
+      withControlPlaneLock(async () => {}),
+      (error) => error.code === 'CONTROL_PLANE_LOCK_PATH_INVALID',
+    );
+    assert.deepEqual(fs.readdirSync(unsafeControlDirectory), []);
+  } finally {
+    if (previousLockPath === undefined) delete process.env.PANEL_CONTROL_LOCK_PATH;
+    else process.env.PANEL_CONTROL_LOCK_PATH = previousLockPath;
+  }
+
+  const dbPath = path.join(unsafeDbDirectory, 'panel.sqlite3');
+  const db = new PanelDb(dbPath);
+  await assert.rejects(db.ready, (error) => error.code === 'DB_LOCK_PATH_INVALID');
+  assert.deepEqual(fs.readdirSync(unsafeDbDirectory), []);
+});
+
+test('database bakery lease preserves concurrent writes and counts all active jobs', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-bakery-'));
+  const dbPath = path.join(root, 'panel.sqlite3');
+  const dbModule = require.resolve('../backend/db');
+  const childSource = [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    'const originalUnlink = fs.unlinkSync;',
+    'fs.unlinkSync = (filePath) => {',
+    "  if (path.basename(String(filePath)) === path.basename(process.env.TEST_DB_PATH) + '.lock') {",
+    "    const error = new Error('attempted to unlink shared DB namespace'); error.code = 'SHARED_UNLINK'; throw error;",
+    '  }',
+    '  return originalUnlink.call(fs, filePath);',
+    '};',
+    "const { PanelDb } = require(process.env.TEST_DB_MODULE);",
+    'const db = new PanelDb(process.env.TEST_DB_PATH);',
+    'const count = Number(process.env.TEST_WRITE_COUNT);',
+    '(async () => {',
+    "  await new Promise((resolve) => process.once('message', (message) => { if (message === 'start') resolve(); }));",
+    '  for (let index = 0; index < count; index += 1) {',
+    "    await db.audit({ actor: 'stress', action: 'bakery_write', result: 'ok', details: { index } });",
+    '  }',
+    "  process.send({ type: 'result', ok: true }, () => process.disconnect());",
+    '})().catch((error) => {',
+    "  process.send({ type: 'result', ok: false, code: error.code, message: error.message }, () => process.disconnect());",
+    '  process.exitCode = 1;',
+    '});',
+  ].join('\n');
+  const children = Array.from({ length: 6 }, () => spawn(process.execPath, ['-e', childSource], {
+    env: {
+      ...process.env,
+      TEST_DB_MODULE: dbModule,
+      TEST_DB_PATH: dbPath,
+      TEST_WRITE_COUNT: '8',
+      PANEL_DB_LOCK_TIMEOUT_MS: '30000',
+    },
+    stdio: ['ignore', 'ignore', 'pipe', 'ipc'],
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  for (const child of children) child.send('start');
+  const outcomes = await Promise.all(children.map((child) => waitForChildMessage(child, 'result', 30000)));
+  assert.deepEqual(outcomes.map((outcome) => outcome.ok), Array(children.length).fill(true));
+  const exits = await Promise.all(children.map((child) => waitForChildExit(child, 10000)));
+  assert.deepEqual(exits.map((exit) => exit.code), Array(children.length).fill(0));
+
+  const db = new PanelDb(dbPath);
+  assert.equal((await db.listAudit(100)).length, 48);
+  const first = await db.createJob('phase3', {}, 'tester');
+  const second = await db.createJob('phase3', {}, 'tester');
+  const third = await db.createJob('token_import', {}, 'tester');
+  await db.updateJob(first.id, { status: 'succeeded', result: {} });
+  assert.equal(await db.countActiveJobs(), 2);
+  assert.equal(await db.countActiveJobs('phase3'), 1);
+  assert.equal(await db.countActiveJobs('token_import'), 1);
+  await db.updateJob(second.id, { status: 'failed', error: 'test cleanup' });
+  await db.updateJob(third.id, { status: 'failed', error: 'test cleanup' });
+
+  const namespacePath = dbPath + '.lock';
+  const namespaceBefore = fs.statSync(namespacePath);
+  const malformedPath = namespacePath + '.lease-v2-' + 'f'.repeat(32) + '.ticket';
+  fs.writeFileSync(malformedPath, 'not-a-panel-lease', { mode: 0o600 });
+  await assert.rejects(
+    db.audit({ actor: 'tester', action: 'must_fail_closed', result: 'ok' }),
+    (error) => error.code === 'DB_LOCK_PATH_INVALID',
+  );
+  assert.equal(fs.readFileSync(malformedPath, 'utf8'), 'not-a-panel-lease');
+  const namespaceAfter = fs.statSync(namespacePath);
+  assert.equal(namespaceAfter.dev, namespaceBefore.dev);
+  assert.equal(namespaceAfter.ino, namespaceBefore.ino);
+});
+
+test('job payloads, results, errors, and historical rows are redacted at the DB boundary', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-redaction-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const marker = 'sensitive-value-for-boundary-test';
+  const job = await db.createJob('account_test', {
+    prompt: 'Authorization: Bearer ' + marker,
+    credentials: { access_token: marker },
+    tokenCount: 7,
+    fingerprint: '0123456789abcdef',
+  });
+  await db.updateJob(job.id, {
+    status: 'succeeded',
+    result: { message: 'password=' + marker, tokenCount: 9, fingerprint: 'fedcba9876543210' },
+    error: 'Bearer ' + marker,
+  });
+  await db.audit({
+    jobId: job.id,
+    action: 'redaction_test',
+    details: { credential: marker, tokenCount: 11, fingerprint: 'aaaaaaaaaaaaaaaa' },
+  });
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET payload_json = ?, result_json = ?, error = ? WHERE id = ?');
+    statement.run([
+      JSON.stringify({ prompt: 'api_key=' + marker, tokenCount: 13 }),
+      JSON.stringify({ message: 'refresh_token=' + marker, fingerprint: 'bbbbbbbbbbbbbbbb' }),
+      'Authorization: Bearer ' + marker,
+      job.id,
+    ]);
+    statement.free();
+  });
+  const loaded = await db.getJob(job.id);
+  const audit = await db.listAudit(10);
+  assert.equal(JSON.stringify({ loaded, audit }).includes(marker), false);
+  assert.equal(loaded.payload.tokenCount, 13);
+  assert.equal(loaded.result.fingerprint, 'bbbbbbbbbbbbbbbb');
+  assert.equal(audit[0].details.tokenCount, 11);
+  assert.equal(audit[0].details.fingerprint, 'aaaaaaaaaaaaaaaa');
+});
+
+test('malformed DB and control lock files fail closed and are never deleted as stale markers', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-invalid-lock-'));
+  const dbPath = path.join(root, 'panel.sqlite3');
+  const dbLockPath = dbPath + '.lock';
+  const controlLockPath = path.join(root, 'control.lock');
+  const unrelated = 'unrelated-user-file';
+  fs.writeFileSync(dbLockPath, unrelated);
+  fs.writeFileSync(controlLockPath, unrelated);
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(dbLockPath, old, old);
+  fs.utimesSync(controlLockPath, old, old);
+
+  const db = new PanelDb(dbPath);
+  await assert.rejects(db.ready, (error) => error.code === 'DB_LOCK_PATH_INVALID');
+  assert.equal(fs.readFileSync(dbLockPath, 'utf8'), unrelated);
+
+  const previousLockPath = process.env.PANEL_CONTROL_LOCK_PATH;
+  process.env.PANEL_CONTROL_LOCK_PATH = controlLockPath;
+  try {
+    await assert.rejects(
+      withControlPlaneLock(async () => {}),
+      (error) => error.code === 'CONTROL_PLANE_LOCK_PATH_INVALID',
+    );
+    assert.equal(fs.readFileSync(controlLockPath, 'utf8'), unrelated);
+  } finally {
+    if (previousLockPath === undefined) delete process.env.PANEL_CONTROL_LOCK_PATH;
+    else process.env.PANEL_CONTROL_LOCK_PATH = previousLockPath;
+  }
+});
+
+test('PanelDb pins its real parent directory and rejects a replacement directory', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-parent-'));
+  const displaced = parent + '-displaced';
+  const db = new PanelDb(path.join(parent, 'panel.sqlite3'));
+  await db.createJob('preview', {}, 'tester');
+  fs.renameSync(parent, displaced);
+  fs.mkdirSync(parent);
+  await assert.rejects(db.listJobs(10), /父目录已被替换/);
+});
+
+test('Phase3 disposition refuses to overwrite a concurrently changed username record', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-username-race-'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'race@example.test', password: 'secret', status: 'oauth_done' },
+  ]));
+  const previousRoot = process.env.GPT_REGISTER_ROOT;
+  process.env.GPT_REGISTER_ROOT = root;
+  try {
+    const entry = findUsernameEntry({ email: 'race@example.test' });
+    fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+      { email: 'race@example.test', password: 'secret', status: 'manual_change' },
+    ]));
+    assert.throws(
+      () => persistAccountDisposition(entry, 'ACCOUNT_DEACTIVATED'),
+      /记录在 Phase3 期间发生变化/,
+    );
+  } finally {
+    if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previousRoot;
+  }
+});
+
+test('authentication ignores forged actors, rate-limits failures, and protects remote startup', () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    maxFailures: process.env.PANEL_AUTH_MAX_FAILURES,
+    allowRemote: process.env.PANEL_ALLOW_INSECURE_REMOTE,
+  };
+  const request = {
+    headers: { authorization: 'Bearer wrong', 'x-panel-actor': 'forged-admin' },
+    socket: { remoteAddress: '198.51.100.77' },
+  };
+  process.env.PANEL_ADMIN_TOKEN = 'test-admin-token-123456';
+  process.env.PANEL_REQUIRE_AUTH = '1';
+  process.env.PANEL_AUTH_MAX_FAILURES = '1';
+  delete process.env.PANEL_ALLOW_INSECURE_REMOTE;
+  try {
+    assert.equal(requestActor(request), 'anonymous');
+    assert.equal(authorizationError(request).status, 401);
+    assert.equal(authorizationError(request).status, 429);
+    delete process.env.PANEL_ADMIN_TOKEN;
+    process.env.PANEL_REQUIRE_AUTH = '0';
+    assert.throws(
+      () => validateListenConfiguration('0.0.0.0'),
+      (error) => error.code === 'PANEL_REMOTE_AUTH_REQUIRED',
+    );
+    assert.throws(
+      () => validateListenConfiguration('127.example.invalid'),
+      (error) => error.code === 'PANEL_REMOTE_AUTH_REQUIRED',
+    );
+    assert.doesNotThrow(() => validateListenConfiguration('127.0.0.1'));
+    assert.doesNotThrow(() => validateListenConfiguration('::1'));
+  } finally {
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.maxFailures === undefined) delete process.env.PANEL_AUTH_MAX_FAILURES;
+    else process.env.PANEL_AUTH_MAX_FAILURES = previous.maxFailures;
+    if (previous.allowRemote === undefined) delete process.env.PANEL_ALLOW_INSECURE_REMOTE;
+    else process.env.PANEL_ALLOW_INSECURE_REMOTE = previous.allowRemote;
+  }
+});
+
+test('snapshot version changes when token or username contents change', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-version-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'version@example.test', status: 'oauth_done' },
+  ]));
+  const tokenPath = path.join(root, 'tokens', 'token.json');
+  fs.writeFileSync(tokenPath, JSON.stringify({ access_token: 'opaque-token-a', email: 'version@example.test' }));
+  const first = await buildSnapshot(new URLSearchParams(), {
+    rootDirectory: root,
+    readSub2Api: false,
+    includeInternal: true,
+  });
+  const tokenStat = fs.statSync(tokenPath);
+  fs.writeFileSync(tokenPath, JSON.stringify({ access_token: 'opaque-token-b', email: 'version@example.test' }));
+  fs.utimesSync(tokenPath, tokenStat.atime, tokenStat.mtime);
+  const second = await buildSnapshot(new URLSearchParams(), {
+    rootDirectory: root,
+    readSub2Api: false,
+    includeInternal: true,
+  });
+  assert.notEqual(first.version, second.version);
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'version@example.test', status: 'account_deleted' },
+  ]));
+  const third = await buildSnapshot(new URLSearchParams(), {
+    rootDirectory: root,
+    readSub2Api: false,
+    includeInternal: true,
+  });
+  assert.notEqual(second.version, third.version);
+});
+
+test('import job result keeps only non-sensitive remote fields', () => {
+  const safe = safeImportResult({
+    success: true,
+    account_id: 12,
+    created: 1,
+    access_token: 'secret-access-token',
+    credentials: { refresh_token: 'secret-refresh-token' },
+    message: 'done',
+  });
+  assert.deepEqual(safe, {
+    success: true,
+    accountId: 12,
+    total: 0,
+    created: 1,
+    updated: 0,
+    skipped: 0,
+    failed: 0,
+    errorCount: 0,
+    warningCount: 0,
+    message: 'done',
+  });
+  assert.equal(JSON.stringify(safe).includes('secret-'), false);
+
+  const nested = safeImportResult({
+    total: 1,
+    created: 0,
+    updated: 1,
+    skipped: 0,
+    failed: 0,
+    items: [{ index: 0, action: 'updated', account_id: 266 }],
+  });
+  assert.equal(nested.accountId, 266);
+  assert.equal(Object.hasOwn(nested, 'items'), false);
+});

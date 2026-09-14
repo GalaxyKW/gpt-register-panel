@@ -1,0 +1,489 @@
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const test = require('node:test');
+const vm = require('node:vm');
+
+require('./test-isolation');
+
+const { tokenImportJobStatus } = require('../backend/server');
+
+const source = fs.readFileSync(path.resolve(__dirname, '..', 'frontend', 'app.js'), 'utf8');
+const htmlSource = fs.readFileSync(path.resolve(__dirname, '..', 'frontend', 'index.html'), 'utf8');
+const stylesSource = fs.readFileSync(path.resolve(__dirname, '..', 'frontend', 'styles.css'), 'utf8');
+
+function sourceSection(startMarker, endMarker) {
+  const start = source.indexOf(startMarker);
+  const end = source.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(start, -1, startMarker + ' missing');
+  assert.notEqual(end, -1, endMarker + ' missing');
+  return source.slice(start, end);
+}
+
+test('frontend treats every blocking plan item as a conflict and explains terminal sources', () => {
+  const actionContracts = sourceSection('function actionReasonLabel', 'function statusClass');
+  const lockingContracts = sourceSection('function actionRequestPending', 'function renderMetrics');
+  const renderPlan = sourceSection('function renderPlan', 'function applyFilters');
+  const context = {
+    elements: {
+      planPanel: {},
+      planSummary: {},
+      planVersion: {},
+      planRows: {},
+      importButton: {},
+    },
+    state: {
+      plan: null,
+      importRequestPending: false,
+      snapshot: { readOnly: false },
+    },
+    escapeHtml: (value) => String(value ?? ''),
+    actionLabel: (value) => value,
+    formatFingerprint: (value) => value || '-',
+  };
+  vm.runInNewContext(actionContracts + '\n' + lockingContracts + '\n' + renderPlan + `
+    renderPlan({
+      version: 'a'.repeat(64),
+      selectedKeys: ['token:one'],
+      items: [
+        { action: 'create', reason: 'token_only', fingerprints: {} },
+        { action: 'update', reason: 'token_changed', conflictingVersions: true, fingerprints: {} },
+      ],
+    });
+    result = {
+      disabled: elements.importButton.disabled,
+      summary: elements.planSummary.textContent,
+      rows: elements.planRows.innerHTML,
+      terminal: actionReasonLabel('source_account_terminal'),
+    identityReasons: [
+        actionReasonLabel('source_identity_insufficient'),
+        actionReasonLabel('conflicting_strong_identity'),
+        actionReasonLabel('incomparable_strong_identity'),
+        actionReasonLabel('ambiguous_sub2api_identity'),
+        actionReasonLabel('free_name_exhausted'),
+        actionReasonLabel('sub2api_account_schema_invalid'),
+        actionReasonLabel('sub2api_target_kind_invalid'),
+      ],
+      unknownAvailability: actionReasonLabel('sub2api_status_missing'),
+      invalidAutoPause: actionReasonLabel('sub2api_auto_pause_invalid'),
+    };
+  `, context);
+  assert.equal(context.result.disabled, true);
+  assert.match(context.result.summary, /冲突 1/);
+  assert.match(context.result.rows, /来源 token 版本冲突，禁止导入/);
+  assert.equal(context.result.terminal, '来源账号已处置，跳过');
+  assert.equal(context.result.identityReasons.every((label) => label.includes('禁止导入')), true);
+  assert.match(context.result.unknownAvailability, /跳过/);
+  assert.match(context.result.invalidAutoPause, /跳过/);
+  assert.match(source, /unknown:\s*'未知'/);
+  assert.match(source, /可用性未知/);
+});
+
+test('frontend polling helper keeps an unknown task locked and schedules a slower retry', () => {
+  const pollingContract = sourceSection('function jobPollFailureState', 'async function watchJobs');
+  const context = {};
+  vm.runInNewContext(pollingContract + `
+    result = {
+      first: jobPollFailureState(0),
+      exhausted: jobPollFailureState(6),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result.first }, {
+    unknown: false,
+    nextAttempt: 1,
+    delayMs: 1000,
+  });
+  assert.deepEqual({ ...context.result.exhausted }, {
+    unknown: true,
+    nextAttempt: 0,
+    delayMs: 15000,
+  });
+  const unknownBranch = sourceSection('// A polling failure says nothing', '    }\n  };');
+  assert.doesNotMatch(unknownBranch, /RequestPending\s*=\s*false/);
+  assert.match(unknownBranch, /status:\s*'unknown'/);
+});
+
+test('frontend locks the initial UI when active-job recovery cannot be confirmed', () => {
+  const resumeContract = sourceSection('async function resumeActiveJob', 'async function loadSnapshot');
+  const firstRequest = resumeContract.indexOf("apiFetch('/api/jobs?limit=200')");
+  const initialLock = resumeContract.indexOf("status: 'unknown'");
+  assert.notEqual(firstRequest, -1);
+  assert.ok(initialLock >= 0 && initialLock < firstRequest);
+  assert.match(resumeContract.slice(0, firstRequest), /renderJob\(state\.job\);\s*updateActionState\(\)/);
+  const failureBranch = resumeContract.slice(resumeContract.indexOf('  } catch (error) {'));
+  assert.match(failureBranch, /status:\s*'unknown'/);
+  assert.match(failureBranch, /resumeProbe:\s*true/);
+  assert.match(failureBranch, /renderJob\(state\.job\);\s*updateActionState\(\)/);
+  assert.match(failureBranch, /window\.setTimeout\(\(\) => resumeActiveJob\(\), 15000\)/);
+  assert.match(resumeContract, /if \(state\.job\?\.resumeProbe\)[\s\S]*state\.job = null;[\s\S]*updateActionState\(\)/);
+});
+
+test('frontend usage formatting never turns missing statistics into zero', () => {
+  const usageContract = sourceSection('function finiteNumber', 'function badgeClass');
+  const context = {};
+  vm.runInNewContext(usageContract + `
+    result = {
+      missing: formatUsage({}),
+      invalid: formatUsage({ totalTokens: 'not-a-number', requests: '' }),
+      explicitZero: formatUsage({ totalTokens: 0, requests: 0 }),
+      partialZero: formatUsage({ totalTokens: 0 }),
+      requestsOnly: formatUsage({ requests: 4 }),
+      nestedMissing: formatPeriodUsage({ current: {} }),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    missing: '-',
+    invalid: '-',
+    explicitZero: '0',
+    partialZero: '0 / - 次',
+    requestsOnly: '- / 4 次',
+    nestedMissing: '-',
+  });
+});
+
+test('frontend token import totals separate errors, runtime skips, and successes', () => {
+  const countsContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const context = { finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0 };
+  vm.runInNewContext(countsContract + `
+    result = tokenImportResultCounts({
+      imported: [
+        { action: 'create' },
+        { action: 'update', error: 'failed' },
+        { action: 'skip', skipped: true },
+      ],
+      failed: 99,
+      runtimeSkipped: 99,
+    });
+  `, context);
+  assert.deepEqual({ ...context.result }, { succeeded: 1, skipped: 1, failed: 1 });
+});
+
+test('frontend renders a completed Phase3 result without bogus zero counters', () => {
+  const renderJob = sourceSection('function renderJob', 'function stopJobPolling');
+  const context = {
+    elements: {
+      jobPanel: { dataset: {} },
+      jobTitle: {},
+      jobStatus: {},
+      jobMeta: {},
+    },
+    jobStatusClass: () => 'badge-success',
+    jobStatusLabel: () => '已完成',
+    formatDate: () => '现在',
+  };
+  vm.runInNewContext(renderJob + `
+    renderJob({
+      id: 'phase3-job',
+      type: 'phase3',
+      status: 'succeeded',
+      result: { tokenFile: 'redacted.json' },
+      finishedAt: 'now',
+    });
+    result = elements.jobMeta.textContent;
+  `, context);
+  assert.match(context.result, /检测到 token 更新/);
+  assert.doesNotMatch(context.result, /成功 0/);
+});
+
+test('token import terminal status distinguishes total failure from partial success', () => {
+  assert.equal(tokenImportJobStatus({
+    imported: [{ action: 'update', error: 'failed' }, { action: 'create', error: 'failed' }],
+  }), 'failed');
+  assert.equal(tokenImportJobStatus({
+    imported: [{ action: 'update', error: 'failed' }, { action: 'create' }],
+  }), 'partial');
+  assert.equal(tokenImportJobStatus({
+    imported: [{ action: 'skip', skipped: true }],
+  }), 'succeeded');
+  assert.equal(tokenImportJobStatus({ failed: 1 }), 'failed');
+});
+
+test('frontend difference metric excludes in-sync rows and starts imports with the right task type', () => {
+  const renderMetrics = sourceSection('function renderMetrics', 'function selectedRowsFromView');
+  const context = {
+    elements: {
+      tokenCount: {},
+      tokenDetail: {},
+      accountCount: {},
+      accountDetail: {},
+      diffCount: {},
+      diffDetail: {},
+      lastRead: {},
+      modeBadge: {},
+      cleanupButton: null,
+    },
+    state: {},
+    finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0,
+    kindLabel: (value) => value,
+    formatDate: (value) => value,
+    actionsLocked: () => false,
+  };
+  vm.runInNewContext(renderMetrics + `
+    renderMetrics({
+      sources: { summary: { tokenCount: 4, validTokenCount: 4, invalidTokenCount: 0 } },
+      sub2api: { accountCount: 4, apiError: null, statsError: null },
+      diff: { counts: { in_sync: 3, token_only: 1 } },
+      generatedAt: 'now',
+      readOnly: true,
+    });
+    result = { count: elements.diffCount.textContent, detail: elements.diffDetail.textContent };
+  `, context);
+  assert.deepEqual({ ...context.result }, { count: '1', detail: 'token_only 1' });
+  const importHandler = sourceSection("elements.importButton.addEventListener('click'", "elements.phase3Button.addEventListener('click'");
+  assert.match(importHandler, /watchJob\(body\.jobId, 'token_import'\)/);
+});
+
+test('frontend globally locks mutating actions while any request or task is unresolved', () => {
+  const lockContract = sourceSection('function actionRequestPending', 'function renderMetrics');
+  const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  assert.match(lockContract, /previewRequestPending/);
+  assert.match(lockContract, /importRequestPending/);
+  assert.match(lockContract, /phase3RequestPending/);
+  assert.match(lockContract, /accountTestRequestPending/);
+  assert.match(lockContract, /cleanupRequestPending/);
+  assert.match(lockContract, /\['queued', 'running', 'unknown'\]/);
+  assert.match(updateContract, /phase3Button\.disabled = locked/);
+  assert.match(updateContract, /accountTestButton\.disabled = locked/);
+  assert.match(updateContract, /previewButton\.disabled = locked/);
+  assert.match(updateContract, /updateImportButtonState\(\)/);
+  assert.match(updateContract, /cleanupButton\.disabled = Boolean\(state\.snapshot\?\.readOnly\) \|\| locked/);
+});
+
+test('mobile layout keeps controls usable and wide tables horizontally scrollable', () => {
+  assert.match(stylesSource, /\.table-wrap, \.plan-wrap \{ overflow: auto; \}/);
+  const mobile = stylesSource.slice(stylesSource.indexOf('@media (max-width: 700px)'));
+  assert.match(mobile, /\.toolbar \{ position: static;[^}]*flex-direction: column;/);
+  assert.match(mobile, /\.toolbar label, \.toolbar \.search-field \{ width: 100%; min-width: 0; \}/);
+  assert.match(mobile, /\.job-copy p \{ white-space: normal; \}/);
+});
+
+test('frontend refreshes every terminal job outcome before preserving its notice', () => {
+  const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
+  const terminalStart = watchContract.indexOf('if (loaded.every((job) => terminalJob(job.status)))');
+  const terminalEnd = watchContract.indexOf("state.jobPollTimer = window.setTimeout(() => poll(0), 1200)", terminalStart);
+  const terminalBranch = watchContract.slice(terminalStart, terminalEnd);
+  assert.notEqual(terminalStart, -1);
+  assert.notEqual(terminalEnd, -1);
+  assert.match(terminalBranch, /snapshotRefreshPending = true;[\s\S]*const snapshotRefreshed = await loadSnapshot\(\)/);
+  assert.match(terminalBranch, /if \(!snapshotRefreshed\)[\s\S]*保持操作锁定[\s\S]*window\.setTimeout\(\(\) => poll\(0\), 5000\);\s*return;/);
+  assert.match(terminalBranch, /snapshotRefreshPending = false;\s*showNotice\(terminalNotice, terminalNoticeKind\)/);
+  assert.match(sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'"), /return loaded;/);
+});
+
+test('frontend retries a 401 with a fresh bounded signal and a password dialog token', async () => {
+  const apiHeadersContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
+  const apiFetchContract = sourceSection('const API_REQUEST_TIMEOUT_MS', 'function renderSelectOptions');
+  const values = new Map();
+  const calls = [];
+  const listeners = new Map();
+  const input = { value: '', focus() {} };
+  const dialog = {
+    returnValue: '',
+    addEventListener(type, listener) { listeners.set(type, listener); },
+    removeEventListener(type, listener) {
+      if (listeners.get(type) === listener) listeners.delete(type);
+    },
+    showModal() {
+      queueMicrotask(() => {
+        input.value = 'new-admin-token';
+        this.returnValue = 'confirm';
+        listeners.get('close')?.();
+      });
+    },
+  };
+  const context = {
+    AbortController,
+    Headers,
+    Response,
+    URL,
+    elements: {
+      adminTokenDialog: dialog,
+      adminTokenInput: input,
+      adminTokenOrigin: {},
+    },
+    fetch: async (url, options) => {
+      calls.push({ url, options });
+      return new Response(JSON.stringify({ attempt: calls.length }), {
+        status: calls.length === 1 ? 401 : 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    },
+    sessionStorage: {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    window: {
+      clearTimeout,
+      location: { origin: 'http://127.0.0.1:4170' },
+      setTimeout,
+    },
+  };
+  vm.runInNewContext(apiHeadersContract + '\n' + apiFetchContract + `
+    resultPromise = apiFetch('/api/health', { timeoutMs: 1000 });
+    blockedPromise = resultPromise.then(() => apiFetch('https://example.invalid/api/health', { timeoutMs: 1000 }));
+  `, context);
+  const response = await context.resultPromise;
+  assert.equal(response.status, 200);
+  assert.equal(calls.length, 2);
+  assert.notEqual(calls[0].options.signal, calls[1].options.signal);
+  assert.equal(calls[0].options.headers.get('x-panel-token'), null);
+  assert.equal(calls[1].options.headers.get('x-panel-token'), 'new-admin-token');
+  assert.equal(calls.every((call) => call.options.redirect === 'error'), true);
+  assert.equal(input.value, '');
+  assert.equal(context.elements.adminTokenOrigin.textContent, 'http://127.0.0.1:4170');
+  await assert.rejects(context.blockedPromise, /拒绝向非同源地址发送面板凭证/);
+  assert.equal(calls.length, 2);
+});
+
+test('frontend API deadline also bounds a response body that never finishes', async () => {
+  const apiHeadersContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
+  const apiFetchContract = sourceSection('const API_REQUEST_TIMEOUT_MS', 'function renderSelectOptions');
+  const context = {
+    AbortController,
+    Headers,
+    ReadableStream,
+    Response,
+    URL,
+    elements: {},
+    fetch: async (url, options) => new Response(new ReadableStream({
+      start(controller) {
+        options.signal.addEventListener('abort', () => {
+          controller.error(new DOMException('aborted', 'AbortError'));
+        }, { once: true });
+      },
+    }), { status: 200 }),
+    sessionStorage: {
+      getItem: () => null,
+      setItem() {},
+      removeItem() {},
+    },
+    window: {
+      clearTimeout,
+      location: { origin: 'http://127.0.0.1:4170' },
+      setTimeout,
+    },
+  };
+  vm.runInNewContext(apiHeadersContract + '\n' + apiFetchContract + `
+    resultPromise = apiFetch('/api/snapshot', { timeoutMs: 10 });
+  `, context);
+  await assert.rejects(context.resultPromise, (error) => (
+    error?.name === 'TimeoutError' && /请求超时/.test(error.message)
+  ));
+});
+
+test('frontend keeps an in-memory token fallback when session storage is unavailable', () => {
+  const tokenContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
+  const context = {
+    Headers,
+    sessionStorage: {
+      getItem() { throw new DOMException('blocked', 'SecurityError'); },
+      setItem() { throw new DOMException('blocked', 'SecurityError'); },
+      removeItem() { throw new DOMException('blocked', 'SecurityError'); },
+    },
+  };
+  vm.runInNewContext(tokenContract + `
+    savePanelToken('memory-only-token');
+    result = {
+      saved: readPanelToken(),
+      header: apiHeaders().get('x-panel-token'),
+    };
+    clearPanelToken();
+    result.cleared = readPanelToken();
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    saved: 'memory-only-token',
+    header: 'memory-only-token',
+    cleared: '',
+  });
+});
+
+test('frontend ignores an older snapshot response that arrives last', async () => {
+  const loadSnapshotContract = sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'");
+  const requests = [];
+  const stateForTest = {
+    snapshot: null,
+    selected: new Set(),
+    snapshotRequestSequence: 0,
+    resumeJobsPending: false,
+    job: null,
+  };
+  const context = {
+    URLSearchParams,
+    elements: {
+      historicalToggle: { checked: false },
+      loadingLabel: {},
+      refreshButton: {},
+      statusFilter: {},
+      availabilityFilter: {},
+      diffFilter: {},
+    },
+    state: stateForTest,
+    apiFetch: () => new Promise((resolve) => requests.push(resolve)),
+    applyFilters() {},
+    loadAccountTestModels() {},
+    renderMetrics() {},
+    renderPlan() {},
+    renderSelectOptions() {},
+    resumeActiveJob: async () => {},
+    showNotice() {},
+  };
+  vm.runInNewContext(loadSnapshotContract + `
+    firstPromise = loadSnapshot();
+    secondPromise = loadSnapshot();
+  `, context);
+  assert.equal(requests.length, 2);
+  const newer = {
+    marker: 'newer',
+    rows: [{ key: 'newer' }],
+    filters: { statuses: [], availabilities: [], diffKinds: [] },
+    sub2api: { apiError: null, statsError: null },
+  };
+  requests[1]({ ok: true, json: async () => newer });
+  assert.equal(await context.secondPromise, true);
+  const older = {
+    marker: 'older',
+    rows: [{ key: 'older' }],
+    filters: { statuses: [], availabilities: [], diffKinds: [] },
+    sub2api: { apiError: null, statsError: null },
+  };
+  requests[0]({ ok: true, json: async () => older });
+  assert.equal(await context.firstPromise, false);
+  assert.equal(stateForTest.snapshot.marker, 'newer');
+});
+
+test('frontend account search includes phone numbers', () => {
+  const filterContract = sourceSection('function applyFilters', 'function showNotice');
+  const context = {
+    elements: {
+      searchInput: { value: '13800138000' },
+      statusFilter: { value: '' },
+      availabilityFilter: { value: '' },
+      sourceFilter: { value: '' },
+      diffFilter: { value: '' },
+    },
+    renderRows() {},
+    state: {
+      rows: [],
+      snapshot: {
+        rows: [
+          { key: 'phone', phone: '+86 138-0013-8000' },
+          { key: 'other', phone: '13900139000' },
+        ],
+      },
+    },
+  };
+  vm.runInNewContext(filterContract + '\napplyFilters(); result = state.rows.map((row) => row.key);', context);
+  assert.deepEqual([...context.result], ['phone']);
+});
+
+test('frontend administrator credential uses an origin-labelled password dialog', () => {
+  assert.match(htmlSource, /<dialog id="adminTokenDialog"[^>]*aria-labelledby="adminTokenTitle"/);
+  assert.match(htmlSource, /<input id="adminTokenInput"[^>]*type="password"[^>]*required>/);
+  assert.match(htmlSource, /<code id="adminTokenOrigin"><\/code>/);
+  assert.doesNotMatch(source, /window\.prompt\s*\(/);
+  assert.match(stylesSource, /\.auth-dialog::backdrop/);
+  const mobile = stylesSource.slice(stylesSource.indexOf('@media (max-width: 700px)'));
+  assert.match(mobile, /\.auth-dialog-form \{ padding: 18px; \}/);
+  assert.match(mobile, /\.auth-dialog-actions \.button \{ flex: 1 1 0; \}/);
+});

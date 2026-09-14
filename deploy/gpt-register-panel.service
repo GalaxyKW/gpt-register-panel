@@ -1,0 +1,98 @@
+[Unit]
+Description=GPT Register Panel
+Documentation=file:///mnt/nvme/item/gpt-register-panel/README.md
+Wants=network-online.target
+After=network-online.target
+RequiresMountsFor=/mnt/nvme
+# RequiresMountsFor covers ordered startup; BindsTo also stops the panel if an
+# externally managed mount disappears while the service is already running.
+BindsTo=mnt-nvme.mount
+# Refuse to fall back to the directory underneath a missing mount, or to start
+# on a read-only NTFS recovery mount.
+AssertPathIsMountPoint=/mnt/nvme
+AssertPathIsReadWrite=/mnt/nvme
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The current production tree is root-owned. Migrate User/Group together with
+# the gpt_register and runtime ownership before changing these values.
+User=root
+Group=root
+WorkingDirectory=/mnt/nvme/item/gpt-register-panel
+Environment=NODE_ENV=production
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# The executable entrypoint validates and loads the project .env itself. Do not
+# copy credentials into this unit or expose them through EnvironmentFile.
+ExecStartPre=/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/.env
+ExecStartPre=/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/backend/server.js
+ExecStartPre=/usr/bin/test -d /mnt/nvme/gpt_register
+ExecStartPre=/usr/bin/test -d /mnt/nvme/item/gpt-register-panel/runtime
+ExecStartPre=/usr/bin/test -d /mnt/nvme/tmp
+ExecStartPre=/usr/bin/test -x /usr/bin/node
+ExecStart=/usr/bin/node /mnt/nvme/item/gpt-register-panel/backend/server.js
+Restart=on-failure
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=45s
+# Let the panel handle SIGTERM first so it can persist interrupted job states
+# and terminate Phase3's process group. systemd still SIGKILLs the full cgroup
+# at TimeoutStopSec if a descendant escapes the bounded drain.
+KillSignal=SIGTERM
+KillMode=mixed
+SendSIGKILL=yes
+UMask=0077
+LimitCORE=0
+TasksMax=512
+
+# Baseline hardening that remains compatible with the Phase3 Node/Chromium
+# child process and its private Xvfb instance.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+# Keep the host filesystem read-only except for panel runtime state, the
+# gpt_register state tree used by Phase3, and its existing screenshot folder.
+# If deployment configuration moves a writable path, add that exact trusted
+# path here instead of widening this list.
+ReadWritePaths=/mnt/nvme/item/gpt-register-panel/runtime
+ReadWritePaths=/mnt/nvme/gpt_register
+ReadWritePaths=/mnt/nvme/tmp
+# gpt_register atomically replaces state files in its root, so the root itself
+# must remain writable. Overlay executable code, dependencies and configuration
+# as read-only to prevent a browser compromise from persisting into Phase3.
+ReadOnlyPaths=/mnt/nvme/gpt_register/index.js
+ReadOnlyPaths=/mnt/nvme/gpt_register/src
+ReadOnlyPaths=/mnt/nvme/gpt_register/node_modules
+ReadOnlyPaths=/mnt/nvme/gpt_register/package.json
+ReadOnlyPaths=-/mnt/nvme/gpt_register/package-lock.json
+ReadOnlyPaths=-/mnt/nvme/gpt_register/config.json
+ReadOnlyPaths=-/mnt/nvme/gpt_register/config.local.json
+ReadOnlyPaths=-/mnt/nvme/gpt_register/config.server.json
+ReadOnlyPaths=-/mnt/nvme/gpt_register/cloudflare-email-worker.js
+InaccessiblePaths=-/mnt/nvme/item/gpt-register-panel/.git
+InaccessiblePaths=-/mnt/nvme/gpt_register/.git
+ProtectHostname=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+SystemCallArchitectures=native
+# Node, Sub2API, Chromium and Xvfb require local, IPv4/IPv6 and network-status
+# sockets. Raw packet, Bluetooth and VM sockets are deliberately unavailable.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+# Phase3 deliberately resolves its already-verified parent directory FD via
+# /proc/<panel-pid>/fd. With Yama ptrace_scope=1 the child needs this one
+# capability to traverse its parent's descriptor; removing it breaks Phase3.
+# Drop it only after the descriptor is passed as an inherited child FD.
+CapabilityBoundingSet=CAP_SYS_PTRACE
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

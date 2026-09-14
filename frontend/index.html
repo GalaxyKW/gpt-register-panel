@@ -25,6 +25,14 @@
   <main class="page">
     <section id="notice" class="notice" hidden></section>
 
+    <section id="jobPanel" class="job-panel" hidden aria-live="polite">
+      <div class="job-mark" aria-hidden="true">↗</div>
+      <div class="job-copy">
+        <div class="job-heading"><strong id="jobTitle">任务</strong><span id="jobStatus" class="badge badge-neutral">-</span></div>
+        <p id="jobMeta">-</p>
+      </div>
+    </section>
+
     <section class="metrics" aria-label="概览">
       <div class="metric"><span>来源 token</span><strong id="tokenCount">-</strong><small id="tokenDetail">-</small></div>
       <div class="metric"><span>Sub2API 账号</span><strong id="accountCount">-</strong><small id="accountDetail">-</small></div>
@@ -34,8 +42,8 @@
 
     <section class="toolbar" aria-label="筛选">
       <label class="search-field">
-        <span>搜索账号、邮箱或身份</span>
-        <input id="searchInput" type="search" placeholder="例如 free00001 或邮箱">
+        <span>搜索账号、邮箱、手机号或身份</span>
+        <input id="searchInput" type="search" placeholder="例如 free00001、邮箱或手机号">
       </label>
       <label>
         <span>状态</span>
@@ -58,7 +66,18 @@
         <span>差异</span>
         <select id="diffFilter"><option value="">全部差异</option></select>
       </label>
+      <label class="test-model-field">
+        <span>账号测试模型</span>
+        <select id="accountTestModelSelect">
+          <option value="gpt-5.6-luna">5.6-luna</option>
+          <option value="gpt-5.6-terra">gpt-5.6-terra</option>
+          <option value="gpt-5.6-sol">gpt-5.6-sol</option>
+          <option value="gpt-5.4">gpt-5.4</option>
+          <option value="gpt-5.4-mini">gpt-5.4-mini</option>
+        </select>
+      </label>
       <div class="toolbar-actions">
+        <label class="toolbar-check"><input id="historicalToggle" type="checkbox"><span>显示历史备份</span></label>
         <span id="selectionCount" class="selection-count">已选 0</span>
         <details class="column-picker">
           <summary><span class="button-icon" aria-hidden="true">☷</span><span>列</span></summary>
@@ -68,7 +87,9 @@
         <button id="clearSelectionButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">×</span><span>清除选择</span></button>
         <button id="previewButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">⌁</span><span>检查差异</span></button>
         <button id="importButton" class="button button-primary" type="button" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
-        <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="Phase 3 仅支持单账号"><span class="button-icon" aria-hidden="true">↗</span><span>Phase 3</span></button>
+        <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="按顺序提交所选账号的 Phase 3"><span class="button-icon" aria-hidden="true">↗</span><span>Phase 3 批量</span></button>
+        <button id="accountTestButton" class="button button-secondary account-test-button" type="button" disabled title="测试已选的上游账号"><span class="button-icon" aria-hidden="true">✓</span><span>测试选中账号</span></button>
+        <button id="cleanupButton" class="button button-danger" type="button" disabled title="删除 tokens 和 use_token 中已过期的 JSON 文件"><span class="button-icon" aria-hidden="true">⌫</span><span>清理过期 token</span></button>
       </div>
     </section>
 
@@ -113,6 +134,26 @@
       <div id="emptyState" class="empty-state" hidden>没有符合筛选条件的账号</div>
     </section>
   </main>
+
+  <dialog id="adminTokenDialog" class="auth-dialog" aria-labelledby="adminTokenTitle" aria-describedby="adminTokenHelp">
+    <form method="dialog" class="auth-dialog-form">
+      <div class="auth-dialog-heading">
+        <span class="auth-dialog-mark" aria-hidden="true"></span>
+        <div>
+          <h2 id="adminTokenTitle">需要管理员令牌</h2>
+          <p id="adminTokenHelp">令牌仅发送到当前面板 <code id="adminTokenOrigin"></code>，关闭后不会保留在输入框中。</p>
+        </div>
+      </div>
+      <label class="auth-dialog-field" for="adminTokenInput">
+        <span>面板管理员令牌</span>
+        <input id="adminTokenInput" name="panel-token" type="password" autocomplete="current-password" spellcheck="false" maxlength="4096" required>
+      </label>
+      <div class="auth-dialog-actions">
+        <button class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
+        <button class="button button-primary" type="submit" value="confirm">验证并重试</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/app.js" defer></script>
 </body>
 </html>

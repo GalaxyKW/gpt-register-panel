@@ -4,9 +4,31 @@ const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
 
+require('./test-isolation');
+
 const { PanelDb } = require('../backend/db');
-const { buildImportPlan, importPlanSummary, buildSnapshot } = require('../backend/sync');
-const { findUsernameEntry, sanitizeLog, runPhase3Job, getActivePhase3Job } = require('../backend/phase3Worker');
+const {
+  buildImportPlan,
+  buildOAuthUpdatePayload,
+  collectCandidates,
+  executeImportPlanItem,
+  importPlanSummary,
+  buildSnapshot,
+  confirmedSub2ApiRead,
+  snapshotVersion,
+  resolveGroupIds,
+  writeBackup,
+} = require('../backend/sync');
+const {
+  canonicalPhase3Keys,
+  findUsernameEntry,
+  sanitizeLog,
+  runCommand,
+  runPhase3Job,
+  getActivePhase3Job,
+} = require('../backend/phase3Worker');
+const { getAccountAvailability } = require('../backend/accountAvailability');
+const { identitiesCompatible } = require('../backend/diff');
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-m2-'));
@@ -46,6 +68,56 @@ test('import plan assigns five-digit free names and never exposes raw token', ()
   assert.equal(safe.items[0].fingerprints.access.length, 16);
 });
 
+test('five-digit free name capacity fails closed instead of emitting a sixth digit', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const plan = buildImportPlan(sources, [{
+    id: 99999,
+    name: 'free99999',
+    identityKeys: ['user:other-user'],
+    tokenFingerprints: {},
+  }]);
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'free_name_exhausted');
+  assert.equal(plan[0].accountName, null);
+});
+
+test('import plan ignores historical old_codex backups', () => {
+  const { root } = fixture();
+  fs.renameSync(
+    path.join(root, 'tokens', 'one.json'),
+    path.join(root, 'tokens', 'old_codex-one.json'),
+  );
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const plan = buildImportPlan(sources, []);
+  assert.equal(plan.length, 0);
+});
+
+test('snapshot CAS distinguishes omitted, failed, and confirmed-empty remote reads', () => {
+  const base = {
+    sources: {
+      tokens: [],
+      usernameContentHash: null,
+      usernameMtimeMs: 0,
+      usernameSize: 0,
+    },
+    accounts: [],
+  };
+  const omitted = snapshotVersion({ ...base, sub2apiRead: false, apiError: null });
+  const failed = snapshotVersion({ ...base, sub2apiRead: false, apiError: 'redacted failure' });
+  const confirmedEmpty = snapshotVersion({ ...base, sub2apiRead: true, apiError: null });
+  assert.equal(new Set([omitted, failed, confirmedEmpty]).size, 3);
+  assert.equal(confirmedSub2ApiRead({ ...base, sub2apiRead: false, apiError: null }), false);
+  assert.equal(confirmedSub2ApiRead({ ...base, sub2apiRead: false, apiError: 'redacted failure' }), false);
+  assert.equal(confirmedSub2ApiRead({ ...base, sub2apiRead: true, apiError: null }), true);
+  assert.equal(confirmedSub2ApiRead({
+    _internal: { ...base, sub2apiRead: true, apiError: null },
+    sub2api: { apiError: 'inconsistent public failure' },
+  }), false);
+});
+
 test('PanelDb persists jobs and audit rows in an independent SQLite file', async () => {
   const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-db-')), 'panel.sqlite3');
   const db = new PanelDb(file);
@@ -55,6 +127,10 @@ test('PanelDb persists jobs and audit rows in an independent SQLite file', async
   assert.equal((await db.getJob(job.id)).status, 'succeeded');
   assert.equal((await db.listAudit(10)).length, 1);
   assert.equal(fs.statSync(file).mode & 0o077, 0);
+  const pending = await db.createJob('token_import', { selectedKeys: ['y'] }, 'tester');
+  const secondLiveDb = new PanelDb(file);
+  assert.equal((await secondLiveDb.getJob(pending.id)).status, 'queued');
+  await db.updateJob(pending.id, { status: 'failed', error: 'test cleanup' });
 });
 
 test('phase3 worker matches only records with a password and redacts logs', () => {
@@ -63,6 +139,10 @@ test('phase3 worker matches only records with a password and redacts logs', () =
   process.env.GPT_REGISTER_ROOT = root;
   try {
     assert.equal(findUsernameEntry({ email: 'ONE@example.test' }).email, 'one@example.test');
+    assert.deepEqual(
+      canonicalPhase3Keys({ email: 'ONE@example.test' }).sort(),
+      ['email:one@example.test'],
+    );
     assert.throws(() => findUsernameEntry({ email: 'missing@example.test' }), /未找到/);
     assert.equal(sanitizeLog('access_token=secret refresh_token:secret2 Bearer abc.def').includes('secret'), false);
   } finally {
@@ -71,12 +151,74 @@ test('phase3 worker matches only records with a password and redacts logs', () =
   }
 });
 
+test('phase3 username reads enforce a non-overridable hard size limit', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-username-limit-'));
+  const usernameFile = path.join(root, 'username.json');
+  fs.writeFileSync(usernameFile, '[]\n');
+  fs.truncateSync(usernameFile, 32 * 1024 * 1024 + 1);
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    maximum: process.env.GPT_REGISTER_USERNAME_MAX_BYTES,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_USERNAME_MAX_BYTES = String(Number.MAX_SAFE_INTEGER);
+  try {
+    assert.throws(
+      () => findUsernameEntry({ email: 'bounded@example.test' }),
+      (error) => error.code === 'PHASE3_USERNAME_TOO_LARGE',
+    );
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.maximum === undefined) delete process.env.GPT_REGISTER_USERNAME_MAX_BYTES;
+    else process.env.GPT_REGISTER_USERNAME_MAX_BYTES = previous.maximum;
+  }
+});
+
+test('username record limits are shared by snapshots and Phase3 and remain hard-capped', () => {
+  const {
+    readGptRegisterSources,
+    usernameRecordLimit,
+  } = require('../backend/adapters/gptRegisterFs');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-username-record-limit-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'record-limit@example.test', password: 'hidden' },
+    {},
+    {},
+    {},
+  ]));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    maximum: process.env.GPT_REGISTER_USERNAME_MAX_RECORDS,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_USERNAME_MAX_RECORDS = '3';
+  try {
+    assert.equal(usernameRecordLimit(Number.MAX_SAFE_INTEGER), 100_000);
+    assert.throws(
+      () => readGptRegisterSources({ rootDirectory: root }),
+      (error) => error.code === 'GPT_REGISTER_USERNAME_RECORD_LIMIT',
+    );
+    assert.throws(
+      () => findUsernameEntry({ email: 'record-limit@example.test' }),
+      (error) => error.code === 'GPT_REGISTER_USERNAME_RECORD_LIMIT',
+    );
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.maximum === undefined) delete process.env.GPT_REGISTER_USERNAME_MAX_RECORDS;
+    else process.env.GPT_REGISTER_USERNAME_MAX_RECORDS = previous.maximum;
+  }
+});
+
 test('phase3 jobs run serially and reject duplicate account submissions', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
   fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
-    { email: 'queue-one@example.test', password: 'hidden' },
+    { email: 'queue-one@example.test', phone: '138-0000', password: 'hidden' },
     { email: 'queue-two@example.test', password: 'hidden' },
   ]));
   fs.writeFileSync(path.join(root, 'index.js'), [
@@ -97,7 +239,7 @@ test('phase3 jobs run serially and reject duplicate account submissions', async 
   const events = [];
   const db = {
     async updateJob(id, patch) { updates.push({ id, patch }); },
-    async audit() {},
+    async audit() { throw new Error('simulated audit storage failure'); },
   };
   const logger = {
     info(event, fields) { events.push({ event, fields }); },
@@ -105,13 +247,37 @@ test('phase3 jobs run serially and reject duplicate account submissions', async 
     error(event, fields) { events.push({ event, fields }); },
   };
   try {
-    const first = runPhase3Job({ email: 'queue-one@example.test', db, jobId: 'job-one', logger });
+    assert.deepEqual(
+      canonicalPhase3Keys({ email: 'queue-one@example.test' }).sort(),
+      ['email:queue-one@example.test', 'phone:1380000'],
+    );
+    const first = runPhase3Job({
+      email: 'queue-one@example.test',
+      db,
+      jobId: 'job-one',
+      logger,
+      async persistSuccess(result) {
+        events.push({ event: 'phase3.terminal_persisted', fields: { email: result.email } });
+      },
+    });
     assert.equal(getActivePhase3Job({ email: 'queue-one@example.test' }).jobId, 'job-one');
     await assert.rejects(
       runPhase3Job({ email: 'queue-one@example.test', db, jobId: 'job-duplicate', logger }),
       (error) => error.code === 'PHASE3_DUPLICATE',
     );
-    const second = runPhase3Job({ email: 'queue-two@example.test', db, jobId: 'job-two', logger });
+    await assert.rejects(
+      runPhase3Job({ phone: '+1380000', db, jobId: 'job-phone-duplicate', logger }),
+      (error) => error.code === 'PHASE3_DUPLICATE',
+    );
+    const second = runPhase3Job({
+      email: 'queue-two@example.test',
+      db,
+      jobId: 'job-two',
+      logger,
+      async persistSuccess(result) {
+        events.push({ event: 'phase3.terminal_persisted', fields: { email: result.email } });
+      },
+    });
     const [firstResult, secondResult] = await Promise.all([first, second]);
     assert.equal(firstResult.email, 'queue-one@example.test');
     assert.equal(secondResult.email, 'queue-two@example.test');
@@ -119,6 +285,432 @@ test('phase3 jobs run serially and reject duplicate account submissions', async 
     assert.equal(getActivePhase3Job({ email: 'queue-two@example.test' }), null);
     assert.deepEqual(updates.map((item) => item.id), ['job-one', 'job-two']);
     assert.equal(events.filter((item) => item.event === 'phase3.started_after_queue').length, 2);
+    assert.equal(events.filter((item) => item.event === 'phase3.audit_failed_after_success').length, 2);
+    for (const email of ['queue-one@example.test', 'queue-two@example.test']) {
+      const terminalIndex = events.findIndex((item) => (
+        item.event === 'phase3.terminal_persisted' && item.fields.email === email
+      ));
+      const auditFailureIndex = events.findIndex((item) => (
+        item.event === 'phase3.audit_failed_after_success' && item.fields.email === email
+      ));
+      assert.equal(terminalIndex >= 0 && terminalIndex < auditFailureIndex, true);
+    }
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('Phase3 shutdown preserves success when a valid token was already published', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-shutdown-token-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'shutdown-token@example.test', password: 'hidden' },
+  ]));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const email = (process.argv.find((arg) => arg.startsWith('--email=')) || '').slice(8);",
+    "fs.writeFileSync(path.join(process.cwd(), 'tokens', 'shutdown.json'), JSON.stringify({ access_token: 'published-before-stop', email }));",
+    "process.on('SIGTERM', () => {});",
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+    grace: process.env.PANEL_PHASE3_KILL_GRACE_MS,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  process.env.PANEL_PHASE3_KILL_GRACE_MS = '100';
+  const controller = new AbortController();
+  const order = [];
+  try {
+    const running = runPhase3Job({
+      email: 'shutdown-token@example.test',
+      db: {
+        async updateJob() {},
+        async audit() { order.push('audit'); },
+      },
+      jobId: 'job-shutdown-token',
+      signal: controller.signal,
+      async persistSuccess() { order.push('terminal'); },
+    });
+    const tokenPath = path.join(root, 'tokens', 'shutdown.json');
+    for (let attempt = 0; !fs.existsSync(tokenPath) && attempt < 200; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(fs.existsSync(tokenPath), true);
+    controller.abort();
+    const result = await running;
+    assert.equal(result.interruptedAfterToken, true);
+    assert.deepEqual(order, ['terminal', 'audit']);
+  } finally {
+    controller.abort();
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+    if (previous.grace === undefined) delete process.env.PANEL_PHASE3_KILL_GRACE_MS;
+    else process.env.PANEL_PHASE3_KILL_GRACE_MS = previous.grace;
+  }
+});
+
+test('phase3 pins one source tree while preserving cwd, __dirname, and relative require semantics', async () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-pinned-'));
+  const root = path.join(parent, 'register');
+  const movedRoot = root + '-moved';
+  fs.mkdirSync(root, { mode: 0o700 });
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.mkdirSync(path.join(root, 'src'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'pinned@example.test', password: 'hidden', status: 'oauth_done' },
+  ]));
+  fs.writeFileSync(path.join(root, 'src', 'early.js'), [
+    "const fs = require('node:fs');",
+    "module.exports = { value: 'early-original', directory: __dirname, ino: fs.statSync(__dirname).ino };",
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'src', 'late.js'), [
+    "const fs = require('node:fs');",
+    "module.exports = { value: 'late-original', directory: __dirname, ino: fs.statSync(__dirname).ino };",
+  ].join('\n'));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const early = require('./src/early');",
+    'const pinned = process.cwd();',
+    'const original = fs.realpathSync(pinned);',
+    "const moved = original + '-moved';",
+    'const rootBefore = fs.statSync(pinned);',
+    'const dirnameBefore = fs.statSync(__dirname);',
+    'fs.renameSync(original, moved);',
+    'fs.mkdirSync(original, { mode: 0o700 });',
+    "fs.mkdirSync(path.join(original, 'tokens'));",
+    "fs.mkdirSync(path.join(original, 'use_token'));",
+    "fs.mkdirSync(path.join(original, 'src'));",
+    "fs.writeFileSync(path.join(original, 'username.json'), JSON.stringify([{ email: 'pinned@example.test', password: 'replacement' }]));",
+    "fs.writeFileSync(path.join(original, 'tokens', 'forged.json'), JSON.stringify({ access_token: 'forged-token', email: 'pinned@example.test' }));",
+    "fs.writeFileSync(path.join(original, 'src', 'late.js'), \"module.exports = { value: 'late-replacement', ino: 0 };\\n\");",
+    "const late = require('./src/late');",
+    'const cwdAfter = process.cwd();',
+    "fs.writeFileSync(path.join(cwdAfter, 'tokens', 'real.json'), JSON.stringify({ access_token: 'real-token', email: 'pinned@example.test' }));",
+    "fs.writeFileSync(path.join(cwdAfter, 'semantics.json'), JSON.stringify({",
+    '  rootIno: rootBefore.ino,',
+    '  dirnameIno: dirnameBefore.ino,',
+    '  cwdAfterIno: fs.statSync(cwdAfter).ino,',
+    '  sourceIno: fs.statSync(path.join(cwdAfter, \"src\")).ino,',
+    '  early,',
+    '  late,',
+    '}));',
+    "fs.writeSync(1, 'unlabelled-worker-secret-value\\n');",
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  const events = [];
+  const logger = {
+    info(event, fields) { events.push({ event, fields }); },
+    warn(event, fields) { events.push({ event, fields }); },
+    error(event, fields) { events.push({ event, fields }); },
+  };
+  try {
+    const result = await runPhase3Job({
+      email: 'pinned@example.test',
+      jobId: 'pinned-job',
+      db: { async audit() {}, async updateJob() {} },
+      logger,
+    });
+    assert.equal(result.tokenFile, 'tokens/real.json');
+    const semantics = JSON.parse(fs.readFileSync(path.join(movedRoot, 'semantics.json'), 'utf8'));
+    assert.equal(semantics.dirnameIno, semantics.rootIno);
+    assert.equal(semantics.cwdAfterIno, semantics.rootIno);
+    assert.equal(semantics.early.value, 'early-original');
+    assert.equal(semantics.late.value, 'late-original');
+    assert.equal(semantics.early.ino, semantics.sourceIno);
+    assert.equal(semantics.late.ino, semantics.sourceIno);
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'real.json')), false);
+    assert.equal(fs.existsSync(path.join(root, 'tokens', 'forged.json')), true);
+    const persistedSurface = JSON.stringify({ result, events });
+    assert.equal(persistedSurface.includes('unlabelled-worker-secret-value'), false);
+    assert.equal(Object.hasOwn(result.process, 'stdout'), false);
+    assert.equal(Object.hasOwn(result.process, 'stderr'), false);
+    assert.equal(result.process.stdoutBytes > 0, true);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('gpt_register snapshots reject group/world-writable roots, directories, and JSON files', () => {
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const makeRoot = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-untrusted-source-'));
+    fs.mkdirSync(path.join(root, 'tokens'));
+    fs.mkdirSync(path.join(root, 'use_token'));
+    fs.writeFileSync(path.join(root, 'username.json'), '[]\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(root, 'tokens', 'one.json'), JSON.stringify({
+      access_token: 'opaque-test-token',
+      email: 'permissions@example.test',
+    }), { mode: 0o600 });
+    return root;
+  };
+  for (const mutate of [
+    (root) => fs.chmodSync(root, 0o777),
+    (root) => fs.chmodSync(path.join(root, 'tokens'), 0o777),
+    (root) => fs.chmodSync(path.join(root, 'username.json'), 0o666),
+    (root) => fs.chmodSync(path.join(root, 'tokens', 'one.json'), 0o666),
+  ]) {
+    const root = makeRoot();
+    mutate(root);
+    assert.throws(
+      () => readGptRegisterSources({ rootDirectory: root }),
+      (error) => error.code === 'GPT_REGISTER_PATH_PERMISSIONS_INVALID',
+    );
+  }
+});
+
+test('phase3 refuses writable index.js and node executables before spawning', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-path-mode-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'mode@example.test', password: 'hidden' },
+  ]), { mode: 0o600 });
+  const marker = path.join(root, 'spawned');
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    `fs.writeFileSync(${JSON.stringify(marker)}, 'spawned');`,
+  ].join('\n'), { mode: 0o666 });
+  fs.chmodSync(path.join(root, 'index.js'), 0o666);
+  const fakeNode = path.join(root, 'fake-node');
+  fs.writeFileSync(fakeNode, '#!/bin/sh\nexit 1\n', { mode: 0o777 });
+  fs.chmodSync(fakeNode, 0o777);
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  const run = () => runPhase3Job({
+    email: 'mode@example.test',
+    db: { async audit() {}, async updateJob() {} },
+  });
+  try {
+    await assert.rejects(run(), (error) => error.code === 'PHASE3_PATH_PERMISSIONS_INVALID');
+    assert.equal(fs.existsSync(marker), false);
+    fs.chmodSync(path.join(root, 'index.js'), 0o600);
+    process.env.GPT_REGISTER_NODE_PATH = fakeNode;
+    await assert.rejects(run(), (error) => error.code === 'PHASE3_PATH_PERMISSIONS_INVALID');
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('phase3 timeout waits for a SIGTERM-resistant child to be killed and closed', async () => {
+  const startedAt = Date.now();
+  await assert.rejects(
+    runCommand(process.execPath, ['-e', [
+      "process.on('SIGTERM', () => {});",
+      'setInterval(() => {}, 1000);',
+    ].join('\n')], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 1000,
+      terminationGraceMs: 100,
+      maxOutputBytes: 4096,
+    }),
+    (error) => error.code === 'PHASE3_TIMEOUT' && error.details?.signal === 'SIGKILL',
+  );
+  const durationMs = Date.now() - startedAt;
+  assert.equal(durationMs >= 1000, true);
+  assert.equal(durationMs < 5000, true);
+
+  const descendantStartedAt = Date.now();
+  await assert.rejects(
+    runCommand('/bin/sh', ['-c', "(trap '' TERM; while :; do /bin/sleep 1; done) & trap 'exit 0' TERM; wait"], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 1000,
+      terminationGraceMs: 100,
+      maxOutputBytes: 4096,
+    }),
+    (error) => error.code === 'PHASE3_TIMEOUT',
+  );
+  assert.equal(Date.now() - descendantStartedAt < 5000, true);
+});
+
+test('phase3 timeout kills an escaped detached descendant before releasing the job', async () => {
+  const script = [
+    '( /usr/bin/setsid /bin/sh -c "trap \'\' TERM; exec /bin/sleep 10" &',
+    '  echo keeper_pid=$!;',
+    '  /bin/sleep 0.3',
+    ') &',
+    "trap '' TERM",
+    'while :; do /bin/sleep 1; done',
+  ].join('\n');
+  const startedAt = Date.now();
+  let failure;
+  try {
+    await runCommand('/bin/sh', ['-c', script], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 1000,
+      terminationGraceMs: 100,
+      terminationHardDeadlineMs: 100,
+      maxOutputBytes: 4096,
+    });
+    assert.fail('runCommand should reject after the timeout');
+  } catch (error) {
+    failure = error;
+  }
+  const keeperPid = Number(failure?.details?.stdout?.match(/keeper_pid=(\d+)/)?.[1]);
+  assert.equal(
+    Number.isSafeInteger(keeperPid) && keeperPid > 1,
+    true,
+    JSON.stringify(failure?.details || {}),
+  );
+  let keeperStillRunning = false;
+  if (process.platform !== 'win32') {
+    try {
+      const stat = fs.readFileSync('/proc/' + String(keeperPid) + '/stat', 'utf8');
+      const commandEnd = stat.lastIndexOf(')');
+      const state = commandEnd < 0 ? '' : stat.slice(commandEnd + 2).trim().split(/\s+/)[0];
+      keeperStillRunning = !['Z', 'X'].includes(state);
+    } catch {}
+  }
+  if (keeperStillRunning) {
+    try { process.kill(-keeperPid, 'SIGKILL'); } catch {}
+    try { process.kill(keeperPid, 'SIGKILL'); } catch {}
+  }
+  assert.equal(keeperStillRunning, false);
+  assert.equal(failure?.code, 'PHASE3_TIMEOUT');
+  assert.equal(failure?.details?.signal, 'SIGKILL');
+  assert.equal(failure?.details?.forcedClose, false);
+  assert.equal(Date.now() - startedAt >= 1000, true);
+  assert.equal(Date.now() - startedAt < 3000, true);
+});
+
+test('phase3 output is continuously drained, bounded, and redacted after chunk assembly', async () => {
+  const splitSecret = await runCommand('/bin/sh', ['-c', [
+    "printf 'Authorization: Bea'",
+    "printf 'rer boundary-secret-value'",
+  ].join('; ')], {
+    cwd: os.tmpdir(),
+    env: { PATH: process.env.PATH || '' },
+    timeoutMs: 5000,
+    maxOutputBytes: 4096,
+  });
+  assert.equal(splitSecret.stdout.includes('boundary-secret-value'), false);
+  assert.match(splitSecret.stdout, /\[redacted\]/);
+
+  await assert.rejects(
+    runCommand('/bin/sh', ['-c', "trap '' TERM; exec /usr/bin/yes x"], {
+      cwd: os.tmpdir(),
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 5000,
+      terminationGraceMs: 100,
+      maxOutputBytes: 1024,
+    }),
+    (error) => error.code === 'PHASE3_OUTPUT_LIMIT'
+      && error.details?.signal === 'SIGKILL'
+      && Buffer.byteLength(error.details.stdout) < 2048,
+  );
+});
+
+test('phase3 persists a discard disposition when the account is deactivated', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-discard-'));
+  const movedRoot = root + '-moved';
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'discard@example.test', password: 'hidden', status: 'oauth_done' },
+  ]));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "const file = path.join(process.cwd(), 'username.json');",
+    "const records = JSON.parse(fs.readFileSync(file, 'utf8'));",
+    "records[0].status = 'account_deactivated';",
+    "records[0].phase3Disposition = 'discard';",
+    "records[0].phase3LastAttemptAt = new Date().toISOString();",
+    "records[0].phase3LastErrorCode = 'ACCOUNT_DEACTIVATED';",
+    "records[0].phase3Retryable = false;",
+    "fs.writeFileSync(file, JSON.stringify(records, null, 2));",
+    'const original = fs.realpathSync(process.cwd());',
+    "fs.renameSync(original, original + '-moved');",
+    'fs.mkdirSync(original, { mode: 0o700 });',
+    "fs.mkdirSync(path.join(original, 'tokens'));",
+    "fs.mkdirSync(path.join(original, 'use_token'));",
+    "fs.writeFileSync(path.join(original, 'username.json'), JSON.stringify([{ email: 'discard@example.test', password: 'replacement', status: 'manual_replacement' }]));",
+    "fs.writeSync(2, 'unlabelled-discard-secret\\n');",
+    "process.stderr.write('ACCOUNT_DEACTIVATED\\n');",
+    'process.exitCode = 1;',
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  const events = [];
+  const logger = {
+    info(event, fields) { events.push({ event, fields }); },
+    warn(event, fields) { events.push({ event, fields }); },
+    error(event, fields) { events.push({ event, fields }); },
+  };
+  try {
+    let failure;
+    await assert.rejects(
+      runPhase3Job({
+        email: 'discard@example.test',
+        jobId: 'discard-job',
+        db: { async audit() {}, async updateJob() {} },
+        logger,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'ACCOUNT_DEACTIVATED' && error.accountDisposition === 'discard';
+      },
+    );
+    assert.equal(JSON.stringify(failure.details).includes('unlabelled-discard-secret'), false);
+    assert.equal(Object.hasOwn(failure.details, 'stdout'), false);
+    assert.equal(Object.hasOwn(failure.details, 'stderr'), false);
+    assert.equal(JSON.stringify(events).includes('unlabelled-discard-secret'), false);
+    const records = JSON.parse(fs.readFileSync(path.join(movedRoot, 'username.json'), 'utf8'));
+    assert.equal(records[0].status, 'account_deleted');
+    assert.equal(records[0].phase3Disposition, 'discard');
+    assert.equal(records[0].phase3LastErrorCode, 'ACCOUNT_DEACTIVATED');
+    const replacement = JSON.parse(fs.readFileSync(path.join(root, 'username.json'), 'utf8'));
+    assert.equal(replacement[0].status, 'manual_replacement');
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous.root;
@@ -148,7 +740,9 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
       return { stats: { '42': {
         historical: { totalTokens: 1234, requests: 12 },
         current: { totalTokens: 55, requests: 2 },
-      } }, errors: {} };
+      } }, errors: {
+        '42': { code: 'UPSTREAM', message: 'Bearer secret.header.value access_token=hidden-value' },
+      } };
     },
   };
   const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
@@ -159,6 +753,9 @@ test('snapshot maps Sub2API historical and current-window stats to rows', async 
   const row = snapshot.rows.find((item) => item.accountId === 42);
   assert.equal(row.usage.historical.totalTokens, 1234);
   assert.equal(row.usage.current.totalTokens, 55);
+  const account = snapshot.sub2api.accounts.find((item) => item.id === 42);
+  assert.equal(account.usageError.includes('secret.header.value'), false);
+  assert.equal(account.usageError.includes('hidden-value'), false);
 });
 
 test('import plan never updates an available Sub2API account', () => {
@@ -169,6 +766,8 @@ test('import plan never updates an available Sub2API account', () => {
   const account = {
     id: 9,
     name: 'free00009',
+    platform: 'openai',
+    type: 'oauth',
     status: 'active',
     schedulable: true,
     identityKeys: token.identityKeys,
@@ -179,6 +778,17 @@ test('import plan never updates an available Sub2API account', () => {
   assert.equal(plan[0].reason, 'sub2api_available');
 });
 
+test('import plan skips an explicitly disabled source token', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  token.disabled = true;
+  const plan = buildImportPlan(sources, []);
+  assert.equal(plan[0].action, 'skip');
+  assert.equal(plan[0].reason, 'source_disabled');
+});
+
 test('import plan updates only an unavailable account with a fresh source token', () => {
   const { root } = fixture();
   const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
@@ -187,6 +797,8 @@ test('import plan updates only an unavailable account with a fresh source token'
   const account = {
     id: 10,
     name: 'free00010',
+    platform: 'openai',
+    type: 'oauth',
     status: 'error',
     schedulable: false,
     identityKeys: token.identityKeys,
@@ -195,6 +807,27 @@ test('import plan updates only an unavailable account with a fresh source token'
   const plan = buildImportPlan(sources, [account]);
   assert.equal(plan[0].action, 'update');
   assert.equal(plan[0].reason, 'token_changed');
+});
+
+test('import plan treats a missing remote refresh fingerprint as unknown', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const account = {
+    id: 11,
+    name: 'free00011',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys: token.identityKeys,
+    // Sub2API's lite listing exposes access fingerprint but not refresh.
+    tokenFingerprints: { access: token.fingerprints.access, refresh: null },
+  };
+  const plan = buildImportPlan(sources, [account]);
+  assert.equal(plan[0].action, 'skip');
+  assert.equal(plan[0].reason, 'already_in_sync');
 });
 
 test('import plan writes only the freshest candidate when one account has duplicate sources', () => {
@@ -223,7 +856,7 @@ test('import plan writes only the freshest candidate when one account has duplic
     last_refresh: '2099-08-20T00:00:00.000Z',
   }));
   fs.writeFileSync(path.join(root, 'use_token', 'old.json'), JSON.stringify({
-    access_token: makeAccess('old-user', false),
+    access_token: makeAccess('fresh-user', false),
     refresh_token: 'refresh-old',
     email: 'duplicate@example.test',
     expired: '2020-08-21T00:00:00.000Z',
@@ -234,17 +867,756 @@ test('import plan writes only the freshest candidate when one account has duplic
   const plan = buildImportPlan(sources, [{
     id: 77,
     name: 'free00077',
+    platform: 'openai',
+    type: 'oauth',
     status: 'error',
     schedulable: false,
-    identityKeys: ['email:duplicate@example.test'],
+    identityKeys: ['user:fresh-user', 'email:duplicate@example.test'],
     tokenFingerprints: { access: 'different-access', refresh: 'different-refresh' },
   }]);
   const updates = plan.filter((item) => item.action === 'update');
-  const superseded = plan.filter((item) => item.reason === 'superseded_by_newer_source');
   assert.equal(updates.length, 1);
   assert.equal(updates[0].source, 'tokens');
   assert.equal(updates[0].relativePath, 'tokens/fresh.json');
-  assert.equal(superseded.length, 1);
-  assert.equal(superseded[0].source, 'use_token');
-  assert.equal(superseded[0].supersededBy, 'tokens/fresh.json');
+  assert.equal(updates[0].duplicateSource, true);
+  assert.equal(plan.some((item) => item.relativePath === 'use_token/old.json'), false);
+});
+
+test('treats expired active Sub2API accounts as unavailable for replacement', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const account = {
+    id: 88,
+    name: 'free00088',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    expiresAt: '2020-01-01T00:00:00.000Z',
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: 'old-access' },
+  };
+  assert.equal(getAccountAvailability(account, Date.parse('2026-01-01T00:00:00.000Z')).key, 'unavailable');
+  assert.equal(buildImportPlan(sources, [account])[0].action, 'update');
+  assert.equal(getAccountAvailability({ ...account, autoPauseOnExpired: false }, Date.parse('2026-01-01T00:00:00.000Z')).key, 'available');
+  assert.equal(getAccountAvailability({
+    ...account,
+    expiresAt: null,
+    credentialExpiresAt: '2020-01-01T00:00:00.000Z',
+    credentialExpiryStatus: 'valid',
+  }, Date.parse('2026-01-01T00:00:00.000Z')).key, 'available');
+});
+
+test('unknown Sub2API state fails closed and is never planned as an update', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const base = {
+    id: 89,
+    name: 'free00089',
+    platform: 'openai',
+    type: 'oauth',
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: 'old-access' },
+  };
+  const missingStatus = { ...base, schedulable: true };
+  assert.deepEqual(getAccountAvailability(missingStatus), {
+    key: 'unknown',
+    reason: 'sub2api_status_missing',
+  });
+  const plan = buildImportPlan(sources, [missingStatus]);
+  assert.equal(plan[0].action, 'skip');
+  assert.equal(plan[0].reason, 'sub2api_status_missing');
+
+  assert.equal(getAccountAvailability({
+    ...base,
+    status: 'active',
+    schedulable: true,
+    expiresAt: 'not-a-date',
+  }).key, 'unknown');
+  assert.equal(getAccountAvailability({ ...base, status: 'active' }).key, 'unknown');
+});
+
+test('does not match contradictory strong identities even with the same email', () => {
+  assert.equal(identitiesCompatible(
+    ['account:source-a', 'email:shared@example.test'],
+    ['account:source-b', 'email:shared@example.test'],
+  ), false);
+  assert.equal(identitiesCompatible(
+    ['account:source-a', 'email:old@example.test'],
+    ['account:source-a', 'email:new@example.test'],
+  ), true);
+  assert.equal(identitiesCompatible(
+    ['account:source-a', 'user:user-a', 'email:shared@example.test'],
+    ['email:shared@example.test'],
+  ), false);
+  assert.equal(identitiesCompatible(
+    ['email:shared@example.test'],
+    ['email:shared@example.test'],
+  ), true);
+});
+
+function syntheticToken(relativePath, identityKeys, options = {}) {
+  return {
+    source: options.source || 'tokens',
+    relativePath,
+    fileName: path.basename(relativePath),
+    mtimeMs: options.mtimeMs || 1,
+    parseStatus: 'ok',
+    expiryStatus: options.expiryStatus || 'valid',
+    expiresAt: options.expiresAt === undefined ? '2099-01-01T00:00:00.000Z' : options.expiresAt,
+    lastRefresh: options.lastRefresh || null,
+    disabled: false,
+    email: options.email || '',
+    accountId: options.accountId || '',
+    userId: options.userId || '',
+    identityKeys,
+    fingerprints: {
+      access: options.accessFingerprint || ('access-' + relativePath),
+      refresh: options.refreshFingerprint || null,
+    },
+    raw: {
+      access_token: options.accessToken || ('opaque-' + relativePath),
+      ...(options.refreshToken ? { refresh_token: options.refreshToken } : {}),
+    },
+  };
+}
+
+test('candidate grouping merges partial versions but keeps different workspace users separate', () => {
+  const complete = syntheticToken(
+    'tokens/complete.json',
+    ['account:workspace-a', 'user:user-a', 'email:same@example.test'],
+    { accountId: 'workspace-a', userId: 'user-a', email: 'same@example.test', mtimeMs: 2 },
+  );
+  const userOnly = syntheticToken(
+    'use_token/user-only.json',
+    ['user:user-a', 'email:same@example.test'],
+    { source: 'use_token', userId: 'user-a', email: 'same@example.test', mtimeMs: 1 },
+  );
+  const merged = collectCandidates({ tokens: [userOnly, complete] });
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].records.length, 2);
+  assert.equal(buildImportPlan({ tokens: [userOnly, complete], usernames: [] }, []).length, 1);
+
+  const firstUser = syntheticToken(
+    'tokens/user-one.json',
+    ['account:shared-workspace', 'user:user-one'],
+    { accountId: 'shared-workspace', userId: 'user-one' },
+  );
+  const secondUser = syntheticToken(
+    'tokens/user-two.json',
+    ['account:shared-workspace', 'user:user-two'],
+    { accountId: 'shared-workspace', userId: 'user-two' },
+  );
+  assert.equal(collectCandidates({ tokens: [firstUser, secondUser] }).length, 2);
+  assert.deepEqual(
+    buildImportPlan({ tokens: [secondUser, firstUser], usernames: [] }, []).map((item) => item.action),
+    ['create', 'create'],
+  );
+
+  const firstWorkspace = syntheticToken(
+    'tokens/workspace-one.json',
+    ['account:workspace-one', 'user:shared-user'],
+    { accountId: 'workspace-one', userId: 'shared-user' },
+  );
+  const secondWorkspace = syntheticToken(
+    'tokens/workspace-two.json',
+    ['account:workspace-two', 'user:shared-user'],
+    { accountId: 'workspace-two', userId: 'shared-user' },
+  );
+  assert.equal(collectCandidates({ tokens: [firstWorkspace, secondWorkspace] }).length, 2);
+  assert.deepEqual(
+    buildImportPlan({ tokens: [secondWorkspace, firstWorkspace], usernames: [] }, [])
+      .map((item) => item.action),
+    ['create', 'create'],
+  );
+});
+
+test('ambiguous partial strong identities fail closed instead of creating duplicates', () => {
+  const firstUser = syntheticToken(
+    'tokens/user-one.json',
+    ['account:shared-workspace', 'user:user-one'],
+    { accountId: 'shared-workspace', userId: 'user-one' },
+  );
+  const secondUser = syntheticToken(
+    'tokens/user-two.json',
+    ['account:shared-workspace', 'user:user-two'],
+    { accountId: 'shared-workspace', userId: 'user-two' },
+  );
+  const accountOnly = syntheticToken(
+    'use_token/account-only.json',
+    ['account:shared-workspace'],
+    { source: 'use_token', accountId: 'shared-workspace' },
+  );
+  const plan = buildImportPlan({ tokens: [firstUser, accountOnly, secondUser], usernames: [] }, []);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'conflicting_strong_identity');
+});
+
+test('contradictory source identities cannot compete for one partial remote identity', () => {
+  const firstUser = syntheticToken(
+    'tokens/user-one.json',
+    ['account:shared-workspace', 'user:user-one'],
+    { accountId: 'shared-workspace', userId: 'user-one', mtimeMs: 1 },
+  );
+  const secondUser = syntheticToken(
+    'tokens/user-two.json',
+    ['account:shared-workspace', 'user:user-two'],
+    { accountId: 'shared-workspace', userId: 'user-two', mtimeMs: 2 },
+  );
+  const partialRemote = {
+    id: 41,
+    name: 'free00041',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    schemaValid: true,
+    accountId: 'shared-workspace',
+    userId: '',
+    identityKeys: ['account:shared-workspace'],
+    tokenFingerprints: {},
+  };
+
+  const plan = buildImportPlan(
+    { tokens: [firstUser, secondUser], usernames: [] },
+    [partialRemote],
+  );
+  assert.equal(plan.length, 2);
+  assert.deepEqual(plan.map((item) => item.action), ['conflict', 'conflict']);
+  assert.deepEqual(plan.map((item) => item.reason), [
+    'ambiguous_sub2api_identity',
+    'ambiguous_sub2api_identity',
+  ]);
+});
+
+test('strong source selects the correct remote ID and ignores an email-only legacy row', () => {
+  const token = syntheticToken(
+    'tokens/current.json',
+    ['account:account-a', 'user:user-a', 'email:shared@example.test'],
+    { accountId: 'account-a', userId: 'user-a', email: 'shared@example.test' },
+  );
+  const plan = buildImportPlan({ tokens: [token], usernames: [] }, [
+    {
+      id: 264,
+      name: 'free00006',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'error',
+      schedulable: false,
+      identityKeys: ['email:shared@example.test'],
+      tokenFingerprints: { access: 'legacy' },
+    },
+    {
+      id: 266,
+      name: 'free00007',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'error',
+      schedulable: false,
+      identityKeys: ['account:account-a', 'user:user-a', 'email:shared@example.test'],
+      tokenFingerprints: { access: 'old' },
+    },
+  ]);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].accountId, 266);
+});
+
+test('standard UUID identities match case-insensitively without creating a duplicate', () => {
+  const accountUuidUpper = '{123E4567-E89B-12D3-A456-426614174000}';
+  const userUuidUpper = '123E4567-E89B-12D3-A456-426614174001';
+  const token = syntheticToken(
+    'tokens/uuid.json',
+    ['account:' + accountUuidUpper, 'user:' + userUuidUpper],
+    { accountId: accountUuidUpper, userId: userUuidUpper },
+  );
+  const plan = buildImportPlan({ tokens: [token], usernames: [] }, [{
+    id: 267,
+    name: 'free00267',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys: [
+      'account:123e4567-e89b-12d3-a456-426614174000',
+      'user:123e4567-e89b-12d3-a456-426614174001',
+    ],
+    tokenFingerprints: { access: 'old' },
+  }]);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].accountId, 267);
+});
+
+test('group resolution accepts only one exact safe match', async () => {
+  const previousIds = process.env.SUB2API_GROUP_IDS;
+  const previousName = process.env.SUB2API_GROUP_NAME;
+  try {
+    delete process.env.SUB2API_GROUP_IDS;
+    process.env.SUB2API_GROUP_NAME = 'share';
+    assert.deepEqual(await resolveGroupIds({
+      async listGroups() {
+        return [
+          { id: 3, name: 'share' },
+          { id: 4, name: 'share-beta' },
+          { id: 5, slug: 'not-share' },
+        ];
+      },
+    }), [3]);
+    await assert.rejects(
+      resolveGroupIds({
+        async listGroups() {
+          return [{ id: 3, name: 'share' }, { id: 6, code: 'SHARE' }];
+        },
+      }),
+      (error) => error.code === 'SUB2API_GROUP_AMBIGUOUS',
+    );
+    await assert.rejects(
+      resolveGroupIds({ async listGroups() { return [{ id: true, name: 'share' }]; } }),
+      (error) => error.code === 'SUB2API_GROUP_NOT_FOUND',
+    );
+
+    process.env.SUB2API_GROUP_IDS = '7, 7,9';
+    assert.deepEqual(await resolveGroupIds({ async listGroups() { throw new Error('unused'); } }), [7, 9]);
+    process.env.SUB2API_GROUP_IDS = '7,unsafe';
+    await assert.rejects(
+      resolveGroupIds({ async listGroups() { throw new Error('unused'); } }),
+      (error) => error.code === 'SUB2API_GROUP_CONFIG_INVALID',
+    );
+  } finally {
+    if (previousIds === undefined) delete process.env.SUB2API_GROUP_IDS;
+    else process.env.SUB2API_GROUP_IDS = previousIds;
+    if (previousName === undefined) delete process.env.SUB2API_GROUP_NAME;
+    else process.env.SUB2API_GROUP_NAME = previousName;
+  }
+});
+
+test('OAuth update payload preserves refresh metadata without exposing it in summaries', () => {
+  const accessToken = [
+    'header',
+    Buffer.from(JSON.stringify({
+      'https://api.openai.com/auth': {
+        chatgpt_plan_type: 'free',
+        poid: 'organization-a',
+      },
+    })).toString('base64url'),
+    'signature',
+  ].join('.');
+  const source = syntheticToken('tokens/refresh.json', ['account:account-a', 'user:user-a'], {
+    accountId: 'account-a',
+    userId: 'user-a',
+    accessToken,
+    refreshToken: 'refresh-value',
+  });
+  source.raw.client_id = 'untrusted-client-id';
+  source.raw.scope = 'x'.repeat(5000);
+  source.raw.token_type = 'Bearer\nunsafe';
+  source.raw.organization_id = 'y'.repeat(513);
+  const payload = buildOAuthUpdatePayload({
+    _raw: source.raw,
+    _record: source,
+    email: source.email,
+    expiresAt: source.expiresAt,
+  });
+  assert.equal(payload.credentials.refresh_token, 'refresh-value');
+  assert.equal(typeof payload.credentials.client_id, 'string');
+  assert.equal(payload.credentials.client_id.length > 0, true);
+  assert.notEqual(payload.credentials.client_id, 'untrusted-client-id');
+  assert.equal(Object.hasOwn(payload.credentials, 'scope'), false);
+  assert.equal(Object.hasOwn(payload.credentials, 'token_type'), false);
+  assert.equal(payload.credentials.plan_type, 'free');
+  assert.equal(payload.credentials.organization_id, 'organization-a');
+});
+
+test('update plan uses the ID-scoped OAuth endpoint and rechecks availability', async () => {
+  const identityKeys = ['account:account-a', 'user:user-a', 'email:update@example.test'];
+  const source = syntheticToken('tokens/update.json', identityKeys, {
+    accountId: 'account-a',
+    userId: 'user-a',
+    email: 'update@example.test',
+    accessFingerprint: 'new-fingerprint',
+    accessToken: 'new-access-value',
+  });
+  const before = {
+    id: 12,
+    name: 'free00012',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys,
+    tokenFingerprints: { access: 'old-fingerprint' },
+  };
+  const after = {
+    ...before,
+    status: 'active',
+    schedulable: true,
+    tokenFingerprints: { access: source.fingerprints.access },
+  };
+  const planItem = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
+  let reads = 0;
+  let genericCalls = 0;
+  const applied = [];
+  const client = {
+    async getAccount(id) {
+      assert.equal(id, 12);
+      reads += 1;
+      return reads === 1 ? before : after;
+    },
+    async applyOAuthCredentials(id, payload) {
+      applied.push({ id, payload });
+      return after;
+    },
+    async importCodexSession() {
+      genericCalls += 1;
+      throw new Error('update must not use generic import');
+    },
+  };
+  const outcome = await executeImportPlanItem({ client, item: planItem });
+  assert.equal(outcome.skipped, false);
+  assert.equal(outcome.verification.accountId, 12);
+  assert.equal(applied.length, 1);
+  assert.equal(applied[0].id, 12);
+  assert.equal(Object.hasOwn(applied[0].payload.credentials, 'refresh_token'), false);
+  assert.equal(typeof applied[0].payload.credentials.client_id, 'string');
+  assert.equal(applied[0].payload.credentials.client_id.length > 0, true);
+  assert.match(applied[0].payload.extra.access_token_sha256, /^[a-f0-9]{64}$/);
+  assert.equal(genericCalls, 0);
+
+  const availableClient = {
+    async getAccount() { return { ...before, status: 'active', schedulable: true }; },
+    async applyOAuthCredentials() { throw new Error('available target must be skipped'); },
+  };
+  const skipped = await executeImportPlanItem({ client: availableClient, item: planItem });
+  assert.equal(skipped.skipped, true);
+  assert.equal(skipped.reason, 'sub2api_available');
+
+  let unknownUpdateCalls = 0;
+  const unknownClient = {
+    async getAccount() { return { ...before, status: '', statusKnown: false, schedulable: true }; },
+    async applyOAuthCredentials() { unknownUpdateCalls += 1; },
+  };
+  const unknown = await executeImportPlanItem({ client: unknownClient, item: planItem });
+  assert.equal(unknown.skipped, true);
+  assert.equal(unknown.reason, 'sub2api_status_missing');
+  assert.equal(unknownUpdateCalls, 0);
+
+  let identityUpdateCalls = 0;
+  const changedIdentityClient = {
+    async getAccount() {
+      return { ...before, identityKeys: ['account:different-account', 'user:different-user'] };
+    },
+    async applyOAuthCredentials() { identityUpdateCalls += 1; },
+  };
+  await assert.rejects(
+    executeImportPlanItem({ client: changedIdentityClient, item: planItem }),
+    (error) => error.code === 'SUB2API_TARGET_IDENTITY_MISMATCH',
+  );
+  assert.equal(identityUpdateCalls, 0);
+});
+
+test('update preflight binds every strong identity dimension from the planned remote row', async () => {
+  const source = syntheticToken(
+    'tokens/account-only.json',
+    ['account:shared-account'],
+    { accountId: 'shared-account', accessFingerprint: 'new-fingerprint' },
+  );
+  const plannedRemote = {
+    id: 13,
+    name: 'free00013',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys: ['account:shared-account', 'user:planned-user'],
+    tokenFingerprints: { access: 'old-fingerprint' },
+  };
+  const planItem = buildImportPlan({ tokens: [source], usernames: [] }, [plannedRemote])[0];
+  assert.equal(planItem.action, 'update');
+
+  let mutations = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item: planItem,
+      client: {
+        async getAccount() {
+          return {
+            ...plannedRemote,
+            // This replacement still matches the source's account ID. The
+            // planned remote user ID is what must make the preflight fail.
+            identityKeys: ['account:shared-account', 'user:replacement-user'],
+          };
+        },
+        async applyOAuthCredentials() { mutations += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_TARGET_CHANGED',
+  );
+  assert.equal(mutations, 0);
+});
+
+test('source token changes after remote preflight block every mutation', async () => {
+  const runScenario = async (changeSource) => {
+    const { root } = fixture();
+    const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+    const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+    const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+    const before = {
+      id: 90,
+      name: 'free00090',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'error',
+      schedulable: false,
+      identityKeys: token.identityKeys,
+      tokenFingerprints: { access: 'old-fingerprint' },
+    };
+    const item = buildImportPlan(sources, [before])[0];
+    let changed = false;
+    let mutations = 0;
+    const client = {
+      async getAccount() {
+        if (!changed) {
+          changed = true;
+          changeSource(root);
+        }
+        return before;
+      },
+      async applyOAuthCredentials() { mutations += 1; },
+    };
+    await assert.rejects(
+      executeImportPlanItem({ client, item, sourceRoot: root }),
+      (error) => error.code === 'SOURCE_TOKEN_CHANGED',
+    );
+    assert.equal(mutations, 0);
+  };
+
+  await runScenario((root) => {
+    fs.writeFileSync(path.join(root, 'tokens', 'one.json'), JSON.stringify({
+      access_token: 'replacement-access',
+      refresh_token: 'replacement-refresh',
+      account_id: 'a-1',
+      user_id: 'u-1',
+      email: 'one@example.test',
+      type: 'codex',
+    }));
+  });
+
+  await runScenario((root) => {
+    fs.writeFileSync(path.join(root, 'use_token', 'new-winner.json'), JSON.stringify({
+      access_token: 'newer-access',
+      refresh_token: 'newer-refresh',
+      account_id: 'a-1',
+      user_id: 'u-1',
+      email: 'one@example.test',
+      last_refresh: '2099-01-01T00:00:00.000Z',
+      type: 'codex',
+    }));
+  });
+});
+
+test('final remote preflight skips a target that becomes available before mutation', async () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const before = {
+    id: 91,
+    name: 'free00091',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: 'old-fingerprint' },
+  };
+  const available = { ...before, status: 'active', schedulable: true };
+  const item = buildImportPlan(sources, [before])[0];
+  let reads = 0;
+  let mutations = 0;
+  const outcome = await executeImportPlanItem({
+    sourceRoot: root,
+    item,
+    client: {
+      async getAccount() {
+        reads += 1;
+        return reads === 1 ? before : available;
+      },
+      async applyOAuthCredentials() { mutations += 1; },
+    },
+  });
+  assert.equal(reads, 2);
+  assert.equal(mutations, 0);
+  assert.equal(outcome.skipped, true);
+  assert.equal(outcome.reason, 'sub2api_available');
+});
+
+test('create verification consumes the nested Codex import account ID', async () => {
+  const identityKeys = ['account:new-account', 'user:new-user'];
+  const source = syntheticToken('tokens/new.json', identityKeys, {
+    accountId: 'new-account',
+    userId: 'new-user',
+    accessFingerprint: 'new-create-fp',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  source.raw.credentials = { access_token: 'nested-import-value' };
+  source.raw.unknown = { credential: 'nested-unknown-value' };
+  let genericCalls = 0;
+  let importPayload = null;
+  const client = {
+    async listAccounts() { return []; },
+    async importCodexSession(payload) {
+      genericCalls += 1;
+      importPayload = payload;
+      return {
+        total: 1,
+        created: 1,
+        updated: 0,
+        skipped: 0,
+        failed: 0,
+        items: [{ index: 0, action: 'created', account_id: 42 }],
+      };
+    },
+    async getAccount(id) {
+      assert.equal(id, 42);
+      return {
+        id,
+        name: item.accountName,
+        platform: 'openai',
+        type: 'oauth',
+        status: 'active',
+        schedulable: true,
+        identityKeys,
+        tokenFingerprints: { access: source.fingerprints.access },
+      };
+    },
+    async applyOAuthCredentials() { throw new Error('create must not use ID-scoped update'); },
+  };
+  const outcome = await executeImportPlanItem({ client, item, groups: [3] });
+  assert.equal(genericCalls, 1);
+  assert.equal(importPayload.update_existing, false);
+  assert.equal(importPayload.content.includes('nested-import-value'), false);
+  assert.equal(importPayload.content.includes('nested-unknown-value'), false);
+  assert.equal(outcome.result.accountId, 42);
+  assert.equal(outcome.verification.accountId, 42);
+
+  await assert.rejects(
+    executeImportPlanItem({
+      client: {
+        async listAccounts() { return []; },
+        async importCodexSession(payload) {
+          assert.equal(payload.update_existing, false);
+          // Even a buggy or concurrently raced remote must not be accepted as
+          // a successful create when it reports that an existing row changed.
+          return {
+            total: 1,
+            created: 0,
+            updated: 1,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'updated', account_id: 99 }],
+          };
+        },
+      },
+      item,
+      groups: [3],
+    }),
+    (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH',
+  );
+
+  await assert.rejects(
+    executeImportPlanItem({
+      client: {
+        async listAccounts() { return []; },
+        async importCodexSession() {
+          return {
+            total: 2,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 43 }],
+          };
+        },
+      },
+      item,
+    }),
+    (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH',
+  );
+
+  await assert.rejects(
+    executeImportPlanItem({
+      client: {
+        async listAccounts() {
+          return [{
+            id: 44,
+            name: 'free00044',
+            platform: 'openai',
+            type: 'oauth',
+            status: 'active',
+            schedulable: true,
+            identityKeys: ['account:unrelated', 'user:unrelated'],
+            tokenFingerprints: { access: 'unrelated' },
+          }];
+        },
+        async importCodexSession() {
+          return {
+            total: 1,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 44 }],
+          };
+        },
+      },
+      item,
+    }),
+    (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH',
+  );
+});
+
+test('credential backups require a private directory and enforce file retention', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-backups-'));
+  const backupDir = path.join(root, 'private');
+  fs.mkdirSync(backupDir, { mode: 0o700 });
+  const previous = {
+    directory: process.env.PANEL_BACKUP_DIR,
+    files: process.env.PANEL_BACKUP_MAX_FILES,
+    bytes: process.env.PANEL_BACKUP_MAX_TOTAL_BYTES,
+  };
+  process.env.PANEL_BACKUP_DIR = backupDir;
+  process.env.PANEL_BACKUP_MAX_FILES = '2';
+  process.env.PANEL_BACKUP_MAX_TOTAL_BYTES = String(1024 * 1024);
+  try {
+    for (let index = 0; index < 3; index += 1) {
+      const filePath = writeBackup({ index, credentials: 'fake-backup-value-' + index });
+      assert.equal(path.dirname(filePath), backupDir);
+      assert.equal(fs.statSync(filePath).mode & 0o077, 0);
+    }
+    assert.equal(fs.readdirSync(backupDir).filter((name) => name.endsWith('.json')).length, 2);
+    fs.chmodSync(backupDir, 0o777);
+    assert.throws(
+      () => writeBackup({ index: 4 }),
+      (error) => error.code === 'SUB2API_BACKUP_PERMISSIONS_INVALID',
+    );
+  } finally {
+    fs.chmodSync(backupDir, 0o700);
+    for (const [key, value] of Object.entries(previous)) {
+      const name = {
+        directory: 'PANEL_BACKUP_DIR',
+        files: 'PANEL_BACKUP_MAX_FILES',
+        bytes: 'PANEL_BACKUP_MAX_TOTAL_BYTES',
+      }[key];
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });

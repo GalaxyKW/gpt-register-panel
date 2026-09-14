@@ -1,11 +1,11 @@
 {
   "name": "gpt-register-panel",
   "version": "0.1.0",
-  "private": false,
-  "description": "Read-only account and token diff panel for gpt_register and Sub2API.",
+  "private": true,
+  "description": "Secure account, token diff, and controlled synchronization panel for gpt_register and Sub2API.",
   "main": "backend/index.js",
   "scripts": {
-    "test": "node --test tests/*.test.js",
+    "test": "node --require ./tests/test-isolation.js --test tests/*.test.js",
     "snapshot": "node backend/cli/snapshot.js",
     "snapshot:sub2api": "node backend/cli/snapshot.js --with-sub2api",
     "start": "node backend/server.js"

@@ -1,10 +1,13 @@
+const { normalizeIdentityValue } = require('./lib/token');
+
 function accountKeys(account) {
   if (Array.isArray(account?.identityKeys) && account.identityKeys.length > 0) {
     return account.identityKeys;
   }
   const keys = [];
   const add = (prefix, value) => {
-    const text = value === undefined || value === null ? '' : String(value).trim().toLowerCase();
+    const raw = value === undefined || value === null ? '' : String(value).trim();
+    const text = normalizeIdentityValue(prefix, raw);
     if (text && !keys.includes(prefix + text)) keys.push(prefix + text);
   };
   add('account:', account?.accountId);
@@ -13,17 +16,85 @@ function accountKeys(account) {
   return keys;
 }
 
+function identityParts(keys = []) {
+  const parts = { account: new Set(), user: new Set(), email: new Set() };
+  for (const key of keys) {
+    const raw = String(key || '').trim();
+    const separator = raw.indexOf(':');
+    if (separator <= 0) continue;
+    const kind = raw.slice(0, separator).toLowerCase();
+    const value = normalizeIdentityValue(kind + ':', raw.slice(separator + 1));
+    if (!value) continue;
+    if (kind === 'account') parts.account.add(value);
+    else if (kind === 'user') parts.user.add(value);
+    else if (kind === 'email') parts.email.add(value);
+  }
+  return parts;
+}
+
+function hasStrongIdentity(keys = []) {
+  const parts = identityParts(keys);
+  return parts.account.size > 0 || parts.user.size > 0;
+}
+
+function identitiesStronglyCompatible(leftKeys = [], rightKeys = []) {
+  const left = identityParts(leftKeys);
+  const right = identityParts(rightKeys);
+  let strongMatch = false;
+  for (const kind of ['account', 'user']) {
+    if (left[kind].size > 0 && right[kind].size > 0) {
+      const shares = [...left[kind]].some((value) => right[kind].has(value));
+      if (!shares) return false;
+      strongMatch = true;
+    }
+  }
+  return strongMatch;
+}
+
+// Strong identifiers must never contradict each other just because an email
+// happens to be shared or stale. Email remains a compatibility fallback only
+// when neither side has a stronger identifier. If either side has an account
+// or user ID, an email match alone is not enough to authorize a mapping.
+function identitiesCompatible(leftKeys = [], rightKeys = []) {
+  const left = identityParts(leftKeys);
+  const right = identityParts(rightKeys);
+  const leftHasStrong = left.account.size > 0 || left.user.size > 0;
+  const rightHasStrong = right.account.size > 0 || right.user.size > 0;
+  // Account/user IDs are authoritative. An email can change or be shared,
+  // so it must not veto an otherwise exact strong-identity match.
+  if (leftHasStrong || rightHasStrong) {
+    return identitiesStronglyCompatible(leftKeys, rightKeys);
+  }
+  if (left.email.size > 0 && right.email.size > 0) {
+    return [...left.email].some((value) => right.email.has(value));
+  }
+  return false;
+}
+
 function isExpired(record, nowMs) {
   if (!record?.expiresAt) return false;
   const timestamp = Date.parse(record.expiresAt);
   return Number.isFinite(timestamp) && timestamp <= nowMs;
 }
 
+function isExpiryInvalid(record) {
+  return record?.expiryStatus === 'invalid';
+}
+
+function normalizedIdentityKey(key) {
+  const raw = String(key || '').trim();
+  const separator = raw.indexOf(':');
+  if (separator <= 0) return raw;
+  const prefix = raw.slice(0, separator).toLowerCase() + ':';
+  return prefix + normalizeIdentityValue(prefix, raw.slice(separator + 1));
+}
+
 function addIndex(index, key, value) {
-  if (!key) return;
-  const list = index.get(key) || [];
+  const normalizedKey = normalizedIdentityKey(key);
+  if (!normalizedKey) return;
+  const list = index.get(normalizedKey) || [];
   list.push(value);
-  index.set(key, list);
+  index.set(normalizedKey, list);
 }
 
 function indexByIdentity(records, getKeys) {
@@ -46,8 +117,14 @@ function uniqueRecords(list) {
 
 function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
   const nowMs = Number(options.nowMs || Date.now());
+  // Files prefixed with old_codex are retained as backups, but are not part
+  // of the active source set. They can be included as diagnostic rows.
+  const includeHistorical = options.includeHistorical === true;
+  const activeTokenRecords = tokenRecords.filter((record) => (
+    record?.historical !== true
+  ));
   const tokenIndex = indexByIdentity(
-    tokenRecords.filter((record) => record.parseStatus === 'ok'),
+    activeTokenRecords.filter((record) => record.parseStatus === 'ok'),
     (record) => Array.isArray(record.identityKeys) ? record.identityKeys : [],
   );
   const accountIndex = indexByIdentity(accountRecords, accountKeys);
@@ -55,6 +132,36 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
   const items = [];
 
   for (const token of tokenRecords) {
+    if (token?.historical === true) {
+      if (!includeHistorical) continue;
+      if (token.parseStatus !== 'ok') {
+        items.push({
+          kind: 'invalid_file',
+          source: token.source,
+          relativePath: token.relativePath,
+          fileName: token.fileName,
+          token,
+          account: null,
+          issues: [token.parseError || '无法解析 token 文件'],
+        });
+        continue;
+      }
+      const historicalCandidates = uniqueRecords(
+        (token.identityKeys || [])
+          .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
+          .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
+      );
+      items.push({
+        kind: 'historical_backup',
+        source: token.source,
+        relativePath: token.relativePath,
+        fileName: token.fileName,
+        token,
+        account: historicalCandidates.length === 1 ? historicalCandidates[0] : null,
+        issues: ['historical_backup'],
+      });
+      continue;
+    }
     if (token.parseStatus !== 'ok') {
       items.push({
         kind: 'invalid_file',
@@ -68,36 +175,61 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
       continue;
     }
 
-    const duplicateKeys = (token.identityKeys || []).filter((key) => (tokenIndex.get(key) || []).length > 1);
+    // Email is a fallback identity and can legitimately be shared or stale.
+    // Only duplicate strong IDs should block automatic mapping.
+    const duplicateKeys = (token.identityKeys || []).filter((key) => {
+      const kind = String(key || '').split(':', 1)[0].toLowerCase();
+      if (!['account', 'user'].includes(kind)) return false;
+      return uniqueRecords(tokenIndex.get(normalizedIdentityKey(key)) || []).some((candidate) => (
+        candidate !== token
+          && identitiesStronglyCompatible(token.identityKeys || [], candidate.identityKeys || [])
+      ));
+    });
     if (duplicateKeys.length > 0) {
+      // Duplicate source files are still surfaced individually, but they do
+      // not make a uniquely matching Sub2API account look untracked. The
+      // import planner applies the same identity matching rule and chooses a
+      // single freshest source before writing.
+      const duplicateCandidates = uniqueRecords(
+        (token.identityKeys || [])
+          .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
+          .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
+      );
+      const duplicateAccount = duplicateCandidates.length === 1 ? duplicateCandidates[0] : null;
+      if (duplicateAccount) matchedAccountIds.add(String(duplicateAccount.id));
       items.push({
         kind: 'duplicate_identity',
         source: token.source,
         relativePath: token.relativePath,
         fileName: token.fileName,
         token,
-        account: null,
+        account: duplicateAccount,
         issues: duplicateKeys,
       });
       continue;
     }
 
     const candidates = uniqueRecords(
-      (token.identityKeys || []).flatMap((key) => accountIndex.get(key) || []),
+      (token.identityKeys || [])
+        .flatMap((key) => accountIndex.get(normalizedIdentityKey(key)) || [])
+        .filter((account) => identitiesCompatible(token.identityKeys, accountKeys(account))),
     );
     if (candidates.length === 0) {
+      const expiryInvalid = isExpiryInvalid(token);
+      const expired = isExpired(token, nowMs);
       items.push({
-        kind: 'token_only',
+        kind: expiryInvalid ? 'expiry_invalid' : expired ? 'expired' : 'token_only',
         source: token.source,
         relativePath: token.relativePath,
         fileName: token.fileName,
         token,
         account: null,
-        issues: isExpired(token, nowMs) ? ['expired'] : [],
+        issues: expiryInvalid ? ['expiry_invalid'] : expired ? ['expired'] : [],
       });
       continue;
     }
     if (candidates.length > 1) {
+      for (const candidate of candidates) matchedAccountIds.add(String(candidate.id));
       items.push({
         kind: 'mapping_conflict',
         source: token.source,
@@ -113,7 +245,8 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
     const account = candidates[0];
     matchedAccountIds.add(String(account.id));
     const issues = [];
-    if (isExpired(token, nowMs)) issues.push('expired');
+    if (isExpiryInvalid(token)) issues.push('expiry_invalid');
+    else if (isExpired(token, nowMs)) issues.push('expired');
     const tokenAccess = token.fingerprints?.access || null;
     const accountAccess = account.tokenFingerprints?.access || null;
     if (tokenAccess && accountAccess && tokenAccess !== accountAccess) {
@@ -135,14 +268,23 @@ function buildDiff(tokenRecords = [], accountRecords = [], options = {}) {
 
   for (const account of accountRecords) {
     if (!matchedAccountIds.has(String(account.id))) {
+      const keys = accountKeys(account);
+      const duplicateStrongKeys = keys.filter((key) => {
+        const kind = String(key || '').split(':', 1)[0].toLowerCase();
+        if (!['account', 'user'].includes(kind)) return false;
+        return uniqueRecords(accountIndex.get(normalizedIdentityKey(key)) || []).some((candidate) => (
+          String(candidate?.id) !== String(account.id)
+            && identitiesStronglyCompatible(keys, accountKeys(candidate))
+        ));
+      });
       items.push({
-        kind: 'sub2api_only',
+        kind: duplicateStrongKeys.length > 0 ? 'mapping_conflict' : 'sub2api_only',
         source: 'sub2api',
         relativePath: null,
         fileName: null,
         token: null,
         account,
-        issues: [],
+        issues: duplicateStrongKeys,
       });
     }
   }
@@ -167,12 +309,14 @@ function toSafeDiff(diff) {
             source: item.token.source,
             relativePath: item.token.relativePath,
             fileName: item.token.fileName,
+            historical: item.token.historical === true,
             parseStatus: item.token.parseStatus,
             parseError: item.token.parseError || null,
             email: item.token.email,
             accountId: item.token.accountId,
             userId: item.token.userId,
             expiresAt: item.token.expiresAt,
+            expiryStatus: item.token.expiryStatus || null,
             lastRefresh: item.token.lastRefresh,
             fingerprints: item.token.fingerprints,
           }
@@ -188,6 +332,7 @@ function toSafeDiff(diff) {
             accountId: item.account.accountId,
             userId: item.account.userId,
             expiresAt: item.account.expiresAt,
+            credentialExpiresAt: item.account.credentialExpiresAt,
             tokenFingerprints: item.account.tokenFingerprints,
             groupIds: item.account.groupIds,
           }
@@ -198,7 +343,11 @@ function toSafeDiff(diff) {
 
 module.exports = {
   accountKeys,
+  hasStrongIdentity,
+  identitiesStronglyCompatible,
+  identitiesCompatible,
   isExpired,
+  isExpiryInvalid,
   buildDiff,
   toSafeDiff,
 };
