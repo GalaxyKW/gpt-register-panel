@@ -53,23 +53,49 @@ function assertDirectoryTree(directory, label = '目录') {
   return absolute;
 }
 
-function syncDirectory(directory) {
+const UNSUPPORTED_DIRECTORY_FSYNC_CODES = new Set([
+  'EINVAL',
+  'ENOSYS',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+]);
+
+function isUnsupportedDirectoryFsyncError(error) {
+  return UNSUPPORTED_DIRECTORY_FSYNC_CODES.has(error?.code);
+}
+
+function syncDirectory(directory, fsApi = fs) {
   let descriptor;
+  let operationError;
+
   try {
-    descriptor = fs.openSync(directory, fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0));
-    fs.fsyncSync(descriptor);
-  } catch {
-    // Some filesystems (notably certain mounted user-space filesystems) do not
-    // support fsync on directories. The file operation itself remains valid.
-  } finally {
-    if (descriptor !== undefined) {
-      try { fs.closeSync(descriptor); } catch {}
+    descriptor = fsApi.openSync(
+      directory,
+      fsApi.constants.O_RDONLY | (fsApi.constants.O_DIRECTORY || 0),
+    );
+    try {
+      fsApi.fsyncSync(descriptor);
+    } catch (error) {
+      if (!isUnsupportedDirectoryFsyncError(error)) operationError = error;
+    }
+  } catch (error) {
+    operationError = error;
+  }
+
+  if (descriptor !== undefined) {
+    try {
+      fsApi.closeSync(descriptor);
+    } catch (error) {
+      if (!operationError) operationError = error;
     }
   }
+
+  if (operationError) throw operationError;
 }
 
 module.exports = {
   ensureDirectoryTree,
   assertDirectoryTree,
+  isUnsupportedDirectoryFsyncError,
   syncDirectory,
 };

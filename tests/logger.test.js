@@ -106,6 +106,11 @@ test('free-text redaction covers compound headers, structured values, and opaque
     'password fake-password-space handled',
     'credential fake-credential-space retained',
     'API key fake-api-space rotated',
+    'password is fake-password-copula handled-again',
+    'API key is "fake api copula" rotated-again',
+    'JWT was fake-jwt-copula rejected',
+    'apikey=fake-api-alias',
+    'pwd=fake-password-alias',
   ].join('; '));
   for (const secret of [
     'fake-access-space',
@@ -113,12 +118,20 @@ test('free-text redaction covers compound headers, structured values, and opaque
     'fake-password-space',
     'fake-credential-space',
     'fake-api-space',
+    'fake-password-copula',
+    'fake api copula',
+    'fake-jwt-copula',
+    'fake-api-alias',
+    'fake-password-alias',
   ]) assert.equal(spaceSeparated.includes(secret), false, secret + ' leaked');
   assert.match(spaceSeparated, /completed/);
   assert.match(spaceSeparated, /retried/);
   assert.match(spaceSeparated, /handled/);
   assert.match(spaceSeparated, /retained/);
   assert.match(spaceSeparated, /rotated/);
+  assert.match(spaceSeparated, /handled-again/);
+  assert.match(spaceSeparated, /rotated-again/);
+  assert.match(spaceSeparated, /rejected/);
 
   const metadata = [
     'access token expiry future',
@@ -126,6 +139,8 @@ test('free-text redaction covers compound headers, structured values, and opaque
     'token fingerprint safe-fingerprint',
     'token status active',
     'tokenCount 4',
+    'token is count 5',
+    'JWT was fingerprint safe-jwt-fingerprint',
   ].join('; ');
   assert.equal(redactText(metadata), metadata);
 
@@ -140,6 +155,32 @@ test('free-text redaction covers compound headers, structured values, and opaque
   );
   assert.equal(longUrl.includes(longUserinfoSecret), false);
   assert.equal(longUrl, 'https://[redacted]@host.example/path');
+});
+
+test('logger startup writes and fsyncs one valid JSONL preflight record', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const originalFsyncSync = fs.fsyncSync;
+  let fileFsyncCalls = 0;
+  fs.fsyncSync = function trackedFsync(descriptor) {
+    if (fs.fstatSync(descriptor).isFile()) fileFsyncCalls += 1;
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    const logger = new PanelLogger({ filePath, console: false });
+    assert.equal(logger.health().healthy, true);
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  const lines = fs.readFileSync(filePath, 'utf8').trimEnd().split('\n');
+  assert.equal(lines.length, 1);
+  const entry = JSON.parse(lines[0]);
+  assert.equal(entry.event, 'logger.write_preflight');
+  assert.equal(entry.level, 'info');
+  assert.equal(entry.pid, process.pid);
+  assert.ok(Number.isFinite(Date.parse(entry.timestamp)));
+  assert.ok(fileFsyncCalls >= 1);
 });
 
 test('structured logger rotates files, supports tail, and uses restrictive permissions', () => {
@@ -164,6 +205,44 @@ test('structured logger rotates files, supports tail, and uses restrictive permi
   });
   assert.equal(bounded.maxBytes, 128 * 1024 * 1024);
   assert.equal(bounded.rotations, 100);
+});
+
+test('logger treats rotation failure as a failed write until rotation recovers', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024, rotations: 2 });
+  fs.appendFileSync(filePath, JSON.stringify({
+    event: 'existing.large',
+    padding: 'x'.repeat(1100),
+  }) + '\n');
+
+  const originalRenameSync = fs.renameSync;
+  fs.renameSync = function failingRotation(from, to) {
+    if (from === filePath) {
+      const error = new Error('forced rotation failure');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalRenameSync.call(fs, from, to);
+  };
+  try {
+    logger.info('test.rotation.failure.one');
+    logger.info('test.rotation.failure.two');
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+
+  assert.equal(logger.health().healthy, false);
+  assert.equal(logger.health().failedWrites, 2);
+  assert.equal(logger.health().consecutiveWriteFailures, 2);
+  const failedText = fs.readFileSync(filePath, 'utf8');
+  assert.equal(failedText.includes('test.rotation.failure.one'), false);
+  assert.equal(failedText.includes('test.rotation.failure.two'), false);
+
+  logger.info('test.rotation.recovered');
+  assert.equal(logger.health().healthy, true);
+  assert.equal(logger.health().consecutiveWriteFailures, 0);
+  assert.equal(logger.tail(1)[0].event, 'test.rotation.recovered');
 });
 
 test('logger fails closed when its destination cannot be initialized', () => {
@@ -217,7 +296,7 @@ test('logger tail re-redacts valid legacy JSON lines before returning them', () 
     detail: 'access token legacy-space-secret at https://legacy-user:legacy-pass@host.example/path',
   }) + '\n');
   const logger = new PanelLogger({ filePath, console: false });
-  const serialized = JSON.stringify(logger.tail(1));
+  const serialized = JSON.stringify(logger.tail(2));
   assert.equal(serialized.includes('opaque-legacy-jwt'), false);
   assert.equal(serialized.includes('legacy-one'), false);
   assert.equal(serialized.includes('legacy-two'), false);
@@ -247,7 +326,10 @@ test('logger tail reads bounded blocks from the end and drops a truncated first 
     return originalReadSync.call(fs, descriptor, buffer, offset, length, position);
   };
   try {
-    assert.deepEqual(logger.tail(2).map((entry) => entry.event), ['tail.one', 'tail.two']);
+    assert.deepEqual(
+      logger.tail(3).map((entry) => entry.event),
+      ['tail.one', 'tail.two', 'logger.write_preflight'],
+    );
     assert.ok(requestedBytes <= hardReadLimit);
     assert.ok(requestedBytes < fs.statSync(filePath).size);
 

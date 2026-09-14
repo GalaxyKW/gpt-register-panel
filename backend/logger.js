@@ -8,7 +8,7 @@ const MAX_LOG_BYTES = 128 * 1024 * 1024;
 const MAX_LOG_ROTATIONS = 100;
 const LOG_TAIL_BLOCK_BYTES = 64 * 1024;
 const LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024;
-const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|prompts?|secrets?|secret_keys?|api_keys?|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
+const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|prompts?|secrets?|secret_keys?|api_?keys?|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
   'state', 'states', 'expiry', 'expiries', 'expiration', 'expirations',
@@ -160,9 +160,13 @@ function redactSpaceSeparatedPattern(value, pattern) {
   while ((match = pattern.exec(text))) {
     if (match.index < cursor) continue;
     if (match[3].length > 128 || !SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
-    if (pattern.lastIndex >= text.length || startsWithNonSecretMetadata(text, pattern.lastIndex)) continue;
+    let valueStart = pattern.lastIndex;
+    const connector = /^(?:is|was|are|were)\b[ \t]+/i.exec(text.slice(valueStart));
+    if (connector) valueStart += connector[0].length;
+    if (valueStart >= text.length || startsWithNonSecretMetadata(text, valueStart)) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
-    const span = assignedValueSpan(text, pattern.lastIndex);
+    output += text.slice(pattern.lastIndex, valueStart);
+    const span = assignedValueSpan(text, valueStart);
     output += span.replacement;
     cursor = span.end;
     pattern.lastIndex = Math.max(span.end, pattern.lastIndex);
@@ -368,11 +372,22 @@ class PanelLogger {
       // Probe the actual destination during startup. Merely validating the
       // parent directory would let a read-only mount, exhausted filesystem,
       // or an unsafe file replacement silently disable the entire audit log.
+      const timestamp = new Date().toISOString();
+      const line = JSON.stringify({
+        timestamp,
+        level: 'info',
+        event: 'logger.write_preflight',
+        pid: this.pid,
+      }) + '\n';
+      this.rotateIfNeeded(Buffer.byteLength(line));
       descriptor = this.openValidatedFile();
       fs.fchmodSync(descriptor, 0o600);
+      fs.writeFileSync(descriptor, line);
+      fs.fsyncSync(descriptor);
       fs.closeSync(descriptor);
       descriptor = undefined;
       this.fileHealthy = true;
+      this.lastWriteSucceededAt = timestamp;
     } catch (error) {
       if (descriptor !== undefined) {
         try { fs.closeSync(descriptor); } catch {}
@@ -428,6 +443,7 @@ class PanelLogger {
       descriptor = this.openValidatedFile();
       fs.fchmodSync(descriptor, 0o600);
       fs.writeFileSync(descriptor, line);
+      fs.fsyncSync(descriptor);
       this.fileHealthy = true;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = new Date().toISOString();
@@ -475,34 +491,56 @@ class PanelLogger {
   }
 
   rotateIfNeeded(nextBytes) {
-    let size = 0;
+    let fileStat;
     try {
-      const stat = fs.lstatSync(this.filePath);
-      if (stat.isSymbolicLink() || !stat.isFile()) return;
-      size = stat.size;
-    } catch {}
-    if (size + nextBytes <= this.maxBytes) return;
+      fileStat = fs.lstatSync(this.filePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return;
+      throw error;
+    }
+    if (fileStat.isSymbolicLink() || !fileStat.isFile()) {
+      throw new Error('日志轮转源必须是普通文件');
+    }
+    if (fileStat.size + nextBytes <= this.maxBytes) return;
     try {
       for (let index = this.rotations - 1; index >= 1; index -= 1) {
         const from = this.filePath + '.' + index;
         const to = this.filePath + '.' + (index + 1);
         let fromStat;
-        try { fromStat = fs.lstatSync(from); } catch { fromStat = null; }
-        if (!fromStat || fromStat.isSymbolicLink() || !fromStat.isFile()) continue;
+        try { fromStat = fs.lstatSync(from); } catch (error) {
+          if (error?.code === 'ENOENT') fromStat = null;
+          else throw error;
+        }
+        if (!fromStat) continue;
+        if (fromStat.isSymbolicLink() || !fromStat.isFile()) {
+          throw new Error('日志轮转源必须是普通文件');
+        }
         let toStat;
-        try { toStat = fs.lstatSync(to); } catch { toStat = null; }
-        if (toStat?.isSymbolicLink()) continue;
+        try { toStat = fs.lstatSync(to); } catch (error) {
+          if (error?.code === 'ENOENT') toStat = null;
+          else throw error;
+        }
+        if (toStat && (toStat.isSymbolicLink() || !toStat.isFile())) {
+          throw new Error('日志轮转目标必须是普通文件');
+        }
         fs.renameSync(from, to);
       }
-      const fileStat = fs.lstatSync(this.filePath);
-      if (!fileStat.isSymbolicLink() && fileStat.isFile()) {
-        const target = this.filePath + '.1';
-        let targetStat;
-        try { targetStat = fs.lstatSync(target); } catch { targetStat = null; }
-        if (!targetStat || (!targetStat.isSymbolicLink() && targetStat.isFile())) fs.renameSync(this.filePath, target);
+      const target = this.filePath + '.1';
+      let targetStat;
+      try { targetStat = fs.lstatSync(target); } catch (error) {
+        if (error?.code === 'ENOENT') targetStat = null;
+        else throw error;
       }
+      if (targetStat && (targetStat.isSymbolicLink() || !targetStat.isFile())) {
+        throw new Error('日志轮转目标必须是普通文件');
+      }
+      fs.renameSync(this.filePath, target);
     } catch (error) {
       this.fallback('error', 'logger.rotate_failed', { error: error.message });
+      const wrapped = new Error('日志轮转失败');
+      wrapped.code = 'PANEL_LOG_ROTATION_FAILED';
+      wrapped.cause = error;
+      throw wrapped;
     }
   }
 
