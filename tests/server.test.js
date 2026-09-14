@@ -129,6 +129,11 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
       'SUB2API_ACCOUNTS_PAGINATION_REQUIRED',
       'SUB2API_ACCOUNTS_PAGINATION_INVALID',
+      'SUB2API_GROUP_RESOLVE_FAILED',
+      'SUB2API_GROUP_NOT_FOUND',
+      'SUB2API_GROUP_AMBIGUOUS',
+      'SUB2API_GROUP_NOT_ACTIVE',
+      'SUB2API_GROUP_PLATFORM_MISMATCH',
     ]],
     [503, [
       'REQUEST_ABORTED',
@@ -149,6 +154,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
       'ACCOUNT_TEST_BASELINE_INVALID',
       'GPT_REGISTER_SOURCE_MISSING',
+      'SUB2API_GROUP_CONFIG_INVALID',
     ]],
   ]);
   for (const [expectedStatus, codes] of mappings) {
@@ -1748,7 +1754,7 @@ test('sync preview binds the resolved create group IDs with one consistent clien
       async listAccounts() { accountReads += 1; return []; },
       async listGroups() {
         groupReads += 1;
-        return [{ id: 17, name: 'share', platform: 'openai' }];
+        return [{ id: 17, name: 'share', platform: 'openai', status: 'active' }];
       },
     };
     server = createServer({

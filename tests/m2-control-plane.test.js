@@ -2781,7 +2781,7 @@ test('group resolution accepts only one exact safe match', async () => {
     assert.deepEqual(await resolveImportGroupBinding({
       async listGroups() {
         unnecessaryReads += 1;
-        return [{ id: 11, name: 'openai-default', platform: 'openai' }];
+        return [{ id: 11, name: 'openai-default', platform: 'openai', status: 'active' }];
       },
     }, createPlan), {
       mode: 'sub2api_default',
@@ -2801,10 +2801,10 @@ test('group resolution accepts only one exact safe match', async () => {
     assert.deepEqual(await resolveGroupIds({
       async listGroups() {
         return [
-          { id: 3, name: 'share', platform: 'openai' },
-          { id: 4, name: 'share-beta', platform: 'openai' },
-          { id: 5, slug: 'not-share', platform: 'openai' },
-          { id: 12, name: 'share', platform: 'anthropic' },
+          { id: 3, name: 'share', platform: 'openai', status: 'active' },
+          { id: 4, name: 'share-beta', platform: 'openai', status: 'active' },
+          { id: 5, slug: 'not-share', platform: 'openai', status: 'active' },
+          { id: 12, name: 'share', platform: 'anthropic', status: 'active' },
         ];
       },
     }), [3]);
@@ -2812,8 +2812,8 @@ test('group resolution accepts only one exact safe match', async () => {
       resolveGroupIds({
         async listGroups() {
           return [
-            { id: 3, name: 'share', platform: 'openai' },
-            { id: 6, code: 'SHARE', platform: 'openai' },
+            { id: 3, name: 'share', platform: 'openai', status: 'active' },
+            { id: 6, code: 'SHARE', platform: 'openai', status: 'active' },
           ];
         },
       }),
@@ -2821,7 +2821,9 @@ test('group resolution accepts only one exact safe match', async () => {
     );
     await assert.rejects(
       resolveGroupIds({
-        async listGroups() { return [{ id: true, name: 'share', platform: 'openai' }]; },
+        async listGroups() {
+          return [{ id: true, name: 'share', platform: 'openai', status: 'active' }];
+        },
       }),
       (error) => error.code === 'SUB2API_GROUP_NOT_FOUND',
     );
@@ -2834,13 +2836,52 @@ test('group resolution accepts only one exact safe match', async () => {
     );
 
     process.env.SUB2API_GROUP_IDS = '9, 7,9';
-    assert.deepEqual(await resolveGroupIds({ async listGroups() { throw new Error('unused'); } }), [7, 9]);
+    let explicitReads = 0;
+    const explicitGroups = {
+      async listGroups() {
+        explicitReads += 1;
+        return [
+          { id: 9, platform: 'openai', status: 'active' },
+          { id: 7, platform: 'openai', status: 'active' },
+        ];
+      },
+    };
+    assert.deepEqual(await resolveGroupIds(explicitGroups), [7, 9]);
     assert.deepEqual(await resolveImportGroupBinding({
-      async listGroups() { throw new Error('unused'); },
+      async listGroups() {
+        explicitReads += 1;
+        return [
+          { id: 7, platform: 'openai', status: 'active' },
+          { id: 9, platform: 'openai', status: 'active' },
+        ];
+      },
     }, createPlan), {
       mode: 'explicit',
       groupIds: [7, 9],
     });
+    assert.equal(explicitReads, 2);
+
+    for (const [groups, expectedCode] of [
+      [[{ id: 7, platform: 'openai', status: 'active' }], 'SUB2API_GROUP_NOT_FOUND'],
+      [[
+        { id: 7, platform: 'openai', status: 'inactive' },
+        { id: 9, platform: 'openai', status: 'active' },
+      ], 'SUB2API_GROUP_NOT_ACTIVE'],
+      [[
+        { id: 7, platform: 'anthropic', status: 'active' },
+        { id: 9, platform: 'openai', status: 'active' },
+      ], 'SUB2API_GROUP_PLATFORM_MISMATCH'],
+      [[
+        { id: 7, platform: 'openai', status: 'active' },
+        { id: 7, platform: 'openai', status: 'active' },
+        { id: 9, platform: 'openai', status: 'active' },
+      ], 'SUB2API_GROUP_AMBIGUOUS'],
+    ]) {
+      await assert.rejects(
+        resolveGroupIds({ async listGroups() { return groups; } }),
+        (error) => error.code === expectedCode,
+      );
+    }
     process.env.SUB2API_GROUP_IDS = '7,unsafe';
     await assert.rejects(
       resolveGroupIds({ async listGroups() { throw new Error('unused'); } }),
@@ -2873,7 +2914,9 @@ test('import rejects a named-group retarget before starting the job, backup, or 
   try {
     const previewClient = {
       async listAccounts() { return []; },
-      async listGroups() { return [{ id: 7, name: 'share', platform: 'openai' }]; },
+      async listGroups() {
+        return [{ id: 7, name: 'share', platform: 'openai', status: 'active' }];
+      },
     };
     const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
       rootDirectory: root,
@@ -2913,7 +2956,7 @@ test('import rejects a named-group retarget before starting the job, backup, or 
           async listAccounts() { return []; },
           async listGroups() {
             groupReads += 1;
-            return [{ id: 8, name: 'share', platform: 'openai' }];
+            return [{ id: 8, name: 'share', platform: 'openai', status: 'active' }];
           },
           async exportAccounts() { backups += 1; return { accounts: [] }; },
           async importCodexSession() { writes += 1; },
@@ -2923,6 +2966,81 @@ test('import rejects a named-group retarget before starting the job, backup, or 
       (error) => error.code === 'IMPORT_PLAN_STALE',
     );
     assert.equal(groupReads, 1);
+    assert.equal(started, 0);
+    assert.equal(backups, 0);
+    assert.equal(writes, 0);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('import revalidates explicit groups before starting the job, backup, or write', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.SUB2API_GROUP_IDS = '7';
+  delete process.env.SUB2API_GROUP_NAME;
+  try {
+    const previewClient = {
+      async listAccounts() { return []; },
+      async listGroups() {
+        return [{ id: 7, name: 'reviewed', platform: 'openai', status: 'active' }];
+      },
+    };
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: previewClient,
+    });
+    const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
+      .map((item) => item.key);
+    const previewPlan = buildImportPlan(preview._internal.sources, [], selectedKeys);
+    const previewBinding = await resolveImportGroupBinding(previewClient, previewPlan);
+    const planIntentVersion = buildImportPlanIntentVersion(
+      preview.version,
+      selectedKeys,
+      previewPlan,
+      previewBinding,
+    );
+
+    let started = 0;
+    let backups = 0;
+    let writes = 0;
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        planIntentVersion,
+        selectedKeys,
+        actor: 'tester',
+        jobId: 'explicit-group-revalidation-job',
+        db: { async startMutationJob() { started += 1; } },
+        client: {
+          async listAccounts() { return []; },
+          async listGroups() {
+            return [{ id: 7, name: 'reviewed', platform: 'openai', status: 'inactive' }];
+          },
+          async exportAccounts() { backups += 1; return { accounts: [] }; },
+          async importCodexSession() { writes += 1; },
+          async applyOAuthCredentials() { writes += 1; },
+        },
+      }),
+      (error) => error.code === 'SUB2API_GROUP_NOT_ACTIVE',
+    );
     assert.equal(started, 0);
     assert.equal(backups, 0);
     assert.equal(writes, 0);
@@ -3937,6 +4055,10 @@ test('token import returns reconciliation details and never starts the next acco
         assert.equal(options.signal, controller.signal);
         return [];
       },
+      async listGroups(options) {
+        assert.equal(options.signal, controller.signal);
+        return [{ id: 7, platform: 'openai', status: 'active' }];
+      },
       async exportAccounts(ids, options) {
         assert.deepEqual(ids, []);
         assert.equal(options.signal, controller.signal);
@@ -4022,6 +4144,10 @@ test('token import returns reconciliation details and never starts the next acco
         async listAccounts(options) {
           assert.equal(options.signal, postflightController.signal);
           return [];
+        },
+        async listGroups(options) {
+          assert.equal(options.signal, postflightController.signal);
+          return [{ id: 7, platform: 'openai', status: 'active' }];
         },
         async exportAccounts(ids, options) {
           assert.deepEqual(ids, []);
@@ -5067,6 +5193,9 @@ test('token import checkpoints the credential backup before creating any backup 
         },
         client: {
           async listAccounts() { return []; },
+          async listGroups() {
+            return [{ id: 7, platform: 'openai', status: 'active' }];
+          },
           async exportAccounts() { return { accounts: [], proxies: [] }; },
           async applyOAuthCredentials() { remoteWrites += 1; },
           async importCodexSession() { remoteWrites += 1; },

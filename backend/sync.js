@@ -49,6 +49,7 @@ const POSTFLIGHT_READ_ATTEMPTS = 3;
 const POSTFLIGHT_RETRY_DELAY_MS = 25;
 const BACKUP_DIRECTORY_SCAN_LIMIT = 20_000;
 const MAX_IMPORT_GROUP_IDS = 1_000;
+const IMPORT_GROUP_ELIGIBILITY_POLICY = 'active-openai-v1';
 
 function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
@@ -997,6 +998,7 @@ function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan, 
     error.code = 'IMPORT_PLAN_INVALID';
     throw error;
   }
+  const createGroupBinding = normalizeImportGroupBinding(plan, groupBinding);
   const material = {
     schema: 'sync-plan-intent-v1',
     snapshotVersion: normalizedSnapshotVersion,
@@ -1005,7 +1007,15 @@ function buildImportPlanIntentVersion(snapshotVersionValue, selectedKeys, plan, 
     // observed during preview, or explicitly commit to Sub2API's default
     // binding when no group is configured, so execution cannot silently
     // redirect a reviewed create to a different group.
-    createGroupBinding: normalizeImportGroupBinding(plan, groupBinding),
+    createGroupBinding: createGroupBinding.mode === 'not_applicable'
+      ? createGroupBinding
+      : {
+          ...createGroupBinding,
+          // Keep the eligibility predicate in the immutable intent as well as
+          // in the resolver. A future policy change must invalidate an older
+          // preview instead of silently reinterpreting its reviewed group IDs.
+          eligibilityPolicy: IMPORT_GROUP_ELIGIBILITY_POLICY,
+        },
     items: plan.map(importPlanIntentItem),
   };
   return 'sync-plan-v1.' + crypto.createHash('sha256')
@@ -1258,7 +1268,6 @@ async function resolveGroupIds(client, options = {}) {
   const signal = options.signal;
   throwIfJobInterrupted(signal);
   const configured = configuredGroupIds();
-  if (configured.length > 0) return configured;
   // An omitted setting keeps the historical `share` default. An explicitly
   // empty setting means "use Sub2API's default binding" and must not be
   // silently converted back to `share` by a truthiness fallback.
@@ -1274,8 +1283,47 @@ async function resolveGroupIds(client, options = {}) {
   try {
     const groups = await client.listGroups({ signal });
     throwIfJobInterrupted(signal);
+    if (configured.length > 0) {
+      const requested = new Set(configured);
+      const matches = new Map(configured.map((id) => [id, []]));
+      for (const group of groups) {
+        const value = group?.id;
+        if (!['string', 'number'].includes(typeof value)) continue;
+        const text = String(value).trim();
+        if (!/^[1-9]\d*$/.test(text)) continue;
+        const id = Number(text);
+        if (!Number.isSafeInteger(id) || !requested.has(id)) continue;
+        matches.get(id).push(group);
+      }
+      for (const id of configured) {
+        const candidates = matches.get(id);
+        if (candidates.length === 0) {
+          const error = new Error('配置的 Sub2API 分组不存在或未出现在 active 分组列表中');
+          error.code = 'SUB2API_GROUP_NOT_FOUND';
+          throw error;
+        }
+        if (candidates.length !== 1) {
+          const error = new Error('配置的 Sub2API 分组 ID 在远端响应中不唯一');
+          error.code = 'SUB2API_GROUP_AMBIGUOUS';
+          throw error;
+        }
+        const [group] = candidates;
+        if (String(group?.status || '').trim().toLowerCase() !== 'active') {
+          const error = new Error('配置的 Sub2API 分组不是 active 状态');
+          error.code = 'SUB2API_GROUP_NOT_ACTIVE';
+          throw error;
+        }
+        if (String(group?.platform || '').trim().toLowerCase() !== 'openai') {
+          const error = new Error('配置的 Sub2API 分组不属于 OpenAI 平台');
+          error.code = 'SUB2API_GROUP_PLATFORM_MISMATCH';
+          throw error;
+        }
+      }
+      return configured;
+    }
     const resolved = groups
       .filter((group) => String(group?.platform || '').trim().toLowerCase() === 'openai')
+      .filter((group) => String(group?.status || '').trim().toLowerCase() === 'active')
       .filter((group) => (useDefaultBinding
         ? String(group?.name || '').trim().toLowerCase() === wanted
         : [group?.name, group?.slug, group?.code]
@@ -1306,7 +1354,12 @@ async function resolveGroupIds(client, options = {}) {
     return unique;
   } catch (error) {
     rethrowIfJobInterrupted(error, signal);
-    if (['SUB2API_GROUP_NOT_FOUND', 'SUB2API_GROUP_AMBIGUOUS'].includes(error?.code)) throw error;
+    if ([
+      'SUB2API_GROUP_NOT_FOUND',
+      'SUB2API_GROUP_AMBIGUOUS',
+      'SUB2API_GROUP_NOT_ACTIVE',
+      'SUB2API_GROUP_PLATFORM_MISMATCH',
+    ].includes(error?.code)) throw error;
     // A client/transport exception is outside the panel trust boundary. Do
     // not reflect its arbitrary message into a later job error or HTTP body.
     const wrapped = new Error('读取 Sub2API 分组失败');
