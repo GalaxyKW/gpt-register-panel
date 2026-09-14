@@ -909,6 +909,56 @@ test('phase3 resolver revalidates lossy identity and token selection input', asy
   }
 });
 
+test('phase3 resolver reports the target defect before checking an unissuable revision', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-rejection-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const writeToken = (name, email, extra = {}) => fs.writeFileSync(
+    path.join(root, 'tokens', name),
+    JSON.stringify({ access_token: 'test-access-' + name, email, ...extra }),
+  );
+  writeToken('no-username.json', 'no-username@example.test');
+  writeToken('ambiguous.json', 'ambiguous@example.test');
+  writeToken('no-password.json', 'no-password@example.test');
+  writeToken('terminal.json', 'terminal@example.test');
+  writeToken('identity-mismatch.json', 'token-owner@example.test');
+  writeToken('old_codex-historical.json', 'historical@example.test');
+  fs.writeFileSync(path.join(root, 'tokens', 'invalid.json'), JSON.stringify({
+    email: 'invalid@example.test',
+  }));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([
+    { email: 'ambiguous@example.test', password: 'first-test-password' },
+    { email: 'ambiguous@example.test', password: 'second-test-password' },
+    { email: 'no-password@example.test' },
+    { email: 'terminal@example.test', password: 'test-password', status: 'account_deleted' },
+    { email: 'request-owner@example.test', password: 'test-password' },
+    { email: 'historical@example.test', password: 'test-password' },
+    { email: 'invalid@example.test', password: 'test-password' },
+  ]));
+  const previousRoot = process.env.GPT_REGISTER_ROOT;
+  process.env.GPT_REGISTER_ROOT = root;
+  const invalidRevision = 'phase3-target-v1.' + 'A'.repeat(43);
+  const resolveOne = (email, relativePath) => resolvePhase3Requests([{
+    originalIndex: 0,
+    email,
+    selectedKey: 'token:tokens:tokens/' + relativePath,
+    phase3TargetRevision: invalidRevision,
+  }]).rejected[0]?.error;
+  try {
+    assert.equal(resolveOne('missing@example.test', 'missing.json'), 'phase3_source_not_found');
+    assert.equal(resolveOne('no-username@example.test', 'no-username.json'), 'phase3_account_not_found');
+    assert.equal(resolveOne('ambiguous@example.test', 'ambiguous.json'), 'phase3_account_ambiguous');
+    assert.equal(resolveOne('no-password@example.test', 'no-password.json'), 'phase3_password_missing');
+    assert.equal(resolveOne('terminal@example.test', 'terminal.json'), 'phase3_account_terminal');
+    assert.equal(resolveOne('request-owner@example.test', 'identity-mismatch.json'), 'phase3_source_identity_mismatch');
+    assert.equal(resolveOne('historical@example.test', 'old_codex-historical.json'), 'phase3_source_historical');
+    assert.equal(resolveOne('invalid@example.test', 'invalid.json'), 'phase3_source_invalid');
+  } finally {
+    if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previousRoot;
+  }
+});
+
 test('Phase3 aborts promptly from its private queue without starting queued work', async () => {
   let markEntered;
   let releaseBlocker;

@@ -2093,10 +2093,7 @@ function resolvePhase3Requests(requests = []) {
     if (!identity || !selectedKey) {
       code = 'phase3_request_invalid';
       message = 'Phase3 账号身份或 token 选择键无效';
-    } else if (!phase3TargetRevisionMatches(request?.phase3TargetRevision, revisionEvidence)) {
-      code = 'phase3_target_revision_changed';
-      message = '所选 Phase 3 目标已变化或快照凭证无效，请刷新后重新选择';
-    } else if (!selectedKey || selectedTokenMatches.length !== 1) {
+    } else if (selectedTokenMatches.length !== 1) {
       code = 'phase3_source_not_found';
       message = '所选本地 token 不存在或选择键无效';
     } else if (selectedToken.historical === true) {
@@ -2121,6 +2118,13 @@ function resolvePhase3Requests(requests = []) {
     } else if (TERMINAL_ACCOUNT_STATUSES.has(String(record.status || '').trim().toLowerCase())) {
       code = 'phase3_account_terminal';
       message = '该账号已是终态，不能再次执行 Phase 3';
+    } else if (!phase3TargetRevisionMatches(request?.phase3TargetRevision, revisionEvidence)) {
+      // A revision can only be evaluated after its token and username
+      // evidence has been resolved uniquely. Checking it first collapsed every
+      // missing/ambiguous/terminal target into the same stale-revision error
+      // and made the more actionable rejection branches below unreachable.
+      code = 'phase3_target_revision_changed';
+      message = '所选 Phase 3 目标已变化或快照凭证无效，请刷新后重新选择';
     }
     if (code) {
       rejected.push({
