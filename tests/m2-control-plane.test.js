@@ -564,8 +564,8 @@ test('phase3 executes the validated index inode even when its path is replaced b
   fs.writeFileSync(path.join(root, 'index.js'), originalSource, { mode: 0o600 });
 
   // The wrapper runs only after phase3Worker has opened and validated index.js.
-  // It replaces that path, then forwards the already inherited script fd to
-  // the real Node launcher to make the check-to-exec race deterministic.
+  // It replaces that path, then forwards the already inherited script, Node
+  // and root fds to the real Node launcher to make the race deterministic.
   const nodeWrapper = path.join(root, 'node-wrapper');
   fs.writeFileSync(nodeWrapper, [
     '#!' + process.execPath,
@@ -578,7 +578,7 @@ test('phase3 executes the validated index inode even when its path is replaced b
     'const result = spawnSync(process.execPath, process.argv.slice(2), {',
     '  cwd: process.cwd(),',
     '  env: process.env,',
-    "  stdio: ['ignore', 'inherit', 'inherit', 3],",
+    "  stdio: ['ignore', 'inherit', 'inherit', 3, 4, 5],",
     '});',
     'if (result.error) throw result.error;',
     'process.exit(result.status === null ? 1 : result.status);',
@@ -605,7 +605,7 @@ test('phase3 executes the validated index inode even when its path is replaced b
     assert.equal(fs.readFileSync(path.join(root, 'index.js.validated'), 'utf8'), originalSource);
     const entrypoint = JSON.parse(fs.readFileSync(path.join(root, 'entrypoint.json'), 'utf8'));
     assert.equal(entrypoint.isMain, true);
-    assert.match(entrypoint.filename, /^\/proc\/[1-9][0-9]*\/fd\/[0-9]+\/index\.js$/);
+    assert.equal(entrypoint.filename, '/proc/self/fd/5/index.js');
     assert.equal(entrypoint.dirname, path.dirname(entrypoint.filename));
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;

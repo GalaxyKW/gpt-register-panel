@@ -69,8 +69,9 @@ test('systemd unit limits privilege and writable scope without blocking Phase3 n
   assert.equal(one(unit, 'Service', 'PrivateDevices'), 'true');
   assert.equal(one(unit, 'Service', 'ProtectSystem'), 'strict');
   assert.equal(one(unit, 'Service', 'RestrictNamespaces'), 'true');
-  assert.equal(one(unit, 'Service', 'CapabilityBoundingSet'), 'CAP_SYS_PTRACE');
+  assert.equal(one(unit, 'Service', 'CapabilityBoundingSet'), '');
   assert.equal(one(unit, 'Service', 'AmbientCapabilities'), '');
+  assert.equal(fs.readFileSync(UNIT_PATH, 'utf8').includes('CAP_SYS_PTRACE'), false);
   assert.equal(one(unit, 'Service', 'LimitCORE'), '0');
   assert.ok(Number(one(unit, 'Service', 'TasksMax')) >= 128);
   assert.deepEqual(

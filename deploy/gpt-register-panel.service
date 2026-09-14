@@ -87,11 +87,10 @@ SystemCallArchitectures=native
 # Node, Sub2API, Chromium and Xvfb require local, IPv4/IPv6 and network-status
 # sockets. Raw packet, Bluetooth and VM sockets are deliberately unavailable.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-# Phase3 deliberately resolves its already-verified parent directory FD via
-# /proc/<panel-pid>/fd. With Yama ptrace_scope=1 the child needs this one
-# capability to traverse its parent's descriptor; removing it breaks Phase3.
-# Drop it only after the descriptor is passed as an inherited child FD.
-CapabilityBoundingSet=CAP_SYS_PTRACE
+# Phase3 inherits its verified script, Node executable and source-root FDs
+# directly as child FDs 3-5. It never traverses another process' descriptors,
+# so this root service deliberately receives no Linux capabilities.
+CapabilityBoundingSet=
 AmbientCapabilities=
 
 [Install]

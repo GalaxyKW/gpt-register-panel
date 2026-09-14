@@ -49,6 +49,8 @@ const PHASE3_USERNAME_HARD_MAX_BYTES = 32 * 1024 * 1024;
 const PHASE3_FINAL_KILL_WAIT_MS = 5000;
 const PHASE3_DESCENDANT_LIMIT = 4096;
 const PHASE3_SCRIPT_CHILD_FD = 3;
+const PHASE3_NODE_CHILD_FD = 4;
+const PHASE3_ROOT_CHILD_FD = 5;
 const READ_ONLY_NOFOLLOW = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
@@ -219,16 +221,14 @@ function openPinnedPhase3Root(root) {
   let handle;
   try {
     handle = openRootDirectory(root, 'GPT_REGISTER_ROOT');
-    const sharedTraversalPath = '/proc/' + process.pid + '/fd/' + handle.descriptor;
-    let sharedStat;
-    try { sharedStat = fs.statSync(sharedTraversalPath); } catch {}
+    let pinnedStat;
+    try { pinnedStat = fs.statSync(handle.traversalPath); } catch {}
     if (!handle.procPinned || !/^\/proc\/self\/fd\/\d+$/.test(handle.traversalPath || '')
-        || !sameFileIdentity(handle.stat, sharedStat)) {
+        || !sameFileIdentity(handle.stat, pinnedStat)) {
       const error = new Error('当前平台无法固定 GPT_REGISTER_ROOT，拒绝执行 Phase3');
       error.code = 'PHASE3_PATH_PIN_UNAVAILABLE';
       throw error;
     }
-    handle.sharedTraversalPath = sharedTraversalPath;
     assertTrustedPhase3Object(fs.fstatSync(handle.descriptor), 'GPT_REGISTER_ROOT');
     return handle;
   } catch (error) {
@@ -243,21 +243,21 @@ function openPinnedPhase3Root(root) {
   }
 }
 
-function sharedDescriptorPath(descriptor) {
-  return '/proc/' + process.pid + '/fd/' + descriptor;
-}
-
-// This launcher is deliberately constant. The verified index.js is inherited
-// as a descriptor instead of putting its source in argv/environment. Compile
-// that descriptor-backed source as the real main module so gpt_register's
+// This launcher is deliberately constant. The verified index.js, Node binary
+// and source root are inherited directly as child descriptors instead of
+// resolving descriptors from the parent process. Compile the descriptor-
+// backed source as the real main module so gpt_register's
 // `require.main === module` entrypoint runs normally.
 const PHASE3_LAUNCHER_SOURCE = [
   `'use strict';`,
   "const fs = require('node:fs');",
   "const Module = require('node:module');",
-  'const [root, ...forwarded] = process.argv.slice(1);',
-  "if (!/^\\/proc\\/[1-9][0-9]*\\/fd\\/[0-9]+$/.test(root || '')) {",
-  "  throw new Error('invalid pinned Phase3 root');",
+  `const root = '/proc/self/fd/${PHASE3_ROOT_CHILD_FD}';`,
+  'const forwarded = process.argv.slice(1);',
+  `if (!fs.fstatSync(${PHASE3_SCRIPT_CHILD_FD}).isFile()`,
+  `    || !fs.fstatSync(${PHASE3_NODE_CHILD_FD}).isFile()`,
+  `    || !fs.fstatSync(${PHASE3_ROOT_CHILD_FD}).isDirectory()) {`,
+  "  throw new Error('invalid inherited Phase3 descriptors');",
   '}',
   `const source = fs.readFileSync(${PHASE3_SCRIPT_CHILD_FD}, 'utf8');`,
   "const script = root + '/index.js';",
@@ -934,14 +934,13 @@ async function runPhase3JobNow({
       const phase3Argument = phone && entry.phone
         ? '--phone=' + entry.phone
         : '--email=' + entry.email;
-      const pinnedRootPath = rootHandle.sharedTraversalPath;
-      result = await runCommand(sharedDescriptorPath(nodeHandle.descriptor), [
+      const pinnedRootPath = '/proc/self/fd/' + PHASE3_ROOT_CHILD_FD;
+      result = await runCommand('/proc/self/fd/' + PHASE3_NODE_CHILD_FD, [
         '--preserve-symlinks',
         '--preserve-symlinks-main',
         '-e',
         phase3LauncherSource(),
         '--',
-        pinnedRootPath,
         '--phase3',
         phase3Argument,
       ], {
@@ -950,7 +949,11 @@ async function runPhase3JobNow({
         timeoutMs: process.env.PANEL_PHASE3_TIMEOUT_MS,
         maxOutputBytes: process.env.PANEL_PHASE3_MAX_OUTPUT_BYTES,
         terminationGraceMs: process.env.PANEL_PHASE3_KILL_GRACE_MS,
-        extraFileDescriptors: [scriptHandle.descriptor],
+        extraFileDescriptors: [
+          scriptHandle.descriptor,
+          nodeHandle.descriptor,
+          rootHandle.descriptor,
+        ],
         signal,
       });
     } catch (error) {

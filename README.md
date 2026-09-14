@@ -39,7 +39,7 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 ## systemd 服务
 
-仓库提供 `deploy/gpt-register-panel.service`。该 unit 直接执行固定的 `/usr/bin/node` 和 `backend/server.js`，由应用自身安全读取项目 `.env`，不会把管理员令牌或 Sub2API 凭据复制到 systemd 配置中。当前生产目录由 root 持有，因此模板暂时使用 `User=root`；capability bounding set 仅保留 Phase3 子进程访问已固定父进程 FD 所需的 `CAP_SYS_PTRACE`，迁移到专用服务账号并改为直接继承该 FD 仍是更稳妥的最终方案。迁移时必须同步调整 `gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+仓库提供 `deploy/gpt-register-panel.service`。该 unit 直接执行固定的 `/usr/bin/node` 和 `backend/server.js`，由应用自身安全读取项目 `.env`，不会把管理员令牌或 Sub2API 凭据复制到 systemd 配置中。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
 
 安装并启用：
 
@@ -108,7 +108,7 @@ unit 使用只读文件系统视图，只开放以下默认写路径：
 
 没有 `access_token` 或可匹配身份的来源文件会标记为“文件异常”，不会进入导入计划；过期字段存在但无法解析的文件会单独标记为“过期时间无效”，同样禁止自动导入。导入任务只把远程接口的计数、状态和账号 ID 保存到面板 SQLite，不保存远程返回中的凭据字段。统计接口部分账号失败时，概览和对应单元格都会明确显示读取失败，不会伪装成 `0`。
 
-Phase 3 由固定的 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 或 `--phone=...` 启动，禁止 shell 拼接和任意路径；`gpt_register` 的非交互参数向后兼容原有交互选择。成功后会要求对应 token 指纹发生变化；识别到账号被删除/停用时，会把 `username.json` 标记为 `account_deleted` 和 `phase3Disposition=discard`，后续不会重复排队。面板允许一次提交最多 100 个账号，但仍按共享浏览器 profile 串行执行；队列总量也受 `PANEL_PHASE3_MAX_ACTIVE_JOBS` 限制。同一请求和已有队列中的重复账号会逐项返回并跳过，浏览器刷新后会恢复整批任务状态。Phase 3 对 `username.json` 使用 32 MiB 不可上调硬上限；TERM/KILL 后仍未关闭管道时会在最终期限强制收口任务。
+Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 或 `--phone=...`，禁止 shell 拼接和任意路径；实际启动前会分别打开并验证 Node、`index.js` 和源码根目录，再通过继承的 `/proc/self/fd/4`、fd 3 与 `/proc/self/fd/5` 执行，避免路径在校验后被替换。`gpt_register` 的非交互参数向后兼容原有交互选择。成功后会要求对应 token 指纹发生变化；识别到账号被删除/停用时，会把 `username.json` 标记为 `account_deleted` 和 `phase3Disposition=discard`，后续不会重复排队。面板允许一次提交最多 100 个账号，但仍按共享浏览器 profile 串行执行；队列总量也受 `PANEL_PHASE3_MAX_ACTIVE_JOBS` 限制。同一请求和已有队列中的重复账号会逐项返回并跳过，浏览器刷新后会恢复整批任务状态。Phase 3 对 `username.json` 使用 32 MiB 不可上调硬上限；TERM/KILL 后仍未关闭管道时会在最终期限强制收口任务。
 
 “清理过期 token”只扫描 `GPT_REGISTER_ROOT/tokens` 和 `GPT_REGISTER_ROOT/use_token` 下的普通 JSON 文件，要求能解析且明确存在过期时间；扫描结果带版本号，确认操作时会重新校验版本，文件发生变化就拒绝处理。所谓删除实际是移动到 `GPT_REGISTER_ROOT/.panel-quarantine/expired-tokens`（或 `PANEL_TOKEN_QUARANTINE_DIR` 指定的目录），并按批次保留原相对路径，便于恢复；跨文件系统时会先完整复制并刷盘，再移除来源。删除列表、跳过项和操作者会写入结构化日志与 SQLite 审计，不会记录 token 原文；无 access token、无法解析、无过期时间或未过期文件不会处理。恢复时将隔离目录中的文件移回原来的 `tokens/` 或 `use_token/` 目录。
 

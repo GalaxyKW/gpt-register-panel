@@ -198,7 +198,7 @@ tokens 和 use_token 同一身份出现多个版本时，默认只把修改时�
 ### 10.2 Worker 约束
 
 - 使用 spawn 或 execFile，禁止 shell: true 和字符串拼接命令。
-- 固定工作目录为 /mnt/nvme/gpt_register，环境变量只允许必要配置。
+- 打开并校验 /mnt/nvme/gpt_register 后，将其固定为继承的子进程目录 fd，并通过 `/proc/self/fd` 作为工作目录；环境变量只允许必要配置。
 - 任务默认串行，避免共享 browser-profile、邮箱验证码和临时状态。
 - 设置超时、取消、重试上限和任务锁。
 - stdout/stderr 进入脱敏日志，过滤 access token、refresh token、验证码、密码和 OAuth code。

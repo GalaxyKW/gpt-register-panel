@@ -1,10 +1,12 @@
 # gpt_register Phase 3 接口约定
 
-面板的 Phase 3 worker 只允许调用固定命令：
+面板的 Phase 3 worker 只允许以下固定逻辑命令：
 
 ```text
 node /mnt/nvme/gpt_register/index.js --phase3 --email=<已校验邮箱>
 ```
+
+实际启动不会在校验后重新按路径打开这些对象。worker 会分别打开并验证 Node 可执行文件、`index.js` 与 `gpt_register` 根目录，将它们直接继承为子进程 fd 4、3、5，并通过 `/proc/self/fd` 执行。这样既不需要 shell，也不需要访问父进程的 fd 或授予 `CAP_SYS_PTRACE`。
 
 `/mnt/nvme/gpt_register/index.js` 已增加向后兼容的参数：
 
