@@ -1620,8 +1620,38 @@ function assertImportResultSucceeded(result) {
   throw error;
 }
 
+function verifyCreatedGroupBinding(account, expectedGroupIds) {
+  let expected;
+  let actual;
+  try {
+    expected = normalizedImportGroupIds(
+      expectedGroupIds,
+      'SUB2API_CREATE_GROUP_MISMATCH',
+    );
+    actual = normalizedImportGroupIds(
+      account?.groupIds,
+      'SUB2API_CREATE_GROUP_MISMATCH',
+    );
+  } catch {
+    throw targetVerificationError(
+      '导入后无法确认 Sub2API 账号的分组绑定',
+      'SUB2API_CREATE_GROUP_MISMATCH',
+    );
+  }
+  if (expected.length === 0
+      || expected.length !== actual.length
+      || expected.some((id, index) => id !== actual[index])) {
+    throw targetVerificationError(
+      '导入后 Sub2API 账号的分组绑定与计划不一致',
+      'SUB2API_CREATE_GROUP_MISMATCH',
+    );
+  }
+  return expected;
+}
+
 async function verifyImportedAccount(client, item, result, logger, context = {}, options = {}) {
   const signal = options.signal;
+  const expectedGroupIds = options.expectedGroupIds;
   throwIfJobInterrupted(signal);
   const reportedId = importResultAccountId(result);
   let account = Number.isSafeInteger(reportedId) && reportedId > 0
@@ -1658,6 +1688,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
     account = matches[0];
   }
   verifyTargetIdentity(item, account, reportedId);
+  const verifiedGroupIds = verifyCreatedGroupBinding(account, expectedGroupIds);
   const expectedIdentity = item.sourceIdentityKeys?.length
     ? item.sourceIdentityKeys
     : item._account?.identityKeys || [item.identityKey];
@@ -1693,6 +1724,10 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
       'SUB2API_CREATE_RACE_IDENTITY_CONFLICT',
     );
   }
+  // Recheck the complete-list row too. A concurrent group edit between the
+  // detail GET and the final uniqueness scan must not be reported as a
+  // confirmed create.
+  verifyCreatedGroupBinding(identityMatches[0], expectedGroupIds);
   const expectedName = item?.accountName;
   const nameMatches = accountsMatchingFreeName(accounts, expectedName);
   if (parseCanonicalFreeName(expectedName) === null
@@ -1709,11 +1744,13 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
     accountId: account.id,
     accountName: account.name || null,
     fingerprint: actualFingerprint,
+    groupIds: verifiedGroupIds,
   });
   return {
     accountId: account.id,
     accountName: account.name || null,
     fingerprint: actualFingerprint,
+    groupIds: verifiedGroupIds,
     status: account.status || null,
   };
 }
@@ -2333,7 +2370,7 @@ async function executeImportPlanItem({
       rawResult,
       logger,
       context,
-      { signal },
+      { signal, expectedGroupIds: boundGroups },
     );
     throwIfPostWriteInterrupted(signal);
     return {

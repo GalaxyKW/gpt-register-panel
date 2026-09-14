@@ -4474,6 +4474,7 @@ test('import plan items pass one cancellation signal through update and create r
     schedulable: true,
     identityKeys: createIdentity,
     tokenFingerprints: { ...createSource.fingerprints },
+    groupIds: [1],
   };
   let createLists = 0;
   let createWrites = 0;
@@ -4954,6 +4955,7 @@ test('create verification consumes the nested Codex import account ID', async ()
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
     credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+    groupIds: [3],
   };
   const client = {
     async listAccounts(options) {
@@ -5010,6 +5012,7 @@ test('create verification consumes the nested Codex import account ID', async ()
   assert.equal(importOptions.idempotencyKey.includes(source.raw.refresh_token), false);
   assert.equal(outcome.result.accountId, 42);
   assert.equal(outcome.verification.accountId, 42);
+  assert.deepEqual(outcome.verification.groupIds, [3]);
 
   await assert.rejects(
     executeImportPlanItem({
@@ -5087,6 +5090,70 @@ test('create verification consumes the nested Codex import account ID', async ()
   );
 });
 
+test('create postflight requires the exact preview-bound group set', async () => {
+  const identityKeys = ['account:create-group-account', 'user:create-group-user'];
+  const source = syntheticToken('tokens/create-group.json', identityKeys, {
+    accountId: 'create-group-account',
+    userId: 'create-group-user',
+    accessFingerprint: 'create-group-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const baseAccount = {
+    id: 510,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  for (const { detailGroups, listGroups, expectedLists } of [
+    { detailGroups: [2], listGroups: [2], expectedLists: 1 },
+    { detailGroups: [1], listGroups: [1, 2], expectedLists: 2 },
+  ]) {
+    let listCalls = 0;
+    let writes = 0;
+    let deletionCalls = 0;
+    await assert.rejects(
+      executeImportPlanItem({
+        item,
+        groups: [1],
+        client: {
+          async listAccounts() {
+            listCalls += 1;
+            return listCalls === 1
+              ? []
+              : [{ ...baseAccount, groupIds: listGroups }];
+          },
+          async importCodexSession(payload) {
+            assert.deepEqual(payload.group_ids, [1]);
+            writes += 1;
+            return {
+              total: 1,
+              created: 1,
+              updated: 0,
+              skipped: 0,
+              failed: 0,
+              items: [{ index: 0, action: 'created', account_id: 510 }],
+            };
+          },
+          async getAccount() {
+            return { ...baseAccount, groupIds: detailGroups };
+          },
+          async deleteAccount() { deletionCalls += 1; },
+        },
+      }),
+      (error) => error.code === 'SUB2API_CREATE_GROUP_MISMATCH'
+        && error.requiresReconciliation === true
+        && error.writeOutcomeUnknown === true,
+    );
+    assert.equal(listCalls, expectedLists);
+    assert.equal(writes, 1);
+    assert.equal(deletionCalls, 0);
+  }
+});
+
 test('create responses require exact numeric counters, one raw item, and consistent ids', async () => {
   const identityKeys = ['account:strict-create-account', 'user:strict-create-user'];
   const source = syntheticToken('tokens/strict-create.json', identityKeys, {
@@ -5147,6 +5214,7 @@ test('create postflight retries only bounded complete reads and never retries th
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    groupIds: [1],
   };
   const controller = new AbortController();
   let writeCalls = 0;
@@ -5211,6 +5279,7 @@ test('create postflight fails closed on a concurrent duplicate strong identity',
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    groupIds: [1],
   };
   let listCalls = 0;
   let importCalls = 0;
@@ -5267,6 +5336,7 @@ test('create postflight fails closed when the allocated free name is no longer u
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    groupIds: [1],
   };
   let listCalls = 0;
   let importCalls = 0;
