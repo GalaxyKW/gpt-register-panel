@@ -1529,10 +1529,11 @@ test('frontend treats expired token cleanup as a durable polled task', () => {
   assert.match(cleanupHandler, /\^job_\[a-f0-9\]\{24\}\$/);
   assert.match(cleanupHandler, /watchJob\(result\.jobId, 'token_cleanup'\)/);
   assert.doesNotMatch(cleanupHandler, /已隔离 ' \+ \(result\.count/);
-  assert.match(watchContract, /job\.type === 'token_cleanup'/);
-  assert.match(watchContract, /state\.cleanupRequestPending = false/);
+  assert.match(watchContract, /loaded\[0\]\.type === 'token_cleanup'/);
+  assert.doesNotMatch(watchContract, /state\.cleanupRequestPending = false/);
   assert.match(resumeContract, /job\.type === 'token_cleanup'/);
   assert.match(resumeContract, /state\.cleanupRequestPending = true/);
+  assert.match(resumeContract, /!activeJobs\.some\(\(job\) => job\.type === 'token_cleanup'\)[\s\S]*state\.cleanupRequestPending = false/);
 });
 
 test('frontend rejects inconsistent, non-numeric, or oversized expired token listings', async () => {
@@ -1790,17 +1791,102 @@ test('mobile layout keeps controls usable and wide tables horizontally scrollabl
   assert.match(mobile, /\.reconciliation-ack-button \{ width: calc\(100% - 43px\); margin-left: 43px; \}/);
 });
 
-test('frontend refreshes every terminal job outcome before preserving its notice', () => {
+test('frontend reverifies the complete job inventory before preserving a terminal notice', () => {
   const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
   const terminalStart = watchContract.indexOf('if (loaded.every((job) => terminalJob(job.status)))');
   const terminalEnd = watchContract.indexOf('schedulePoll(() => poll(0), 1200)', terminalStart);
   const terminalBranch = watchContract.slice(terminalStart, terminalEnd);
   assert.notEqual(terminalStart, -1);
   assert.notEqual(terminalEnd, -1);
-  assert.match(terminalBranch, /snapshotRefreshPending = true;[\s\S]*const snapshotRefreshed = await loadSnapshot\(\{ isCurrent: watcherIsCurrent \}\)/);
-  assert.match(terminalBranch, /if \(!snapshotRefreshed\)[\s\S]*保持操作锁定[\s\S]*schedulePoll\(\(\) => poll\(0\), 5000\);\s*return;/);
-  assert.match(terminalBranch, /snapshotRefreshPending = false;\s*showNotice\(terminalNotice, terminalNoticeKind\)/);
+  assert.match(terminalBranch, /snapshotRefreshPending = true;[\s\S]*const snapshotRefreshed = await loadSnapshot\(\{ resumeJobs: true \}\)/);
+  assert.match(terminalBranch, /expectedSnapshotRequestId[\s\S]*snapshotRequestSequence !== expectedSnapshotRequestId/);
+  assert.match(terminalBranch, /if \(!snapshotRefreshed\)[\s\S]*保持操作锁定[\s\S]*loadSnapshot\(\{ resumeJobs: true \}\)/);
+  assert.doesNotMatch(terminalBranch, /(?:import|phase3|accountTest|cleanup)RequestPending = false/);
+  assert.match(terminalBranch, /另一个后台任务仍在执行，写操作保持锁定/);
   assert.match(sourceSection('async function loadSnapshot', "elements.refreshButton.addEventListener('click'"), /return loaded;/);
+});
+
+test('frontend keeps writes locked when another tab queues the same workflow as a watched job finishes', async () => {
+  const pollingSupport = sourceSection('function stopJobPolling', 'async function watchJobs');
+  const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
+  const watchedJobId = 'job_' + 'a'.repeat(24);
+  const otherTabJobId = 'job_' + 'b'.repeat(24);
+  const notices = [];
+  const lockStates = [];
+  let loadOptions = null;
+  const stateForTest = {
+    jobPollTimer: null,
+    watchGeneration: 0,
+    watchIds: [],
+    jobs: [],
+    job: null,
+    snapshotRequestSequence: 4,
+    snapshotRefreshPending: false,
+    jobInventoryVerified: true,
+    importRequestPending: true,
+  };
+  const activeJobPendingForTest = () => (
+    ['queued', 'running', 'unknown'].includes(stateForTest.job?.status)
+  );
+  const context = {
+    state: stateForTest,
+    elements: { jobMeta: {} },
+    apiFetch: async (pathname) => {
+      assert.equal(pathname, '/api/jobs/' + watchedJobId);
+      return {
+        ok: true,
+        async json() {
+          return {
+            id: watchedJobId,
+            type: 'token_import',
+            status: 'succeeded',
+            result: { imported: [{ action: 'update' }] },
+          };
+        },
+      };
+    },
+    renderJob() {},
+    jobNeedsReconciliation: () => false,
+    reconciliationNoticeForJobs: () => '',
+    renderPlan() {},
+    updateActionState() {
+      lockStates.push(stateForTest.snapshotRefreshPending || activeJobPendingForTest());
+    },
+    async loadSnapshot(options) {
+      loadOptions = options;
+      stateForTest.snapshotRequestSequence += 1;
+      if (options?.resumeJobs === true) {
+        // Model the authoritative inventory response observing a task that a
+        // second tab queued after this watcher began.
+        stateForTest.watchGeneration += 1;
+        stateForTest.jobs = [{
+          id: otherTabJobId,
+          type: 'token_import',
+          status: 'running',
+        }];
+        stateForTest.job = stateForTest.jobs[0];
+        stateForTest.importRequestPending = true;
+      }
+      stateForTest.snapshotRefreshPending = false;
+      return true;
+    },
+    activeJobPending: activeJobPendingForTest,
+    showNotice: (...args) => notices.push(args),
+    window: {
+      clearTimeout() {},
+      setTimeout() { throw new Error('terminal success must not schedule the old watcher'); },
+    },
+  };
+  vm.runInNewContext(pollingSupport + '\n' + watchContract
+    + `\nresultPromise = watchJobs([${JSON.stringify(watchedJobId)}], 'token_import');`, context);
+  await context.resultPromise;
+  assert.deepEqual(JSON.parse(JSON.stringify(loadOptions)), { resumeJobs: true });
+  assert.equal(stateForTest.job.id, otherTabJobId);
+  assert.equal(stateForTest.job.status, 'running');
+  assert.equal(stateForTest.importRequestPending, true);
+  assert.equal(lockStates.at(-1), true);
+  assert.match(notices.at(-1)[0], /另一个后台任务仍在执行，写操作保持锁定/);
+  assert.equal(notices.at(-1)[1], 'notice-warning');
 });
 
 test('frontend retries a 401 with a fresh bounded signal and a password dialog token', async () => {

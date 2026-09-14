@@ -2488,24 +2488,41 @@ async function watchJobs(jobIds, initialType = 'phase3') {
         }
         // Even a failed/interrupted operation may have created a Phase3 token,
         // changed an account disposition, or partially restored test state.
-        // Always refresh before showing the final outcome, and show the notice
-        // afterwards because loadSnapshot intentionally clears stale notices.
+        // Re-list the complete task inventory before the snapshot: another
+        // tab/process may have queued work after this watcher originally
+        // proved its inventory. A plain snapshot refresh would otherwise reuse
+        // that stale proof and briefly unlock writes beside the new task.
         renderPlan(null);
         state.snapshotRefreshPending = true;
         updateActionState();
-        const snapshotRefreshed = await loadSnapshot({ isCurrent: watcherIsCurrent });
-        if (!watcherIsCurrent()) return;
+        const expectedSnapshotRequestId = state.snapshotRequestSequence + 1;
+        const snapshotRefreshed = await loadSnapshot({ resumeJobs: true });
+        // loadSnapshot intentionally replaces this watcher generation while it
+        // rechecks inventory. Its monotonically increasing request ID is the
+        // authority for detecting a newer manual/terminal refresh here.
+        if (state.snapshotRequestSequence !== expectedSnapshotRequestId) return;
         if (!snapshotRefreshed) {
           showNotice('任务已结束，但账号快照刷新失败；为避免基于陈旧状态重复操作，已保持操作锁定并将在后台重试。', 'notice-warning');
-          schedulePoll(() => poll(0), 5000);
+          // Inventory failures already install their own retry. If inventory
+          // was proven but the following snapshot failed and no new job owns
+          // the polling slot, retry the whole inventory+snapshot sequence.
+          if (state.jobInventoryVerified === true && !activeJobPending()) {
+            const retryRequestId = state.snapshotRequestSequence;
+            state.jobPollTimer = window.setTimeout(() => {
+              if (state.snapshotRequestSequence === retryRequestId && !activeJobPending()) {
+                void loadSnapshot({ resumeJobs: true });
+              }
+            }, 5000);
+          }
           return;
         }
-        state.snapshotRefreshPending = false;
-        showNotice(terminalNotice, terminalNoticeKind);
-        if (loaded.some((job) => job.type === 'token_import')) state.importRequestPending = false;
-        if (loaded.some((job) => job.type === 'phase3')) state.phase3RequestPending = false;
-        if (loaded.some((job) => job.type === 'account_test')) state.accountTestRequestPending = false;
-        if (loaded.some((job) => job.type === 'token_cleanup')) state.cleanupRequestPending = false;
+        showNotice(activeJobPending()
+          ? terminalNotice + ' 已重新核实任务清单，另一个后台任务仍在执行，写操作保持锁定。'
+          : terminalNotice,
+        activeJobPending() ? 'notice-warning' : terminalNoticeKind);
+        // resumeActiveJob reconciles per-workflow pending flags against the
+        // newly listed active jobs. Do not clear an old workflow flag here:
+        // a task of the same type may have been started in another tab.
         renderPlan(state.plan);
         updateActionState();
         return;
