@@ -42,10 +42,15 @@ function getAccountAvailability(account, nowMs = Date.now()) {
     ? typeof account.schedulable === 'boolean'
     : account.schedulableKnown === true && typeof account.schedulable === 'boolean';
   if (!statusKnown) return unknown(status ? 'sub2api_status_unknown' : 'sub2api_status_missing');
-  if (!schedulableKnown) return unknown('sub2api_schedulable_missing');
+  // A known non-active status is already sufficient evidence that the account
+  // is unavailable. Older Sub2API responses can omit `schedulable` for error,
+  // inactive, or disabled rows; requiring that unrelated field first would
+  // strand exactly the accounts whose OAuth credentials are eligible for
+  // repair. Active rows remain fail-closed unless scheduler state is known.
   if (status !== 'active') {
     return { key: 'unavailable', reason: 'sub2api_status_' + status };
   }
+  if (!schedulableKnown) return unknown('sub2api_schedulable_missing');
   if (account.schedulable === false) {
     return { key: 'unavailable', reason: 'sub2api_unschedulable' };
   }

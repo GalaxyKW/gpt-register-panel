@@ -2674,6 +2674,39 @@ test('unknown Sub2API state fails closed and is never planned as an update', () 
   assert.equal(getAccountAvailability({ ...base, status: 'active' }).key, 'unknown');
 });
 
+test('known non-active status remains unavailable when scheduler metadata is omitted', () => {
+  const { root } = fixture();
+  const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+  const sources = readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  const token = sources.tokens.find((item) => item.parseStatus === 'ok');
+  const base = {
+    id: 90,
+    name: 'free00090',
+    platform: 'openai',
+    type: 'oauth',
+    statusKnown: true,
+    schedulableKnown: false,
+    identityKeys: token.identityKeys,
+    tokenFingerprints: { access: 'old-access' },
+  };
+
+  for (const status of ['error', 'inactive', 'disabled']) {
+    const account = { ...base, status };
+    assert.deepEqual(getAccountAvailability(account), {
+      key: 'unavailable',
+      reason: 'sub2api_status_' + status,
+    });
+    const plan = buildImportPlan(sources, [account]);
+    assert.equal(plan[0].action, 'update');
+    assert.equal(plan[0].availability, 'unavailable');
+  }
+
+  assert.deepEqual(getAccountAvailability({ ...base, status: 'active' }), {
+    key: 'unknown',
+    reason: 'sub2api_schedulable_missing',
+  });
+});
+
 test('does not match contradictory strong identities even with the same email', () => {
   assert.equal(identitiesCompatible(
     ['account:source-a', 'email:shared@example.test'],
