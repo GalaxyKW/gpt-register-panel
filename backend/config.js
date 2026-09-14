@@ -2,6 +2,17 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const MAX_ENV_BYTES = 1024 * 1024;
+const BOOLEAN_ENV_NAMES = Object.freeze([
+  'PANEL_LOG_CONSOLE',
+  'PANEL_REQUIRE_AUTH',
+  'PANEL_WRITE_ENABLED',
+  'PANEL_ALLOW_INSECURE_WRITE',
+  'PANEL_ALLOW_INSECURE_REMOTE',
+  'PANEL_ALLOW_UNBACKED_WRITES',
+  'PANEL_PHASE3_ENABLED',
+  'SUB2API_ALLOW_INSECURE_HTTP',
+  'SUB2API_CONFIRM_MIXED_CHANNEL_RISK',
+]);
 
 function parseValue(value) {
   const trimmed = String(value || '').trim();
@@ -16,6 +27,59 @@ function envPathError() {
   const error = new Error('.env 必须是位于非符号链接目录中的普通文件');
   error.code = 'ENV_PATH_INVALID';
   return error;
+}
+
+function envConfigurationError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function validateBooleanEnvironment(environment = process.env) {
+  for (const name of BOOLEAN_ENV_NAMES) {
+    const value = environment[name];
+    if (value !== undefined && value !== '0' && value !== '1') {
+      throw envConfigurationError('ENV_BOOLEAN_INVALID', name + ' 必须严格设置为 0 或 1');
+    }
+  }
+}
+
+function booleanEnvEnabled(name, fallback = false, environment = process.env) {
+  const value = environment[name];
+  if (value === undefined) return Boolean(fallback);
+  if (value !== '0' && value !== '1') {
+    throw envConfigurationError('ENV_BOOLEAN_INVALID', name + ' 必须严格设置为 0 或 1');
+  }
+  return value === '1';
+}
+
+function parseEnvContent(content) {
+  const entries = [];
+  const seen = new Map();
+  const lines = String(content || '').split(/\r?\n/);
+  for (const [lineIndex, line] of lines.entries()) {
+    const lineNumber = lineIndex + 1;
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const separator = trimmed.indexOf('=');
+    if (separator <= 0) {
+      throw envConfigurationError('ENV_SYNTAX_INVALID', '.env 包含无效配置行');
+    }
+    const key = trimmed.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw envConfigurationError('ENV_SYNTAX_INVALID', '.env 包含无效配置项名');
+    }
+    if (seen.has(key)) {
+      throw envConfigurationError(
+        'ENV_DUPLICATE_KEY',
+        '.env 包含重复配置项 ' + key
+          + '（第 ' + seen.get(key) + ' 行和第 ' + lineNumber + ' 行）',
+      );
+    }
+    seen.set(key, lineNumber);
+    entries.push([key, parseValue(trimmed.slice(separator + 1))]);
+  }
+  return entries;
 }
 
 function sameFileState(left, right) {
@@ -107,20 +171,29 @@ function readEnvFile(filePath) {
   }
 }
 
-function loadEnv(filePath = path.resolve(__dirname, '..', '.env')) {
+function loadEnv(filePath = path.resolve(__dirname, '..', '.env'), environment = process.env) {
   const content = readEnvFile(filePath);
   if (content === null) return false;
-  const lines = content.split(/\r?\n/);
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const separator = trimmed.indexOf('=');
-    if (separator <= 0) continue;
-    const key = trimmed.slice(0, separator).trim();
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key) || process.env[key] !== undefined) continue;
-    process.env[key] = parseValue(trimmed.slice(separator + 1));
+  // Parse and validate the complete file before mutating process.env. This
+  // prevents an invalid trailing line or duplicate from leaving a partially
+  // applied deployment configuration behind.
+  const entries = parseEnvContent(content);
+  const prospectiveEnvironment = { ...environment };
+  for (const [key, value] of entries) {
+    if (prospectiveEnvironment[key] === undefined) prospectiveEnvironment[key] = value;
+  }
+  validateBooleanEnvironment(prospectiveEnvironment);
+  for (const [key, value] of entries) {
+    if (environment[key] === undefined) environment[key] = value;
   }
   return true;
 }
 
-module.exports = { loadEnv, readEnvFile };
+module.exports = {
+  BOOLEAN_ENV_NAMES,
+  booleanEnvEnabled,
+  loadEnv,
+  parseEnvContent,
+  readEnvFile,
+  validateBooleanEnvironment,
+};

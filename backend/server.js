@@ -5,7 +5,11 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { URL } = require('node:url');
 
-const { loadEnv } = require('./config');
+const {
+  booleanEnvEnabled,
+  loadEnv,
+  validateBooleanEnvironment,
+} = require('./config');
 const {
   buildSnapshot,
   buildImportPlan,
@@ -167,6 +171,25 @@ function configuredPanelToken() {
   return String(process.env.PANEL_ADMIN_TOKEN || '');
 }
 
+function validateRuntimeConfiguration() {
+  validateBooleanEnvironment();
+  const configuredToken = configuredPanelToken();
+  const requireAuthentication = booleanEnvEnabled('PANEL_REQUIRE_AUTH', true);
+  if (requireAuthentication && !configuredToken) {
+    const error = new Error('已启用面板认证，但未配置管理员令牌');
+    error.code = 'PANEL_AUTH_CONFIG_REQUIRED';
+    throw error;
+  }
+  // A configured token protects reads even when PANEL_REQUIRE_AUTH=0, so it
+  // must meet the same requirements whenever it would participate in auth.
+  if ((requireAuthentication || configuredToken)
+      && !/^[\x21-\x7e]{16,4096}$/.test(configuredToken)) {
+    const error = new Error('面板管理员令牌不符合安全要求');
+    error.code = 'PANEL_ADMIN_TOKEN_INVALID';
+    throw error;
+  }
+}
+
 function headerToken(request) {
   const authorization = String(request.headers.authorization || '');
   const value = authorization.toLowerCase().startsWith('bearer ')
@@ -177,7 +200,7 @@ function headerToken(request) {
 
 function authorizationError(request, write = false) {
   const configuredToken = configuredPanelToken();
-  const shouldProtectRead = process.env.PANEL_REQUIRE_AUTH === '1' || configuredToken;
+  const shouldProtectRead = booleanEnvEnabled('PANEL_REQUIRE_AUTH', true) || configuredToken;
   if (shouldProtectRead) {
     const authorized = Boolean(configuredToken)
       && tokensEqual(headerToken(request), configuredToken);
@@ -264,15 +287,11 @@ function isLoopbackHost(host) {
 }
 
 function validateListenConfiguration(host) {
+  validateRuntimeConfiguration();
   const configuredToken = configuredPanelToken();
-  if (process.env.PANEL_REQUIRE_AUTH === '1' && !configuredToken) {
-    const error = new Error('PANEL_REQUIRE_AUTH=1 时必须配置 PANEL_ADMIN_TOKEN');
-    error.code = 'PANEL_AUTH_CONFIG_REQUIRED';
-    throw error;
-  }
   if (!isLoopbackHost(host)
       && !configuredToken
-      && process.env.PANEL_ALLOW_INSECURE_REMOTE !== '1') {
+      && !booleanEnvEnabled('PANEL_ALLOW_INSECURE_REMOTE')) {
     const error = new Error('非回环监听必须配置 PANEL_ADMIN_TOKEN，或明确设置 PANEL_ALLOW_INSECURE_REMOTE=1');
     error.code = 'PANEL_REMOTE_AUTH_REQUIRED';
     throw error;
@@ -872,6 +891,7 @@ function serveStatic(request, response) {
 }
 
 function createServer(options = {}) {
+  validateRuntimeConfiguration();
   const db = options.db || new PanelDb(options.dbPath);
   const logger = options.logger || createLogger({ dbPath: options.dbPath || db.dbPath });
   const jobManager = options.jobManager || createBackgroundJobManager({ db });
@@ -1722,6 +1742,7 @@ function createServer(options = {}) {
 }
 
 async function startServer(options = {}) {
+  validateRuntimeConfiguration();
   const host = options.host ?? process.env.PANEL_HOST ?? '127.0.0.1';
   const port = Number(options.port ?? process.env.PANEL_PORT ?? 4170);
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
@@ -1887,6 +1908,7 @@ module.exports = {
   hasJsonContentType,
   readJsonBody,
   requestActor,
+  validateRuntimeConfiguration,
   validateListenConfiguration,
   normalizedSelectedKeys,
   openVerifiedStaticFile,

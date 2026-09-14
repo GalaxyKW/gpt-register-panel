@@ -19,6 +19,7 @@ const {
   resetAuthFailureBuckets,
   safeStaticPath,
   startServer,
+  validateRuntimeConfiguration,
 } = require('../backend/server');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 
@@ -127,6 +128,118 @@ test('server startup waits for database initialization before listening', async 
     startServer({ host: '127.0.0.1', port: 0, db, logger }),
     (error) => error === sentinel,
   );
+});
+
+test('authentication defaults to enabled and startup validates before database access', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+  };
+  delete process.env.PANEL_ADMIN_TOKEN;
+  delete process.env.PANEL_REQUIRE_AUTH;
+  resetAuthFailureBuckets();
+  let databaseAccessed = false;
+  const db = { dbPath: '/tmp/unused-panel-default-auth-test.sqlite3' };
+  Object.defineProperty(db, 'ready', {
+    get() {
+      databaseAccessed = true;
+      return Promise.resolve();
+    },
+  });
+  try {
+    assert.equal(authorizationError({
+      headers: {},
+      socket: { remoteAddress: '127.0.0.1' },
+    }).status, 401);
+    await assert.rejects(
+      startServer({
+        host: '127.0.0.1',
+        port: 0,
+        db,
+        logger: { info() {}, warn() {}, error() {} },
+      }),
+      (error) => error.code === 'PANEL_AUTH_CONFIG_REQUIRED',
+    );
+    assert.equal(databaseAccessed, false);
+  } finally {
+    resetAuthFailureBuckets();
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+  }
+});
+
+test('startup rejects invalid booleans before database access', async () => {
+  const previous = {
+    phase3: process.env.PANEL_PHASE3_ENABLED,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    token: process.env.PANEL_ADMIN_TOKEN,
+  };
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  delete process.env.PANEL_ADMIN_TOKEN;
+  process.env.PANEL_PHASE3_ENABLED = 'true';
+  let databaseAccessed = false;
+  const db = { dbPath: '/tmp/unused-panel-invalid-boolean-test.sqlite3' };
+  Object.defineProperty(db, 'ready', {
+    get() {
+      databaseAccessed = true;
+      return Promise.resolve();
+    },
+  });
+  try {
+    await assert.rejects(
+      startServer({ host: '127.0.0.1', port: 0, db }),
+      (error) => error.code === 'ENV_BOOLEAN_INVALID',
+    );
+    assert.equal(databaseAccessed, false);
+  } finally {
+    if (previous.phase3 === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.phase3;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+  }
+});
+
+test('configured administrator tokens must be bounded printable ASCII without whitespace', () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+  };
+  process.env.PANEL_REQUIRE_AUTH = '1';
+  const invalidTokens = [
+    'short-token',
+    'sixteen chars ok ',
+    'sixteen\tchars-ok',
+    'non-ascii-token-密钥',
+    'x'.repeat(4097),
+  ];
+  try {
+    for (const token of invalidTokens) {
+      process.env.PANEL_ADMIN_TOKEN = token;
+      let validationError;
+      assert.throws(
+        () => validateRuntimeConfiguration(),
+        (caught) => {
+          validationError = caught;
+          return caught.code === 'PANEL_ADMIN_TOKEN_INVALID';
+        },
+      );
+      assert.equal(validationError.message.includes(token), false);
+      assert.equal(validationError.message.includes(String(token.length)), false);
+    }
+    process.env.PANEL_ADMIN_TOKEN = '0123456789abcdef';
+    assert.doesNotThrow(() => validateRuntimeConfiguration());
+    process.env.PANEL_ADMIN_TOKEN = '!'.repeat(4096);
+    assert.doesNotThrow(() => validateRuntimeConfiguration());
+  } finally {
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+  }
 });
 
 test('write endpoints fail closed when the audit log becomes unavailable', async () => {

@@ -6,25 +6,80 @@ const test = require('node:test');
 
 require('./test-isolation');
 
-const { loadEnv, readEnvFile } = require('../backend/config');
+const {
+  BOOLEAN_ENV_NAMES,
+  loadEnv,
+  readEnvFile,
+  validateBooleanEnvironment,
+} = require('../backend/config');
 
 test('loadEnv reads a regular file without overwriting existing environment values', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-'));
   const filePath = path.join(directory, '.env');
   fs.writeFileSync(filePath, 'PANEL_CONFIG_TEST_NEW=loaded\nPANEL_CONFIG_TEST_EXISTING=replaced\n');
-  const previousNew = process.env.PANEL_CONFIG_TEST_NEW;
-  const previousExisting = process.env.PANEL_CONFIG_TEST_EXISTING;
-  delete process.env.PANEL_CONFIG_TEST_NEW;
-  process.env.PANEL_CONFIG_TEST_EXISTING = 'kept';
-  try {
-    assert.equal(loadEnv(filePath), true);
-    assert.equal(process.env.PANEL_CONFIG_TEST_NEW, 'loaded');
-    assert.equal(process.env.PANEL_CONFIG_TEST_EXISTING, 'kept');
-  } finally {
-    if (previousNew === undefined) delete process.env.PANEL_CONFIG_TEST_NEW;
-    else process.env.PANEL_CONFIG_TEST_NEW = previousNew;
-    if (previousExisting === undefined) delete process.env.PANEL_CONFIG_TEST_EXISTING;
-    else process.env.PANEL_CONFIG_TEST_EXISTING = previousExisting;
+  const environment = { PANEL_CONFIG_TEST_EXISTING: 'kept' };
+  assert.equal(loadEnv(filePath, environment), true);
+  assert.equal(environment.PANEL_CONFIG_TEST_NEW, 'loaded');
+  assert.equal(environment.PANEL_CONFIG_TEST_EXISTING, 'kept');
+});
+
+test('loadEnv rejects duplicate keys without partially applying earlier values', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-atomic-'));
+  const filePath = path.join(directory, '.env');
+  fs.writeFileSync(filePath, [
+    'PANEL_CONFIG_TEST_ATOMIC=must-not-apply',
+    'PANEL_CONFIG_TEST_DUPLICATE=first',
+    'PANEL_CONFIG_TEST_DUPLICATE=second',
+    '',
+  ].join('\n'));
+  // Duplicate detection must not be bypassed just because the parent process
+  // already supplied the same key and would otherwise win precedence.
+  const environment = { PANEL_CONFIG_TEST_DUPLICATE: 'parent-value' };
+  let duplicateError;
+  assert.throws(
+    () => loadEnv(filePath, environment),
+    (error) => {
+      duplicateError = error;
+      return error.code === 'ENV_DUPLICATE_KEY';
+    },
+  );
+  assert.match(duplicateError.message, /PANEL_CONFIG_TEST_DUPLICATE/);
+  assert.match(duplicateError.message, /第 2 行和第 3 行/);
+  assert.equal(duplicateError.message.includes('first'), false);
+  assert.equal(duplicateError.message.includes('second'), false);
+  assert.equal(environment.PANEL_CONFIG_TEST_ATOMIC, undefined);
+  assert.equal(environment.PANEL_CONFIG_TEST_DUPLICATE, 'parent-value');
+});
+
+test('loadEnv validates boolean settings before applying any values', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-boolean-'));
+  const filePath = path.join(directory, '.env');
+  fs.writeFileSync(filePath, [
+    'PANEL_CONFIG_TEST_ATOMIC=must-not-apply',
+    'PANEL_WRITE_ENABLED=true',
+    '',
+  ].join('\n'));
+  const environment = {};
+  assert.throws(
+    () => loadEnv(filePath, environment),
+    (error) => error.code === 'ENV_BOOLEAN_INVALID',
+  );
+  assert.equal(environment.PANEL_CONFIG_TEST_ATOMIC, undefined);
+  assert.equal(environment.PANEL_WRITE_ENABLED, undefined);
+});
+
+test('every declared boolean environment setting accepts only 0 or 1', () => {
+  const invalidValues = ['', 'true', 'false', 'TRUE', 'yes', ' 1', '1 ', '2'];
+  for (const name of BOOLEAN_ENV_NAMES) {
+    assert.doesNotThrow(() => validateBooleanEnvironment({ [name]: '0' }));
+    assert.doesNotThrow(() => validateBooleanEnvironment({ [name]: '1' }));
+    for (const invalidValue of invalidValues) {
+      assert.throws(
+        () => validateBooleanEnvironment({ [name]: invalidValue }),
+        (error) => error.code === 'ENV_BOOLEAN_INVALID'
+          && error.message === name + ' 必须严格设置为 0 或 1',
+      );
+    }
   }
 });
 
