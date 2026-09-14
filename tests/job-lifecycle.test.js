@@ -26,6 +26,12 @@ const {
   shutdownServer,
 } = require('../backend/server');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
+const testAuditLogger = {
+  checkpoint() { return true; },
+  info() {},
+  warn() {},
+  error() {},
+};
 
 test('terminal job updates retry a bounded number of times with one stable timestamp', async () => {
   const patches = [];
@@ -60,6 +66,31 @@ test('terminal job updates retry a bounded number of times with one stable times
     /persistent sqlite failure/,
   );
   assert.equal(failures, 2);
+});
+
+test('terminal job updates surface a rejected CAS without retrying it', async () => {
+  let attempts = 0;
+  let retries = 0;
+  await assert.rejects(
+    updateTerminalJob({
+      async updateJob() {
+        attempts += 1;
+        return { applied: false, currentStatus: 'interrupted' };
+      },
+    }, 'job-terminal-conflict', {
+      status: 'succeeded',
+      result: { completed: true },
+    }, {
+      attempts: 4,
+      initialDelayMs: 0,
+      onRetry() { retries += 1; },
+    }),
+    (error) => error.code === 'JOB_TERMINAL_STATUS_CONFLICT'
+      && error.requestedStatus === 'succeeded'
+      && error.currentStatus === 'interrupted',
+  );
+  assert.equal(attempts, 1);
+  assert.equal(retries, 0);
 });
 
 test('Sub2API requests distinguish an external shutdown abort from a timeout', async () => {
@@ -190,6 +221,7 @@ test('account-test worker propagates shutdown cancellation as a job interruption
     db: { async updateJob() {}, async audit() {} },
     jobId: 'job-account-interrupt',
     client,
+    logger: testAuditLogger,
     signal: controller.signal,
   });
   await started;
@@ -231,6 +263,7 @@ test('account-test cancellation after a successful probe records reconciliation 
     db: { async updateJob() {}, async audit() {} },
     jobId: 'job-account-post-test-interrupt',
     client,
+    logger: testAuditLogger,
     signal: controller.signal,
   });
   assert.equal(reads, 1);
@@ -247,8 +280,9 @@ test('shutdown drains a concurrently completed job before interrupting remaining
   const events = [];
   let jobStatus = 'running';
   const db = {
-    async interruptOwnedActiveJobs() {
+    async interruptOwnedActiveJobs(reason, options) {
       events.push('interrupt-db');
+      assert.deepEqual(options.excludeJobIds, []);
       if (['queued', 'running'].includes(jobStatus)) jobStatus = 'interrupted';
       return [];
     },
@@ -268,8 +302,59 @@ test('shutdown drains a concurrently completed job before interrupting remaining
   manager.track(record, operation);
   const result = await manager.shutdown({ timeoutMs: 100 });
   assert.equal(result.active, 0);
+  assert.equal(result.remaining, 0);
+  assert.equal(result.outstandingAdmissions, 0);
   assert.equal(jobStatus, 'succeeded');
   assert.deepEqual(events, ['worker-aborted', 'worker-finished', 'interrupt-db']);
+});
+
+test('shutdown timeout retains an active job claim until its real terminal outcome is persisted', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-shutdown-claim-'));
+  const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
+  const protectedClaim = 'phase3:email:still-unwinding@example.test';
+  const orphanClaim = 'phase3:email:unobserved@example.test';
+  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [protectedClaim] });
+  await db.updateJob(job.id, { status: 'running', startedAt: new Date().toISOString() });
+  const orphan = await db.createJob('phase3', {}, 'tester', { claimKeys: [orphanClaim] });
+  const manager = createBackgroundJobManager({ db });
+  const record = manager.begin(job, 'phase3');
+  let releaseWorker;
+  const workerGate = new Promise((resolve) => { releaseWorker = resolve; });
+  const worker = (async () => {
+    // Deliberately model a non-cancellable operation that must finish its
+    // unwind and persist the real result after the shutdown drain expires.
+    await workerGate;
+    await updateTerminalJob(db, job.id, {
+      status: 'succeeded',
+      result: { completed: true },
+    });
+  })();
+  const tracked = manager.track(record, worker);
+
+  const result = await manager.shutdown({ timeoutMs: 0 });
+  assert.equal(result.remaining, 1);
+  assert.equal(result.active, 1);
+  assert.equal(result.outstandingAdmissions, 0);
+  assert.deepEqual(result.interrupted, [orphan.id]);
+  assert.equal((await db.getJob(job.id)).status, 'running');
+  assert.equal((await db.getJob(orphan.id)).status, 'interrupted');
+  await assert.rejects(
+    db.createJob('phase3', {}, 'tester', { claimKeys: [protectedClaim] }),
+    (error) => error.code === 'JOB_ALREADY_CLAIMED'
+      && error.existingJobId === job.id,
+  );
+
+  releaseWorker();
+  await tracked;
+  assert.equal(manager.activeCount, 0);
+  const completed = await db.getJob(job.id);
+  assert.equal(completed.status, 'succeeded');
+  assert.deepEqual(completed.result, { completed: true });
+
+  const replacement = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: [protectedClaim],
+  });
+  await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
 });
 
 test('shutdown aborts admission callers while tracking their underlying unwind', async () => {
@@ -277,11 +362,13 @@ test('shutdown aborts admission callers while tracking their underlying unwind',
   let markAdmissionEntered;
   let mutations = 0;
   let interruptedWrites = 0;
+  let interruptOptions = null;
   const admissionEntered = new Promise((resolve) => { markAdmissionEntered = resolve; });
   const manager = createBackgroundJobManager({
     db: {
-      async interruptOwnedActiveJobs() {
+      async interruptOwnedActiveJobs(reason, options) {
         interruptedWrites += 1;
+        interruptOptions = options;
         return [];
       },
     },
@@ -303,8 +390,11 @@ test('shutdown aborts admission callers while tracking their underlying unwind',
     () => manager.begin({ id: 'must-not-start' }, 'phase3'),
     (error) => error.code === 'JOB_INTERRUPTED',
   );
-  await shutdown;
+  const shutdownResult = await shutdown;
   assert.equal(interruptedWrites, 1);
+  assert.deepEqual(interruptOptions.excludeJobIds, []);
+  assert.equal(shutdownResult.remaining, 0);
+  assert.equal(shutdownResult.outstandingAdmissions, 1);
 
   releaseAdmission();
   for (let attempt = 0; manager.admissionCount > 0 && attempt < 20; attempt += 1) {
@@ -431,16 +521,28 @@ test('PanelDb terminal transitions cannot overwrite an earlier shutdown interrup
   const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
   const claimKey = 'phase3:email:terminal-guard@example.test';
   const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
-  await db.updateJob(job.id, {
+  const interruption = await db.updateJob(job.id, {
     status: 'interrupted',
     error: 'service stopped',
     finishedAt: new Date().toISOString(),
   });
-  await db.updateJob(job.id, {
+  assert.equal(interruption.applied, true);
+  assert.equal(interruption.currentStatus, 'interrupted');
+  const lateSuccess = await db.updateJob(job.id, {
     status: 'succeeded',
     result: { shouldNotReplace: true },
     finishedAt: new Date().toISOString(),
   });
+  assert.equal(lateSuccess.applied, false);
+  assert.equal(lateSuccess.currentStatus, 'interrupted');
+  await assert.rejects(
+    updateTerminalJob(db, job.id, {
+      status: 'succeeded',
+      result: { shouldNotReplace: true },
+    }),
+    (error) => error.code === 'JOB_TERMINAL_STATUS_CONFLICT'
+      && error.currentStatus === 'interrupted',
+  );
   const persisted = await db.getJob(job.id);
   assert.equal(persisted.status, 'interrupted');
   assert.equal(persisted.result, null);

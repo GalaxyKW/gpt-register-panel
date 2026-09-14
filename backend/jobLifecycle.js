@@ -38,10 +38,19 @@ async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
   let lastError;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await db.updateJob(jobId, terminalPatch);
+      const result = await db.updateJob(jobId, terminalPatch);
+      if (result?.applied === false) {
+        const error = new Error('任务终态已由其他执行路径写入，拒绝覆盖');
+        error.code = 'JOB_TERMINAL_STATUS_CONFLICT';
+        error.jobId = jobId;
+        error.requestedStatus = patch.status;
+        error.currentStatus = result.currentStatus || null;
+        throw error;
+      }
+      return result;
     } catch (error) {
       lastError = error;
-      if (attempt >= attempts) break;
+      if (attempt >= attempts || error?.code === 'JOB_TERMINAL_STATUS_CONFLICT') break;
       if (typeof options.onRetry === 'function') {
         try { options.onRetry(error, attempt); } catch {}
       }
@@ -145,18 +154,29 @@ function createBackgroundJobManager({ db } = {}) {
     const reason = interruptedJobError();
     for (const controller of pendingAdmissions) controller.abort(reason);
     for (const record of active.values()) record.controller.abort(reason);
-    // Phase3's default TERM + KILL deadlines total ten seconds. Keep the drain
-    // below twelve seconds, leaving the rest of systemd's 45-second stop
-    // budget for a contended SQLite lock and final connection closure.
+    // Phase3's TERM + KILL process-tree cleanup has a five-second hard limit.
+    // Keep the drain below twelve seconds, leaving the rest of systemd's
+    // 45-second stop budget for a contended SQLite lock and final connection
+    // closure.
     const timeoutMs = boundedInteger(options.timeoutMs, 10_000, 0, 12_000);
     const remaining = await waitForIdle(timeoutMs);
-    // Give a worker that completed concurrently with SIGTERM a chance to
-    // persist success first. Only work still queued/running after the bounded
-    // drain is labelled interrupted and has its claims released.
+    const excludedJobIds = [...active.keys()];
+    const outstandingAdmissions = admissions;
+    // A worker still registered here has not finished unwinding and may yet
+    // persist its real terminal outcome. Retain its claim until that happens;
+    // only owned jobs with no active observer (for example, an admission
+    // interrupted between durable creation and begin()) may be interrupted.
     const interrupted = db && typeof db.interruptOwnedActiveJobs === 'function'
-      ? await db.interruptOwnedActiveJobs('面板服务停止，任务已安全中断')
+      ? await db.interruptOwnedActiveJobs('面板服务停止，任务已安全中断', {
+        excludeJobIds: excludedJobIds,
+      })
       : [];
-    return { remaining, active: active.size, interrupted };
+    return {
+      remaining,
+      active: active.size,
+      outstandingAdmissions,
+      interrupted,
+    };
   }
 
   return {

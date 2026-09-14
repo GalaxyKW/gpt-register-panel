@@ -12,11 +12,26 @@ const {
   classifyAccountTestTargets,
   normalizeAccountTestModelId,
   normalizeAccountTestRequest,
-  runAccountTestJob,
-  runAccountTestJobNow,
+  runAccountTestJob: runAccountTestJobWithoutLogger,
+  runAccountTestJobNow: runAccountTestJobNowWithoutLogger,
 } = require('../backend/accountTestWorker');
 const { parseSseEvents } = require('../backend/adapters/sub2apiAdmin');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
+
+const testAuditLogger = {
+  checkpoint() { return true; },
+  info() {},
+  warn() {},
+  error() {},
+};
+
+function runAccountTestJob(args = {}) {
+  return runAccountTestJobWithoutLogger({ logger: testAuditLogger, ...args });
+}
+
+function runAccountTestJobNow(args = {}) {
+  return runAccountTestJobNowWithoutLogger({ logger: testAuditLogger, ...args });
+}
 
 function requestJson(baseUrl, pathname, options = {}) {
   return new Promise((resolve, reject) => {
@@ -166,6 +181,168 @@ function fakeWorkerDb() {
     async audit() {},
   };
 }
+
+test('account test requires a durable log checkpoint immediately before dispatch', async () => {
+  const account = oauthTestAccount(9, 'active', true);
+  const events = [];
+  let testCalls = 0;
+  const client = {
+    async listAccounts() { return [{ ...account }]; },
+    async getAccount() { return { ...account }; },
+    async testAccount() {
+      testCalls += 1;
+      events.push('test');
+      return { success: true };
+    },
+  };
+  const logger = {
+    checkpoint(event) {
+      events.push(event);
+      return false;
+    },
+    info() {},
+    warn() {},
+    error() {},
+  };
+  const outcome = await runAccountTestJobNow({
+    accountIds: [9],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-audit-checkpoint-blocks-probe',
+    client,
+    logger,
+  });
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_test_failed');
+  assert.equal(testCalls, 0);
+  assert.deepEqual(events, ['account_test.test_mutation_checkpoint']);
+});
+
+test('account test checkpoints the probe before calling Sub2API', async () => {
+  const account = oauthTestAccount(10, 'active', true);
+  const events = [];
+  const client = {
+    async listAccounts() { return [{ ...account }]; },
+    async getAccount() { return { ...account }; },
+    async testAccount() {
+      events.push('test');
+      return { success: true };
+    },
+  };
+  const logger = {
+    checkpoint(event) {
+      events.push(event);
+      return true;
+    },
+    info() {},
+    warn() {},
+    error() {},
+  };
+  const outcome = await runAccountTestJobNow({
+    accountIds: [10],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-audit-checkpoint-before-probe',
+    client,
+    logger,
+  });
+  assert.equal(outcome.succeeded, 1);
+  assert.deepEqual(events.slice(0, 2), [
+    'account_test.test_mutation_checkpoint',
+    'test',
+  ]);
+});
+
+test('scheduler enable is not dispatched when its log checkpoint fails', async () => {
+  const account = oauthTestAccount(13, 'error', false);
+  const checkpoints = [];
+  let schedulerWrites = 0;
+  const client = {
+    async listAccounts() { return [{ ...account }]; },
+    async getAccount() { return { ...account }; },
+    async testAccount() { return { success: true }; },
+    async setSchedulable() {
+      schedulerWrites += 1;
+      return { ...account, schedulable: true };
+    },
+  };
+  const logger = {
+    checkpoint(event) {
+      checkpoints.push(event);
+      return event !== 'account_test.scheduler_enable_checkpoint';
+    },
+    info() {},
+    warn() {},
+    error() {},
+  };
+  const outcome = await runAccountTestJobNow({
+    accountIds: [13],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-audit-checkpoint-blocks-enable',
+    client,
+    logger,
+  });
+  assert.equal(schedulerWrites, 0);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].reconciliationScope, 'test');
+  assert.deepEqual(checkpoints, [
+    'account_test.test_mutation_checkpoint',
+    'account_test.scheduler_enable_checkpoint',
+  ]);
+});
+
+test('scheduler rollback is not dispatched when its log checkpoint fails', async () => {
+  let account = oauthTestAccount(14, 'error', false);
+  const schedulerWrites = [];
+  const checkpoints = [];
+  const client = {
+    async listAccounts() { return [{ ...account }]; },
+    async getAccount() { return { ...account }; },
+    async testAccount() {
+      account = {
+        ...account,
+        status: 'active',
+        tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+      };
+      return { success: true };
+    },
+    async setSchedulable(id, value) {
+      assert.equal(id, 14);
+      schedulerWrites.push(value);
+      account = { ...account, schedulable: value };
+      return { ...account };
+    },
+  };
+  const logger = {
+    checkpoint(event) {
+      checkpoints.push(event);
+      return event !== 'account_test.scheduler_rollback_checkpoint';
+    },
+    info() {},
+    warn() {},
+    error() {},
+  };
+  const outcome = await runAccountTestJobNow({
+    accountIds: [14],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-audit-checkpoint-blocks-rollback',
+    client,
+    logger,
+  });
+  assert.deepEqual(schedulerWrites, [true]);
+  assert.equal(account.schedulable, true);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].reconciliationScope, 'scheduler');
+  assert.deepEqual(checkpoints, [
+    'account_test.test_mutation_checkpoint',
+    'account_test.scheduler_enable_checkpoint',
+    'account_test.scheduler_rollback_checkpoint',
+  ]);
+});
 
 test('error-account recovery preserves an originally enabled scheduler when recovery is unconfirmed', async () => {
   let account = oauthTestAccount(11, 'error', true);
@@ -1096,6 +1273,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     server = createServer({
       dbPath: path.join(root, 'panel.sqlite3'),
       logger: {
+        checkpoint() { return true; },
         info() {},
         warn() {},
         error() {},

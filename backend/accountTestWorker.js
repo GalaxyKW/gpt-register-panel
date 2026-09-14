@@ -4,7 +4,7 @@ const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { getAccountAvailability } = require('./accountAvailability');
 const { accountKeys, hasStrongIdentity, identitiesStronglyCompatible } = require('./diff');
 const { normalizeIdentityValue } = require('./lib/token');
-const { redactText } = require('./logger');
+const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
 
@@ -444,6 +444,13 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
       || current.schedulable !== mutation.written) {
     return { attempted: false, succeeded: false, state: current, reason: 'rollback_state_changed' };
   }
+  assertAuditLogCheckpoint(options.logger, 'account_test.scheduler_rollback_checkpoint', {
+    jobId: options.jobId || null,
+    actor: options.actor || 'local',
+    accountId: id,
+    expectedSchedulable: mutation.original,
+  });
+  throwIfJobInterrupted(options.signal);
   const writeResponse = await client.setSchedulable(
     id,
     mutation.original,
@@ -568,6 +575,13 @@ async function runAccountTestJobNow({
       schedulableBefore = current.schedulable;
       const shouldRecover = accountStatus(account) === 'error';
 
+      assertAuditLogCheckpoint(logger, 'account_test.test_mutation_checkpoint', {
+        jobId,
+        actor,
+        accountId: id,
+        model: normalizedModelId || null,
+      });
+      throwIfJobInterrupted(signal);
       const test = await client.testAccount(id, {
         modelId: normalizedModelId,
         prompt,
@@ -774,6 +788,12 @@ async function runAccountTestJobNow({
         throw error;
       }
 
+      assertAuditLogCheckpoint(logger, 'account_test.scheduler_enable_checkpoint', {
+        jobId,
+        actor,
+        accountId: id,
+        expectedSchedulable: true,
+      });
       throwIfJobInterrupted(signal);
       recoveryAttempted = true;
       recoveryMutation = {
@@ -830,7 +850,7 @@ async function runAccountTestJobNow({
             client,
             id,
             recoveryMutation,
-            { signal },
+            { signal, logger, jobId, actor },
           );
         } catch (rollbackError) {
           writeLog(logger, 'error', 'account_test.recovery_rollback_failed', {
@@ -924,7 +944,7 @@ async function runAccountTestJobNow({
             client,
             id,
             recoveryMutation,
-            { signal },
+            { signal, logger, jobId, actor },
           );
           if (rollback.succeeded) {
             writeLog(logger, 'warn', 'account_test.recovery_rolled_back', {

@@ -614,19 +614,32 @@ class PanelDb {
         'UPDATE sync_jobs SET ' + fields.join(', ') + ' WHERE id = ?' + statusGuard,
       );
       statement.run(values);
+      const applied = database.getRowsModified() > 0;
       statement.free();
-      if (terminalStatus) {
+      if (terminalStatus && applied) {
         const claimStatement = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
         claimStatement.run([id]);
         claimStatement.free();
       }
+      let currentStatus = patch.status || null;
+      if (!applied) {
+        currentStatus = resultRows(database.exec(
+          'SELECT status FROM sync_jobs WHERE id = ' + sqlString(id) + ' LIMIT 1',
+        ))[0]?.status || null;
+      }
+      return { applied, currentStatus };
     });
   }
 
-  interruptOwnedActiveJobs(reason = '面板服务停止，任务已安全中断') {
+  interruptOwnedActiveJobs(reason = '面板服务停止，任务已安全中断', options = {}) {
     const owner = currentProcessOwner();
     const finishedAt = new Date().toISOString();
     const safeReason = redactText(String(reason || '面板服务停止，任务已安全中断'));
+    const excludedJobIds = new Set(
+      (Array.isArray(options?.excludeJobIds) ? options.excludeJobIds : [])
+        .map((id) => String(id || '').trim())
+        .filter(Boolean),
+    );
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
@@ -640,7 +653,8 @@ class PanelDb {
           WHERE status IN ('queued', 'running')
             AND owner_pid = ${sqlString(owner.pid)}
             AND ${startCondition}
-            AND ${bootCondition}`));
+            AND ${bootCondition}`))
+          .filter((row) => !excludedJobIds.has(String(row.id)));
         if (rows.length > 0) {
           const statement = database.prepare(`UPDATE sync_jobs
             SET status = 'interrupted', error = ?, finished_at = ?
