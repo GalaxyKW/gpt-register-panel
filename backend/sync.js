@@ -196,10 +196,18 @@ function withSyncLock(callback, options = {}) {
 }
 
 function configuredForSub2Api() {
-  return Boolean(
-    process.env.SUB2API_BASE_URL
-      && (process.env.SUB2API_ADMIN_API_KEY || process.env.SUB2API_JWT),
-  );
+  try {
+    // Construction performs the same URL, transport-policy, and credential
+    // validation used by real requests, but has no network or logging side
+    // effects. Keep health/snapshot admission aligned with the client instead
+    // of treating merely truthy (but unusable) environment text as configured.
+    new Sub2ApiAdminClient();
+    return true;
+  } catch {
+    // Configuration errors can contain deployment input. The public contract
+    // is deliberately boolean so no URL credential or token is reflected.
+    return false;
+  }
 }
 
 function safeVersionInput(snapshot) {

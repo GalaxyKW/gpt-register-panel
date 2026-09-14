@@ -19,6 +19,7 @@ const {
   executeImportPlanItem: executeImportPlanItemWithAuditCheckpoint,
   importPlanSummary,
   buildSnapshot,
+  configuredForSub2Api,
   confirmedSub2ApiRead,
   snapshotVersion,
   importPlanIntentVersionsEqual,
@@ -60,6 +61,85 @@ const TEST_CREATE_POLICY = Object.freeze({
   updateExisting: false,
   skipDefaultGroupBind: true,
   confirmMixedChannelRisk: false,
+});
+
+test('Sub2API configured state requires a locally constructible client without network access', async () => {
+  const names = [
+    'SUB2API_BASE_URL',
+    'SUB2API_ADMIN_API_KEY',
+    'SUB2API_JWT',
+    'SUB2API_ALLOW_INSECURE_HTTP',
+  ];
+  const previous = new Map(names.map((name) => [name, process.env[name]]));
+  const originalFetch = global.fetch;
+  let fetchCalls = 0;
+  global.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('configuration check must not fetch');
+  };
+  const configure = (values) => {
+    for (const name of names) delete process.env[name];
+    Object.assign(process.env, values);
+  };
+  try {
+    configure({
+      SUB2API_BASE_URL: TEST_SUB2API_BASE_URL,
+      SUB2API_ADMIN_API_KEY: 'valid-test-key',
+    });
+    assert.equal(configuredForSub2Api(), true);
+
+    for (const values of [
+      {
+        SUB2API_BASE_URL: 'not-a-url',
+        SUB2API_ADMIN_API_KEY: 'configured-but-invalid',
+      },
+      {
+        SUB2API_BASE_URL: ' ' + TEST_SUB2API_BASE_URL,
+        SUB2API_ADMIN_API_KEY: 'configured-but-invalid',
+      },
+      {
+        SUB2API_BASE_URL: 'http://127.0.0.1:\n18080',
+        SUB2API_ADMIN_API_KEY: 'configured-but-invalid',
+      },
+      {
+        SUB2API_BASE_URL: TEST_SUB2API_BASE_URL,
+        SUB2API_ADMIN_API_KEY: '   ',
+      },
+      {
+        SUB2API_BASE_URL: TEST_SUB2API_BASE_URL,
+        SUB2API_ADMIN_API_KEY: 'invalid\nheader',
+      },
+      {
+        SUB2API_BASE_URL: 'https://embedded:credential@example.test',
+        SUB2API_ADMIN_API_KEY: 'configured-but-invalid',
+      },
+      {
+        SUB2API_BASE_URL: 'http://192.0.2.10:8080',
+        SUB2API_ADMIN_API_KEY: 'configured-but-invalid',
+      },
+    ]) {
+      configure(values);
+      assert.equal(configuredForSub2Api(), false);
+    }
+    assert.equal(fetchCalls, 0);
+
+    let clientFactoryCalls = 0;
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      clientFactory() {
+        clientFactoryCalls += 1;
+        throw new Error('invalid configuration must not initialize a snapshot client');
+      },
+    });
+    assert.equal(clientFactoryCalls, 0);
+    assert.equal(snapshot.sub2api.readStatus, 'omitted');
+    assert.equal(snapshot.sub2api.accountCount, null);
+  } finally {
+    global.fetch = originalFetch;
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 function importExecutionBindingForPlan(plan, options = {}) {

@@ -16,12 +16,14 @@ const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
 const DEFAULT_RESPONSE_BODY_BYTES = 4 * 1024 * 1024;
 const MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024;
+const MAX_ADMIN_BASE_URL_BYTES = 4096;
 const MAX_ADMIN_REQUEST_PATH_BYTES = 4096;
 const MAX_BATCH_ACCOUNT_IDS = 1000;
 const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST']);
 const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const URL_WHITESPACE_CONTROL_OR_BIDI = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
 const CREDENTIAL_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
@@ -1154,6 +1156,26 @@ function configuredCredential(value) {
   return text;
 }
 
+function configuredBaseUrl(value) {
+  let text;
+  try {
+    text = String(value ?? '');
+  } catch {
+    text = '';
+  }
+  if (!text) return '';
+  // WHATWG URL parsing silently strips tabs/newlines and surrounding ASCII
+  // whitespace. Reject that ambiguous deployment input before canonicalizing
+  // it, and bound it before any error path can retain an oversized value.
+  if (Buffer.byteLength(text, 'utf8') > MAX_ADMIN_BASE_URL_BYTES
+      || URL_WHITESPACE_CONTROL_OR_BIDI.test(text)) {
+    const error = new Error('Sub2API 管理 API 地址格式无效');
+    error.code = 'SUB2API_BASE_URL_INVALID';
+    throw error;
+  }
+  return text.replace(/\/$/, '');
+}
+
 function statsSchemaError(message = 'Sub2API 账号统计响应结构无效') {
   const error = new Error(message);
   error.code = 'SUB2API_STATS_SCHEMA_INVALID';
@@ -1168,9 +1190,9 @@ function canonicalBatchAccountId(rawId, allowed) {
 
 class Sub2ApiAdminClient {
   constructor(options = {}) {
-    this.baseUrl = String(
+    this.baseUrl = configuredBaseUrl(
       options.baseUrl || process.env.SUB2API_BASE_URL || '',
-    ).replace(/\/$/, '');
+    );
     this.apiKey = configuredCredential(
       options.apiKey || process.env.SUB2API_ADMIN_API_KEY || '',
     );
