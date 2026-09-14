@@ -3050,6 +3050,46 @@ if (elements.accountTestButton) {
 }
 
 if (elements.cleanupButton) {
+  const expiredTokenListingProblem = (listing) => {
+    const invalid = '服务器返回的过期 token 清单无效，已停止活动目录清理';
+    const expiredCount = listing?.count;
+    if (typeof expiredCount !== 'number'
+        || !Number.isSafeInteger(expiredCount)
+        || expiredCount < 0
+        || expiredCount > 1_000_000
+        || !Array.isArray(listing?.items)
+        || listing.items.length !== expiredCount
+        || listing.items.length > 1_000_000
+        || typeof listing?.recoveryRequired !== 'boolean'
+        || typeof listing?.claimCount !== 'number'
+        || !Number.isSafeInteger(listing.claimCount)
+        || listing.claimCount < 0
+        || listing.claimCount > 1_000_000
+        || typeof listing?.claimCountTruncated !== 'boolean'
+        || (listing.recoveryRequired
+          !== (listing.claimCount > 0 || listing.claimCountTruncated))) return invalid;
+    const seenPaths = new Set();
+    for (const item of listing.items) {
+      if (!item || typeof item !== 'object' || Array.isArray(item)) return invalid;
+      const source = item.source;
+      const relativePath = item.relativePath;
+      if (!['tokens', 'use_token'].includes(source)
+          || typeof relativePath !== 'string'
+          || relativePath.length === 0
+          || relativePath.length > 1024
+          || relativePath.includes('\\')
+          || /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(relativePath)) return invalid;
+      const segments = relativePath.split('/');
+      if (segments.length !== 2
+          || segments[0] !== source
+          || !segments[1]
+          || !segments[1].toLowerCase().endsWith('.json')
+          || /^old_codex[-_]/i.test(segments[1])
+          || seenPaths.has(relativePath)) return invalid;
+      seenPaths.add(relativePath);
+    }
+    return '';
+  };
   elements.cleanupButton.addEventListener('click', async () => {
     if (state.cleanupRequestPending) return;
     state.cleanupRequestPending = true;
@@ -3058,16 +3098,9 @@ if (elements.cleanupButton) {
       const scanResponse = await apiFetch('/api/tokens/expired');
       const listing = await scanResponse.json();
       if (!scanResponse.ok) throw new Error(listing.message || listing.error || '过期 token 扫描失败');
+      const listingProblem = expiredTokenListingProblem(listing);
+      if (listingProblem) throw new Error(listingProblem);
       const expiredCount = listing.count;
-      if (typeof expiredCount !== 'number'
-          || !Number.isSafeInteger(expiredCount)
-          || expiredCount < 0
-          || expiredCount > 1_000_000
-          || !Array.isArray(listing.items)
-          || listing.items.length !== expiredCount
-          || listing.items.length > 1_000_000) {
-        throw new Error('服务器返回的过期 token 清单无效，已停止活动目录清理');
-      }
       if (listing.recoveryRequired === true) {
         const claimCount = Number.isSafeInteger(Number(listing.claimCount))
           ? Math.max(0, Number(listing.claimCount))

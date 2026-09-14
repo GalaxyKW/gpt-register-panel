@@ -1542,10 +1542,22 @@ test('frontend rejects inconsistent, non-numeric, or oversized expired token lis
   );
   const oversizedItems = [];
   oversizedItems.length = 1_000_001;
+  const validShape = {
+    version: 'a'.repeat(64),
+    count: 1,
+    items: [{ source: 'tokens', relativePath: 'tokens/one.json' }],
+    recoveryRequired: false,
+    claimCount: 0,
+    claimCountTruncated: false,
+  };
   const scenarios = [
     { version: 'a'.repeat(64), count: 2, items: [{ relativePath: 'tokens/one.json' }] },
     { version: 'a'.repeat(64), count: '1', items: [{ relativePath: 'tokens/one.json' }] },
     { version: 'a'.repeat(64), count: 1_000_001, items: oversizedItems },
+    { ...validShape, recoveryRequired: 'false' },
+    { ...validShape, claimCount: '0' },
+    { ...validShape, claimCountTruncated: 0 },
+    { ...validShape, recoveryRequired: true },
   ];
   for (const listing of scenarios) {
     let clickHandler;
@@ -1578,6 +1590,126 @@ test('frontend rejects inconsistent, non-numeric, or oversized expired token lis
   }
 });
 
+test('frontend rejects malformed, duplicate, historical, or cross-scope cleanup preview paths', async () => {
+  const cleanupHandler = sourceSection(
+    "if (elements.cleanupButton) {",
+    "elements.clearSelectionButton.addEventListener",
+  );
+  const item = (sourceName, relativePath) => ({ source: sourceName, relativePath });
+  const scenarios = [
+    [item('archive', 'archive/one.json')],
+    [item('tokens', 'use_token/one.json')],
+    [item('tokens', '/tokens/one.json')],
+    [item('tokens', 'tokens/../one.json')],
+    [item('tokens', 'tokens/nested/one.json')],
+    [item('tokens', 'tokens\\one.json')],
+    [item('tokens', 'tokens/one.txt')],
+    [item('tokens', 'tokens/old_codex-backup.json')],
+    [item('tokens', 'tokens/one.json'), item('tokens', 'tokens/one.json')],
+    [item('tokens', 'tokens/\u202eone.json')],
+    [item('tokens', 'tokens/\u200fone.json')],
+    [null],
+  ];
+  for (const items of scenarios) {
+    let clickHandler;
+    let confirmations = 0;
+    let mutationRequests = 0;
+    const notices = [];
+    const context = {
+      elements: {
+        cleanupButton: {
+          addEventListener(event, handler) {
+            assert.equal(event, 'click');
+            clickHandler = handler;
+          },
+        },
+      },
+      state: { cleanupRequestPending: false },
+      updateActionState() {},
+      apiFetch: async () => ({
+        ok: true,
+        async json() {
+          return {
+            version: 'a'.repeat(64),
+            count: items.length,
+            items,
+            recoveryRequired: false,
+            claimCount: 0,
+            claimCountTruncated: false,
+          };
+        },
+      }),
+      idempotentMutationFetch: async () => { mutationRequests += 1; },
+      showNotice: (...args) => notices.push(args),
+      watchJob: async () => {},
+      window: { confirm: () => { confirmations += 1; return true; } },
+    };
+    vm.runInNewContext(cleanupHandler, context);
+    await clickHandler();
+    assert.equal(confirmations, 0);
+    assert.equal(mutationRequests, 0);
+    assert.equal(context.state.cleanupRequestPending, false);
+    assert.match(notices.at(-1)[0], /过期 token 清单无效/);
+  }
+
+  let validClickHandler;
+  let confirmation = '';
+  let submitted = null;
+  let watchedJob = null;
+  const validListing = {
+    version: 'b'.repeat(64),
+    count: 2,
+    items: [
+      item('tokens', 'tokens/current.json'),
+      item('use_token', 'use_token/当前.json'),
+    ],
+    recoveryRequired: false,
+    claimCount: 0,
+    claimCountTruncated: false,
+  };
+  const validContext = {
+    elements: {
+      cleanupButton: {
+        addEventListener(_event, handler) { validClickHandler = handler; },
+      },
+    },
+    state: { cleanupRequestPending: false },
+    updateActionState() {},
+    apiFetch: async () => ({ ok: true, async json() { return validListing; } }),
+    async idempotentMutationFetch(workflow, pathname, body) {
+      submitted = { workflow, pathname, body };
+      return {
+        response: { ok: true },
+        body: { jobId: 'job_' + 'a'.repeat(24) },
+      };
+    },
+    showNotice() {},
+    watchJob: async (jobId, type) => { watchedJob = { jobId, type }; },
+    window: {
+      confirm(message) {
+        confirmation = message;
+        return true;
+      },
+    },
+  };
+  vm.runInNewContext(cleanupHandler, validContext);
+  await validClickHandler();
+  assert.match(confirmation, /tokens\/current\.json/);
+  assert.match(confirmation, /use_token\/当前\.json/);
+  assert.deepEqual(JSON.parse(JSON.stringify(submitted)), {
+    workflow: 'token_cleanup',
+    pathname: '/api/tokens/expired/delete',
+    body: {
+      version: validListing.version,
+      confirmation: 'DELETE_EXPIRED_TOKENS',
+    },
+  });
+  assert.deepEqual(watchedJob, {
+    jobId: 'job_' + 'a'.repeat(24),
+    type: 'token_cleanup',
+  });
+});
+
 test('frontend blocks global cleanup when stranded quarantine claims require recovery', async () => {
   const cleanupHandler = sourceSection(
     "if (elements.cleanupButton) {",
@@ -1607,6 +1739,7 @@ test('frontend blocks global cleanup when stranded quarantine claims require rec
           items: [],
           recoveryRequired: true,
           claimCount: 2,
+          claimCountTruncated: false,
         };
       },
     }),
