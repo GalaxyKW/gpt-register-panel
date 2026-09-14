@@ -450,14 +450,101 @@ test('account test checkpoints the probe before calling Sub2API', async () => {
   ]);
 });
 
+test('non-boolean or missing test success requires reconciliation and stops the batch', async () => {
+  const variants = [
+    ['numeric success', { success: 1, message: 'invalid-result-secret-marker' }],
+    ['missing success', { message: 'invalid-result-secret-marker' }],
+  ];
+  for (let index = 0; index < variants.length; index += 1) {
+    const [label, response] = variants[index];
+    const accounts = [
+      oauthTestAccount(110 + (index * 2), 'error', false),
+      oauthTestAccount(111 + (index * 2), 'active', true),
+    ];
+    const tested = [];
+    const schedulerWrites = [];
+    const logRecords = [];
+    const logger = {
+      checkpoint() { return true; },
+      info(event, fields) { logRecords.push({ event, fields }); },
+      warn(event, fields) { logRecords.push({ event, fields }); },
+      error(event, fields) { logRecords.push({ event, fields }); },
+    };
+    const outcome = await runAccountTestJobNow({
+      accountIds: accounts.map((account) => account.id),
+      targetBaselines: targetBaselines(...accounts),
+      db: fakeWorkerDb(),
+      jobId: 'test-invalid-test-response-' + index,
+      logger,
+      client: {
+        async listAccounts() { return accounts.map((account) => ({ ...account })); },
+        async getAccount(id) {
+          const account = accounts.find((candidate) => candidate.id === id);
+          return account ? { ...account } : null;
+        },
+        async testAccount(id) {
+          tested.push(id);
+          return response;
+        },
+        async setSchedulable(id, value) { schedulerWrites.push({ id, value }); },
+      },
+    });
+    assert.deepEqual(tested, [accounts[0].id], label);
+    assert.deepEqual(schedulerWrites, [], label);
+    assert.equal(outcome.requiresReconciliation, true, label);
+    assert.equal(outcome.reconciliationCount, 1, label);
+    assert.equal(outcome.attemptedCount, 1, label);
+    assert.equal(outcome.notAttemptedCount, 1, label);
+    assert.equal(outcome.results[0].code, 'account_test_reconciliation_required', label);
+    assert.equal(outcome.results[0].causeCode, 'ACCOUNT_TEST_RESULT_INVALID', label);
+    assert.equal(outcome.results[0].testSuccess, null, label);
+    assert.equal(outcome.results[0].testSuccessKnown, false, label);
+    assert.equal(outcome.results[0].testOutcomeUnknown, true, label);
+    assert.equal(outcome.results[0].reconciliationScope, 'test', label);
+    assert.equal(outcome.results[0].reconciliationReason, 'test_response_invalid', label);
+    assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation', label);
+    assert.equal(JSON.stringify({ outcome, logRecords }).includes('invalid-result-secret-marker'), false);
+  }
+});
+
+test('known failed test messages are redacted again at the worker boundary', async () => {
+  const account = oauthTestAccount(115, 'active', true);
+  const logRecords = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [account.id],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-failure-message-redaction',
+    logger: {
+      checkpoint() { return true; },
+      info(event, fields) { logRecords.push({ event, fields }); },
+      warn(event, fields) { logRecords.push({ event, fields }); },
+      error(event, fields) { logRecords.push({ event, fields }); },
+    },
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        return { success: false, message: 'access_token=worker-boundary-marker' };
+      },
+    },
+  });
+
+  assert.equal(outcome.results[0].code, 'upstream_test_failed');
+  assert.equal(JSON.stringify({ outcome, logRecords }).includes('worker-boundary-marker'), false);
+});
+
 test('scheduler enable is not dispatched when its log checkpoint fails', async () => {
-  const account = oauthTestAccount(13, 'error', false);
+  let account = oauthTestAccount(13, 'error', false);
   const checkpoints = [];
   let schedulerWrites = 0;
   const client = {
     async listAccounts() { return [{ ...account }]; },
     async getAccount() { return { ...account }; },
-    async testAccount() { return { success: true }; },
+    async testAccount() {
+      account = { ...account, status: 'active' };
+      return { success: true };
+    },
     async setSchedulable() {
       schedulerWrites += 1;
       return { ...account, schedulable: true };
@@ -501,14 +588,19 @@ test('scheduler rollback is not dispatched when its log checkpoint fails', async
       account = {
         ...account,
         status: 'active',
-        tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
       };
       return { success: true };
     },
     async setSchedulable(id, value) {
       assert.equal(id, 14);
       schedulerWrites.push(value);
-      account = { ...account, schedulable: value };
+      account = {
+        ...account,
+        schedulable: value,
+        ...(value === true
+          ? { tempUnschedulableUntil: '2099-01-01T00:00:00.000Z' }
+          : {}),
+      };
       return { ...account };
     },
   };
@@ -569,39 +661,67 @@ test('error-account recovery preserves an originally enabled scheduler when reco
   assert.equal(account.schedulable, true);
 });
 
-test('error-account recovery checks temporary blockers and confirms scheduler rollback', async () => {
-  let account = oauthTestAccount(12, 'error', false);
-  const schedulableCalls = [];
-  const client = {
-    async listAccounts() { return [{ ...account }]; },
-    async getAccount() { return { ...account }; },
-    async testAccount() {
-      account = {
-        ...account,
-        status: 'active',
-        tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
-      };
-      return { success: true };
-    },
-    async setSchedulable(id, value) {
-      assert.equal(id, 12);
-      schedulableCalls.push(value);
-      account = { ...account, schedulable: value };
-      return { ...account };
-    },
-  };
-  const outcome = await runAccountTestJobNow({
-    accountIds: [12],
-    targetBaselines: targetBaselines(account),
-    db: fakeWorkerDb(),
-    jobId: 'test-error-blocked',
-    client,
-  });
-  assert.equal(outcome.failed, 1);
-  assert.equal(outcome.results[0].code, 'account_recovery_not_confirmed');
-  assert.equal(outcome.results[0].enabled, false);
-  assert.deepEqual(schedulableCalls, [true, false]);
-  assert.equal(account.schedulable, false);
+test('error-account recovery does not toggle scheduling while another blocker remains', async () => {
+  const variants = [
+    ['still error', {}],
+    ['expired', {
+      status: 'active',
+      autoPauseOnExpired: true,
+      expiresAt: '2000-01-01T00:00:00.000Z',
+      expiryStatus: 'valid',
+    }],
+    ['temporarily unavailable', {
+      status: 'active',
+      tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+      tempUnschedulableUntilStatus: 'valid',
+    }],
+    ['rate limited', {
+      status: 'active',
+      rateLimitResetAt: '2099-01-01T00:00:00.000Z',
+      rateLimitResetStatus: 'valid',
+    }],
+    ['overloaded', {
+      status: 'active',
+      overloadUntil: '2099-01-01T00:00:00.000Z',
+      overloadUntilStatus: 'valid',
+    }],
+    ['availability unknown', {
+      status: 'active',
+      autoPauseOnExpired: null,
+    }],
+  ];
+  for (let index = 0; index < variants.length; index += 1) {
+    const [label, stateAfterTest] = variants[index];
+    let account = oauthTestAccount(120 + index, 'error', false);
+    const submitted = { ...account };
+    const schedulableCalls = [];
+    const client = {
+      async listAccounts() { return [{ ...submitted }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = { ...account, ...stateAfterTest };
+        return { success: true };
+      },
+      async setSchedulable(id, value) {
+        schedulableCalls.push({ id, value });
+        account = { ...account, schedulable: value };
+        return { ...account };
+      },
+    };
+    const outcome = await runAccountTestJobNow({
+      accountIds: [account.id],
+      targetBaselines: targetBaselines(submitted),
+      db: fakeWorkerDb(),
+      jobId: 'test-error-blocked-' + index,
+      client,
+    });
+    assert.equal(outcome.failed, 1, label);
+    assert.equal(outcome.results[0].code, 'account_recovery_not_confirmed', label);
+    assert.equal(outcome.results[0].enabled, false, label);
+    assert.equal(outcome.results[0].enabledKnown, true, label);
+    assert.deepEqual(schedulableCalls, [], label);
+    assert.equal(account.schedulable, false, label);
+  }
 });
 
 test('non-error success re-reads state and does not report a stale pre-test snapshot', async () => {
@@ -1044,7 +1164,6 @@ test('scheduler rollback does not adopt state changed after its write response',
         account = {
           ...account,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
@@ -1088,7 +1207,6 @@ test('mismatched scheduler-rollback response marks the write outcome unknown', a
         account = {
           ...account,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
@@ -1096,7 +1214,11 @@ test('mismatched scheduler-rollback response marks the write outcome unknown', a
         assert.equal(id, 30);
         schedulableCalls.push(value);
         if (value === true) {
-          account = { ...account, schedulable: true };
+          account = {
+            ...account,
+            schedulable: true,
+            tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+          };
           return { ...account };
         }
         return { ...replacement };
@@ -1187,7 +1309,6 @@ test('unknown scheduler-rollback outcome requires reconciliation and is never re
         account = {
           ...account,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
@@ -1196,7 +1317,11 @@ test('unknown scheduler-rollback outcome requires reconciliation and is never re
         assert.notEqual(options.signal, controller.signal);
         assert.equal(options.signal.aborted, false);
         if (value === true) {
-          account = { ...account, schedulable: true };
+          account = {
+            ...account,
+            schedulable: true,
+            tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+          };
           return { ...account };
         }
         const error = new Error('scheduler rollback timed out');
@@ -1791,14 +1916,17 @@ test('account-test total deadline covers a dispatched scheduler restore and keep
         account = {
           ...account,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
       async setSchedulable(id, value, options) {
         schedulerWrites.push({ id, value });
         if (value === true) {
-          account = { ...account, schedulable: true };
+          account = {
+            ...account,
+            schedulable: true,
+            tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+          };
           return { ...account };
         }
         try {
@@ -1847,7 +1975,6 @@ test('pre-dispatch scheduler-enable interruption records the known test without 
         first = {
           ...first,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
@@ -1898,14 +2025,17 @@ test('pre-dispatch scheduler rollback still holds known unrestored enable for re
         first = {
           ...first,
           status: 'active',
-          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
         };
         return { success: true };
       },
       async setSchedulable(id, value, options) {
         schedulerCalls.push({ id, value });
         if (value === true) {
-          first = { ...first, schedulable: true };
+          first = {
+            ...first,
+            schedulable: true,
+            tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+          };
           return { ...first };
         }
         controller.abort();

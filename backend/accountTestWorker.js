@@ -841,8 +841,25 @@ async function runAccountTestJobNow({
         timeoutMs: Math.max(1, deadline - Date.now()),
         signal,
       });
-      testSuccessKnown = typeof test?.success === 'boolean';
-      testSucceeded = test?.success === true;
+      let returnedTestSuccess;
+      try {
+        returnedTestSuccess = test?.success;
+      } catch {
+        // Treat hostile/invalid response objects exactly like a missing
+        // success field and never copy a thrown remote value into logs.
+        returnedTestSuccess = undefined;
+      }
+      if (typeof returnedTestSuccess !== 'boolean') {
+        const error = new Error('Sub2API 账号测试结果结构无效');
+        error.code = 'ACCOUNT_TEST_RESULT_INVALID';
+        throw accountTestReconciliationError(
+          error,
+          'test_response_invalid',
+          { testOutcomeUnknown: true },
+        );
+      }
+      testSuccessKnown = true;
+      testSucceeded = returnedTestSuccess;
       // Any dispatched test can change Sub2API runtime state, including a
       // test whose terminal result is a known failure. If shutdown wins before
       // postflight verification, persist the unfinished chain rather than
@@ -855,7 +872,7 @@ async function runAccountTestJobNow({
         );
       }
       throwIfJobInterrupted(signal);
-      if (!test.success) {
+      if (!returnedTestSuccess) {
         let afterFailure = null;
         let afterFailureReadError = null;
         try {
@@ -899,7 +916,10 @@ async function runAccountTestJobNow({
           accountName: account.name || null,
           status: 'failed',
           code: 'upstream_test_failed',
-          message: test.message || '常规请求失败',
+          // Keep the worker boundary defensive even though the production
+          // adapter currently emits a fixed failure message. Injected clients
+          // and future adapters must not be able to persist or log credentials.
+          message: safeErrorMessage(test.message || '常规请求失败'),
           testSuccess: false,
           statusBefore,
           enabled: afterFailure.schedulable === true,
@@ -1055,11 +1075,50 @@ async function runAccountTestJobNow({
         continue;
       }
       if (afterTest.schedulable !== schedulableBefore
-          || !['active', 'error'].includes(accountStatus(afterTest))
           || schedulableBefore !== false) {
         const error = new Error('测试后账号状态已变化或不允许自动启用调度');
         error.code = 'ACCOUNT_TEST_STATE_CHANGED';
         throw error;
+      }
+      // Evaluate the state that would exist after enabling scheduling before
+      // issuing any write. Enabling cannot repair an error/disabled status,
+      // expiry, rate limit, temporary pause, overload, or malformed runtime
+      // metadata; toggling true and then rolling back only adds an avoidable
+      // mutation window and can overwrite a concurrent administrator change.
+      const availabilityIfEnabled = getAccountAvailability({
+        ...afterTest,
+        schedulable: true,
+        schedulableKnown: true,
+      });
+      if (availabilityIfEnabled.key !== 'available') {
+        const result = {
+          accountId: id,
+          accountName: afterTest.name || account.name || null,
+          status: 'failed',
+          code: 'account_recovery_not_confirmed',
+          message: availabilityIfEnabled.key === 'unknown'
+            ? '测试成功，但账号恢复后的可用性无法确认；未修改调度设置'
+            : '测试成功，但账号仍存在其他不可用状态；未修改调度设置',
+          testSuccess: true,
+          enabled: false,
+          enabledKnown: true,
+          statusBefore,
+          statusAfter: afterTest.status || null,
+          statusAfterKnown: true,
+          durationMs: Date.now() - itemStartedAt,
+        };
+        results.push(result);
+        await auditResult(db, logger, result, actor, jobId, normalizedModelId);
+        writeLog(logger, 'error', 'account_test.recovery_unconfirmed', {
+          jobId,
+          actor,
+          accountId: id,
+          accountName: result.accountName,
+          availability: availabilityIfEnabled.reason,
+          schedulerPreserved: true,
+          durationMs: result.durationMs,
+        });
+        continue;
       }
       schedulerEnablePending = true;
 
