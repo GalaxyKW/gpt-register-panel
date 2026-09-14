@@ -20,20 +20,52 @@ Type=simple
 # the gpt_register and runtime ownership before changing these values.
 User=root
 Group=root
-WorkingDirectory=/mnt/nvme/item/gpt-register-panel
+# Resolve the NTFS-backed sources exactly once while systemd constructs the
+# private mount namespace. RuntimeDirectory is root-owned and not reachable
+# through the locally writable /mnt/nvme mount root, so later ancestor renames
+# cannot redirect WorkingDirectory, ExecStart or Phase3 to replacement trees.
+RuntimeDirectory=gpt-register-panel
+RuntimeDirectoryMode=0700
+BindReadOnlyPaths=/mnt/nvme/item/gpt-register-panel:/run/gpt-register-panel/code
+BindPaths=/mnt/nvme/item/gpt-register-panel/runtime:/run/gpt-register-panel/runtime
+BindPaths=/mnt/nvme/gpt_register:/run/gpt-register-panel/gpt_register
+WorkingDirectory=/run/gpt-register-panel/code
 Environment=NODE_ENV=production
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# Do not inherit system-manager or deployment-file Node preload/module search
+# hooks into either the trusted preflight interpreter or the root service.
+Environment=NODE_OPTIONS=
+Environment=NODE_PATH=
 # Keep secrets on a filesystem that enforces Unix permissions. PANEL_ENV_FILE
 # contains only a path; credentials are never copied into the unit or exposed
 # through EnvironmentFile/systemd's environment inspection interfaces.
 Environment=PANEL_ENV_FILE=/etc/gpt-register-panel/panel.env
+# Keep every security-sensitive default on a pinned path. loadEnv() never
+# overwrites process variables set by the unit, so stale paths in panel.env
+# cannot redirect these operations through the untrusted NTFS mount ancestry.
+Environment=GPT_REGISTER_ROOT=/run/gpt-register-panel/gpt_register
+Environment=GPT_REGISTER_NODE_PATH=/usr/bin/node
+Environment=PANEL_DB_PATH=/run/gpt-register-panel/runtime/panel.sqlite3
+Environment=PANEL_BACKUP_DIR=/run/gpt-register-panel/runtime/backups
+Environment=PANEL_LOG_PATH=/run/gpt-register-panel/runtime/panel.log
+Environment=PANEL_CONTROL_LOCK_PATH=/run/gpt-register-panel/runtime/panel.sqlite3.control.lock
+Environment=PANEL_TOKEN_QUARANTINE_DIR=/run/gpt-register-panel/gpt_register/.panel-quarantine/expired-tokens
 ExecStartPre=/usr/bin/test -r /etc/gpt-register-panel/panel.env
-ExecStartPre=/usr/bin/test -r /mnt/nvme/item/gpt-register-panel/backend/server.js
-ExecStartPre=/usr/bin/test -d /mnt/nvme/gpt_register
-ExecStartPre=/usr/bin/test -d /mnt/nvme/item/gpt-register-panel/runtime
-ExecStartPre=/usr/bin/test -d /mnt/nvme/tmp
 ExecStartPre=/usr/bin/test -x /usr/bin/node
-ExecStart=/usr/bin/node /mnt/nvme/item/gpt-register-panel/backend/server.js
+# ExecStartPre runs inside the completed private mount namespace. Refuse a
+# source that was replaced before binding, is a symlink/wrong type, is not
+# root-owned, or is writable by a group/other user. Keep these checks inline so
+# no helper executable can itself be replaced from the data mount.
+ExecStartPre=/usr/bin/node -e "const fs=require('node:fs');for(const p of process.argv.slice(1)){const s=fs.lstatSync(p);if(s.isSymbolicLink()||!s.isDirectory()||s.uid!==0||(s.mode&0o22)!==0)throw Error('unsafe service directory: '+p)}" /run/gpt-register-panel /run/gpt-register-panel/code /run/gpt-register-panel/code/backend /run/gpt-register-panel/code/frontend /run/gpt-register-panel/code/node_modules /run/gpt-register-panel/runtime /run/gpt-register-panel/gpt_register /run/gpt-register-panel/gpt_register/src /run/gpt-register-panel/gpt_register/node_modules
+ExecStartPre=/usr/bin/node -e "const fs=require('node:fs');for(const p of process.argv.slice(1)){const s=fs.lstatSync(p);if(s.isSymbolicLink()||!s.isFile()||s.uid!==0||(s.mode&0o22)!==0)throw Error('unsafe service file: '+p)}" /etc/gpt-register-panel/panel.env /run/gpt-register-panel/code/backend/server.js /run/gpt-register-panel/code/package.json /run/gpt-register-panel/gpt_register/index.js /run/gpt-register-panel/gpt_register/package.json /run/gpt-register-panel/gpt_register/config.json
+# Walk every module/code entry without following directory symlinks. Bound both
+# discovered entries and depth before growing the work stack, so an attacker-
+# supplied replacement tree fails without turning startup into an OOM. npm bin
+# links are accepted only when relative and resolved to a regular file in the
+# same pinned scan root. The one historical node-gyp Python link has an exact,
+# separately verified system target; every other external link is rejected.
+ExecStartPre=/usr/bin/node -e "const fs=require('node:fs'),path=require('node:path'),MAX_ENTRIES=50000,MAX_DEPTH=64,roots=process.argv.slice(1).map((p)=>path.resolve(p)),validated=new Set(),internalTargets=[];let discovered=roots.length;if(discovered>MAX_ENTRIES)throw Error('service code entry limit exceeded');const safe=(s)=>s.uid===0&&(s.mode&0o22)===0;const pythonLink='/run/gpt-register-panel/gpt_register/node_modules/sleep/build/node_gyp_bins/python3',pythonTarget=fs.realpathSync('/usr/bin/python3');for(const root of roots){const rs=fs.lstatSync(root);if(!rs.isDirectory()||!safe(rs))throw Error('unsafe service code root: '+root);const stack=[[root,0]];while(stack.length){const [p,depth]=stack.pop(),s=fs.lstatSync(p);if(s.isSymbolicLink()){if(s.uid!==0)throw Error('unsafe service code link owner: '+p);const raw=fs.readlinkSync(p),target=fs.realpathSync(p),ts=fs.lstatSync(target);if(p===pythonLink&&raw==='/usr/bin/python3'&&target===pythonTarget){if(!ts.isFile()||!safe(ts))throw Error('unsafe node-gyp Python target');continue}const relative=path.relative(root,target);if(path.isAbsolute(raw)||!relative||relative==='..'||relative.startsWith('..'+path.sep)||path.isAbsolute(relative)||ts.dev!==rs.dev||!ts.isFile()||!safe(ts))throw Error('unsafe service code link: '+p);internalTargets.push(target);continue}if(s.dev!==rs.dev||(!s.isDirectory()&&!s.isFile())||!safe(s))throw Error('unsafe service code entry: '+p);validated.add(p);if(s.isDirectory()){if(depth>=MAX_DEPTH)throw Error('service code depth limit exceeded');const directory=fs.opendirSync(p);try{for(let entry;(entry=directory.readSync())!==null;){if(++discovered>MAX_ENTRIES)throw Error('service code entry limit exceeded');stack.push([path.join(p,entry.name),depth+1])}}finally{directory.closeSync()}}}}for(const target of internalTargets)if(!validated.has(target))throw Error('service code link target was not scanned')" /run/gpt-register-panel/code/backend /run/gpt-register-panel/code/frontend /run/gpt-register-panel/code/node_modules /run/gpt-register-panel/gpt_register/src /run/gpt-register-panel/gpt_register/node_modules
+ExecStart=/usr/bin/node /run/gpt-register-panel/code/backend/server.js
 Restart=on-failure
 RestartSec=5s
 TimeoutStartSec=30s
@@ -54,31 +86,35 @@ NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
 ProtectSystem=strict
-# Keep the host filesystem read-only except for panel runtime state, the
-# gpt_register state tree used by Phase3, and its existing screenshot folder.
+# Keep the host filesystem read-only except for the two pinned writable data
+# roots. The project code has its own read-only bind and is never executed via
+# its original path below the locally writable /mnt/nvme mount root.
 # If deployment configuration moves a writable path, add that exact trusted
 # path here instead of widening this list.
-ReadWritePaths=/mnt/nvme/item/gpt-register-panel/runtime
-ReadWritePaths=/mnt/nvme/gpt_register
-ReadWritePaths=/mnt/nvme/tmp
+ReadWritePaths=/run/gpt-register-panel/runtime
+ReadWritePaths=/run/gpt-register-panel/gpt_register
+ReadOnlyPaths=/run/gpt-register-panel/code
 # gpt_register atomically replaces state files in its root, so the root itself
 # must remain writable. Overlay executable code, dependencies and configuration
 # as read-only to prevent a browser compromise from persisting into Phase3.
-ReadOnlyPaths=/mnt/nvme/gpt_register/index.js
-ReadOnlyPaths=/mnt/nvme/gpt_register/src
-ReadOnlyPaths=/mnt/nvme/gpt_register/node_modules
-ReadOnlyPaths=/mnt/nvme/gpt_register/package.json
-ReadOnlyPaths=-/mnt/nvme/gpt_register/package-lock.json
-ReadOnlyPaths=-/mnt/nvme/gpt_register/config.json
-ReadOnlyPaths=-/mnt/nvme/gpt_register/config.local.json
-ReadOnlyPaths=-/mnt/nvme/gpt_register/config.server.json
-ReadOnlyPaths=-/mnt/nvme/gpt_register/cloudflare-email-worker.js
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/index.js
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/src
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/node_modules
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/package.json
+ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/package-lock.json
+ReadOnlyPaths=/run/gpt-register-panel/gpt_register/config.json
+ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/config.local.json
+ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/config.server.json
+ReadOnlyPaths=-/run/gpt-register-panel/gpt_register/cloudflare-email-worker.js
 ReadOnlyPaths=/etc/gpt-register-panel/panel.env
 # The legacy project-local file may live on NTFS and cannot reliably enforce
 # 0600. Hide it from the service after migrating its values to /etc.
 InaccessiblePaths=-/mnt/nvme/item/gpt-register-panel/.env
 InaccessiblePaths=-/mnt/nvme/item/gpt-register-panel/.git
 InaccessiblePaths=-/mnt/nvme/gpt_register/.git
+InaccessiblePaths=-/run/gpt-register-panel/code/.env
+InaccessiblePaths=-/run/gpt-register-panel/code/.git
+InaccessiblePaths=-/run/gpt-register-panel/gpt_register/.git
 ProtectHostname=true
 ProtectClock=true
 ProtectKernelTunables=true

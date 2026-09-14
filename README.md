@@ -54,9 +54,19 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 ## systemd 服务
 
-仓库提供 `deploy/gpt-register-panel.service`。该 unit 直接执行固定的 `/usr/bin/node` 和 `backend/server.js`，通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+仓库提供 `deploy/gpt-register-panel.service`。该 unit 先在 root 管理的 `/run/gpt-register-panel` 下创建私有目录，再把项目代码只读绑定为 `code`、把 `runtime` 和 `gpt_register` 分别绑定为独立可写数据根；服务只从这些已经固定的可信别名启动。这样即使 `/mnt/nvme` 顶层可被普通本机用户写入，启动检查完成后再重命名或替换 `item`、项目目录或 `gpt_register` 的原路径，也不能把服务入口或 Phase3 重定向到替换树。启动前还会在私有挂载视图中检查关键目录和文件必须由 root 持有、类型正确、不是符号链接并且不可由组或其他用户写入，任一条件不满足都会拒绝启动。
 
-首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json` 和所需配置，并创建 unit 要求的运行目录。若已有项目本地 `.env`，可在不打印内容的情况下把它迁移为私有配置，然后立即更换过短或已暴露的令牌：
+unit 直接执行固定的 `/usr/bin/node` 和 `/run/gpt-register-panel/code/backend/server.js`，并显式清空 `NODE_OPTIONS`、`NODE_PATH`，避免 system manager 默认环境或部署配置在预检及正式启动前注入 Node preload/import 或额外模块搜索路径。它通过非敏感的 `PANEL_ENV_FILE` 路径让应用读取 `/etc/gpt-register-panel/panel.env`；不会把管理员令牌或 Sub2API 凭据复制到 unit 或 systemd 环境中。项目目录中的旧 `.env` 会对服务隐藏，避免 NTFS 挂载权限把秘密暴露给其他本机用户。当前生产目录由 root 持有，因此模板暂时使用 `User=root`，但 capability bounding set 与 ambient capabilities 均为空。Phase3 会把已验证的脚本、Node 可执行文件和源码根目录直接继承为子进程 fd 3、4、5，不需要访问父进程 fd 或保留 `CAP_SYS_PTRACE`。迁移到专用服务账号仍是更稳妥的最终方案；迁移时必须同步调整 `panel.env`、`gpt_register`、`runtime`、日志、备份和隔离目录的所有权及权限。
+
+首次安装前先确认 `/mnt/nvme/gpt_register` 中存在 `index.js`、`src/`、`node_modules/`、`package.json` 和所需配置，并创建 unit 要求的运行目录。unit 会以最多 50000 个条目、64 层深度递归核验面板的 `backend`、`frontend`、`node_modules` 以及 gpt_register 的 `src`、`node_modules`：普通文件和目录必须由 root 持有、不可由组或其他用户写入，也不能跨入其他文件系统；相对符号链接只允许指向同一个已绑定扫描根内并且同样经过核验的普通文件，此外仅为现有 node-gyp Python 链接保留了指向真实 `/usr/bin/python3` 的精确例外。其他符号链接、特殊文件、外部目标或超限依赖树都会令服务拒绝启动。
+
+安装前先只读列出权限异常、全部符号链接和特殊文件。第一、第三条命令的结果必须为空；第二条列出的每个链接都必须符合上述内部目标或精确 Python 例外。发现异常时，应在离线维护窗口通过可信的软件包来源重新安装依赖，或逐项核验后修正所有者和权限，不要对整个 `gpt_register` 盲目递归 `chown`，以免把 token、账号文件或浏览器状态一并扩大到错误的信任范围：
+
+    find backend frontend node_modules /mnt/nvme/gpt_register/src /mnt/nvme/gpt_register/node_modules -xdev \( -type f -o -type d \) \( ! -user root -o -perm /022 \) -print
+    find backend frontend node_modules /mnt/nvme/gpt_register/src /mnt/nvme/gpt_register/node_modules -xdev -type l -printf '%p -> %l\n'
+    find backend frontend node_modules /mnt/nvme/gpt_register/src /mnt/nvme/gpt_register/node_modules -xdev ! -type f ! -type d ! -type l -print
+
+当前生产依赖中若仍有历史遗留的非 root 文件，新 unit 会按设计 fail-closed；必须先处理这些异常，不能为尽快启动而放宽 unit。若已有项目本地 `.env`，可在不打印内容的情况下把它迁移为私有配置，然后立即更换过短或已暴露的令牌：
 
     cd /mnt/nvme/item/gpt-register-panel
     npm ci
@@ -81,15 +91,14 @@ gpt_register 与 Sub2API 的账号、token 差异管理面板。
 
 服务不仅声明 `RequiresMountsFor=/mnt/nvme`，还绑定对应 mount unit，并要求该路径确实是可写挂载点：这既避免磁盘未挂载时把生产数据写入根分区下的同名目录，也会在运行中挂载消失时停止面板。异常退出会自动重启；停止时先向主进程发送 SIGTERM，应用默认等待任务 10 秒且硬上限为 12 秒，45 秒总期限到达后 systemd 会清理整个 cgroup。挂载消失后，即使磁盘稍后恢复，也不能假定面板会自动回来；先用 `findmnt` 确认同一设备已在 `/mnt/nvme` 可写挂载，再检查并显式启动服务。
 
-unit 使用只读文件系统视图，只开放以下默认写路径：
+unit 使用只读文件系统视图，只开放以下已经绑定并固定的服务内写路径：
 
-- `/mnt/nvme/item/gpt-register-panel/runtime`
-- `/mnt/nvme/gpt_register`
-- `/mnt/nvme/tmp`
+- `/run/gpt-register-panel/runtime`（来源为项目的 `runtime`）
+- `/run/gpt-register-panel/gpt_register`（来源为 `/mnt/nvme/gpt_register`）
 
-`gpt_register` 根目录必须可写，因为 Phase3 会在其中原子替换 `username.json` 等状态文件；unit 会把 `index.js`、`src`、`node_modules`、包清单和配置文件重新覆盖为只读，并隐藏两个项目的 `.git`。同时启用私有设备视图、禁止子进程新建 namespace、禁用 core dump、限制进程数和 socket address family；保留 Chromium/Xvfb 所需的 Unix、IPv4、IPv6 与 netlink socket。上线新版 unit 前仍应在真实环境跑一次非破坏性的 Phase3 验证，因为 Chromium 或显示环境升级可能引入新的设备需求。
+`gpt_register` 根目录必须可写，因为 Phase3 会在其中原子替换 `username.json` 等状态文件；unit 会把可信别名下的 `index.js`、`src`、`node_modules`、包清单和配置文件重新覆盖为只读，并隐藏原路径及可信别名中的两个项目 `.git`。数据库、备份、日志、控制面锁、token 隔离目录、Phase3 根和 Phase3 Node 路径均由 unit 显式固定，`panel.env` 中遗留的原始绝对路径不会覆盖它们。`/mnt/nvme/tmp` 不再作为额外可写路径；临时文件使用 systemd 提供的私有 `/tmp`。同时启用私有设备视图、禁止子进程新建 namespace、禁用 core dump、限制进程数和 socket address family；保留 Chromium/Xvfb 所需的 Unix、IPv4、IPv6 与 netlink socket。上线新版 unit 前仍应在真实环境跑一次非破坏性的 Phase3 验证，因为 Chromium 或显示环境升级可能引入新的设备需求。
 
-模板按上述固定默认路径收口。若 `panel.env` 或 `gpt_register/config.json` 把数据库、日志、备份、隔离目录、控制面锁、token 输出目录、浏览器 profile 或截图目录移到其他位置，只改应用配置还不够；应在 unit 中加入对应的精确可信路径，并保留代码及配置的只读覆盖。若 `GPT_REGISTER_ROOT` 或挂载点变化，还必须同步修改全部启动检查、`RequiresMountsFor`、`BindsTo` 和读写路径；不能直接把 `/`、`/mnt` 或整个 `/mnt/nvme` 设为可写。所有列入 `ReadWritePaths` 的目录必须在服务启动前存在且由服务账号安全持有。
+模板按上述固定默认路径收口。若要移动数据库、日志、备份、隔离目录、控制面锁、token 输出目录、浏览器 profile 或截图目录，只改 `panel.env` 或 `gpt_register/config.json` 不够；必须为新源目录增加独立的可信 `/run/gpt-register-panel/...` 绑定，令应用只使用绑定后的目标路径，并保留代码及配置的只读覆盖。若 `GPT_REGISTER_ROOT` 或挂载点变化，还必须同步修改全部绑定、环境变量、启动检查、`RequiresMountsFor`、`BindsTo` 和读写路径；不能直接把 `/`、`/mnt` 或整个 `/mnt/nvme` 设为可写。所有绑定源必须在服务启动前存在，关键源目录和文件必须由 root 安全持有且不可由组或其他用户写入。
 
 修改 `/etc/gpt-register-panel/panel.env` 或应用代码后使用 `systemctl restart` 生效。修改仓库中的 unit 时，必须重新执行 `install`、`systemctl daemon-reload`、静态校验和维护窗口重启；单独 `restart` 不会安装仓库副本。不要把真实凭据写入 unit 或提交到仓库。安装前可做静态校验：
 
