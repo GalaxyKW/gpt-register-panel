@@ -1244,6 +1244,181 @@ test('Sub2API Codex imports require a bounded printable idempotency key only', a
   }
 });
 
+test('Sub2API write requests distinguish pre-dispatch failures from unknown remote outcomes', async () => {
+  const originalFetch = global.fetch;
+  const idempotencyKey = 'gptreg-create-v1-' + 'b'.repeat(64);
+  const response = (text, overrides = {}) => ({
+    ok: true,
+    status: 200,
+    statusText: 'OK',
+    body: null,
+    async text() { return text; },
+    ...overrides,
+  });
+  try {
+    const scenarios = [
+      {
+        code: 'SUB2API_TRANSPORT_ERROR',
+        reason: 'transport',
+        fetch: async () => { throw new Error('connection reset'); },
+      },
+      {
+        code: 'SUB2API_EMPTY_RESPONSE',
+        reason: 'empty_response',
+        fetch: async () => response(''),
+      },
+      {
+        code: 'SUB2API_INVALID_JSON',
+        reason: 'invalid_json',
+        fetch: async () => response('{invalid'),
+      },
+      {
+        code: 'SUB2API_IMPORT_SCHEMA_INVALID',
+        reason: 'response_schema',
+        fetch: async () => response(JSON.stringify({ success: true, data: null })),
+      },
+      {
+        code: 'SUB2API_RESPONSE_TOO_LARGE',
+        reason: 'response_too_large',
+        fetch: async () => response('x'.repeat(1025)),
+      },
+      {
+        code: 'SUB2API_REQUEST_REJECTED',
+        reason: 'response_rejected',
+        fetch: async () => response(
+          JSON.stringify({ success: false, message: 'write rejected' }),
+          { ok: false, status: 500, statusText: 'Server Error' },
+        ),
+      },
+      {
+        code: 'SUB2API_REQUEST_REJECTED',
+        reason: 'response_rejected',
+        fetch: async () => response(JSON.stringify({ success: false, message: 'business rejection' })),
+      },
+    ];
+    for (const scenario of scenarios) {
+      global.fetch = scenario.fetch;
+      const client = new Sub2ApiAdminClient({
+        baseUrl: 'http://127.0.0.1:8080',
+        apiKey: 'test-key',
+        maxResponseBytes: 1024,
+      });
+      await assert.rejects(
+        client.importCodexSession({ content: '{}' }, { idempotencyKey }),
+        (error) => error.code === scenario.code
+          && error.writeOutcomeUnknown === true
+          && error.requiresReconciliation === true
+          && error.writeOutcomeReason === scenario.reason,
+      );
+    }
+
+    global.fetch = async () => response(JSON.stringify({
+      success: true,
+      data: { unexpected: true },
+    }));
+    const applyClient = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+    });
+    await assert.rejects(
+      applyClient.applyOAuthCredentials(41, { type: 'oauth', credentials: {} }),
+      (error) => error.code === 'SUB2API_CREDENTIALS_SCHEMA_INVALID'
+        && error.writeOutcomeUnknown === true
+        && error.requiresReconciliation === true,
+    );
+
+    global.fetch = async (url, options) => new Promise((resolve, reject) => {
+      options.signal.addEventListener('abort', () => {
+        const error = new Error('aborted');
+        error.name = 'AbortError';
+        reject(error);
+      }, { once: true });
+    });
+    const timeoutClient = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      timeoutMs: 5,
+    });
+    await assert.rejects(
+      timeoutClient.importCodexSession({ content: '{}' }, { idempotencyKey }),
+      (error) => error.code === 'SUB2API_TIMEOUT'
+        && error.writeOutcomeUnknown === true
+        && error.writeOutcomeReason === 'timeout',
+    );
+
+    const runningAbort = new AbortController();
+    const abortedWrite = timeoutClient.importCodexSession(
+      { content: '{}' },
+      { idempotencyKey, signal: runningAbort.signal },
+    );
+    runningAbort.abort();
+    await assert.rejects(
+      abortedWrite,
+      (error) => error.code === 'JOB_INTERRUPTED'
+        && error.writeOutcomeUnknown === true
+        && error.writeOutcomeReason === 'external_abort',
+    );
+
+    let fetchCalls = 0;
+    global.fetch = async () => {
+      fetchCalls += 1;
+      throw new Error('fetch must not run');
+    };
+    const preAborted = new AbortController();
+    preAborted.abort();
+    await assert.rejects(
+      timeoutClient.importCodexSession(
+        { content: '{}' },
+        { idempotencyKey, signal: preAborted.signal },
+      ),
+      (error) => error.code === 'JOB_INTERRUPTED'
+        && error.writeOutcomeUnknown !== true
+        && error.requiresReconciliation !== true,
+    );
+    const circularPayload = { content: '{}' };
+    circularPayload.circular = circularPayload;
+    await assert.rejects(
+      timeoutClient.importCodexSession(circularPayload, { idempotencyKey }),
+      (error) => error.code === 'SUB2API_REQUEST_SERIALIZATION_FAILED'
+        && error.writeOutcomeUnknown !== true
+        && error.requiresReconciliation !== true,
+    );
+    await assert.rejects(
+      timeoutClient.applyOAuthCredentials(0, { type: 'oauth', credentials: {} }),
+      (error) => error.code === 'SUB2API_CREDENTIALS_ID_INVALID'
+        && error.writeOutcomeUnknown !== true,
+    );
+    assert.equal(fetchCalls, 0);
+
+    global.fetch = async () => response(
+      JSON.stringify({ success: false, message: 'read rejected' }),
+      { ok: false, status: 503, statusText: 'Unavailable' },
+    );
+    await assert.rejects(
+      timeoutClient.request('GET', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_REQUEST_REJECTED'
+        && error.writeOutcomeUnknown !== true
+        && error.requiresReconciliation !== true,
+    );
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API strict postflight listings require a total on every page', async () => {
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+  });
+  client.request = async () => ({ items: [] });
+  await assert.rejects(
+    client.listAccounts({ requireTotal: true }),
+    (error) => error.code === 'SUB2API_ACCOUNTS_TOTAL_REQUIRED',
+  );
+  client.request = async () => ({ items: [], total: 0 });
+  assert.deepEqual(await client.listAccounts({ requireTotal: true }), []);
+});
+
 test('Sub2API batch-stat errors leave the adapter only after redaction', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
   client.request = async () => JSON.parse(

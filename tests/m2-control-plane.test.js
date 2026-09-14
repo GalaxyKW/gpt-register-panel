@@ -2024,6 +2024,7 @@ test('import plan items pass one cancellation signal through update and create r
       async listAccounts(options) {
         assert.equal(options.signal, signal);
         createLists += 1;
+        if (createLists > 1) assert.equal(options.requireTotal, true);
         return createLists === 1 ? [] : [createdAccount];
       },
       async importCodexSession(payload, options) {
@@ -2094,14 +2095,58 @@ test('create cancellation after the POST starts no postflight request', async ()
         },
       },
     }),
-    (error) => error.code === 'JOB_INTERRUPTED',
+    (error) => error.code === 'JOB_INTERRUPTED'
+      && error.writeOutcomeUnknown === true
+      && error.requiresReconciliation === true,
   );
   assert.equal(listCalls, 1);
   assert.equal(importCalls, 1);
   assert.equal(postflightReads, 0);
 });
 
-test('token import does not swallow cancellation or start the next account', async () => {
+test('update postflight failure requires reconciliation without retrying the mutation', async () => {
+  const identityKeys = ['account:update-postflight-account', 'user:update-postflight-user'];
+  const source = syntheticToken('tokens/update-postflight.json', identityKeys, {
+    accountId: 'update-postflight-account',
+    userId: 'update-postflight-user',
+    accessFingerprint: 'update-postflight-new-fingerprint',
+  });
+  const before = {
+    id: 304,
+    name: 'free00304',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys,
+    tokenFingerprints: { access: 'update-postflight-old-fingerprint' },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
+  let reads = 0;
+  let writes = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async getAccount() {
+          reads += 1;
+          if (reads === 1) return before;
+          throw new Error('simulated update postflight failure');
+        },
+        async applyOAuthCredentials() {
+          writes += 1;
+          return { ...before, tokenFingerprints: { access: source.fingerprints.access } };
+        },
+      },
+    }),
+    (error) => error.requiresReconciliation === true
+      && error.writeOutcomeUnknown === true,
+  );
+  assert.equal(writes, 1);
+  assert.equal(reads, 4);
+});
+
+test('token import returns reconciliation details and never starts the next account', async () => {
   const { root } = fixture();
   const secondAccess = [
     'header',
@@ -2153,6 +2198,7 @@ test('token import does not swallow cancellation or start the next account', asy
     const controller = new AbortController();
     let importCalls = 0;
     let postflightReads = 0;
+    const audits = [];
     const client = {
       async listAccounts(options) {
         assert.equal(options.signal, controller.signal);
@@ -2182,24 +2228,86 @@ test('token import does not swallow cancellation or start the next account', asy
         throw new Error('postflight must not run after cancellation');
       },
     };
-    await assert.rejects(
-      executeImport({
-        snapshotVersion: preview.version,
-        selectedKeys,
-        actor: 'tester',
-        db: {
-          async updateJob() {},
-          async audit() {},
-          async saveLink() {},
-        },
-        jobId: 'token-import-abort-job',
-        signal: controller.signal,
-        client,
-      }),
-      (error) => error.code === 'JOB_INTERRUPTED',
-    );
+    const result = await executeImport({
+      snapshotVersion: preview.version,
+      selectedKeys,
+      actor: 'tester',
+      db: {
+        async updateJob() {},
+        async audit(entry) { audits.push(entry); },
+        async saveLink() {},
+      },
+      jobId: 'token-import-abort-job',
+      signal: controller.signal,
+      client,
+    });
     assert.equal(importCalls, 1);
     assert.equal(postflightReads, 0);
+    assert.equal(result.halted, true);
+    assert.equal(result.requiresReconciliation, true);
+    assert.equal(result.reconciliationCount, 1);
+    assert.equal(result.attempted, 1);
+    assert.equal(result.failed, 1);
+    assert.equal(result.imported[0].outcome, 'requires_reconciliation');
+    assert.equal(result.imported[0].code, 'JOB_INTERRUPTED');
+    assert.equal(result.imported[0].writeOutcomeUnknown, true);
+    assert.equal(result.notAttemptedCount, 1);
+    assert.equal(result.notAttempted[0].outcome, 'not_attempted');
+    const reconciliationAudit = audits.find((entry) => entry.result === 'requires_reconciliation');
+    assert.ok(reconciliationAudit);
+    assert.equal(reconciliationAudit.afterFingerprint, null);
+
+    const postflightController = new AbortController();
+    let postflightImportCalls = 0;
+    let failedPostflightReads = 0;
+    const postflightResult = await executeImport({
+      snapshotVersion: preview.version,
+      selectedKeys,
+      actor: 'tester',
+      db: {
+        async updateJob() {},
+        async audit() {},
+        async saveLink() {},
+      },
+      jobId: 'token-import-postflight-failure-job',
+      signal: postflightController.signal,
+      client: {
+        async listAccounts(options) {
+          assert.equal(options.signal, postflightController.signal);
+          return [];
+        },
+        async exportAccounts(ids, options) {
+          assert.deepEqual(ids, []);
+          assert.equal(options.signal, postflightController.signal);
+          return { accounts: [] };
+        },
+        async importCodexSession(payload, options) {
+          assert.equal(payload.update_existing, false);
+          assert.equal(options.signal, postflightController.signal);
+          postflightImportCalls += 1;
+          return {
+            total: 1,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 402 }],
+          };
+        },
+        async getAccount(id, options) {
+          assert.equal(id, 402);
+          assert.equal(options.signal, postflightController.signal);
+          failedPostflightReads += 1;
+          throw new Error('simulated postflight read failure');
+        },
+      },
+    });
+    assert.equal(postflightImportCalls, 1);
+    assert.equal(failedPostflightReads, 3);
+    assert.equal(postflightResult.requiresReconciliation, true);
+    assert.equal(postflightResult.imported[0].outcome, 'requires_reconciliation');
+    assert.equal(postflightResult.notAttemptedCount, 1);
+    assert.equal(postflightResult.notAttempted[0].outcome, 'not_attempted');
   } finally {
     for (const [name, value] of [
       ['GPT_REGISTER_ROOT', environment.root],
@@ -2367,6 +2475,109 @@ test('create verification consumes the nested Codex import account ID', async ()
     }),
     (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH',
   );
+});
+
+test('create responses require exact numeric counters, one raw item, and consistent ids', async () => {
+  const identityKeys = ['account:strict-create-account', 'user:strict-create-user'];
+  const source = syntheticToken('tokens/strict-create.json', identityKeys, {
+    accountId: 'strict-create-account',
+    userId: 'strict-create-user',
+    accessFingerprint: 'strict-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const valid = {
+    total: 1,
+    created: 1,
+    updated: 0,
+    skipped: 0,
+    failed: 0,
+    items: [{ index: 0, action: 'created', account_id: 501 }],
+  };
+  const malformedResults = [
+    { ...valid, total: undefined },
+    { ...valid, created: '1' },
+    { ...valid, failed: false },
+    { ...valid, items: [null, ...valid.items] },
+    { ...valid, items: [{ ...valid.items[0], account_id: '501' }] },
+    { ...valid, account_id: 502 },
+    { ...valid, accountId: '501' },
+    { ...valid, items: [{ ...valid.items[0], accountId: 502 }] },
+  ];
+  for (const result of malformedResults) {
+    await assert.rejects(
+      executeImportPlanItem({
+        item,
+        client: {
+          async listAccounts() { return []; },
+          async importCodexSession() { return result; },
+          async getAccount() { throw new Error('strict validation must precede postflight'); },
+        },
+      }),
+      (error) => error.code === 'SUB2API_CREATE_ACTION_MISMATCH'
+        && error.requiresReconciliation === true
+        && error.writeOutcomeUnknown === true,
+    );
+  }
+});
+
+test('create postflight retries only bounded complete reads and never retries the write', async () => {
+  const identityKeys = ['account:retry-create-account', 'user:retry-create-user'];
+  const source = syntheticToken('tokens/retry-create.json', identityKeys, {
+    accountId: 'retry-create-account',
+    userId: 'retry-create-user',
+    accessFingerprint: 'retry-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const account = {
+    id: 511,
+    name: item.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys,
+    tokenFingerprints: { ...source.fingerprints },
+  };
+  const controller = new AbortController();
+  let writeCalls = 0;
+  let detailReads = 0;
+  let completeLists = 0;
+  const outcome = await executeImportPlanItem({
+    item,
+    signal: controller.signal,
+    client: {
+      async listAccounts(options) {
+        assert.equal(options.signal, controller.signal);
+        if (options.requireTotal !== true) return [];
+        completeLists += 1;
+        if (completeLists < 3) throw new Error('temporary complete-list failure');
+        return [account];
+      },
+      async importCodexSession(payload, options) {
+        assert.equal(options.signal, controller.signal);
+        writeCalls += 1;
+        return {
+          total: 1,
+          created: 1,
+          updated: 0,
+          skipped: 0,
+          failed: 0,
+          items: [{ index: 0, action: 'created', account_id: 511 }],
+        };
+      },
+      async getAccount(id, options) {
+        assert.equal(id, 511);
+        assert.equal(options.signal, controller.signal);
+        detailReads += 1;
+        if (detailReads < 3) throw new Error('temporary detail failure');
+        return account;
+      },
+    },
+  });
+  assert.equal(outcome.verification.accountId, 511);
+  assert.equal(writeCalls, 1);
+  assert.equal(detailReads, 3);
+  assert.equal(completeLists, 3);
 });
 
 test('create postflight fails closed on a concurrent duplicate strong identity', async () => {

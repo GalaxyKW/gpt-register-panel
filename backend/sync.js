@@ -33,6 +33,8 @@ const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
 
 let syncQueue = Promise.resolve();
 const OPENAI_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
+const POSTFLIGHT_READ_ATTEMPTS = 3;
+const POSTFLIGHT_RETRY_DELAY_MS = 25;
 
 function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
@@ -66,6 +68,78 @@ function writeLog(logger, level, event, fields = {}) {
 function rethrowIfJobInterrupted(error, signal) {
   if (error?.code === 'JOB_INTERRUPTED') throw error;
   throwIfJobInterrupted(signal);
+}
+
+function reconciliationRequiredError(error, reason = 'post_write_verification') {
+  const target = error instanceof Error
+    ? error
+    : new Error('Sub2API 写入结果需要人工对账');
+  if (!target.code) target.code = 'SUB2API_WRITE_RECONCILIATION_REQUIRED';
+  target.writeOutcomeUnknown = true;
+  target.requiresReconciliation = true;
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  target.reconciliationReason = /^[a-z0-9_]{1,64}$/.test(normalizedReason)
+    ? normalizedReason
+    : 'post_write_verification';
+  return target;
+}
+
+function writeRequiresReconciliation(error) {
+  return error?.writeOutcomeUnknown === true || error?.requiresReconciliation === true;
+}
+
+function throwIfPostWriteInterrupted(signal) {
+  if (!signal?.aborted) return;
+  throw reconciliationRequiredError(
+    interruptedJobError('面板停机中断了 Sub2API 写后核验，需要对账'),
+    'post_write_abort',
+  );
+}
+
+async function postflightRetryDelay(milliseconds, signal) {
+  throwIfJobInterrupted(signal);
+  await new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      try { signal?.removeEventListener('abort', onAbort); } catch {}
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(interruptedJobError());
+    };
+    if (signal && typeof signal.addEventListener === 'function') {
+      signal.addEventListener('abort', onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+    }
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+  });
+}
+
+async function retryPostflightRead(callback, options = {}) {
+  const signal = options.signal;
+  let lastError;
+  for (let attempt = 1; attempt <= POSTFLIGHT_READ_ATTEMPTS; attempt += 1) {
+    throwIfJobInterrupted(signal);
+    try {
+      const value = await callback();
+      throwIfJobInterrupted(signal);
+      return value;
+    } catch (error) {
+      rethrowIfJobInterrupted(error, signal);
+      lastError = error;
+      if (attempt < POSTFLIGHT_READ_ATTEMPTS) {
+        await postflightRetryDelay(POSTFLIGHT_RETRY_DELAY_MS * attempt, signal);
+      }
+    }
+  }
+  throw lastError;
 }
 
 function queueCancelableRun(predecessor, callback, signal) {
@@ -952,20 +1026,20 @@ async function resolveGroupIds(client, options = {}) {
 }
 
 function safeImportResult(result) {
-  if (!result || typeof result !== 'object') return null;
-  const numberOrZero = (value) => {
-    const number = Number(value);
-    return Number.isFinite(number) ? number : 0;
-  };
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const counterKeys = ['total', 'created', 'updated', 'skipped', 'failed'];
+  const counterOrNull = (value) => (
+    Number.isSafeInteger(value) && value >= 0 ? value : null
+  );
+  const counters = Object.fromEntries(counterKeys.map((key) => [key, counterOrNull(result[key])]));
   return {
     success: result.success === false || String(result.success || '').toLowerCase() === 'false'
       || result.ok === false ? false : true,
+    schemaValid: counterKeys.every((key) => (
+      Object.prototype.hasOwnProperty.call(result, key) && counters[key] !== null
+    )),
     accountId: importResultAccountId(result),
-    total: numberOrZero(result.total),
-    created: numberOrZero(result.created),
-    updated: numberOrZero(result.updated),
-    skipped: numberOrZero(result.skipped),
-    failed: numberOrZero(result.failed),
+    ...counters,
     errorCount: Array.isArray(result.errors) ? result.errors.length : 0,
     warningCount: Array.isArray(result.warnings) ? result.warnings.length : 0,
     message: result.message ? redactText(String(result.message)).slice(0, 500) : null,
@@ -1011,14 +1085,25 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   throwIfJobInterrupted(signal);
   const reportedId = importResultAccountId(result);
   let account = Number.isSafeInteger(reportedId) && reportedId > 0
-    ? await client.getAccount(reportedId, { signal })
+    ? await retryPostflightRead(
+        () => client.getAccount(reportedId, { signal }),
+        { signal },
+      )
     : null;
   throwIfJobInterrupted(signal);
   if (!account) {
-    const accounts = await client.listAccounts({
-      platform: 'openai', type: 'oauth', pageSize: 200, sortBy: 'id', sortOrder: 'asc',
-      signal,
-    });
+    const accounts = await retryPostflightRead(
+      () => client.listAccounts({
+        platform: 'openai',
+        type: 'oauth',
+        pageSize: 200,
+        sortBy: 'id',
+        sortOrder: 'asc',
+        requireTotal: true,
+        signal,
+      }),
+      { signal },
+    );
     throwIfJobInterrupted(signal);
     const matches = accounts.filter((candidate) => identitiesStronglyCompatible(
       item.sourceIdentityKeys?.length ? item.sourceIdentityKeys : item._account?.identityKeys || [item.identityKey],
@@ -1048,12 +1133,16 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   // unless both the strong identity and allocated free name resolve uniquely
   // to the reported row. Do not attempt an unsafe automatic rollback or
   // deletion here.
-  const accounts = await client.listAccounts({
-    pageSize: 200,
-    sortBy: 'id',
-    sortOrder: 'asc',
-    signal,
-  });
+  const accounts = await retryPostflightRead(
+    () => client.listAccounts({
+      pageSize: 200,
+      sortBy: 'id',
+      sortOrder: 'asc',
+      requireTotal: true,
+      signal,
+    }),
+    { signal },
+  );
   throwIfJobInterrupted(signal);
   const identityMatches = accountMatches({ sourceIdentityKeys: expectedIdentity }, accounts);
   if (identityMatches.length !== 1 || Number(identityMatches[0]?.id) !== Number(account.id)) {
@@ -1464,27 +1553,46 @@ async function preflightCreateAccount(client, item, options = {}) {
 
 function assertCreatedImportResult(result, knownAccountIds = new Set()) {
   assertImportResultSucceeded(result);
-  const items = importResultItems(result);
-  const accountId = importResultAccountId(result);
-  const action = importResultAction(result);
-  const counterIs = (key, expected) => (
-    !Object.prototype.hasOwnProperty.call(result || {}, key)
-      || Number(result[key]) === expected
+  const items = Array.isArray(result?.items) ? result.items : null;
+  const item = items?.length === 1
+    && items[0]
+    && typeof items[0] === 'object'
+    && !Array.isArray(items[0])
+    ? items[0]
+    : null;
+  const accountId = item?.account_id;
+  const exactCounter = (key, expected) => (
+    Object.prototype.hasOwnProperty.call(result || {}, key)
+      && Number.isSafeInteger(result[key])
+      && result[key] === expected
   );
-  if (items.length !== 1
-      || action !== 'created'
+  const idAliasMatches = (object, key) => (
+    !Object.prototype.hasOwnProperty.call(object || {}, key)
+      || (Number.isSafeInteger(object[key]) && object[key] === accountId)
+  );
+  if (!result
+      || typeof result !== 'object'
+      || Array.isArray(result)
+      || items?.length !== 1
+      || !item
+      || item.action !== 'created'
       || !Number.isSafeInteger(accountId)
       || accountId <= 0
+      || !idAliasMatches(item, 'accountId')
+      || !idAliasMatches(result, 'account_id')
+      || !idAliasMatches(result, 'accountId')
       || knownAccountIds.has(accountId)
-      || !counterIs('total', 1)
-      || !counterIs('created', 1)
-      || !counterIs('updated', 0)
-      || !counterIs('skipped', 0)
-      || !counterIs('failed', 0)) {
-    throw targetVerificationError(
+      || !exactCounter('total', 1)
+      || !exactCounter('created', 1)
+      || !exactCounter('updated', 0)
+      || !exactCounter('skipped', 0)
+      || !exactCounter('failed', 0)) {
+    const error = targetVerificationError(
       'Sub2API 新建请求返回了不一致的创建结果',
       'SUB2API_CREATE_ACTION_MISMATCH',
     );
+    error.result = safeImportResult(result);
+    throw error;
   }
   return accountId;
 }
@@ -1524,30 +1632,53 @@ async function executeImportPlanItem({
       _verifiedAccount: preflight.account,
     };
     throwIfJobInterrupted(signal);
-    await client.applyOAuthCredentials(
-      item.accountId,
-      buildOAuthUpdatePayload(writeItem),
-      { signal },
-    );
-    throwIfJobInterrupted(signal);
-    const account = await client.getAccount(item.accountId, { signal });
-    throwIfJobInterrupted(signal);
-    const accountId = verifyTargetIdentity(item, account, item.accountId);
-    verifyUpdatedTargetIdentity(writeItem, account);
-    const fingerprint = verifyTargetFingerprint(item, account);
-    const verification = {
-      accountId,
-      accountName: account.name || null,
-      fingerprint,
-      status: account.status || null,
-    };
-    writeLog(logger, 'info', 'import.account_verified', { ...context, ...verification });
-    return {
-      skipped: false,
-      reason: null,
-      result: safeImportResult({ success: true, account_id: accountId, total: 1, updated: 1 }),
-      verification,
-    };
+    let writeResponseReceived = false;
+    try {
+      await client.applyOAuthCredentials(
+        item.accountId,
+        buildOAuthUpdatePayload(writeItem),
+        { signal },
+      );
+      writeResponseReceived = true;
+      throwIfPostWriteInterrupted(signal);
+      const account = await retryPostflightRead(
+        () => client.getAccount(item.accountId, { signal }),
+        { signal },
+      );
+      throwIfPostWriteInterrupted(signal);
+      const accountId = verifyTargetIdentity(item, account, item.accountId);
+      verifyUpdatedTargetIdentity(writeItem, account);
+      const fingerprint = verifyTargetFingerprint(item, account);
+      const verification = {
+        accountId,
+        accountName: account.name || null,
+        fingerprint,
+        status: account.status || null,
+      };
+      writeLog(logger, 'info', 'import.account_verified', { ...context, ...verification });
+      return {
+        skipped: false,
+        reason: null,
+        result: safeImportResult({
+          success: true,
+          account_id: accountId,
+          total: 1,
+          created: 0,
+          updated: 1,
+          skipped: 0,
+          failed: 0,
+        }),
+        verification,
+      };
+    } catch (error) {
+      if (writeResponseReceived || writeRequiresReconciliation(error)) {
+        throw reconciliationRequiredError(
+          error,
+          error?.reconciliationReason || error?.writeOutcomeReason || 'update_postflight',
+        );
+      }
+      throw error;
+    }
   }
   throwIfJobInterrupted(signal);
   if (item.action !== 'create') {
@@ -1585,27 +1716,42 @@ async function executeImportPlanItem({
     confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
   };
   throwIfJobInterrupted(signal);
-  const rawResult = await client.importCodexSession(payload, {
-    idempotencyKey: buildCodexImportIdempotencyKey(writeItem, context),
-    signal,
-  });
-  throwIfJobInterrupted(signal);
-  assertCreatedImportResult(rawResult, knownAccountIds);
-  const verification = await verifyImportedAccount(
-    client,
-    item,
-    rawResult,
-    logger,
-    context,
-    { signal },
-  );
-  throwIfJobInterrupted(signal);
-  return {
-    skipped: false,
-    reason: null,
-    result: safeImportResult(rawResult),
-    verification,
-  };
+  let writeResponseReceived = false;
+  let rawResult = null;
+  try {
+    rawResult = await client.importCodexSession(payload, {
+      idempotencyKey: buildCodexImportIdempotencyKey(writeItem, context),
+      signal,
+    });
+    writeResponseReceived = true;
+    throwIfPostWriteInterrupted(signal);
+    assertCreatedImportResult(rawResult, knownAccountIds);
+    const verification = await verifyImportedAccount(
+      client,
+      item,
+      rawResult,
+      logger,
+      context,
+      { signal },
+    );
+    throwIfPostWriteInterrupted(signal);
+    return {
+      skipped: false,
+      reason: null,
+      result: safeImportResult(rawResult),
+      verification,
+    };
+  } catch (error) {
+    if (writeResponseReceived || writeRequiresReconciliation(error)) {
+      const marked = reconciliationRequiredError(
+        error,
+        error?.reconciliationReason || error?.writeOutcomeReason || 'create_postflight',
+      );
+      if (!marked.result && rawResult) marked.result = safeImportResult(rawResult);
+      throw marked;
+    }
+    throw error;
+  }
 }
 
 function backupDirectory() {
@@ -1928,7 +2074,10 @@ async function executeImport({
         groupCount: groups.length,
       });
       const imported = [];
-      for (const item of plan) {
+      let notAttempted = [];
+      let haltedForReconciliation = false;
+      for (let itemIndex = 0; itemIndex < plan.length; itemIndex += 1) {
+        const item = plan[itemIndex];
         throwIfJobInterrupted(signal);
         const itemStartedAt = Date.now();
         const baseFields = {
@@ -2031,6 +2180,62 @@ async function executeImport({
             sub2apiAccountId: verification.accountId,
           });
         } catch (error) {
+          if (writeRequiresReconciliation(error)) {
+            const message = safeErrorMessage(error);
+            const reconciliationReason = String(
+              error?.reconciliationReason || error?.writeOutcomeReason || 'write_outcome_unknown',
+            ).slice(0, 64);
+            imported.push({
+              ...safeImportItem(item),
+              result: safeImportResult(error?.result),
+              verification: null,
+              error: message,
+              code: error?.code || 'SUB2API_WRITE_RECONCILIATION_REQUIRED',
+              outcome: 'requires_reconciliation',
+              writeOutcomeUnknown: true,
+              requiresReconciliation: true,
+              reconciliationReason,
+            });
+            notAttempted = plan.slice(itemIndex + 1).map((remainingItem) => ({
+              ...safeImportItem(remainingItem),
+              outcome: 'not_attempted',
+              notAttemptedReason: 'requires_reconciliation',
+            }));
+            haltedForReconciliation = true;
+            try {
+              await db?.audit({
+                jobId,
+                actor,
+                action: item.action === 'create' ? 'account_import' : 'token_update',
+                targetKey: item.identityKey,
+                beforeFingerprint: item._account?.tokenFingerprints?.access || null,
+                afterFingerprint: null,
+                result: 'requires_reconciliation',
+                details: {
+                  error: message,
+                  code: error?.code || null,
+                  writeOutcomeUnknown: true,
+                  requiresReconciliation: true,
+                  reconciliationReason,
+                  sub2api: safeImportResult(error?.result),
+                },
+              });
+            } catch (auditError) {
+              writeLog(logger, 'error', 'import.audit_failed', {
+                ...baseFields,
+                error: safeErrorMessage(auditError),
+              });
+            }
+            writeLog(logger, 'error', 'import.account_reconciliation_required', {
+              ...baseFields,
+              durationMs: Date.now() - itemStartedAt,
+              error: message,
+              code: error?.code || null,
+              reconciliationReason,
+              remainingCount: notAttempted.length,
+            });
+            break;
+          }
           rethrowIfJobInterrupted(error, signal);
           const message = safeErrorMessage(error);
           imported.push({ ...safeImportItem(item), result: null, error: message, code: error?.code || null });
@@ -2058,23 +2263,38 @@ async function executeImport({
           });
         }
       }
-      throwIfJobInterrupted(signal);
+      if (!haltedForReconciliation) throwIfJobInterrupted(signal);
       const failed = imported.filter((item) => item.error).length;
       const runtimeSkipped = imported.filter((item) => item.skipped).length;
+      const reconciliationCount = imported.filter(
+        (item) => item.requiresReconciliation === true,
+      ).length;
+      const succeeded = imported.length - failed - runtimeSkipped;
       writeLog(logger, failed > 0 ? 'warn' : 'info', 'import.accounts_completed', {
         jobId,
         actor,
         count: plan.length,
-        succeeded: imported.length - failed - runtimeSkipped,
+        attempted: imported.length,
+        succeeded,
         failed,
         skipped: runtimeSkipped,
+        requiresReconciliation: haltedForReconciliation,
+        reconciliationCount,
+        notAttempted: notAttempted.length,
       });
       return {
         ...importPlanSummary(plan),
         imported,
+        notAttempted,
         backupPath,
+        attempted: imported.length,
+        succeeded,
         failed,
         runtimeSkipped,
+        notAttemptedCount: notAttempted.length,
+        halted: haltedForReconciliation,
+        requiresReconciliation: haltedForReconciliation,
+        reconciliationCount,
       };
     }, { signal }), { signal });
     writeLog(logger, result.failed > 0 ? 'warn' : 'info', 'import.completed', {
@@ -2084,6 +2304,8 @@ async function executeImport({
       importedCount: result.imported?.length || 0,
       failed: result.failed || 0,
       skipped: Boolean(result.skipped || result.runtimeSkipped),
+      requiresReconciliation: result.requiresReconciliation === true,
+      notAttempted: result.notAttemptedCount || 0,
       backupPath: result.backupPath || null,
     });
     return result;

@@ -871,12 +871,13 @@ test('import job result keeps only non-sensitive remote fields', () => {
   });
   assert.deepEqual(safe, {
     success: true,
+    schemaValid: false,
     accountId: 12,
-    total: 0,
+    total: null,
     created: 1,
-    updated: 0,
-    skipped: 0,
-    failed: 0,
+    updated: null,
+    skipped: null,
+    failed: null,
     errorCount: 0,
     warningCount: 0,
     message: 'done',
@@ -892,5 +893,17 @@ test('import job result keeps only non-sensitive remote fields', () => {
     items: [{ index: 0, action: 'updated', account_id: 266 }],
   });
   assert.equal(nested.accountId, 266);
+  assert.equal(nested.schemaValid, true);
   assert.equal(Object.hasOwn(nested, 'items'), false);
+
+  const malformedCounters = safeImportResult({
+    total: '1',
+    created: false,
+    updated: 0,
+    skipped: 0,
+  });
+  assert.equal(malformedCounters.schemaValid, false);
+  assert.equal(malformedCounters.total, null);
+  assert.equal(malformedCounters.created, null);
+  assert.equal(malformedCounters.failed, null);
 });

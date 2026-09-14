@@ -452,7 +452,11 @@ function safeModelId(value) {
 async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024) {
   if (!response?.body || typeof response.body.getReader !== 'function') {
     const text = await response.text();
-    if (Buffer.byteLength(text, 'utf8') > limit) throw new Error('response body too large');
+    if (Buffer.byteLength(text, 'utf8') > limit) {
+      const error = new Error('Sub2API response body too large');
+      error.code = 'SUB2API_RESPONSE_TOO_LARGE';
+      throw error;
+    }
     return text;
   }
   const reader = response.body.getReader();
@@ -466,7 +470,9 @@ async function readResponseTextWithLimit(response, limit = 4 * 1024 * 1024) {
       total += chunk.length;
       if (total > limit) {
         try { await reader.cancel(); } catch {}
-        throw new Error('response body too large');
+        const error = new Error('Sub2API response body too large');
+        error.code = 'SUB2API_RESPONSE_TOO_LARGE';
+        throw error;
       }
       chunks.push(chunk);
     }
@@ -516,6 +522,32 @@ function forwardAbortSignal(signal, controller, markExternalAbort = null) {
 function interruptedRequestError(message) {
   const error = new Error(message);
   error.code = 'JOB_INTERRUPTED';
+  return error;
+}
+
+function requestFailure(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function markWriteOutcomeUnknown(error, reason) {
+  const target = error instanceof Error
+    ? error
+    : requestFailure('SUB2API_WRITE_OUTCOME_UNKNOWN', 'Sub2API 写入结果无法确认');
+  target.writeOutcomeUnknown = true;
+  target.requiresReconciliation = true;
+  const normalizedReason = String(reason || '').trim().toLowerCase();
+  target.writeOutcomeReason = /^[a-z0-9_]{1,64}$/.test(normalizedReason)
+    ? normalizedReason
+    : 'unknown';
+  return target;
+}
+
+function writeAwareFailure(error, requestOptions, requestDispatched, reason) {
+  if (requestOptions.writeOperation === true && requestDispatched) {
+    return markWriteOutcomeUnknown(error, reason);
+  }
   return error;
 }
 
@@ -618,11 +650,23 @@ class Sub2ApiAdminClient {
     };
     let response;
     let text;
+    let requestDispatched = false;
     try {
       if (body !== undefined) {
         headers['content-type'] = 'application/json';
-        fetchOptions.body = JSON.stringify(body);
+        try {
+          fetchOptions.body = JSON.stringify(body);
+        } catch {
+          throw requestFailure(
+            'SUB2API_REQUEST_SERIALIZATION_FAILED',
+            'Sub2API 请求数据无法序列化：' + method + ' ' + pathname,
+          );
+        }
       }
+      if (externalSignal?.aborted) {
+        throw interruptedRequestError('Sub2API 管理请求在发送前因面板停机中断');
+      }
+      requestDispatched = true;
       response = await fetch(this.baseUrl + pathname, {
         ...fetchOptions,
         // Admin calls must never silently follow a redirect to another host.
@@ -635,28 +679,51 @@ class Sub2ApiAdminClient {
         requestOptions.maxResponseBytes || this.maxResponseBytes,
       );
     } catch (error) {
-      const safeDetail = safeRemoteText(error?.message || error);
+      let failure;
+      let reason = 'transport';
+      if (abortSource === 'external') {
+        failure = interruptedRequestError('Sub2API 管理请求因面板停机中断');
+        reason = 'external_abort';
+      } else if (abortSource === 'timeout') {
+        failure = requestFailure(
+          'SUB2API_TIMEOUT',
+          'Sub2API request timed out: ' + method + ' ' + pathname,
+        );
+        reason = 'timeout';
+      } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
+        failure = error;
+        reason = 'response_too_large';
+      } else if (error?.code === 'SUB2API_REQUEST_SERIALIZATION_FAILED') {
+        failure = error;
+        reason = 'request_validation';
+      } else {
+        const safeDetail = safeRemoteText(error?.message || error);
+        failure = requestFailure(
+          'SUB2API_TRANSPORT_ERROR',
+          'Sub2API request failed: ' + method + ' ' + pathname + ': ' + safeDetail,
+        );
+      }
+      failure = writeAwareFailure(failure, requestOptions, requestDispatched, reason);
       writeLog(this.logger, 'error', 'sub2api.request_failed', {
         ...this.logContext,
         method,
         path: pathname,
         durationMs: Date.now() - startedAt,
-        error: safeDetail,
+        error: safeRemoteText(failure.message),
+        writeOutcomeUnknown: failure.writeOutcomeUnknown === true,
       });
-      if (abortSource === 'external') {
-        throw interruptedRequestError('Sub2API 管理请求因面板停机中断');
-      }
-      if (error && error.name === 'AbortError') {
-        throw new Error('Sub2API request timed out: ' + method + ' ' + pathname);
-      }
-      throw new Error('Sub2API request failed: ' + method + ' ' + pathname + ': ' + safeDetail);
+      throw failure;
     } finally {
       clearTimeout(timer);
       stopForwardingAbort();
     }
     if (!text || !text.trim()) {
-      const error = new Error('Sub2API 返回空响应：' + method + ' ' + pathname);
-      error.code = 'SUB2API_EMPTY_RESPONSE';
+      const error = writeAwareFailure(
+        requestFailure('SUB2API_EMPTY_RESPONSE', 'Sub2API 返回空响应：' + method + ' ' + pathname),
+        requestOptions,
+        requestDispatched,
+        'empty_response',
+      );
       writeLog(this.logger, 'warn', 'sub2api.response_invalid', {
         ...this.logContext,
         method,
@@ -670,8 +737,12 @@ class Sub2ApiAdminClient {
     try {
       payload = text ? JSON.parse(text) : null;
     } catch {
-      const error = new Error('Sub2API 返回非法 JSON：' + method + ' ' + pathname);
-      error.code = 'SUB2API_INVALID_JSON';
+      const error = writeAwareFailure(
+        requestFailure('SUB2API_INVALID_JSON', 'Sub2API 返回非法 JSON：' + method + ' ' + pathname),
+        requestOptions,
+        requestDispatched,
+        'invalid_json',
+      );
       writeLog(this.logger, 'warn', 'sub2api.response_invalid', {
         ...this.logContext,
         method,
@@ -692,6 +763,15 @@ class Sub2ApiAdminClient {
         || (payloadCode !== undefined && payloadCode !== 0 && payloadCode !== '0')) {
       const detail = payload?.message || payload?.data?.message || payloadCode || response.statusText || 'request failed';
       const safeDetail = safeRemoteText(detail);
+      const error = writeAwareFailure(
+        requestFailure(
+          'SUB2API_REQUEST_REJECTED',
+          'Sub2API ' + method + ' ' + pathname + ' failed: ' + safeDetail,
+        ),
+        requestOptions,
+        requestDispatched,
+        'response_rejected',
+      );
       writeLog(this.logger, 'warn', 'sub2api.request_rejected', {
         ...this.logContext,
         method,
@@ -699,14 +779,18 @@ class Sub2ApiAdminClient {
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
         error: safeDetail,
+        writeOutcomeUnknown: error.writeOutcomeUnknown === true,
       });
-      throw new Error('Sub2API ' + method + ' ' + pathname + ' failed: ' + safeDetail);
+      throw error;
     }
     if (payload === null || payload === undefined
         || (typeof payload !== 'object' && !Array.isArray(payload))) {
-      const error = new Error('Sub2API 返回数据结构无效：' + method + ' ' + pathname);
-      error.code = 'SUB2API_SCHEMA_INVALID';
-      throw error;
+      throw writeAwareFailure(
+        requestFailure('SUB2API_SCHEMA_INVALID', 'Sub2API 返回数据结构无效：' + method + ' ' + pathname),
+        requestOptions,
+        requestDispatched,
+        'response_schema',
+      );
     }
     writeLog(this.logger, 'info', 'sub2api.request_completed', {
       ...this.logContext,
@@ -772,6 +856,10 @@ class Sub2ApiAdminClient {
           throw error;
         }
         expectedTotal = total;
+      } else if (options.requireTotal === true) {
+        const error = new Error('Sub2API 账号列表分页缺少完整统计');
+        error.code = 'SUB2API_ACCOUNTS_TOTAL_REQUIRED';
+        throw error;
       }
       if (expectedTotal !== null) {
         if (rows.size > expectedTotal || (pageRows.length === 0 && rows.size < expectedTotal)) {
@@ -1124,19 +1212,19 @@ class Sub2ApiAdminClient {
       'POST',
       '/api/v1/admin/accounts/import/codex-session',
       payload,
-      { idempotencyKey, signal: options.signal },
+      { idempotencyKey, signal: options.signal, writeOperation: true },
     );
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       const error = new Error('Sub2API 导入响应结构无效');
       error.code = 'SUB2API_IMPORT_SCHEMA_INVALID';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_schema');
     }
     const knownField = ['success', 'ok', 'account_id', 'accountId', 'created', 'updated', 'skipped', 'failed', 'total', 'message', 'errors', 'warnings']
       .some((key) => Object.prototype.hasOwnProperty.call(value, key));
     if (!knownField) {
       const error = new Error('Sub2API 导入响应缺少结果字段');
       error.code = 'SUB2API_IMPORT_SCHEMA_INVALID';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_schema');
     }
     return value;
   }
@@ -1152,18 +1240,18 @@ class Sub2ApiAdminClient {
       'POST',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/apply-oauth-credentials',
       payload,
-      { signal: options.signal },
+      { signal: options.signal, writeOperation: true },
     );
     const account = safeAccount(value);
     if (!account) {
       const error = new Error('Sub2API 凭证更新响应结构无效');
       error.code = 'SUB2API_CREDENTIALS_SCHEMA_INVALID';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_schema');
     }
     if (account.id !== accountId) {
       const error = new Error('Sub2API 凭证更新响应与请求 ID 不一致');
       error.code = 'SUB2API_CREDENTIALS_RESPONSE_MISMATCH';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_mismatch');
     }
     return account;
   }
