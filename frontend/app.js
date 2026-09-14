@@ -186,7 +186,9 @@ function actionReasonLabel(reason) {
     sub2api_temp_unschedulable_invalid: 'Sub2API 临时停调时间无效，跳过',
     sub2api_rate_limit_invalid: 'Sub2API 限流恢复时间无效，跳过',
     sub2api_overload_invalid: 'Sub2API 过载恢复时间无效，跳过',
-  }[reason] || reason || '-';
+    sub2api_read_failed: 'Sub2API 读取失败',
+    sub2api_not_read: '本次未读取 Sub2API',
+  }[reason] || (reason ? '操作原因未识别' : '-');
 }
 
 function phase3ReasonLabel(reason) {
@@ -803,6 +805,24 @@ function renderRemoteState(row, sides) {
     + '<small class="availability-note">' + escapeHtml(availabilityText) + '</small>';
 }
 
+function renderDiffDecision(row, sides) {
+  const action = ['create', 'update', 'skip', 'conflict'].includes(row?.decisionAction)
+    ? row.decisionAction
+    : null;
+  if (action) {
+    const reason = actionReasonLabel(row?.decisionReason);
+    return '<small class="availability-note">同步：' + escapeHtml(actionLabel(action))
+      + (reason === '-' ? '' : ' · ' + escapeHtml(reason)) + '</small>';
+  }
+  const previewable = Boolean(sides?.source)
+    && row?.historical !== true
+    && !['invalid_file', 'remote_unknown'].includes(row?.diffKind);
+  const label = previewable ? '同步：需先预览' : '同步：不可决策';
+  const reason = actionReasonLabel(row?.decisionReason);
+  return '<small class="availability-note">' + escapeHtml(label)
+    + (reason === '-' ? '' : ' · ' + escapeHtml(reason)) + '</small>';
+}
+
 function renderRows() {
   const rows = state.rows;
   const checkboxDisabled = actionsLocked() ? ' disabled' : '';
@@ -823,7 +843,8 @@ function renderRows() {
       + '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(statusLabel(row.status)) + '</span>'
       + renderRemoteState(row, sides) + '</td>'
       + '<td><span class="source-text ' + sourceClass(row.source) + '">' + escapeHtml(row.source || '-') + '</span></td>'
-      + '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span></td>'
+      + '<td' + issueText + '><span class="badge ' + badgeClass(row.diffKind) + '">' + escapeHtml(kindLabel(row.diffKind)) + '</span>'
+      + renderDiffDecision(row, sides) + '</td>'
       + '<td class="comparison-cell">' + renderExpiryComparison(row, sides) + '</td>'
       + '<td class="comparison-cell">' + renderFingerprintComparison(row, sides) + '</td>'
       + '<td class="col-historical"' + usageTitle + '>' + escapeHtml(row.usageError ? '读取失败' : formatUsage(row.usage)) + '</td>'

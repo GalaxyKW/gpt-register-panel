@@ -143,6 +143,13 @@ function rowFromDiffItem(item, options = {}) {
   const schedulableKnown = hasSchedulableKnown
     ? account.schedulableKnown === true && typeof account?.schedulable === 'boolean'
     : typeof account?.schedulable === 'boolean';
+  const decisionAction = ['create', 'update', 'skip', 'conflict'].includes(item?.decisionAction)
+    ? item.decisionAction
+    : null;
+  const decisionReason = typeof item?.decisionReason === 'string'
+      && /^[a-z0-9_]{1,96}$/.test(item.decisionReason)
+    ? item.decisionReason
+    : null;
   return {
     key,
     // Keep the legacy flattened fields below during the rolling upgrade. New
@@ -172,6 +179,9 @@ function rowFromDiffItem(item, options = {}) {
     schedulableKnown,
     source,
     diffKind: item.kind,
+    observedKind: item.observedKind || item.kind,
+    decisionAction,
+    decisionReason,
     issues: Array.isArray(item.issues) ? item.issues : [],
     historical: token?.historical === true,
     expiresAt: account?.credentialExpiresAt || account?.expiresAt || token?.expiresAt || null,

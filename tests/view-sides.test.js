@@ -30,6 +30,9 @@ test('view rows preserve separate safe gpt_register and Sub2API facts', () => {
   const remoteAccess = '2222222222222222';
   const row = rowFromDiffItem({
     kind: 'token_changed',
+    observedKind: 'token_changed',
+    decisionAction: 'skip',
+    decisionReason: 'sub2api_available',
     issues: [],
     token: {
       source: 'tokens',
@@ -86,9 +89,32 @@ test('view rows preserve separate safe gpt_register and Sub2API facts', () => {
   // Legacy aliases remain present for a frontend/backend rolling upgrade.
   assert.equal(row.accountId, 266);
   assert.equal(row.email, 'remote@example.test');
+  assert.equal(row.observedKind, 'token_changed');
+  assert.equal(row.decisionAction, 'skip');
+  assert.equal(row.decisionReason, 'sub2api_available');
   assert.equal(JSON.stringify(row).includes('must-not-leak'), false);
   assert.deepEqual(filterRows([row], { search: 'local-workspace' }), [row]);
   assert.deepEqual(filterRows([row], { search: '266' }), [row]);
+});
+
+test('view rows fail closed for malformed decision metadata', () => {
+  const row = rowFromDiffItem({
+    kind: 'token_changed',
+    observedKind: 'token_changed',
+    decisionAction: 'delete',
+    decisionReason: 'credential=must-not-be-forwarded',
+    token: {
+      source: 'tokens',
+      relativePath: 'tokens/local.json',
+      fingerprints: {},
+    },
+    account: null,
+    issues: [],
+  });
+  assert.equal(row.observedKind, 'token_changed');
+  assert.equal(row.decisionAction, null);
+  assert.equal(row.decisionReason, null);
+  assert.equal(JSON.stringify(row).includes('must-not-be-forwarded'), false);
 });
 
 test('view rows use null for the side that does not exist', () => {
@@ -286,4 +312,51 @@ test('frontend renders scheduler state as enabled, disabled, or unknown with saf
   assert.match(context.result.unknown, /可用性未知：原因无法安全识别/);
   assert.doesNotMatch(context.result.unknown, /must-not-be-rendered/);
   assert.match(context.result.invalidAutoPause, /可用性未知：过期自动停调配置无效/);
+});
+
+test('frontend separates observed differences from safe synchronization decisions', () => {
+  const primitives = sourceSection('function escapeHtml', 'function finiteNumber');
+  const actionContracts = sourceSection('function actionLabel', 'function phase3ReasonLabel');
+  const sideRenderers = sourceSection('function rowSideData', 'function renderRows');
+  const context = {};
+  vm.runInNewContext(primitives + '\n' + actionContracts + '\n' + sideRenderers + `
+    result = {
+      availableChanged: renderDiffDecision({
+        diffKind: 'token_changed',
+        decisionAction: 'skip',
+        decisionReason: 'sub2api_available',
+      }, { source: {}, remote: { id: 41 } }),
+      unavailableChanged: renderDiffDecision({
+        diffKind: 'token_changed',
+        decisionAction: 'update',
+        decisionReason: 'token_changed',
+      }, { source: {}, remote: { id: 42 } }),
+      duplicateNeedsPreview: renderDiffDecision({
+        diffKind: 'duplicate_identity',
+        decisionAction: null,
+        decisionReason: null,
+      }, { source: {}, remote: null }),
+      remoteUnknown: renderDiffDecision({
+        diffKind: 'remote_unknown',
+        decisionAction: null,
+        decisionReason: 'sub2api_read_failed',
+      }, { source: {}, remote: null }),
+      hostileReason: renderDiffDecision({
+        diffKind: 'token_changed',
+        decisionAction: 'skip',
+        decisionReason: 'credential=must-not-render',
+      }, { source: {}, remote: { id: 43 } }),
+    };
+  `, context);
+
+  assert.match(context.result.availableChanged, /同步：跳过/);
+  assert.match(context.result.availableChanged, /Sub2API 当前可用/);
+  assert.match(context.result.unavailableChanged, /同步：更新/);
+  assert.match(context.result.unavailableChanged, /token 不同/);
+  assert.match(context.result.duplicateNeedsPreview, /同步：需先预览/);
+  assert.match(context.result.remoteUnknown, /同步：不可决策/);
+  assert.match(context.result.remoteUnknown, /Sub2API 读取失败/);
+  assert.match(context.result.hostileReason, /操作原因未识别/);
+  assert.doesNotMatch(context.result.hostileReason, /must-not-render/);
+  assert.match(htmlSource, /<th>差异 \/ 同步决策<\/th>/);
 });
