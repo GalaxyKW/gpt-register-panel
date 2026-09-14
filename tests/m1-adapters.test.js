@@ -10,6 +10,7 @@ require('./test-isolation');
 const { readGptRegisterSources, isHistoricalTokenFile } = require('../backend/adapters/gptRegisterFs');
 const {
   buildIdentityKeys,
+  normalizeIdentityValue,
   normalizeTokenDocument,
   tokenFingerprint,
 } = require('../backend/lib/token');
@@ -377,6 +378,9 @@ test('complete source snapshots reject malformed username identity and terminal 
     { email: 'valid@example.test', password: 'present', status: { value: 'account_deleted' } },
     { email: 'valid@example.test', password: { value: 'nested-password-secret' }, status: 'oauth_done' },
     { email: 'del\u007f@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'zero\u200bwidth@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'bidi\u202e@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'c1\u0085@example.test', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', phone: '138\n0000', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', name: 'display\tname', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', password: 'password-lure\r\nnext', status: 'oauth_done' },
@@ -1104,6 +1108,21 @@ test('local and remote email identities reject whitespace, zero-width and bidi a
     assert.equal(account.email, '', email);
     assert.equal(JSON.stringify(account).includes(email), false, email);
   }
+});
+
+test('generic email identity normalization cannot reintroduce rejected email forms', () => {
+  for (const email of [
+    'zero\u200bwidth@example.test',
+    'bidi\u202e@example.test',
+    'c1\u0085@example.test',
+    'double@@example.test',
+  ]) {
+    assert.equal(normalizeIdentityValue('email:', email), '', email);
+  }
+  assert.equal(
+    normalizeIdentityValue('email:', '  Safe@Example.test  '),
+    'safe@example.test',
+  );
 });
 
 test('safe accounts accept only lossless safe-integer numeric strong identities', () => {

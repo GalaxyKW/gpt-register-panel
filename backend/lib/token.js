@@ -28,7 +28,7 @@ function normalizeIdentityValue(prefix, value) {
   const raw = value === undefined || value === null ? '' : String(value);
   if (C0_OR_DEL.test(raw)) return '';
   const text = raw.trim();
-  if (prefix === 'email:') return text.toLowerCase();
+  if (prefix === 'email:') return normalizeEmail(raw);
   if (prefix === 'account:' || prefix === 'user:') {
     const match = /^\{?([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\}?$/i.exec(text);
     if (match && (text.startsWith('{') === text.endsWith('}'))) return match[1].toLowerCase();

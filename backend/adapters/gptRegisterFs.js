@@ -109,9 +109,7 @@ function validateUsernameRecords(records) {
     }
     const email = record.email;
     if (typeof email !== 'string'
-        || email.length > 320
-        || C0_OR_DEL.test(email)
-        || !/^[^\s@]+@[^\s@]+$/.test(email.trim())) {
+        || !normalizeEmail(email)) {
       throw usernameInvalidError();
     }
     if (record.password !== undefined && record.password !== null
@@ -1080,11 +1078,7 @@ function readTokenDirectory(directory, source, rootDirectory, includeRaw = false
 function safeUsernameRecords(records) {
   return records.map((item, index) => {
     const rawEmail = typeof item?.email === 'string' ? item.email : '';
-    const email = rawEmail.length <= 320
-      && !C0_OR_DEL.test(rawEmail)
-      && /^[^\s@]+@[^\s@]+$/.test(rawEmail.trim())
-      ? normalizeEmail(rawEmail)
-      : '';
+    const email = normalizeEmail(rawEmail);
     const rawPhoneValue = typeof item?.phone === 'string' || typeof item?.phone === 'number'
       ? String(item.phone)
       : '';
