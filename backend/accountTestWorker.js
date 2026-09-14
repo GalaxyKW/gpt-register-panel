@@ -22,6 +22,31 @@ function safeErrorMessage(error) {
   return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
 }
 
+function writeRequiresReconciliation(error) {
+  return error?.writeOutcomeUnknown === true || error?.requiresReconciliation === true;
+}
+
+function normalizedReconciliationReason(value, fallback = 'scheduler_write_unknown') {
+  const reason = String(value || '').trim().toLowerCase();
+  if (/^[a-z0-9_]{1,64}$/.test(reason)) return reason;
+  return fallback;
+}
+
+function schedulerReconciliationError(error, reason = 'scheduler_write_unknown', options = {}) {
+  const target = error instanceof Error
+    ? error
+    : new Error('Sub2API 调度设置写入结果无法确认');
+  if (options.writeOutcomeUnknown === true || target.writeOutcomeUnknown === true) {
+    target.writeOutcomeUnknown = true;
+  }
+  target.requiresReconciliation = true;
+  target.reconciliationReason = normalizedReconciliationReason(
+    target.reconciliationReason || target.writeOutcomeReason || reason,
+    reason,
+  );
+  return target;
+}
+
 function withAccountTestSubmissionLock(callback) {
   const run = submissionQueue.then(callback);
   submissionQueue = run.catch(() => {});
@@ -352,7 +377,11 @@ async function auditResult(db, logger, result, actor, jobId, modelId) {
         message: result.message || null,
         durationMs: result.durationMs || 0,
         testSuccess: result.testSuccess === true,
-        enabled: result.enabled === true,
+        enabled: typeof result.enabled === 'boolean' ? result.enabled : null,
+        enabledKnown: typeof result.enabled === 'boolean',
+        requiresReconciliation: result.requiresReconciliation === true,
+        writeOutcomeUnknown: result.writeOutcomeUnknown === true,
+        reconciliationReason: result.reconciliationReason || null,
         statusBefore: result.statusBefore || null,
         statusAfter: result.statusAfter || null,
       },
@@ -367,12 +396,13 @@ async function auditResult(db, logger, result, actor, jobId, modelId) {
   }
 }
 
-async function rollbackOwnedSchedulableMutation(client, id, mutation) {
+async function rollbackOwnedSchedulableMutation(client, id, mutation, options = {}) {
   if (!mutation?.after || mutation.original === mutation.written) {
     return { attempted: false, succeeded: false, state: null, reason: 'rollback_not_owned' };
   }
   let current;
-  try { current = await client.getAccount(id); } catch {
+  try { current = await client.getAccount(id, { signal: options.signal }); } catch (error) {
+    if (error?.code === 'JOB_INTERRUPTED' || options.signal?.aborted) throw error;
     return { attempted: false, succeeded: false, state: null, reason: 'rollback_state_unavailable' };
   }
   if (!sameAccountTarget(mutation.after, current)
@@ -380,7 +410,11 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation) {
       || current.schedulable !== mutation.written) {
     return { attempted: false, succeeded: false, state: current, reason: 'rollback_state_changed' };
   }
-  const writeResponse = await client.setSchedulable(id, mutation.original);
+  const writeResponse = await client.setSchedulable(
+    id,
+    mutation.original,
+    { signal: options.signal },
+  );
   if (!writeResponse
       || !sameAccountTarget(mutation.after, writeResponse)
       || writeResponse.schedulable !== mutation.original) {
@@ -389,15 +423,18 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation) {
       succeeded: false,
       state: writeResponse || current,
       reason: 'rollback_response_mismatch',
+      writeOutcomeUnknown: true,
     };
   }
-  const verified = await client.getAccount(id);
+  const verified = await client.getAccount(id, { signal: options.signal });
+  const succeeded = sameAccountTarget(writeResponse, verified)
+    && accountStateVersion(verified) === accountStateVersion(writeResponse)
+    && verified.schedulable === mutation.original;
   return {
     attempted: true,
-    succeeded: sameAccountTarget(writeResponse, verified)
-      && verified.schedulable === mutation.original,
+    succeeded,
     state: verified,
-    reason: null,
+    reason: succeeded ? null : 'rollback_verification_mismatch',
   };
 }
 
@@ -440,7 +477,9 @@ async function runAccountTestJobNow({
     signal,
   });
   const results = [];
-  for (const id of accountIds) {
+  let reconciliationStopIndex = null;
+  for (let itemIndex = 0; itemIndex < accountIds.length; itemIndex += 1) {
+    const id = accountIds[itemIndex];
     throwIfJobInterrupted(signal);
     const itemStartedAt = Date.now();
     const listedAccount = initialAccounts.find((candidate) => candidate.id === id) || null;
@@ -506,7 +545,14 @@ async function runAccountTestJobNow({
       throwIfJobInterrupted(signal);
       if (!test.success) {
         let afterFailure = account;
-        try { afterFailure = await client.getAccount(id); } catch {}
+        try {
+          afterFailure = await client.getAccount(id, { signal });
+        } catch (readError) {
+          if (readError?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
+            throwIfJobInterrupted(signal);
+            throw readError;
+          }
+        }
         const result = {
           accountId: id,
           accountName: account.name || null,
@@ -671,7 +717,16 @@ async function runAccountTestJobNow({
         after: null,
       };
       throwIfJobInterrupted(signal);
-      const writeResponse = await client.setSchedulable(id, true);
+      let writeResponse;
+      try {
+        writeResponse = await client.setSchedulable(id, true, { signal });
+      } catch (error) {
+        // A pre-dispatch interruption is safe: no scheduler write occurred.
+        // Once dispatched, however, retrying or rolling back an unconfirmed
+        // enable could race the original write, so persist it for reconciliation.
+        if (!writeRequiresReconciliation(error)) recoveryMutation = null;
+        throw error;
+      }
       if (!writeResponse
           || typeof writeResponse !== 'object'
           || !sameAccountTarget(afterTest, writeResponse)
@@ -681,10 +736,12 @@ async function runAccountTestJobNow({
         recoveryMutation = null;
         const error = new Error('启用调度响应与预检账号不一致');
         error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
-        throw error;
+        throw schedulerReconciliationError(error, 'enable_response_mismatch', {
+          writeOutcomeUnknown: true,
+        });
       }
       recoveryMutation.after = writeResponse;
-      const after = await client.getAccount(id);
+      const after = await client.getAccount(id, { signal });
       if (!sameAccountTarget(afterTest, after)) {
         const error = new Error('启用调度后账号身份或结构已变化');
         error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
@@ -702,24 +759,35 @@ async function runAccountTestJobNow({
       const availability = getAccountAvailability(after);
       const recovered = availability.key === 'available';
       if (!enabled || !recovered) {
-        let rollbackState = after;
-        let rollbackSucceeded = false;
-        let rollbackReason = null;
+        let rollback;
         try {
-          const rollback = await rollbackOwnedSchedulableMutation(client, id, recoveryMutation);
-          rollbackState = rollback.state || rollbackState;
-          rollbackSucceeded = rollback.succeeded;
-          rollbackReason = rollback.reason;
+          rollback = await rollbackOwnedSchedulableMutation(
+            client,
+            id,
+            recoveryMutation,
+            { signal },
+          );
         } catch (rollbackError) {
-          rollbackReason = safeErrorMessage(rollbackError);
           writeLog(logger, 'error', 'account_test.recovery_rollback_failed', {
             jobId,
             actor,
             accountId: id,
-            error: rollbackReason,
+            error: safeErrorMessage(rollbackError),
           });
+          recoveryMutation = null;
+          throw schedulerReconciliationError(rollbackError, 'rollback_failed');
         }
         recoveryMutation = null;
+        if (!rollback.succeeded) {
+          const rollbackError = new Error('账号调度设置回滚未能安全确认');
+          rollbackError.code = 'ACCOUNT_TEST_ROLLBACK_UNCONFIRMED';
+          throw schedulerReconciliationError(
+            rollbackError,
+            rollback.reason || 'rollback_unconfirmed',
+            { writeOutcomeUnknown: rollback.writeOutcomeUnknown === true },
+          );
+        }
+        const rollbackState = rollback.state || after;
         const result = {
           accountId: id,
           accountName: account.name || null,
@@ -742,8 +810,8 @@ async function runAccountTestJobNow({
           enabled,
           recovered,
           availability: availability.reason,
-          rollbackSucceeded,
-          rollbackReason,
+          rollbackSucceeded: true,
+          rollbackReason: null,
           durationMs: result.durationMs,
         });
         continue;
@@ -771,9 +839,17 @@ async function runAccountTestJobNow({
         durationMs: result.durationMs,
       });
     } catch (error) {
-      if (recoveryMutation) {
+      let reconciliationError = writeRequiresReconciliation(error)
+        ? schedulerReconciliationError(error)
+        : null;
+      if (recoveryMutation && !reconciliationError) {
         try {
-          const rollback = await rollbackOwnedSchedulableMutation(client, id, recoveryMutation);
+          const rollback = await rollbackOwnedSchedulableMutation(
+            client,
+            id,
+            recoveryMutation,
+            { signal },
+          );
           if (rollback.succeeded) {
             writeLog(logger, 'warn', 'account_test.recovery_rolled_back', {
               jobId,
@@ -788,6 +864,13 @@ async function runAccountTestJobNow({
               accountId: id,
               reason: rollback.reason,
             });
+            const rollbackError = new Error('账号调度设置回滚未能安全确认');
+            rollbackError.code = 'ACCOUNT_TEST_ROLLBACK_UNCONFIRMED';
+            reconciliationError = schedulerReconciliationError(
+              rollbackError,
+              rollback.reason || 'rollback_unconfirmed',
+              { writeOutcomeUnknown: rollback.writeOutcomeUnknown === true },
+            );
           }
         } catch (rollbackError) {
           writeLog(logger, 'error', 'account_test.recovery_rollback_failed', {
@@ -796,17 +879,65 @@ async function runAccountTestJobNow({
             accountId: id,
             error: safeErrorMessage(rollbackError),
           });
+          reconciliationError = schedulerReconciliationError(rollbackError, 'rollback_failed');
         }
       }
-      // Cancellation is a job-level terminal outcome, not a failed account
-      // test. Any owned scheduler mutation has been rolled back above before
-      // the interruption escapes to the observer.
+      recoveryMutation = null;
+      if (reconciliationError) {
+        const causeCode = typeof reconciliationError.code === 'string'
+          && /^[A-Z0-9_]{1,96}$/.test(reconciliationError.code)
+          ? reconciliationError.code
+          : null;
+        const result = {
+          accountId: id,
+          accountName: account?.name || null,
+          status: 'failed',
+          code: 'account_scheduler_reconciliation_required',
+          causeCode,
+          message: '测试成功，但调度设置写入或回滚结果无法确认；已停止后续测试，请人工核对该账号调度状态',
+          testSuccess: testSucceeded,
+          enabled: null,
+          enabledKnown: false,
+          requiresReconciliation: true,
+          writeOutcomeUnknown: reconciliationError.writeOutcomeUnknown === true,
+          reconciliationReason: normalizedReconciliationReason(
+            reconciliationError.reconciliationReason
+              || reconciliationError.writeOutcomeReason,
+          ),
+          statusBefore,
+          statusAfter: null,
+          durationMs: Date.now() - itemStartedAt,
+        };
+        results.push(result);
+        await auditResult(db, logger, result, actor, jobId, normalizedModelId);
+        writeLog(logger, 'error', 'account_test.scheduler_reconciliation_required', {
+          jobId,
+          actor,
+          accountId: id,
+          accountName: account?.name || null,
+          code: causeCode,
+          reconciliationReason: result.reconciliationReason,
+          durationMs: result.durationMs,
+        });
+        reconciliationStopIndex = itemIndex;
+        break;
+      }
+      // Cancellation is a job-level terminal outcome when no scheduler state
+      // is ambiguous. A confirmed mutation that could not be safely rolled
+      // back has already been converted into a persisted reconciliation result.
       if (error?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
         throwIfJobInterrupted(signal);
         throw error;
       }
       let afterFailure = account;
-      try { afterFailure = await client.getAccount(id); } catch {}
+      try {
+        afterFailure = await client.getAccount(id, { signal });
+      } catch (readError) {
+        if (readError?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
+          throwIfJobInterrupted(signal);
+          throw readError;
+        }
+      }
       const result = {
         accountId: id,
         accountName: account?.name || null,
@@ -835,15 +966,41 @@ async function runAccountTestJobNow({
     }
   }
 
+  if (reconciliationStopIndex !== null) {
+    for (let index = reconciliationStopIndex + 1; index < accountIds.length; index += 1) {
+      const accountId = accountIds[index];
+      const listedAccount = initialAccounts.find((candidate) => candidate.id === accountId) || null;
+      const result = {
+        accountId,
+        accountName: listedAccount?.name || null,
+        status: 'skipped',
+        code: 'account_test_not_attempted_reconciliation',
+        message: '前一账号的调度写入结果需要人工核对，本账号未执行测试',
+        durationMs: 0,
+      };
+      results.push(result);
+      await auditResult(db, logger, result, actor, jobId, normalizedModelId);
+    }
+  }
+
   const succeeded = results.filter((item) => item.status === 'succeeded').length;
   const failed = results.filter((item) => item.status === 'failed').length;
   const skipped = results.filter((item) => item.status === 'skipped').length;
+  const reconciliationCount = results.filter(
+    (item) => item.requiresReconciliation === true,
+  ).length;
+  const notAttemptedCount = results.filter(
+    (item) => item.code === 'account_test_not_attempted_reconciliation',
+  ).length;
   const result = {
     model: normalizedModelId || null,
     requested: accountIds.length,
     succeeded,
     failed,
     skipped,
+    requiresReconciliation: reconciliationCount > 0,
+    reconciliationCount,
+    notAttemptedCount,
     durationMs: Date.now() - startedAt,
     results,
   };
@@ -854,6 +1011,9 @@ async function runAccountTestJobNow({
     succeeded,
     failed,
     skipped,
+    requiresReconciliation: result.requiresReconciliation,
+    reconciliationCount,
+    notAttemptedCount,
     durationMs: result.durationMs,
   });
   if (typeof persistResult === 'function') {

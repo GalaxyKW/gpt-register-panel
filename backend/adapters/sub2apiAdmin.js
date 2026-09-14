@@ -1086,7 +1086,7 @@ class Sub2ApiAdminClient {
     };
   }
 
-  async setSchedulable(id, schedulable = true) {
+  async setSchedulable(id, schedulable = true, options = {}) {
     const accountId = positiveAccountId(id);
     if (!accountId) {
       const error = new Error('Sub2API 调度设置缺少有效账号 ID');
@@ -1103,19 +1103,20 @@ class Sub2ApiAdminClient {
       'POST',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/schedulable',
       { schedulable: expectedSchedulable },
+      { signal: options.signal, writeOperation: true },
     );
     const account = safeAccount(value);
     if (!account) {
       const error = new Error('Sub2API 调度设置响应结构无效');
       error.code = 'SUB2API_SCHEDULABLE_SCHEMA_INVALID';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_schema');
     }
     if (account.id !== accountId
         || account.schedulableKnown !== true
         || account.schedulable !== expectedSchedulable) {
       const error = new Error('Sub2API 调度设置响应与请求不一致');
       error.code = 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH';
-      throw error;
+      throw markWriteOutcomeUnknown(error, 'response_mismatch');
     }
     return account;
   }

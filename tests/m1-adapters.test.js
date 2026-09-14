@@ -1058,19 +1058,29 @@ test('Sub2API account errors are redacted and OAuth update responses stay creden
     (error) => error.code === 'SUB2API_CREDENTIALS_RESPONSE_MISMATCH',
   );
 
-  client.request = async () => ({
-    id: 41,
-    name: 'free00041',
-    platform: 'openai',
-    type: 'oauth',
-    status: 'active',
-    schedulable: true,
+  let schedulerRequest = null;
+  client.request = async (...args) => {
+    schedulerRequest = args;
+    return {
+      id: 41,
+      name: 'free00041',
+      platform: 'openai',
+      type: 'oauth',
+      status: 'active',
+      schedulable: true,
+    };
+  };
+  const schedulerController = new AbortController();
+  const scheduled = await client.setSchedulable(41, true, {
+    signal: schedulerController.signal,
   });
-  const scheduled = await client.setSchedulable(41, true);
   assert.equal(scheduled.id, 41);
   assert.equal(scheduled.schedulable, true);
   assert.equal(Object.hasOwn(scheduled, 'credentials'), false);
   assert.equal(JSON.stringify(scheduled).includes('remote-secret'), false);
+  assert.equal(schedulerRequest[0], 'POST');
+  assert.equal(schedulerRequest[3].signal, schedulerController.signal);
+  assert.equal(schedulerRequest[3].writeOperation, true);
 
   client.request = async () => ({
     id: 42,
@@ -1081,7 +1091,10 @@ test('Sub2API account errors are redacted and OAuth update responses stay creden
   });
   await assert.rejects(
     client.setSchedulable(41, true),
-    (error) => error.code === 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH',
+    (error) => error.code === 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH'
+      && error.writeOutcomeUnknown === true
+      && error.requiresReconciliation === true
+      && error.writeOutcomeReason === 'response_mismatch',
   );
 
   client.request = async () => ({
@@ -1093,7 +1106,18 @@ test('Sub2API account errors are redacted and OAuth update responses stay creden
   });
   await assert.rejects(
     client.setSchedulable(41, true),
-    (error) => error.code === 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH',
+    (error) => error.code === 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH'
+      && error.writeOutcomeUnknown === true
+      && error.requiresReconciliation === true
+      && error.writeOutcomeReason === 'response_mismatch',
+  );
+  client.request = async () => ({ unexpected: true });
+  await assert.rejects(
+    client.setSchedulable(41, true),
+    (error) => error.code === 'SUB2API_SCHEDULABLE_SCHEMA_INVALID'
+      && error.writeOutcomeUnknown === true
+      && error.requiresReconciliation === true
+      && error.writeOutcomeReason === 'response_schema',
   );
   await assert.rejects(
     client.setSchedulable(true, true),

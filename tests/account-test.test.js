@@ -424,6 +424,10 @@ test('scheduler recovery rejects a write response for a replaced identity', asyn
   });
   assert.equal(outcome.failed, 1);
   assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].requiresReconciliation, true);
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].enabled, null);
   assert.deepEqual(schedulableCalls, [{ id: 15, value: true }]);
 });
 
@@ -466,10 +470,242 @@ test('scheduler rollback does not adopt state changed after its write response',
     },
   });
   assert.equal(outcome.failed, 1);
-  assert.equal(outcome.results[0].code, 'account_recovery_failed');
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].requiresReconciliation, true);
+  assert.equal(outcome.results[0].reconciliationReason, 'rollback_state_changed');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, false);
+  assert.equal(outcome.results[0].enabled, null);
   assert.deepEqual(schedulableCalls, [true]);
   assert.equal(account.schedulable, true);
   assert.equal(account.tokenFingerprints.access, 'concurrent-admin-fingerprint');
+});
+
+test('mismatched scheduler-rollback response marks the write outcome unknown', async () => {
+  let account = oauthTestAccount(30, 'error', false);
+  const replacement = oauthTestAccount(30, 'active', false, {
+    identityKeys: ['account:replacement-account', 'user:replacement-user'],
+  });
+  const schedulableCalls = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [30],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-rollback-response-mismatch',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = {
+          ...account,
+          status: 'active',
+          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+        };
+        return { success: true };
+      },
+      async setSchedulable(id, value) {
+        assert.equal(id, 30);
+        schedulableCalls.push(value);
+        if (value === true) {
+          account = { ...account, schedulable: true };
+          return { ...account };
+        }
+        return { ...replacement };
+      },
+    },
+  });
+
+  assert.deepEqual(schedulableCalls, [true, false]);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].reconciliationReason, 'rollback_response_mismatch');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].enabled, null);
+});
+
+test('unknown scheduler-enable outcome is persisted and halts the remaining batch without retry', async () => {
+  const controller = new AbortController();
+  const accounts = [
+    oauthTestAccount(25, 'error', false),
+    oauthTestAccount(26, 'active', true),
+  ];
+  let first = accounts[0];
+  const schedulableCalls = [];
+  const tested = [];
+  let persisted = null;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [25, 26],
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-enable-outcome-unknown',
+    signal: controller.signal,
+    persistResult: async (result) => { persisted = result; },
+    client: {
+      async listAccounts() { return [{ ...first }, { ...accounts[1] }]; },
+      async getAccount(id) {
+        return id === 25 ? { ...first } : { ...accounts[1] };
+      },
+      async testAccount(id) {
+        tested.push(id);
+        first = { ...first, status: 'active' };
+        return { success: true };
+      },
+      async setSchedulable(id, value, options) {
+        schedulableCalls.push({ id, value });
+        assert.equal(options.signal, controller.signal);
+        controller.abort();
+        const error = new Error('scheduler response unavailable');
+        error.code = 'JOB_INTERRUPTED';
+        error.writeOutcomeUnknown = true;
+        error.requiresReconciliation = true;
+        error.writeOutcomeReason = 'external_abort';
+        throw error;
+      },
+    },
+  });
+
+  assert.deepEqual(tested, [25]);
+  assert.deepEqual(schedulableCalls, [{ id: 25, value: true }]);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.reconciliationCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'JOB_INTERRUPTED');
+  assert.equal(outcome.results[0].reconciliationReason, 'external_abort');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].enabled, null);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.deepEqual(persisted, outcome);
+});
+
+test('unknown scheduler-rollback outcome requires reconciliation and is never retried', async () => {
+  const controller = new AbortController();
+  let account = oauthTestAccount(27, 'error', false);
+  const schedulableCalls = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [27],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-rollback-outcome-unknown',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return { ...account }; },
+      async testAccount() {
+        account = {
+          ...account,
+          status: 'active',
+          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+        };
+        return { success: true };
+      },
+      async setSchedulable(id, value, options) {
+        schedulableCalls.push({ id, value });
+        assert.equal(options.signal, controller.signal);
+        if (value === true) {
+          account = { ...account, schedulable: true };
+          return { ...account };
+        }
+        const error = new Error('scheduler rollback timed out');
+        error.code = 'SUB2API_TIMEOUT';
+        error.writeOutcomeUnknown = true;
+        error.requiresReconciliation = true;
+        error.writeOutcomeReason = 'timeout';
+        throw error;
+      },
+    },
+  });
+
+  assert.deepEqual(schedulableCalls, [
+    { id: 27, value: true },
+    { id: 27, value: false },
+  ]);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].causeCode, 'SUB2API_TIMEOUT');
+  assert.equal(outcome.results[0].reconciliationReason, 'timeout');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].enabled, null);
+});
+
+test('shutdown cancels the diagnostic read after an unsuccessful account test', async () => {
+  const account = oauthTestAccount(28, 'active', true);
+  const controller = new AbortController();
+  let reads = 0;
+  let markDiagnosticStarted;
+  const diagnosticStarted = new Promise((resolve) => { markDiagnosticStarted = resolve; });
+  const running = runAccountTestJobNow({
+    accountIds: [28],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-failure-diagnostic-cancellation',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount(id, options = {}) {
+        assert.equal(id, 28);
+        reads += 1;
+        if (reads === 1) return { ...account };
+        assert.equal(options.signal, controller.signal);
+        markDiagnosticStarted();
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            const error = new Error('diagnostic read interrupted');
+            error.code = 'JOB_INTERRUPTED';
+            reject(error);
+          }, { once: true });
+        });
+      },
+      async testAccount() { return { success: false, message: 'safe failure' }; },
+    },
+  });
+  await diagnosticStarted;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'JOB_INTERRUPTED');
+  assert.equal(reads, 2);
+});
+
+test('shutdown cancels the diagnostic read after an account test exception', async () => {
+  const account = oauthTestAccount(29, 'active', true);
+  const controller = new AbortController();
+  let reads = 0;
+  let markDiagnosticStarted;
+  const diagnosticStarted = new Promise((resolve) => { markDiagnosticStarted = resolve; });
+  const running = runAccountTestJobNow({
+    accountIds: [29],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-exception-diagnostic-cancellation',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount(id, options = {}) {
+        assert.equal(id, 29);
+        reads += 1;
+        if (reads === 1) return { ...account };
+        assert.equal(options.signal, controller.signal);
+        markDiagnosticStarted();
+        return new Promise((resolve, reject) => {
+          options.signal.addEventListener('abort', () => {
+            const error = new Error('diagnostic read interrupted');
+            error.code = 'JOB_INTERRUPTED';
+            reject(error);
+          }, { once: true });
+        });
+      },
+      async testAccount() {
+        const error = new Error('safe test exception');
+        error.code = 'SAFE_TEST_FAILURE';
+        throw error;
+      },
+    },
+  });
+  await diagnosticStarted;
+  controller.abort();
+  await assert.rejects(running, (error) => error.code === 'JOB_INTERRUPTED');
+  assert.equal(reads, 2);
 });
 
 test('account-test job deadline skips remaining accounts instead of holding the control lock indefinitely', async () => {
