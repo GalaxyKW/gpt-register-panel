@@ -79,6 +79,62 @@ function cleanupWriteOutcomeUnknown(error, { code, message, reason }) {
   return wrapped;
 }
 
+function boundedCleanupCount(value) {
+  const count = Number(value);
+  if (!Number.isSafeInteger(count) || count < 0) return 0;
+  return count;
+}
+
+function attachCleanupProgress(error, item, deletedCount, skippedCount, options = {}) {
+  error.requiresReconciliation = true;
+  error.writeOutcomeUnknown = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.outcome = 'unknown';
+  error.reconciliationScope = 'expired_token_cleanup';
+  error.currentItem = {
+    source: SOURCES.has(item?.source) ? item.source : 'unknown',
+    relativePath: String(item?.relativePath || '')
+      .replace(/[\u0000-\u001f\u007f]/g, '?')
+      .slice(0, 512),
+  };
+  error.completedCount = boundedCleanupCount(deletedCount);
+  error.skippedCount = boundedCleanupCount(skippedCount);
+  if (options.quarantinePath) {
+    error.quarantinePath = String(options.quarantinePath)
+      .replace(/[\u0000-\u001f\u007f]/g, '?')
+      .slice(0, 1024);
+  }
+  return error;
+}
+
+function cleanupClaimRecoveryOutcomeUnknown(error) {
+  if (error?.writeOutcomeUnknown === true) return error;
+  return cleanupWriteOutcomeUnknown(error, {
+    code: 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN',
+    message: 'token claim 无法确认已恢复或隔离；请人工对账，禁止自动重试',
+    reason: 'token_claim_recovery_outcome_unknown',
+  });
+}
+
+function assertCleanupClaimResolved(claimPath) {
+  try {
+    fs.lstatSync(claimPath);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return;
+    throw cleanupWriteOutcomeUnknown(error, {
+      code: 'TOKEN_CLEANUP_CLAIM_RESOLUTION_UNKNOWN',
+      message: 'token claim 的最终清理结果无法确认；请人工对账，禁止自动重试',
+      reason: 'token_claim_resolution_unknown',
+    });
+  }
+  throw cleanupWriteOutcomeUnknown(null, {
+    code: 'TOKEN_CLEANUP_CLAIM_RESOLUTION_UNKNOWN',
+    message: 'token claim 在操作结束后仍然存在；请人工对账，禁止自动重试',
+    reason: 'token_claim_residual_present',
+  });
+}
+
 function cleanupRecoveryInvalid(reason) {
   const error = new Error('检测到无法安全验证的过期 token 清理 claim；请人工核验，禁止自动重试');
   error.code = 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM';
@@ -957,6 +1013,7 @@ function deleteExpiredTokens(options = {}) {
             'changed-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
           );
           moveToQuarantine(claimPath, changedPath);
+          assertCleanupClaimResolved(claimPath);
           claimPath = null;
           batchCreated = true;
           skipped.push({
@@ -971,6 +1028,7 @@ function deleteExpiredTokens(options = {}) {
         continue;
       }
       moveToQuarantine(claimPath, quarantinedPath);
+      assertCleanupClaimResolved(claimPath);
       claimPath = null;
       batchCreated = true;
       deleted.push({
@@ -986,41 +1044,67 @@ function deleteExpiredTokens(options = {}) {
       if (error?.writeOutcomeUnknown === true
           || error?.requiresReconciliation === true
           || error?.doNotRetry === true) {
-        error.requiresReconciliation = true;
-        error.retryAllowed = false;
-        error.doNotRetry = true;
-        error.currentItem = {
-          source: item.source,
-          relativePath: item.relativePath,
-        };
-        error.completedCount = deleted.length;
-        error.skippedCount = skipped.length;
-        if (error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN' && quarantinedPath) {
-          error.quarantinePath = path.relative(quarantineRoot, quarantinedPath);
-        }
-        throw error;
+        const failure = attachCleanupProgress(
+          error,
+          item,
+          deleted.length,
+          skipped.length,
+          {
+            quarantinePath: error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN' && quarantinedPath
+              ? path.relative(quarantineRoot, quarantinedPath)
+              : null,
+          },
+        );
+        throw failure;
       }
-      if (claimPath && !restoreClaimedPath(claimPath, absolutePath)) {
+      if (claimPath) {
+        let restored = false;
         try {
-          const sourceFolder = path.join(batchDirectory, item.source);
-          ensurePrivateDirectory(sourceFolder, 'token 隔离子目录', true);
-          createdSourceFolders.add(sourceFolder);
-          const recoveryPath = path.join(
-            sourceFolder,
-            'recovery-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
-          );
-          moveToQuarantine(claimPath, recoveryPath);
-          batchCreated = true;
-          skipped.push({
-            ...item,
-            reason: 'file_unavailable_quarantined',
-            quarantinePath: path.relative(quarantineRoot, recoveryPath),
-          });
-          continue;
+          restored = restoreClaimedPath(claimPath, absolutePath);
         } catch (recoveryError) {
-          if (recoveryError?.writeOutcomeUnknown === true
-              || recoveryError?.requiresReconciliation === true
-              || recoveryError?.doNotRetry === true) throw recoveryError;
+          throw attachCleanupProgress(
+            cleanupClaimRecoveryOutcomeUnknown(recoveryError),
+            item,
+            deleted.length,
+            skipped.length,
+          );
+        }
+        if (restored) {
+          claimPath = null;
+        } else {
+          let recoveryPath = null;
+          try {
+            const sourceFolder = path.join(batchDirectory, item.source);
+            ensurePrivateDirectory(sourceFolder, 'token 隔离子目录', true);
+            createdSourceFolders.add(sourceFolder);
+            recoveryPath = path.join(
+              sourceFolder,
+              'recovery-' + crypto.randomBytes(6).toString('hex') + '-' + path.basename(item.relativePath),
+            );
+            moveToQuarantine(claimPath, recoveryPath);
+            assertCleanupClaimResolved(claimPath);
+            claimPath = null;
+            batchCreated = true;
+            skipped.push({
+              ...item,
+              reason: 'file_unavailable_quarantined',
+              quarantinePath: path.relative(quarantineRoot, recoveryPath),
+            });
+            continue;
+          } catch (recoveryError) {
+            throw attachCleanupProgress(
+              cleanupClaimRecoveryOutcomeUnknown(recoveryError),
+              item,
+              deleted.length,
+              skipped.length,
+              {
+                quarantinePath: recoveryError?.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+                  && recoveryPath
+                  ? path.relative(quarantineRoot, recoveryPath)
+                  : null,
+              },
+            );
+          }
         }
       }
       skipped.push({ ...item, reason: 'file_unavailable' });

@@ -940,6 +940,96 @@ test('cross-filesystem cleanup never unlinks a newly reusable original source pa
   }
 });
 
+test('cleanup fails closed when a claimed file cannot be restored or quarantined', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'expired-recovery-failure.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: jwt({ suffix: '-claimed-recovery-failure' }),
+    email: 'claimed-recovery-failure@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }), { mode: 0o600 });
+  const options = {
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  };
+  const listing = listExpiredTokens(options);
+  assert.equal(listing.count, 1);
+
+  const originalOpenSync = fs.openSync;
+  const originalLinkSync = fs.linkSync;
+  let snapshotFailureInjected = false;
+  let restoreFailureInjected = false;
+  let fallbackFailureInjected = false;
+  fs.openSync = function failFirstClaimSnapshot(filePath, ...args) {
+    if (!snapshotFailureInjected
+        && path.basename(String(filePath)).startsWith('.panel-token-cleanup-claim-')) {
+      snapshotFailureInjected = true;
+      const error = new Error('simulated claimed snapshot failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalOpenSync.call(fs, filePath, ...args);
+  };
+  fs.linkSync = function failClaimRecovery(from, to) {
+    if (path.basename(String(from)).startsWith('.panel-token-cleanup-claim-')) {
+      const error = new Error('simulated ordinary claim recovery failure');
+      if (String(to) === sourcePath) {
+        restoreFailureInjected = true;
+        error.code = 'EACCES';
+      } else {
+        fallbackFailureInjected = true;
+        error.code = 'EPERM';
+      }
+      throw error;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_CLAIM_RECOVERY_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.linkSync = originalLinkSync;
+  }
+
+  assert.equal(snapshotFailureInjected, true);
+  assert.equal(restoreFailureInjected, true);
+  assert.equal(fallbackFailureInjected, true);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(failure.outcome, 'unknown');
+  assert.equal(failure.reconciliationScope, 'expired_token_cleanup');
+  assert.equal(failure.reconciliationReason, 'token_claim_recovery_outcome_unknown');
+  assert.equal(failure.causeCode, 'EPERM');
+  assert.deepEqual(failure.currentItem, {
+    source: 'tokens',
+    relativePath: 'tokens/expired-recovery-failure.json',
+  });
+  assert.equal(failure.completedCount, 0);
+  assert.equal(failure.skippedCount, 0);
+  assert.equal(Object.hasOwn(failure.currentItem, 'email'), false);
+  assert.equal(Object.hasOwn(failure.currentItem, 'fingerprint'), false);
+  assert.equal(failure.message.includes('simulated'), false);
+  assert.equal(fs.existsSync(sourcePath), false);
+  const remainingClaims = fs.readdirSync(path.join(root, 'tokens')).filter(
+    (name) => name.startsWith('.panel-token-cleanup-claim-'),
+  );
+  assert.equal(remainingClaims.length, 1);
+});
+
 test('cleanup reports an unknown outcome instead of file_unavailable after source unlink', () => {
   const root = makeRoot();
   const tokensDirectory = path.join(root, 'tokens');
