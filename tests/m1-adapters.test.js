@@ -2593,6 +2593,75 @@ test('Sub2API strict postflight listings require a total on every page', async (
   }), []);
 });
 
+test('Sub2API outbound account IDs reject coercion and duplicates before side effects', async () => {
+  const originalFetch = global.fetch;
+  const logs = [];
+  let fetchCalls = 0;
+  let requestCalls = 0;
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger: {
+      info(event, fields) { logs.push({ event, fields }); },
+      warn(event, fields) { logs.push({ event, fields }); },
+      error(event, fields) { logs.push({ event, fields }); },
+    },
+  });
+  client.request = async () => {
+    requestCalls += 1;
+    throw new Error('request must not run');
+  };
+  global.fetch = async () => {
+    fetchCalls += 1;
+    throw new Error('fetch must not run');
+  };
+  try {
+    const invalidSingles = [
+      [() => client.getAccount(' 1 '), 'SUB2API_ACCOUNT_ID_INVALID'],
+      [() => client.getAvailableModels('01'), 'SUB2API_MODELS_ID_INVALID'],
+      [() => client.testAccount(true), 'SUB2API_TEST_ID_INVALID'],
+      [() => client.setSchedulable('1e2', true), 'SUB2API_SCHEDULABLE_ID_INVALID'],
+      [() => client.getAccountStats(Number.MAX_SAFE_INTEGER + 1), 'SUB2API_STATS_ID_INVALID'],
+      [() => client.getAccountTodayStats(new Number(1)), 'SUB2API_STATS_ID_INVALID'],
+      [() => client.applyOAuthCredentials(false, {}), 'SUB2API_CREDENTIALS_ID_INVALID'],
+      [() => client.getAccountStats(1, '30'), 'SUB2API_STATS_DAYS_INVALID'],
+      [() => client.getAccountStats(1, 0), 'SUB2API_STATS_DAYS_INVALID'],
+      [() => client.getAccountStats(1, 91), 'SUB2API_STATS_DAYS_INVALID'],
+    ];
+    for (const [operation, code] of invalidSingles) {
+      await assert.rejects(operation, (error) => error.code === code);
+    }
+
+    for (const ids of [
+      null,
+      [],
+      [true],
+      ['1e2'],
+      [' 1 '],
+      [1.5],
+      [1, 1],
+      Array.from({ length: 1001 }, (_, index) => index + 1),
+    ]) {
+      const expectedCode = Array.isArray(ids) && ids.length === 2
+        ? 'SUB2API_ACCOUNT_IDS_DUPLICATE'
+        : 'SUB2API_ACCOUNT_IDS_INVALID';
+      await assert.rejects(
+        client.getBatchTodayStats(ids),
+        (error) => error.code === expectedCode,
+      );
+      await assert.rejects(
+        client.getBatchTableUsageStats(ids),
+        (error) => error.code === expectedCode,
+      );
+    }
+    assert.equal(requestCalls, 0);
+    assert.equal(fetchCalls, 0);
+    assert.deepEqual(logs, []);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API batch-stat envelopes are complete and errors leave only after redaction', async () => {
   const opaqueStatsError = 'opaque-stats-error-346b19';
   const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });

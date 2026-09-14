@@ -15,6 +15,7 @@ const MAX_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
 const MAX_ADMIN_REQUEST_PATH_BYTES = 4096;
+const MAX_BATCH_ACCOUNT_IDS = 1000;
 const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST']);
 const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
@@ -174,6 +175,20 @@ function positiveAccountId(value) {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
+function requestedAccountId(value, code, message) {
+  const id = typeof value === 'number' && Number.isSafeInteger(value) && value > 0
+    ? value
+    : (typeof value === 'string'
+        && /^[1-9]\d*$/.test(value)
+        && Number.isSafeInteger(Number(value))
+      ? Number(value)
+      : null);
+  if (id) return id;
+  const error = new Error(message);
+  error.code = code;
+  throw error;
+}
+
 function paginationTotal(value) {
   if (typeof value === 'number') {
     return Number.isSafeInteger(value) && value >= 0 ? value : null;
@@ -327,10 +342,22 @@ function validatedAdminRequestTarget(baseUrl, baseOrigin, method, pathname) {
 }
 
 function normalizedAccountIds(ids) {
-  if (!Array.isArray(ids)) return [];
-  return [...new Set(ids.map((value) => Number(value)).filter(
-    (value) => Number.isSafeInteger(value) && value > 0,
-  ))];
+  if (!Array.isArray(ids) || ids.length === 0 || ids.length > MAX_BATCH_ACCOUNT_IDS) {
+    const error = new Error('Sub2API 批量统计必须包含 1-1000 个账号 ID');
+    error.code = 'SUB2API_ACCOUNT_IDS_INVALID';
+    throw error;
+  }
+  const normalized = ids.map((value) => requestedAccountId(
+    value,
+    'SUB2API_ACCOUNT_IDS_INVALID',
+    'Sub2API 批量统计账号 ID 必须是规范正整数',
+  ));
+  if (new Set(normalized).size !== normalized.length) {
+    const error = new Error('Sub2API 批量统计账号 ID 不能重复');
+    error.code = 'SUB2API_ACCOUNT_IDS_DUPLICATE';
+    throw error;
+  }
+  return normalized;
 }
 
 function storedFingerprint(value) {
@@ -1502,12 +1529,11 @@ class Sub2ApiAdminClient {
   }
 
   async getAccount(id, options = {}) {
-    const accountId = positiveAccountId(id);
-    if (!accountId) {
-      const error = new Error('Sub2API 账号详情缺少有效账号 ID');
-      error.code = 'SUB2API_ACCOUNT_ID_INVALID';
-      throw error;
-    }
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_ACCOUNT_ID_INVALID',
+      'Sub2API 账号详情缺少有效账号 ID',
+    );
     const value = await this.request(
       'GET',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)),
@@ -1529,9 +1555,14 @@ class Sub2ApiAdminClient {
   }
 
   async getAvailableModels(id) {
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_MODELS_ID_INVALID',
+      'Sub2API 模型列表缺少有效账号 ID',
+    );
     const value = await this.request(
       'GET',
-      '/api/v1/admin/accounts/' + encodeURIComponent(String(id)) + '/models',
+      '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/models',
     );
     const rows = Array.isArray(value)
       ? value
@@ -1548,8 +1579,13 @@ class Sub2ApiAdminClient {
   }
 
   async testAccount(id, options = {}) {
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_TEST_ID_INVALID',
+      'Sub2API 账号测试缺少有效账号 ID',
+    );
     const startedAt = Date.now();
-    const pathname = '/api/v1/admin/accounts/' + encodeURIComponent(String(id)) + '/test';
+    const pathname = '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/test';
     const modelId = safeModelId(options.modelId || options.model_id);
     const prompt = asString(options.prompt).trim();
     const body = {};
@@ -1557,7 +1593,7 @@ class Sub2ApiAdminClient {
     if (prompt) body.prompt = prompt;
     writeLog(this.logger, 'info', 'sub2api.account_test_started', {
       ...this.logContext,
-      accountId: Number(id),
+      accountId,
       model: modelId || null,
     });
     const headers = {
@@ -1611,7 +1647,7 @@ class Sub2ApiAdminClient {
         reason = 'external_abort';
         writeLog(this.logger, 'warn', 'sub2api.account_test_interrupted', {
           ...this.logContext,
-          accountId: Number(id),
+          accountId,
           model: modelId || null,
           durationMs: Date.now() - startedAt,
         });
@@ -1633,7 +1669,7 @@ class Sub2ApiAdminClient {
       if (requestDispatched) failure = markAccountTestOutcomeUnknown(failure, reason);
       writeLog(this.logger, 'error', 'sub2api.account_test_failed', {
         ...this.logContext,
-        accountId: Number(id),
+        accountId,
         model: modelId || null,
         durationMs: Date.now() - startedAt,
         error: safeRemoteText(failure.message),
@@ -1658,7 +1694,7 @@ class Sub2ApiAdminClient {
       );
       writeLog(this.logger, 'warn', 'sub2api.account_test_rejected', {
         ...this.logContext,
-        accountId: Number(id),
+        accountId,
         model: modelId || null,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
@@ -1691,7 +1727,7 @@ class Sub2ApiAdminClient {
       const detail = 'Sub2API 返回的测试模型与请求不一致';
       writeLog(this.logger, 'warn', 'sub2api.account_test_model_mismatch', {
         ...this.logContext,
-        accountId: Number(id),
+        accountId,
         model: modelId,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
@@ -1705,7 +1741,7 @@ class Sub2ApiAdminClient {
       const detail = 'Sub2API 返回失败测试结果';
       writeLog(this.logger, 'warn', 'sub2api.account_test_unsuccessful', {
         ...this.logContext,
-        accountId: Number(id),
+        accountId,
         model: completedModel,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
@@ -1720,7 +1756,7 @@ class Sub2ApiAdminClient {
     }
     writeLog(this.logger, 'info', 'sub2api.account_test_succeeded', {
       ...this.logContext,
-      accountId: Number(id),
+      accountId,
       model: completedModel,
       statusCode: response.status,
       durationMs: Date.now() - startedAt,
@@ -1734,12 +1770,11 @@ class Sub2ApiAdminClient {
   }
 
   async setSchedulable(id, schedulable = true, options = {}) {
-    const accountId = positiveAccountId(id);
-    if (!accountId) {
-      const error = new Error('Sub2API 调度设置缺少有效账号 ID');
-      error.code = 'SUB2API_SCHEDULABLE_ID_INVALID';
-      throw error;
-    }
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_SCHEDULABLE_ID_INVALID',
+      'Sub2API 调度设置缺少有效账号 ID',
+    );
     if (typeof schedulable !== 'boolean') {
       const error = new Error('Sub2API 调度设置必须是布尔值');
       error.code = 'SUB2API_SCHEDULABLE_VALUE_INVALID';
@@ -1769,17 +1804,32 @@ class Sub2ApiAdminClient {
   }
 
   async getAccountStats(id, days = 30) {
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_STATS_ID_INVALID',
+      'Sub2API 账号统计缺少有效账号 ID',
+    );
+    if (!Number.isSafeInteger(days) || days < 1 || days > 90) {
+      const error = new Error('Sub2API 账号统计天数必须是 1-90 的整数');
+      error.code = 'SUB2API_STATS_DAYS_INVALID';
+      throw error;
+    }
     const value = await this.request(
       'GET',
-      '/api/v1/admin/accounts/' + encodeURIComponent(String(id)) + '/stats?days=' + encodeURIComponent(String(days)),
+      '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/stats?days=' + encodeURIComponent(String(days)),
     );
     return value;
   }
 
   async getAccountTodayStats(id) {
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_STATS_ID_INVALID',
+      'Sub2API 账号统计缺少有效账号 ID',
+    );
     return this.request(
       'GET',
-      '/api/v1/admin/accounts/' + encodeURIComponent(String(id)) + '/today-stats',
+      '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/today-stats',
     );
   }
 
@@ -1890,12 +1940,11 @@ class Sub2ApiAdminClient {
   }
 
   async applyOAuthCredentials(id, payload, options = {}) {
-    const accountId = positiveAccountId(id);
-    if (!accountId) {
-      const error = new Error('Sub2API 凭证更新缺少有效账号 ID');
-      error.code = 'SUB2API_CREDENTIALS_ID_INVALID';
-      throw error;
-    }
+    const accountId = requestedAccountId(
+      id,
+      'SUB2API_CREDENTIALS_ID_INVALID',
+      'Sub2API 凭证更新缺少有效账号 ID',
+    );
     const value = await this.request(
       'POST',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/apply-oauth-credentials',
