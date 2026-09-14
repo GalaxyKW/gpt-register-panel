@@ -484,13 +484,16 @@ test('SIGTERM handler closes admission, drains jobs once, and exits successfully
     exit(code) { exits.push(code); },
   });
   emitter.emit('SIGTERM');
+  emitter.emit('SIGTERM');
   emitter.emit('SIGINT');
   for (let attempt = 0; exits.length === 0 && attempt < 20; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
-  remove();
   assert.deepEqual(exits, [0]);
   assert.equal(events.filter((event) => event === 'jobs.shutdown').length, 1);
+  assert.equal(emitter.listenerCount('SIGTERM'), 1);
+  remove();
+  assert.equal(emitter.listenerCount('SIGTERM'), 0);
   assert.equal(events.includes('server.shutdown_started'), true);
   assert.equal(events.includes('server.shutdown_completed'), true);
   assert.equal(fakeServer.listening, false);

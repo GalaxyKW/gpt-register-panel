@@ -22,6 +22,7 @@ const {
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { PanelDb } = require('./db');
 const {
+  PHASE3_TERMINATION_MAX_TOTAL_MS,
   runPhase3Job,
   getActivePhase3Job,
   canonicalPhase3Keys,
@@ -53,6 +54,7 @@ const CONTENT_TYPES = {
   '.css': 'text/css; charset=utf-8',
   '.json': 'application/json; charset=utf-8',
 };
+const MIN_PHASE3_SHUTDOWN_TIMEOUT_MS = PHASE3_TERMINATION_MAX_TOTAL_MS + 1000;
 const CONTENT_SECURITY_POLICY = "default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
 const STATIC_ALLOWLIST = new Set(['/index.html', '/app.js', '/styles.css']);
 const JSON_BODY_ENDPOINTS = new Set([
@@ -187,6 +189,23 @@ function validateRuntimeConfiguration() {
     const error = new Error('面板管理员令牌不符合安全要求');
     error.code = 'PANEL_ADMIN_TOKEN_INVALID';
     throw error;
+  }
+  if (booleanEnvEnabled('PANEL_PHASE3_ENABLED', false)) {
+    const configuredShutdownTimeout = String(
+      process.env.PANEL_SHUTDOWN_TIMEOUT_MS ?? '',
+    ).trim();
+    const shutdownTimeoutMs = configuredShutdownTimeout
+      ? Number(configuredShutdownTimeout)
+      : 10_000;
+    if (!Number.isFinite(shutdownTimeoutMs)
+        || Math.floor(shutdownTimeoutMs) < MIN_PHASE3_SHUTDOWN_TIMEOUT_MS) {
+      const error = new Error(
+        'Phase3 启用时服务停止等待必须至少为 '
+          + String(MIN_PHASE3_SHUTDOWN_TIMEOUT_MS) + ' 毫秒',
+      );
+      error.code = 'PANEL_SHUTDOWN_BUDGET_TOO_SMALL';
+      throw error;
+    }
   }
 }
 
@@ -2041,8 +2060,11 @@ function installShutdownSignalHandlers(server, options = {}) {
   };
   const onSigterm = () => stop('SIGTERM');
   const onSigint = () => stop('SIGINT');
-  emitter.once('SIGTERM', onSigterm);
-  emitter.once('SIGINT', onSigint);
+  // Keep both handlers installed throughout draining. With `once`, a second
+  // SIGTERM of the same type would hit Node's default handler and terminate
+  // immediately, bypassing process-tree cleanup and terminal persistence.
+  emitter.on('SIGTERM', onSigterm);
+  emitter.on('SIGINT', onSigint);
   return () => {
     emitter.removeListener('SIGTERM', onSigterm);
     emitter.removeListener('SIGINT', onSigint);

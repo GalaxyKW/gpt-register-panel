@@ -228,6 +228,31 @@ test('startup rejects invalid booleans before database access', async () => {
   }
 });
 
+test('Phase3 startup rejects a shutdown budget shorter than process-tree cleanup', () => {
+  const previous = {
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+    shutdown: process.env.PANEL_SHUTDOWN_TIMEOUT_MS,
+  };
+  try {
+    process.env.PANEL_PHASE3_ENABLED = '1';
+    process.env.PANEL_SHUTDOWN_TIMEOUT_MS = '5999';
+    assert.throws(
+      () => validateRuntimeConfiguration(),
+      (error) => error?.code === 'PANEL_SHUTDOWN_BUDGET_TOO_SMALL'
+        && /6000/.test(error.message),
+    );
+    process.env.PANEL_SHUTDOWN_TIMEOUT_MS = '6000';
+    assert.doesNotThrow(() => validateRuntimeConfiguration());
+    delete process.env.PANEL_SHUTDOWN_TIMEOUT_MS;
+    assert.doesNotThrow(() => validateRuntimeConfiguration());
+  } finally {
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+    if (previous.shutdown === undefined) delete process.env.PANEL_SHUTDOWN_TIMEOUT_MS;
+    else process.env.PANEL_SHUTDOWN_TIMEOUT_MS = previous.shutdown;
+  }
+});
+
 test('configured administrator tokens must be bounded printable ASCII without whitespace', () => {
   const previous = {
     token: process.env.PANEL_ADMIN_TOKEN,
