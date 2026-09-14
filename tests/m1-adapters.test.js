@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -954,6 +955,127 @@ test('uses Sub2API stored token fingerprints and credential-presence metadata wi
     id: 'absent',
   });
   assert.equal(Object.prototype.hasOwnProperty.call(safe, 'credentials'), false);
+});
+
+test('safe accounts reject secret-like and confusing strong identities without exposing them', () => {
+  const dangerousValues = [
+    'Bearer identity-leak-marker',
+    'eyJhbGciOiJIUzI1NiJ9.identityleakmarker.signaturemarker',
+    'sk-proj-identity-leak-marker-1234567890',
+    'credential:identity-leak-marker',
+    'account-safe\u202eidentity-leak-marker',
+    'opaque1'.repeat(16),
+  ];
+  dangerousValues.forEach((dangerous, index) => {
+    const input = index % 2 === 0
+      ? { account_id: dangerous }
+      : { user_id: dangerous };
+    const safe = safeAccount({
+      id: 200 + index,
+      email: 'fallback@example.test',
+      ...input,
+    });
+    const serialized = JSON.stringify(safe);
+    assert.equal(safe.schemaValid, false);
+    assert.equal(safe.accountId, '');
+    assert.equal(safe.userId, '');
+    assert.deepEqual(safe.identityKeys, ['email:fallback@example.test']);
+    assert.equal(serialized.includes(dangerous), false);
+    assert.equal(serialized.includes('identity-leak-marker'), false);
+  });
+});
+
+test('safe accounts accept only lossless safe-integer numeric strong identities', () => {
+  const maximum = Number.MAX_SAFE_INTEGER;
+  const safe = safeAccount({
+    id: 206,
+    account_id: maximum,
+    accountId: String(maximum),
+    user_id: 42,
+  });
+  assert.equal(safe.schemaValid, true);
+  assert.equal(safe.accountId, String(maximum));
+  assert.equal(safe.userId, '42');
+  assert.deepEqual(safe.identityKeys, [
+    'account:' + String(maximum),
+    'user:42',
+  ]);
+
+  for (const unsafeValue of [maximum + 1, 1.5, -0]) {
+    const unsafe = safeAccount({ id: 207, account_id: unsafeValue });
+    assert.equal(unsafe.schemaValid, false);
+    assert.equal(unsafe.accountId, '');
+    assert.deepEqual(unsafe.identityKeys, []);
+  }
+
+  const canonical = safeAccount({
+    id: 208,
+    credentials: {
+      chatgpt_account_id: '{123E4567-E89B-12D3-A456-426614174000}',
+      chatgpt_user_id: 'user-real_123',
+    },
+  });
+  assert.equal(canonical.schemaValid, true);
+  assert.equal(canonical.accountId, '123e4567-e89b-12d3-a456-426614174000');
+  assert.equal(canonical.userId, 'user-real_123');
+});
+
+test('stored token fingerprints require exact full SHA-256 values', () => {
+  for (const length of [16, 17, 63, 65]) {
+    const malformed = safeAccount({
+      id: 209,
+      extra: { access_token_sha256: 'a'.repeat(length) },
+    });
+    assert.equal(malformed.schemaValid, false);
+    assert.equal(malformed.fingerprintConflict, true);
+    assert.equal(malformed.tokenFingerprints.access, null);
+  }
+
+  const rawCredential = 'test-only-remote-access-value';
+  const digest = crypto.createHash('sha256').update(rawCredential).digest('hex');
+  const wrongDigest = digest.slice(0, -1) + (digest.endsWith('0') ? '1' : '0');
+  const mismatch = safeAccount({
+    id: 210,
+    credentials: { access_token: rawCredential },
+    extra: { access_token_sha256: wrongDigest },
+  });
+  assert.equal(mismatch.schemaValid, false);
+  assert.equal(mismatch.fingerprintConflict, true);
+  assert.equal(mismatch.tokenFingerprints.access, null);
+  assert.equal(JSON.stringify(mismatch).includes(rawCredential), false);
+});
+
+test('full fingerprint alias conflicts cannot collapse into the same short fingerprint', () => {
+  const prefix = '0123456789abcdef';
+  const account = safeAccount({
+    id: 211,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    credentials: {
+      account_id: 'workspace-fingerprint-conflict',
+      access_token_sha256: prefix + 'a'.repeat(48),
+    },
+    credentials_status: { has_access_token: true },
+    extra: { access_token_sha256: prefix + 'b'.repeat(48) },
+  });
+  assert.equal(account.schemaValid, false);
+  assert.equal(account.fingerprintConflict, true);
+  assert.equal(account.tokenFingerprints.access, null);
+
+  const diff = buildDiff([{
+    source: 'tokens',
+    relativePath: 'tokens/fingerprint-conflict.json',
+    fileName: 'fingerprint-conflict.json',
+    parseStatus: 'ok',
+    expiryStatus: 'missing',
+    identityKeys: ['account:workspace-fingerprint-conflict'],
+    fingerprints: { access: prefix, refresh: null },
+  }], [account]);
+  assert.equal(diff.counts.in_sync, undefined);
+  assert.equal(diff.counts.token_changed, 1);
+  assert.equal(diff.items[0].decisionReason, 'sub2api_account_schema_invalid');
 });
 
 test('credential-presence metadata is tri-state and malformed metadata fails closed', () => {

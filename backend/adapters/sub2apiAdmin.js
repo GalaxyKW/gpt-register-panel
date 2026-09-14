@@ -5,6 +5,7 @@ const {
   asString,
   normalizeIdentityValue,
 } = require('../lib/token');
+const crypto = require('node:crypto');
 const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 
@@ -14,6 +15,12 @@ const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
 const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
+const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
+const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+const COMPACT_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+const CREDENTIAL_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
+const CREDENTIAL_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
+const LONG_OPAQUE_CREDENTIAL = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
 
 function isPlainObject(value) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
@@ -196,6 +203,57 @@ function scalarAliases(values, maximumLength, options = {}) {
   };
 }
 
+function looksLikeCredential(value) {
+  return /^(?:bearer|basic)\s+\S+/i.test(value)
+    || COMPACT_JWT.test(value)
+    || CREDENTIAL_LABEL.test(value)
+    || CREDENTIAL_PREFIX.test(value)
+    || LONG_OPAQUE_CREDENTIAL.test(value);
+}
+
+function strongIdentityScalar(raw, prefix, maximumLength = 512) {
+  let text;
+  if (typeof raw === 'number') {
+    if (!Number.isSafeInteger(raw) || Object.is(raw, -0)) {
+      return { value: '', invalid: true };
+    }
+    text = String(raw);
+  } else if (typeof raw === 'string') {
+    text = raw;
+  } else {
+    return { value: '', invalid: true };
+  }
+  if (!text || text !== text.trim() || text.length > maximumLength
+      || IDENTITY_CONTROL_OR_BIDI.test(text)) {
+    return { value: '', invalid: true };
+  }
+  const value = normalizeIdentityValue(prefix, text);
+  if (!value || value.length > maximumLength
+      || !CANONICAL_STRONG_IDENTITY.test(value)
+      || looksLikeCredential(value)) {
+    return { value: '', invalid: true };
+  }
+  return { value, invalid: false };
+}
+
+function identityAliases(values, prefix, maximumLength = 512) {
+  const present = values.filter((value) => value !== undefined && value !== null && value !== '');
+  const normalized = [];
+  let invalid = false;
+  for (const raw of present) {
+    const field = strongIdentityScalar(raw, prefix, maximumLength);
+    if (field.invalid) invalid = true;
+    else normalized.push(field.value);
+  }
+  const unique = [...new Set(normalized)];
+  return {
+    value: unique[0] || '',
+    values: unique,
+    invalid,
+    conflict: unique.length > 1,
+  };
+}
+
 function identityKeysFromFields(accountField, userField, emailField) {
   return [
     ...accountField.values.map((value) => 'account:' + value),
@@ -228,7 +286,18 @@ function normalizedAccountIds(ids) {
 
 function storedFingerprint(value) {
   const text = asString(value).toLowerCase();
-  return /^[a-f0-9]{16,64}$/.test(text) ? text.slice(0, 16) : null;
+  return /^[a-f0-9]{64}$/.test(text) ? text : null;
+}
+
+function fullTokenFingerprint(value) {
+  const text = asString(value);
+  return text ? crypto.createHash('sha256').update(text).digest('hex') : null;
+}
+
+function shortStoredFingerprint(field) {
+  return field.invalid || field.conflict || !field.value
+    ? null
+    : field.value.slice(0, 16);
 }
 
 function normalizedDateAliases(...values) {
@@ -290,26 +359,20 @@ function safeAccount(account) {
   const emailField = scalarAliases([credentials.email, account.email], 320, {
     normalize: normalizeEmail,
   });
-  const accountField = scalarAliases([
+  const accountField = identityAliases([
     credentials.chatgpt_account_id,
     credentials.account_id,
     account.chatgpt_account_id,
     account.account_id,
     account.accountId,
-  ], 512, {
-    allowNumber: true,
-    normalize: (value) => normalizeIdentityValue('account:', value),
-  });
-  const userField = scalarAliases([
+  ], 'account:');
+  const userField = identityAliases([
     credentials.chatgpt_user_id,
     credentials.user_id,
     account.chatgpt_user_id,
     account.user_id,
     account.userId,
-  ], 512, {
-    allowNumber: true,
-    normalize: (value) => normalizeIdentityValue('user:', value),
-  });
+  ], 'user:');
   const accessField = scalarAliases(
     [credentials.access_token, credentials.accessToken],
     2 * 1024 * 1024,
@@ -332,15 +395,17 @@ function safeAccount(account) {
   ], 128, { normalize: storedFingerprint });
   const computedAccessFingerprint = tokenFingerprint(accessField.value);
   const computedRefreshFingerprint = tokenFingerprint(refreshField.value);
+  const computedAccessDigest = fullTokenFingerprint(accessField.value);
+  const computedRefreshDigest = fullTokenFingerprint(refreshField.value);
   const accessFingerprintConflict = Boolean(
     storedFingerprintField.value
-      && computedAccessFingerprint
-      && storedFingerprintField.value !== computedAccessFingerprint,
+      && computedAccessDigest
+      && storedFingerprintField.value !== computedAccessDigest,
   );
   const refreshFingerprintConflict = Boolean(
     storedRefreshFingerprintField.value
-      && computedRefreshFingerprint
-      && storedRefreshFingerprintField.value !== computedRefreshFingerprint,
+      && computedRefreshDigest
+      && storedRefreshFingerprintField.value !== computedRefreshDigest,
   );
   const credentialsStatus = normalizedCredentialsStatus(account);
   const accessPresence = credentialPresence(
@@ -359,7 +424,12 @@ function safeAccount(account) {
   const credentialsStatusConflict = accessPresence.conflict
     || refreshPresence.conflict
     || idPresence.conflict;
-  const fingerprintConflict = accessFingerprintConflict || refreshFingerprintConflict;
+  const fingerprintConflict = accessFingerprintConflict
+    || refreshFingerprintConflict
+    || storedFingerprintField.invalid
+    || storedFingerprintField.conflict
+    || storedRefreshFingerprintField.invalid
+    || storedRefreshFingerprintField.conflict;
   const identityConflict = accountField.conflict || userField.conflict;
   const scalarSchemaValid = credentialsShapeValid
     && extraShapeValid
@@ -468,13 +538,21 @@ function safeAccount(account) {
     overloadUntil: overload.value,
     overloadUntilStatus: overload.status,
     tokenFingerprints: {
-      access: accessFingerprintConflict
+      access: accessField.invalid
+        || accessField.conflict
+        || storedFingerprintField.invalid
+        || storedFingerprintField.conflict
+        || accessFingerprintConflict
         ? null
-        : storedFingerprintField.value || computedAccessFingerprint,
-      refresh: refreshField.conflict || refreshFingerprintConflict
+        : shortStoredFingerprint(storedFingerprintField) || computedAccessFingerprint,
+      refresh: refreshField.invalid
+        || refreshField.conflict
+        || storedRefreshFingerprintField.invalid
+        || storedRefreshFingerprintField.conflict
+        || refreshFingerprintConflict
         ? null
-        : storedRefreshFingerprintField.value || computedRefreshFingerprint,
-      id: idTokenField.conflict ? null : tokenFingerprint(idTokenField.value),
+        : shortStoredFingerprint(storedRefreshFingerprintField) || computedRefreshFingerprint,
+      id: idTokenField.invalid || idTokenField.conflict ? null : tokenFingerprint(idTokenField.value),
     },
     groupIds,
     usage: nestedUsage || (!hasNestedUsageShape ? normalizeUsageStats(account.usage) : null),
