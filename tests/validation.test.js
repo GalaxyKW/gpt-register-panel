@@ -1069,6 +1069,160 @@ test('audit scalar fields are redacted both before storage and when reading lega
   assert.equal(JSON.stringify(await db.listAudit(10)).includes(marker), false);
 });
 
+test('audit history bounds limits and omits oversized stored fields before decoding', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-audit-bounds-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const marker = 'audit-query-must-not-materialize-secret';
+  const oversizedText = marker + '-'.repeat((16 * 1024) + 1);
+  const oversizedDetails = JSON.stringify({ credential: marker, filler: 'x'.repeat(17 * 1024) });
+  await db.write((database) => {
+    database.run('BEGIN IMMEDIATE');
+    const statement = database.prepare(`INSERT INTO audit_events
+      (job_id, actor, action, target_key, before_fingerprint, after_fingerprint,
+        result, details_json, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+    try {
+      for (let index = 0; index < 105; index += 1) {
+        statement.run([
+          null,
+          'tester',
+          'bounded_history',
+          null,
+          null,
+          null,
+          'ok',
+          '{}',
+          new Date(Date.now() + index).toISOString(),
+        ]);
+      }
+      statement.run([
+        'job-' + oversizedText,
+        oversizedText,
+        oversizedText,
+        oversizedText,
+        oversizedText,
+        oversizedText,
+        oversizedText,
+        oversizedDetails,
+        oversizedText,
+      ]);
+      database.run('COMMIT');
+    } catch (error) {
+      try { database.run('ROLLBACK'); } catch {}
+      throw error;
+    } finally {
+      statement.free();
+    }
+  });
+
+  const originalJsonParse = JSON.parse;
+  let oversizedDetailsParsed = false;
+  JSON.parse = function monitoredJsonParse(value, ...args) {
+    if (typeof value === 'string' && Buffer.byteLength(value, 'utf8') > 16 * 1024) {
+      oversizedDetailsParsed = true;
+    }
+    return originalJsonParse.call(this, value, ...args);
+  };
+  let events;
+  try {
+    events = await db.listAudit('999.75');
+  } finally {
+    JSON.parse = originalJsonParse;
+  }
+  assert.equal(events.length, 100);
+  assert.equal(oversizedDetailsParsed, false);
+  assert.equal(JSON.stringify(events).includes(marker), false);
+  assert.deepEqual(events[0].scalarFieldsOmitted, [
+    'jobId',
+    'actor',
+    'action',
+    'targetKey',
+    'beforeFingerprint',
+    'afterFingerprint',
+    'result',
+    'createdAt',
+  ]);
+  assert.equal(events[0].jobId, null);
+  assert.equal(events[0].actor, '[oversized]');
+  assert.equal(events[0].detailsOmitted, true);
+  assert.equal(events[0].detailsBytes, Buffer.byteLength(oversizedDetails, 'utf8'));
+  assert.equal(events[0].detailsInvalid, false);
+  assert.deepEqual(events[0].details, {});
+  assert.equal((await db.listAudit(2.9)).length, 2);
+  assert.equal((await db.listAudit(0)).length, 1);
+  assert.equal((await db.listAudit('invalid')).length, 100);
+});
+
+test('active account-test admission lookup reads only requested claims and minimal job fields', async () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-account-admission-')), 'panel.sqlite3');
+  const db = new PanelDb(file);
+  const marker = 'active-account-query-must-not-return-history';
+  const requested = await db.createJob('account_test', {
+    accountIds: [41],
+    prompt: marker,
+  }, 'tester', { claimKeys: ['account_test:41'] });
+  await db.createJob('account_test', {
+    accountIds: [99],
+    prompt: marker,
+  }, 'tester', { claimKeys: ['account_test:99'] });
+  const historical = await db.createJob('account_test', {
+    accountIds: [42],
+    prompt: marker,
+  }, 'tester', { claimKeys: ['account_test:42'] });
+  await db.updateJob(historical.id, {
+    status: 'failed',
+    result: { code: 'ACCOUNT_TEST_FAILED' },
+    error: 'historical failure',
+  });
+  await db.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET payload_json = ?, result_json = ?, error = ? WHERE id IN (?, ?)`);
+    statement.run([
+      JSON.stringify({ marker, filler: 'p'.repeat(64 * 1024) }),
+      JSON.stringify({ marker, filler: 'r'.repeat(64 * 1024) }),
+      marker + '-'.repeat(64 * 1024),
+      requested.id,
+      historical.id,
+    ]);
+    statement.free();
+  });
+
+  const jobs = await db.listActiveAccountTestJobsForAccounts([41, 42]);
+  assert.deepEqual(jobs, [{
+    id: requested.id,
+    type: 'account_test',
+    status: 'queued',
+    payload: { accountIds: [41] },
+  }]);
+  assert.equal(JSON.stringify(jobs).includes(marker), false);
+  assert.deepEqual(
+    await db.listActiveAccountTestJobsForAccounts(['41']),
+    jobs,
+  );
+  await assert.rejects(
+    db.listActiveAccountTestJobsForAccounts([0]),
+    (error) => error.code === 'ACCOUNT_TEST_ACTIVE_QUERY_INVALID',
+  );
+  await assert.rejects(
+    db.listActiveAccountTestJobsForAccounts([Symbol('41')]),
+    (error) => error.code === 'ACCOUNT_TEST_ACTIVE_QUERY_INVALID',
+  );
+  await assert.rejects(
+    db.listActiveAccountTestJobsForAccounts(['041']),
+    (error) => error.code === 'ACCOUNT_TEST_ACTIVE_QUERY_INVALID',
+  );
+
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE job_claims SET job_type = ? WHERE claim_key = ?');
+    statement.run(['token_import', 'account_test:41']);
+    statement.free();
+  });
+  await assert.rejects(
+    db.listActiveAccountTestJobsForAccounts([41]),
+    (error) => error.code === 'JOB_CLAIM_INTEGRITY_INVALID',
+  );
+});
+
 test('malformed DB and control lock files fail closed and are never deleted as stale markers', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-invalid-lock-'));
   const dbPath = path.join(root, 'panel.sqlite3');

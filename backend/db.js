@@ -20,6 +20,18 @@ const MAX_JOB_RESULT_BYTES = 2 * 1024 * 1024;
 const MAX_JOB_ERROR_BYTES = 64 * 1024;
 const MAX_AUDIT_TEXT_BYTES = 16 * 1024;
 const MAX_AUDIT_DETAILS_BYTES = 512 * 1024;
+const MAX_AUDIT_LIST_DETAILS_BYTES = 16 * 1024;
+const MAX_AUDIT_LIST_EVENTS = 100;
+const AUDIT_LIST_TEXT_BYTES = Object.freeze({
+  job_id: 128,
+  actor: 32,
+  action: 64,
+  target_key: 1024,
+  before_fingerprint: 256,
+  after_fingerprint: 256,
+  result: 64,
+  created_at: 64,
+});
 const MAX_JOB_CLAIM_KEYS = 1000;
 const MAX_JOB_CLAIM_KEY_BYTES = 512;
 const MAX_RECONCILIATION_LIST_JOBS = 100;
@@ -936,9 +948,61 @@ function normalizedJobListLimit(limit, fallback = 50) {
   return Math.trunc(Math.max(1, Math.min(200, parsed)));
 }
 
+function normalizedAuditListLimit(limit, fallback = MAX_AUDIT_LIST_EVENTS) {
+  let raw;
+  let parsed;
+  try {
+    raw = limit === null || limit === undefined ? '' : String(limit).trim();
+    parsed = Number(limit);
+  } catch {
+    return fallback;
+  }
+  if (!raw || !Number.isFinite(parsed)) return fallback;
+  return Math.trunc(Math.max(1, Math.min(MAX_AUDIT_LIST_EVENTS, parsed)));
+}
+
+function accountTestActiveLookupIds(value) {
+  const invalid = () => {
+    const error = new Error('账号测试活跃任务查询参数无效');
+    error.code = 'ACCOUNT_TEST_ACTIVE_QUERY_INVALID';
+    return error;
+  };
+  if (!Array.isArray(value) || value.length > 100) {
+    throw invalid();
+  }
+  const ids = [];
+  const seen = new Set();
+  for (const valueId of value) {
+    const canonical = typeof valueId === 'number'
+      ? Number.isSafeInteger(valueId) && valueId > 0
+        ? String(valueId)
+        : null
+      : typeof valueId === 'string' && /^[1-9]\d*$/.test(valueId)
+        ? valueId
+        : null;
+    if (!canonical) throw invalid();
+    const id = Number(canonical);
+    if (!Number.isSafeInteger(id) || id <= 0 || String(id) !== canonical) throw invalid();
+    if (seen.has(id)) continue;
+    seen.add(id);
+    ids.push(id);
+  }
+  return ids;
+}
+
 function boundedJobListText(value, maximumCharacters) {
   if (value === null || value === undefined) return null;
   return redactText(String(value)).slice(0, maximumCharacters);
+}
+
+function auditListText(row, field, { nullable = false } = {}) {
+  if (Number(row?.[field + '_omitted']) === 1) {
+    return nullable ? null : '[oversized]';
+  }
+  const value = row?.[field];
+  if (typeof value !== 'string') return nullable ? null : '[invalid]';
+  if (nullable && value.length === 0) return null;
+  return redactText(value);
 }
 
 function durableReconciliationListSummary(row) {
@@ -3033,6 +3097,57 @@ class PanelDb {
     return rows.map((row) => this.decodeJob(row));
   }
 
+  async listActiveAccountTestJobsForAccounts(accountIds = []) {
+    const ids = accountTestActiveLookupIds(accountIds);
+    if (ids.length === 0) return [];
+    const expectedClaims = new Map(ids.map((id) => ['account_test:' + String(id), id]));
+    const rows = await this.read((database) => resultRows(database.exec(`SELECT
+        CASE WHEN typeof(j.id) = 'text' AND length(CAST(j.id AS BLOB)) = 28
+          THEN j.id ELSE NULL END AS id,
+        CASE WHEN typeof(j.status) = 'text' AND length(CAST(j.status AS BLOB)) <= 32
+          THEN j.status ELSE NULL END AS status,
+        CASE WHEN typeof(c.claim_key) = 'text'
+            AND length(CAST(c.claim_key AS BLOB)) <= ${MAX_JOB_CLAIM_KEY_BYTES}
+          THEN c.claim_key ELSE NULL END AS claim_key,
+        CASE WHEN typeof(c.job_type) = 'text' AND length(CAST(c.job_type AS BLOB)) <= 64
+          THEN c.job_type ELSE NULL END AS claim_job_type
+      FROM job_claims AS c
+      INNER JOIN sync_jobs AS j ON j.id = c.job_id
+      WHERE j.type = 'account_test'
+        AND j.status IN ('queued', 'running')
+        AND c.claim_key IN (${[...expectedClaims.keys()].map(sqlString).join(', ')})
+      LIMIT ${ids.length + 1}`)));
+    if (rows.length > ids.length) {
+      throw claimIntegrityError('账号测试活跃任务保护键数量异常');
+    }
+    const jobsById = new Map();
+    const returnedClaims = new Set();
+    for (const row of rows) {
+      if (typeof row.id !== 'string' || !/^job_[a-f0-9]{24}$/.test(row.id)
+          || !['queued', 'running'].includes(row.status)
+          || row.claim_job_type !== 'account_test'
+          || !expectedClaims.has(row.claim_key)
+          || returnedClaims.has(row.claim_key)) {
+        throw claimIntegrityError('账号测试活跃任务保护键元数据无效');
+      }
+      returnedClaims.add(row.claim_key);
+      let job = jobsById.get(row.id);
+      if (!job) {
+        job = {
+          id: row.id,
+          type: 'account_test',
+          status: row.status,
+          payload: { accountIds: [] },
+        };
+        jobsById.set(row.id, job);
+      } else if (job.status !== row.status) {
+        throw claimIntegrityError('账号测试活跃任务状态元数据不一致');
+      }
+      job.payload.accountIds.push(expectedClaims.get(row.claim_key));
+    }
+    return [...jobsById.values()];
+  }
+
   async countActiveJobs(type = null) {
     const normalizedType = typeof type === 'string' ? type.trim() : '';
     const condition = normalizedType
@@ -3089,24 +3204,110 @@ class PanelDb {
   }
 
   async listAudit(limit = 100) {
-    const safeLimit = Math.max(1, Math.min(500, Number(limit) || 100));
+    const safeLimit = normalizedAuditListLimit(limit);
     const rows = await this.read((database) => resultRows(database.exec(
-      'SELECT * FROM audit_events ORDER BY id DESC LIMIT ' + safeLimit,
+      `SELECT id,
+        CASE WHEN job_id IS NULL THEN NULL
+          WHEN typeof(job_id) = 'text'
+            AND length(CAST(job_id AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.job_id}
+          THEN job_id ELSE NULL END AS job_id,
+        CASE WHEN job_id IS NOT NULL AND (typeof(job_id) <> 'text'
+            OR length(CAST(job_id AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.job_id})
+          THEN 1 ELSE 0 END AS job_id_omitted,
+        CASE WHEN typeof(actor) = 'text'
+            AND length(CAST(actor AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.actor}
+          THEN actor ELSE NULL END AS actor,
+        CASE WHEN typeof(actor) <> 'text'
+            OR length(CAST(actor AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.actor}
+          THEN 1 ELSE 0 END AS actor_omitted,
+        CASE WHEN typeof(action) = 'text'
+            AND length(CAST(action AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.action}
+          THEN action ELSE NULL END AS action,
+        CASE WHEN typeof(action) <> 'text'
+            OR length(CAST(action AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.action}
+          THEN 1 ELSE 0 END AS action_omitted,
+        CASE WHEN target_key IS NULL THEN NULL
+          WHEN typeof(target_key) = 'text'
+            AND length(CAST(target_key AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.target_key}
+          THEN target_key ELSE NULL END AS target_key,
+        CASE WHEN target_key IS NOT NULL AND (typeof(target_key) <> 'text'
+            OR length(CAST(target_key AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.target_key})
+          THEN 1 ELSE 0 END AS target_key_omitted,
+        CASE WHEN before_fingerprint IS NULL THEN NULL
+          WHEN typeof(before_fingerprint) = 'text'
+            AND length(CAST(before_fingerprint AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.before_fingerprint}
+          THEN before_fingerprint ELSE NULL END AS before_fingerprint,
+        CASE WHEN before_fingerprint IS NOT NULL AND (typeof(before_fingerprint) <> 'text'
+            OR length(CAST(before_fingerprint AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.before_fingerprint})
+          THEN 1 ELSE 0 END AS before_fingerprint_omitted,
+        CASE WHEN after_fingerprint IS NULL THEN NULL
+          WHEN typeof(after_fingerprint) = 'text'
+            AND length(CAST(after_fingerprint AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.after_fingerprint}
+          THEN after_fingerprint ELSE NULL END AS after_fingerprint,
+        CASE WHEN after_fingerprint IS NOT NULL AND (typeof(after_fingerprint) <> 'text'
+            OR length(CAST(after_fingerprint AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.after_fingerprint})
+          THEN 1 ELSE 0 END AS after_fingerprint_omitted,
+        CASE WHEN typeof(result) = 'text'
+            AND length(CAST(result AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.result}
+          THEN result ELSE NULL END AS result,
+        CASE WHEN typeof(result) <> 'text'
+            OR length(CAST(result AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.result}
+          THEN 1 ELSE 0 END AS result_omitted,
+        CASE WHEN details_json IS NOT NULL
+            AND typeof(details_json) = 'text'
+            AND length(CAST(details_json AS BLOB)) <= ${MAX_AUDIT_LIST_DETAILS_BYTES}
+          THEN details_json ELSE NULL END AS details_json,
+        CASE WHEN details_json IS NOT NULL AND (typeof(details_json) <> 'text'
+            OR length(CAST(details_json AS BLOB)) > ${MAX_AUDIT_LIST_DETAILS_BYTES})
+          THEN 1 ELSE 0 END AS details_omitted,
+        length(CAST(details_json AS BLOB)) AS details_bytes,
+        CASE WHEN typeof(created_at) = 'text'
+            AND length(CAST(created_at AS BLOB)) <= ${AUDIT_LIST_TEXT_BYTES.created_at}
+          THEN created_at ELSE NULL END AS created_at,
+        CASE WHEN typeof(created_at) <> 'text'
+            OR length(CAST(created_at AS BLOB)) > ${AUDIT_LIST_TEXT_BYTES.created_at}
+          THEN 1 ELSE 0 END AS created_at_omitted
+      FROM audit_events ORDER BY id DESC LIMIT ${safeLimit}`,
     )));
     return rows.map((row) => {
       let details = {};
-      try { details = redactValue(JSON.parse(row.details_json || '{}')); } catch {}
+      let detailsInvalid = false;
+      if (typeof row.details_json === 'string') {
+        try { details = redactValue(JSON.parse(row.details_json)); } catch { detailsInvalid = true; }
+      }
+      const detailsBytesValue = Number(row.details_bytes);
+      const detailsBytes = row.details_bytes !== null
+        && Number.isSafeInteger(detailsBytesValue) && detailsBytesValue >= 0
+        ? detailsBytesValue
+        : null;
+      const scalarFields = [
+        ['job_id', 'jobId'],
+        ['actor', 'actor'],
+        ['action', 'action'],
+        ['target_key', 'targetKey'],
+        ['before_fingerprint', 'beforeFingerprint'],
+        ['after_fingerprint', 'afterFingerprint'],
+        ['result', 'result'],
+        ['created_at', 'createdAt'],
+      ];
+      const scalarFieldsOmitted = scalarFields
+        .filter(([field]) => Number(row[field + '_omitted']) === 1)
+        .map(([, publicField]) => publicField);
       return {
-        id: row.id,
-        jobId: row.job_id ? redactText(row.job_id) : null,
-        actor: redactText(row.actor),
-        action: redactText(row.action),
-        targetKey: row.target_key ? redactText(row.target_key) : null,
-        beforeFingerprint: row.before_fingerprint ? redactText(row.before_fingerprint) : null,
-        afterFingerprint: row.after_fingerprint ? redactText(row.after_fingerprint) : null,
-        result: redactText(row.result),
+        id: Number.isSafeInteger(row.id) && row.id > 0 ? row.id : null,
+        jobId: auditListText(row, 'job_id', { nullable: true }),
+        actor: auditListText(row, 'actor'),
+        action: auditListText(row, 'action'),
+        targetKey: auditListText(row, 'target_key', { nullable: true }),
+        beforeFingerprint: auditListText(row, 'before_fingerprint', { nullable: true }),
+        afterFingerprint: auditListText(row, 'after_fingerprint', { nullable: true }),
+        result: auditListText(row, 'result'),
         details,
-        createdAt: row.created_at,
+        detailsOmitted: Number(row.details_omitted) === 1,
+        detailsBytes,
+        detailsInvalid,
+        scalarFieldsOmitted,
+        createdAt: auditListText(row, 'created_at'),
       };
     });
   }

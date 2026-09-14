@@ -2820,7 +2820,9 @@ function createServer(options = {}) {
               // durable task. The opaque revisions themselves are never stored.
               assertAccountTestTargetRevisions(accounts, requestData.targets);
               throwIfJobInterrupted(signal);
-              const jobs = await db.listJobs(200);
+              const jobs = await db.listActiveAccountTestJobsForAccounts(
+                requestData.accountIds,
+              );
               throwIfJobInterrupted(signal);
               const classified = classifyAccountTestTargets(
                 accounts,

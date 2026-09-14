@@ -2136,6 +2136,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     controlLock: process.env.PANEL_CONTROL_LOCK_PATH,
   };
   let server = null;
+  let admissionLookupCalls = 0;
   try {
     await new Promise((resolve, reject) => {
       upstream.once('error', reject);
@@ -2155,8 +2156,19 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
 
     // server.js is intentionally loaded after the fake environment setup.
     const { createServer } = require('../backend/server');
+    const panelDb = new PanelDb(path.join(root, 'panel.sqlite3'));
+    await panelDb.ready;
+    const listActiveAccountTestJobsForAccounts = panelDb
+      .listActiveAccountTestJobsForAccounts.bind(panelDb);
+    panelDb.listActiveAccountTestJobsForAccounts = async (accountIds) => {
+      admissionLookupCalls += 1;
+      return listActiveAccountTestJobsForAccounts(accountIds);
+    };
+    panelDb.listJobs = async () => {
+      throw new Error('account-test admission must not scan historical job bodies');
+    };
     server = createServer({
-      dbPath: path.join(root, 'panel.sqlite3'),
+      db: panelDb,
       logger: {
         checkpoint() { return true; },
         info() {},
@@ -2303,6 +2315,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     assert.deepEqual(testCalls.map((call) => call.id), [1, 2, 3]);
     assert.equal(accounts.get(4).account_id, 'replacement-account-4');
     assert.equal(accounts.get(4).schedulable, false);
+    assert.equal(admissionLookupCalls, 2);
   } finally {
     let closeFailure = null;
     try {
