@@ -1,5 +1,6 @@
 const { getAccountAvailability } = require('./accountAvailability');
 const { accountTestTargetRevision } = require('./accountTargetRevision');
+const { phase3TargetRevision } = require('./phase3TargetRevision');
 const { normalizeEmail } = require('./lib/token');
 
 const TERMINAL_USERNAME_STATUSES = new Set([
@@ -23,7 +24,7 @@ function buildUsernameIndex(usernames = []) {
   return index;
 }
 
-function usernameAssociation(token, usernameIndex) {
+function usernameAssociation(token, usernameIndex, options = {}) {
   if (!token) {
     return {
       phone: '',
@@ -79,6 +80,11 @@ function usernameAssociation(token, usernameIndex) {
     phase3Email: email,
     phase3Eligible: true,
     phase3Reason: null,
+    phase3TargetRevision: phase3TargetRevision({
+      token,
+      username,
+      usernameContentHash: options.usernameContentHash,
+    }),
     usernameMatch: 'unique',
   };
 }
@@ -129,7 +135,7 @@ function rowFromDiffItem(item, options = {}) {
   const usernameIndex = options.usernameIndex instanceof Map
     ? options.usernameIndex
     : buildUsernameIndex(options.usernames);
-  const username = usernameAssociation(token, usernameIndex);
+  const username = usernameAssociation(token, usernameIndex, options);
   const source = token ? token.source : 'sub2api';
   const availability = item?.availability
     ? { key: item.availability, reason: item.availabilityReason || null }
@@ -169,6 +175,7 @@ function rowFromDiffItem(item, options = {}) {
     phase3Email: username.phase3Email,
     phase3Eligible: username.phase3Eligible,
     phase3Reason: username.phase3Reason,
+    phase3TargetRevision: username.phase3TargetRevision || null,
     usernameMatch: username.usernameMatch,
     userId: account?.userId || token?.userId || '',
     chatgptAccountId: account?.accountId || token?.accountId || '',

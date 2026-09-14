@@ -536,11 +536,18 @@ test('phase3 refuses a selected token path that changes account while queued', a
   process.env.GPT_REGISTER_NODE_PATH = process.execPath;
   process.env.PANEL_PHASE3_ENABLED = '1';
   try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const phase3TargetRevision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
     const resolved = resolvePhase3Requests([{
       originalIndex: 0,
       email: 'bound-token@example.test',
       phone: '',
       selectedKey,
+      phase3TargetRevision,
     }]);
     assert.equal(resolved.eligible.length, 1);
     const target = resolved.eligible[0];
@@ -604,11 +611,18 @@ test('phase3 refuses a same-email username record replacement while queued', asy
   process.env.GPT_REGISTER_NODE_PATH = process.execPath;
   process.env.PANEL_PHASE3_ENABLED = '1';
   try {
+    const snapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const phase3TargetRevision = snapshot.rows.find((row) => row.key === selectedKey)
+      ?.phase3TargetRevision;
     const resolved = resolvePhase3Requests([{
       originalIndex: 0,
       email: 'bound-username@example.test',
       phone: '1380000',
       selectedKey,
+      phase3TargetRevision,
     }]);
     assert.equal(resolved.eligible.length, 1);
     const target = resolved.eligible[0];
@@ -637,6 +651,79 @@ test('phase3 refuses a same-email username record replacement while queued', asy
     else process.env.GPT_REGISTER_NODE_PATH = previous.node;
     if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
     else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('phase3 admission rejects an old UI revision after same-path token or username replacement', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-ui-binding-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const tokenPath = path.join(root, 'tokens', 'same-path.json');
+  const usernamePath = path.join(root, 'username.json');
+  const selectedKey = 'token:tokens:tokens/same-path.json';
+  fs.writeFileSync(usernamePath, JSON.stringify([{
+    email: 'ui-bound@example.test',
+    phone: '13800001234',
+    password: 'first-password-secret',
+    status: 'oauth_done',
+  }]));
+  fs.writeFileSync(tokenPath, JSON.stringify({
+    access_token: 'first-access-secret',
+    email: 'ui-bound@example.test',
+    chatgpt_account_id: 'workspace-one',
+    chatgpt_user_id: 'user-one',
+  }));
+  const previousRoot = process.env.GPT_REGISTER_ROOT;
+  process.env.GPT_REGISTER_ROOT = root;
+  try {
+    const firstSnapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const firstRow = firstSnapshot.rows.find((row) => row.key === selectedKey);
+    assert.match(firstRow?.phase3TargetRevision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
+
+    // Preserve source/path/email while replacing both the credential bytes and
+    // a strong identity. The old page must not authorize this unseen token.
+    fs.writeFileSync(tokenPath, JSON.stringify({
+      access_token: 'replacement-access-secret',
+      email: 'ui-bound@example.test',
+      chatgpt_account_id: 'workspace-two',
+      chatgpt_user_id: 'user-two',
+    }));
+    const tokenChanged = resolvePhase3Requests([{
+      originalIndex: 0,
+      email: 'ui-bound@example.test',
+      phone: '13800001234',
+      selectedKey,
+      phase3TargetRevision: firstRow.phase3TargetRevision,
+    }]);
+    assert.equal(tokenChanged.eligible.length, 0);
+    assert.equal(tokenChanged.rejected[0].error, 'phase3_target_revision_changed');
+
+    const secondSnapshot = await buildSnapshot(new URLSearchParams(), {
+      rootDirectory: root,
+      readSub2Api: false,
+    });
+    const secondRow = secondSnapshot.rows.find((row) => row.key === selectedKey);
+    fs.writeFileSync(usernamePath, JSON.stringify([{
+      email: 'ui-bound@example.test',
+      phone: '13800001234',
+      password: 'replacement-password-secret',
+      status: 'oauth_done',
+    }]));
+    const usernameChanged = resolvePhase3Requests([{
+      originalIndex: 0,
+      email: 'ui-bound@example.test',
+      phone: '13800001234',
+      selectedKey,
+      phase3TargetRevision: secondRow.phase3TargetRevision,
+    }]);
+    assert.equal(usernameChanged.eligible.length, 0);
+    assert.equal(usernameChanged.rejected[0].error, 'phase3_target_revision_changed');
+  } finally {
+    if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previousRoot;
   }
 });
 

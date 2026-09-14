@@ -84,12 +84,13 @@ test('JSON API body validation rejects scalar values', () => {
 });
 
 test('Phase 3 accepts batches and removes duplicate email/phone targets', () => {
+  const phase3TargetRevision = 'phase3-target-v1.' + 'A'.repeat(43);
   const batch = normalizePhase3Requests({
     accounts: [
-      { email: ' One@example.test ', phone: '138-0000', selectedKey: 'token:tokens:tokens/one.json' },
-      { email: 'one@example.test', selectedKey: 'token:tokens:tokens/one-copy.json' },
-      { phone: '1380000', selectedKey: 'token:use_token:use_token/one.json' },
-      { email: 'two@example.test', selectedKey: 'token:tokens:tokens/two.json' },
+      { email: ' One@example.test ', phone: '138-0000', selectedKey: 'token:tokens:tokens/one.json', phase3TargetRevision },
+      { email: 'one@example.test', selectedKey: 'token:tokens:tokens/one-copy.json', phase3TargetRevision },
+      { phone: '1380000', selectedKey: 'token:use_token:use_token/one.json', phase3TargetRevision },
+      { email: 'two@example.test', selectedKey: 'token:tokens:tokens/two.json', phase3TargetRevision },
     ],
     selectedKeys: [
       'token:tokens:tokens/one.json',
@@ -111,6 +112,7 @@ test('Phase 3 requires an exact one-to-one selected-key set', () => {
   const accounts = [{
     email: 'one@example.test',
     selectedKey: 'token:tokens:tokens/one.json',
+    phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
   }];
   for (const body of [
     { accounts },
@@ -124,6 +126,19 @@ test('Phase 3 requires an exact one-to-one selected-key set', () => {
     assert.throws(
       () => normalizePhase3Requests(body),
       (error) => error.code === 'PHASE3_SELECTION_INVALID',
+    );
+  }
+});
+
+test('Phase 3 refuses missing or malformed snapshot target revisions', () => {
+  const selectedKey = 'token:tokens:tokens/one.json';
+  for (const phase3TargetRevision of [undefined, '', 'phase3-target-v1.short', 'account-test-v1.' + 'A'.repeat(43)]) {
+    assert.throws(
+      () => normalizePhase3Requests({
+        accounts: [{ email: 'one@example.test', selectedKey, phase3TargetRevision }],
+        selectedKeys: [selectedKey],
+      }),
+      (error) => error.code === 'PHASE3_TARGET_REVISION_INVALID',
     );
   }
 });

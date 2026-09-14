@@ -1078,6 +1078,14 @@ function normalizePhase3Requests(body) {
       throw error;
     }
     itemSelectedKeys.add(selectedKey);
+    const phase3TargetRevision = typeof rawItem.phase3TargetRevision === 'string'
+      ? rawItem.phase3TargetRevision.trim()
+      : '';
+    if (!/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(phase3TargetRevision)) {
+      const error = new Error('每个 Phase 3 账号必须提供当前快照的目标 revision');
+      error.code = 'PHASE3_TARGET_REVISION_INVALID';
+      throw error;
+    }
     const email = typeof rawItem.email === 'string' ? rawItem.email.trim().toLowerCase() : '';
     const phone = typeof rawItem.phone === 'string' ? rawItem.phone.trim() : '';
     const normalizedPhone = phone.replace(/[^0-9]/g, '');
@@ -1103,6 +1111,7 @@ function normalizePhase3Requests(body) {
       email,
       phone: normalizedPhone || phone,
       selectedKey,
+      phase3TargetRevision,
     });
   });
   if (selectedKeys.some((key) => !itemSelectedKeys.has(key))

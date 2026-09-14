@@ -997,6 +997,10 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.match(snapshot.body, /server@example.test/);
     assert.equal(snapshot.body.includes('hidden-password'), false);
     assert.equal(snapshot.body.includes('refresh-hidden'), false);
+    const snapshotRows = JSON.parse(snapshot.body).rows;
+    const phase3RevisionFor = (relativePath) => snapshotRows.find(
+      (row) => row.relativePath === relativePath,
+    )?.phase3TargetRevision;
 
     fs.renameSync(path.join(root, 'use_token'), path.join(root, 'use_token-missing'));
     const incompleteSourcePreview = await postJson(baseUrl, '/api/sync/preview', {
@@ -1040,19 +1044,39 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     assert.equal(crossSiteStylePost.status, 415);
     assert.equal(JSON.parse(crossSiteStylePost.body).error, 'json_content_type_required');
 
+    const selectedTokenKey = 'token:tokens:tokens/token.json';
+    const currentPhase3Revision = phase3RevisionFor('tokens/token.json');
+    const forgedPhase3Revision = currentPhase3Revision.slice(0, -1)
+      + (currentPhase3Revision.endsWith('A') ? 'B' : 'A');
+    const forgedPhase3 = await postJson(baseUrl, '/api/phase3', {
+      accounts: [{
+        email: 'server@example.test',
+        selectedKey: selectedTokenKey,
+        phase3TargetRevision: forgedPhase3Revision,
+      }],
+      selectedKeys: [selectedTokenKey],
+    });
+    assert.equal(forgedPhase3.status, 409);
+    const forgedPhase3Body = JSON.parse(forgedPhase3.body);
+    assert.deepEqual(forgedPhase3Body.jobIds, []);
+    assert.equal(forgedPhase3Body.rejected[0].error, 'phase3_target_revision_changed');
+
     const batchPhase3 = await postJson(baseUrl, '/api/phase3', {
       accounts: [
         {
           email: 'server@example.test',
           selectedKey: 'token:tokens:tokens/token.json',
+          phase3TargetRevision: phase3RevisionFor('tokens/token.json'),
         },
         {
           phone: '15550000001',
           selectedKey: 'token:tokens:tokens/token-duplicate.json',
+          phase3TargetRevision: phase3RevisionFor('tokens/token-duplicate.json'),
         },
         {
           email: 'second@example.test',
           selectedKey: 'token:tokens:tokens/second.json',
+          phase3TargetRevision: phase3RevisionFor('tokens/second.json'),
         },
       ],
       selectedKeys: [

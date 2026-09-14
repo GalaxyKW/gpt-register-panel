@@ -424,7 +424,10 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       sub2apiReadStatus: readStatus,
       usernames: sources.usernames,
     });
-    const allRows = buildRows(diff, { usernames: sources.usernames });
+    const allRows = buildRows(diff, {
+      usernames: sources.usernames,
+      usernameContentHash: sources.usernameContentHash,
+    });
     const rows = filterRows(allRows, {
       search: query.get('search'),
       status: query.get('status'),

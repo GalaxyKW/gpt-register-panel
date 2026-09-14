@@ -867,6 +867,7 @@ test('snapshot rows receive safe username phone and Phase3 eligibility', async (
   assert.equal(row.phone, '+86 138-0013-8000');
   assert.equal(row.phase3Email, 'example@email.test');
   assert.equal(row.phase3Eligible, true);
+  assert.match(row.phase3TargetRevision, /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/);
 });
 
 test('classifies old_codex files as hidden historical backups', () => {

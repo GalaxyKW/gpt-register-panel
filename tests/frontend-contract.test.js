@@ -1327,12 +1327,14 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
   const context = {};
   vm.runInNewContext(reasonContract + '\n' + targetContract + `
+    const revision = 'phase3-target-v1.' + 'A'.repeat(43);
     const eligible = {
       key: 'eligible',
       email: 'stale-remote@example.test',
       phase3Email: 'source-token@example.test',
       phone: '+86 138-0013-8000',
       phase3Eligible: true,
+      phase3TargetRevision: revision,
     };
     const rejected = {
       key: 'ambiguous',
@@ -1361,22 +1363,25 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
         email: 'malformed@example.test',
         phase3Eligible: null,
       }]),
+      missingRevisionProblem: phase3SelectionProblem([{
+        key: 'missing-revision',
+        phase3Eligible: true,
+        phase3Email: 'missing-revision@example.test',
+      }], 1),
     };
   `, context);
   assert.deepEqual(JSON.parse(JSON.stringify(context.result.eligible)), [{
     email: 'source-token@example.test',
     phone: '8613800138000',
     selectedKey: 'eligible',
+    phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
   }]);
   assert.deepEqual([...context.result.rejected], []);
   assert.match(context.result.rejectedProblem, /匹配到多个账号/);
-  assert.deepEqual(JSON.parse(JSON.stringify(context.result.legacy)), [{
-    email: 'legacy@example.test',
-    phone: '',
-    selectedKey: 'legacy',
-  }]);
+  assert.deepEqual([...context.result.legacy], []);
   assert.deepEqual([...context.result.legacyRemote], []);
   assert.deepEqual([...context.result.malformedEligibility], []);
+  assert.match(context.result.missingRevisionProblem, /快照凭证/);
 });
 
 test('frontend disables Phase3 and explains a backend-rejected selected row', () => {

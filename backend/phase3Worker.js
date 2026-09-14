@@ -11,6 +11,7 @@ const {
 } = require('./adapters/gptRegisterFs');
 const { isExpired, isExpiryInvalid } = require('./diff');
 const { normalizeEmail } = require('./lib/token');
+const { phase3TargetRevisionMatches } = require('./phase3TargetRevision');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
@@ -1760,7 +1761,15 @@ function resolvePhase3Requests(requests = []) {
     let code = null;
     let message = null;
     const record = matches.length === 1 ? matches[0] : null;
-    if (!selectedKey || selectedTokenMatches.length !== 1) {
+    const revisionEvidence = selectedToken && record ? {
+      token: selectedToken,
+      username: record,
+      usernameContentHash: sources.usernameContentHash,
+    } : null;
+    if (!phase3TargetRevisionMatches(request?.phase3TargetRevision, revisionEvidence)) {
+      code = 'phase3_target_revision_changed';
+      message = '所选 Phase 3 目标已变化或快照凭证无效，请刷新后重新选择';
+    } else if (!selectedKey || selectedTokenMatches.length !== 1) {
       code = 'phase3_source_not_found';
       message = '所选本地 token 不存在或选择键无效';
     } else if (selectedToken.historical === true) {
@@ -1828,6 +1837,7 @@ function resolvePhase3Requests(requests = []) {
       email: resolvedEmail,
       phone: resolvedPhone || null,
       canonicalKeys,
+      phase3TargetRevision: request.phase3TargetRevision,
     };
     Object.defineProperty(resolvedRequest, 'executionBinding', {
       value: Object.freeze({

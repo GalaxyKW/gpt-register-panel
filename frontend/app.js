@@ -624,18 +624,14 @@ function phase3EmailFromRow(row) {
 }
 
 function phase3RowRejected(row) {
-  if (Object.prototype.hasOwnProperty.call(row || {}, 'phase3Eligible')) {
-    return row.phase3Eligible !== true;
-  }
-  return !['tokens', 'use_token'].includes(String(row?.source || ''));
+  return row?.phase3Eligible !== true
+    || !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || ''));
 }
 
 function phase3TargetsFromRows(rows) {
   const targets = [];
   const seen = new Set();
   for (const row of rows || []) {
-    // Old snapshots did not expose phase3Eligible/phase3Email. Keep their
-    // email-only behavior only for rows that still prove a local token source.
     if (phase3RowRejected(row)) continue;
     const email = phase3EmailFromRow(row);
     const phone = String(row.phone || '').trim();
@@ -644,7 +640,12 @@ function phase3TargetsFromRows(rows) {
     const keys = [email ? 'email:' + email : null, phoneKey ? 'phone:' + phoneKey : null].filter(Boolean);
     if (keys.some((key) => seen.has(key))) continue;
     keys.forEach((key) => seen.add(key));
-    targets.push({ email: email || '', phone: phoneKey || phone || '', selectedKey: row.key });
+    targets.push({
+      email: email || '',
+      phone: phoneKey || phone || '',
+      selectedKey: row.key,
+      phase3TargetRevision: row.phase3TargetRevision,
+    });
   }
   return targets;
 }
@@ -652,6 +653,9 @@ function phase3TargetsFromRows(rows) {
 function phase3SelectionProblem(rows, selectedCount) {
   if (selectedCount === 0) return '请至少选择一个账号';
   if (rows.length !== selectedCount) return '所选账号已不在当前快照中，请刷新后重选';
+  const missingRevision = rows.find((row) => row?.phase3Eligible === true
+    && !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || '')));
+  if (missingRevision) return '所选账号缺少当前 Phase 3 快照凭证，请刷新后重新选择';
   const rejected = rows.find(phase3RowRejected);
   if (rejected) return phase3ReasonLabel(rejected.phase3Reason || 'token_missing');
   const missingTarget = rows.some((row) => (
