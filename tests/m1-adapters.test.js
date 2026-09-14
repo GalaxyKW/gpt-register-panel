@@ -1021,6 +1021,38 @@ test('safe accounts accept only lossless safe-integer numeric strong identities'
   assert.equal(canonical.userId, 'user-real_123');
 });
 
+test('safe accounts fail closed for malformed or contradictory group metadata', () => {
+  const valid = safeAccount({
+    id: 212,
+    group_ids: [9, 3, 9],
+    groupIds: ['3', '9'],
+    groups: [{ id: 9 }, 3],
+    account_groups: [{ group_id: 3 }, { group_id: 9 }],
+  });
+  assert.equal(valid.schemaValid, true);
+  assert.deepEqual(valid.groupIds, [3, 9]);
+
+  const malformedGroups = [
+    { group_ids: 3 },
+    { group_ids: [0] },
+    { group_ids: [-1] },
+    { group_ids: [1.5] },
+    { group_ids: [Number.MAX_SAFE_INTEGER + 1] },
+    { group_ids: [' 3'] },
+    { group_ids: [{}] },
+    { groups: [{}] },
+    { account_groups: [{}] },
+    { group_ids: [3], groupIds: [4] },
+    { group_ids: [3], groups: [{ id: 4 }] },
+    { group_ids: [3], account_groups: [{ group_id: 4 }] },
+  ];
+  for (const metadata of malformedGroups) {
+    const account = safeAccount({ id: 213, ...metadata });
+    assert.equal(account.schemaValid, false);
+    assert.deepEqual(account.groupIds, []);
+  }
+});
+
 test('stored token fingerprints require exact full SHA-256 values', () => {
   for (const length of [16, 17, 63, 65]) {
     const malformed = safeAccount({

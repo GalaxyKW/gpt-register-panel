@@ -343,6 +343,53 @@ function credentialPresence(status, statusKey, rawField, storedFingerprintField 
   };
 }
 
+function normalizedAccountGroupIds(account) {
+  const aliases = [];
+  for (const [key, objectKeys, allowScalar] of [
+    ['group_ids', null, true],
+    ['groupIds', null, true],
+    ['groups', ['id'], true],
+    ['account_groups', ['group_id', 'groupId'], false],
+    ['accountGroups', ['group_id', 'groupId'], false],
+  ]) {
+    if (!hasOwn(account, key) || account[key] === undefined || account[key] === null) continue;
+    const rawValues = account[key];
+    if (!Array.isArray(rawValues) || rawValues.length > 10000) {
+      return { value: [], valid: false };
+    }
+    const ids = [];
+    for (const raw of rawValues) {
+      let candidate = raw;
+      if (objectKeys) {
+        if (isPlainObject(raw)) {
+          const fields = objectKeys.filter((field) => hasOwn(raw, field));
+          if (fields.length !== 1) return { value: [], valid: false };
+          candidate = raw[fields[0]];
+        } else if (!allowScalar) {
+          return { value: [], valid: false };
+        }
+      }
+      if (typeof candidate !== 'string' && typeof candidate !== 'number') {
+        return { value: [], valid: false };
+      }
+      const text = String(candidate);
+      if (text !== text.trim() || !/^[1-9]\d*$/.test(text)) {
+        return { value: [], valid: false };
+      }
+      const id = Number(text);
+      if (!Number.isSafeInteger(id) || id <= 0) return { value: [], valid: false };
+      ids.push(id);
+    }
+    aliases.push([...new Set(ids)].sort((left, right) => left - right));
+  }
+  if (aliases.length === 0) return { value: [], valid: true };
+  const expected = JSON.stringify(aliases[0]);
+  if (aliases.some((ids) => JSON.stringify(ids) !== expected)) {
+    return { value: [], valid: false };
+  }
+  return { value: aliases[0], valid: true };
+}
+
 function safeAccount(account) {
   const id = positiveAccountId(account?.id);
   if (!id) return null;
@@ -480,13 +527,11 @@ function safeAccount(account) {
     rateLimitReset,
     overload,
   ];
+  const groupIds = normalizedAccountGroupIds(account);
   const schemaValid = scalarSchemaValid
     && !autoPauseInvalid
+    && groupIds.valid
     && dateFields.every((field) => field.status !== 'invalid');
-  const rawGroupIds = account.group_ids ?? account.groupIds ?? account.groups;
-  const groupIds = Array.isArray(rawGroupIds)
-    ? rawGroupIds.map((value) => Number(value?.id ?? value)).filter((value) => Number.isSafeInteger(value) && value > 0)
-    : [];
   const nestedUsage = normalizeTableUsageStats(account.usage);
   const hasNestedUsageShape = account.usage && typeof account.usage === 'object'
     && ['historical', 'history', 'current', 'today', 'historical_usage', 'current_usage']
@@ -554,7 +599,7 @@ function safeAccount(account) {
         : shortStoredFingerprint(storedRefreshFingerprintField) || computedRefreshFingerprint,
       id: idTokenField.invalid || idTokenField.conflict ? null : tokenFingerprint(idTokenField.value),
     },
-    groupIds,
+    groupIds: groupIds.value,
     usage: nestedUsage || (!hasNestedUsageShape ? normalizeUsageStats(account.usage) : null),
   };
 }
