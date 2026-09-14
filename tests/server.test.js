@@ -871,9 +871,11 @@ test('concurrent requests that both miss initially create and dispatch only once
           controller.abort();
           return { controller };
         },
-        track(_record, observation) {
-          Promise.resolve(observation).catch(() => {});
-          return observation;
+        track(record, observation) {
+          const tracked = Promise.resolve(observation);
+          tracked.catch(() => {});
+          record.promise = tracked;
+          return tracked;
         },
         async shutdown() { return { active: 0, interrupted: [] }; },
       },

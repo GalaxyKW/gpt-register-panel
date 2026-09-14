@@ -10,6 +10,7 @@ require('./test-isolation');
 
 const {
   accountTestTargetBaseline,
+  accountTestJobStatus,
   assertAccountTestTargetRevisions,
   classifyAccountTestTargets,
   normalizeAccountTestModelId,
@@ -358,6 +359,20 @@ function fakeWorkerDb() {
     async updateJob() {},
     async audit() {},
   };
+}
+
+function rejectWhenAborted(signal, onAbort = null) {
+  return new Promise((resolve, reject) => {
+    const abort = () => {
+      try { onAbort?.(); } catch {}
+      reject(signal.reason instanceof Error ? signal.reason : new Error('aborted'));
+    };
+    if (signal.aborted) {
+      abort();
+      return;
+    }
+    signal.addEventListener('abort', abort, { once: true });
+  });
 }
 
 test('account test requires a durable log checkpoint immediately before dispatch', async () => {
@@ -1126,7 +1141,8 @@ test('unknown scheduler-enable outcome is persisted and halts the remaining batc
       },
       async setSchedulable(id, value, options) {
         schedulableCalls.push({ id, value });
-        assert.equal(options.signal, controller.signal);
+        assert.notEqual(options.signal, controller.signal);
+        assert.equal(options.signal.aborted, false);
         controller.abort();
         const error = new Error('scheduler response unavailable');
         error.code = 'JOB_INTERRUPTED';
@@ -1177,7 +1193,8 @@ test('unknown scheduler-rollback outcome requires reconciliation and is never re
       },
       async setSchedulable(id, value, options) {
         schedulableCalls.push({ id, value });
-        assert.equal(options.signal, controller.signal);
+        assert.notEqual(options.signal, controller.signal);
+        assert.equal(options.signal.aborted, false);
         if (value === true) {
           account = { ...account, schedulable: true };
           return { ...account };
@@ -1463,7 +1480,8 @@ test('shutdown after a known failed test persists reconciliation and stops the r
         assert.equal(id, 28);
         reads += 1;
         if (reads === 1) return { ...account };
-        assert.equal(options.signal, controller.signal);
+        assert.notEqual(options.signal, controller.signal);
+        assert.equal(options.signal.aborted, false);
         markDiagnosticStarted();
         return new Promise((resolve, reject) => {
           options.signal.addEventListener('abort', () => {
@@ -1498,7 +1516,7 @@ test('shutdown after a known failed test persists reconciliation and stops the r
   assert.equal(persistedResult, outcome);
 });
 
-test('shutdown cancels the diagnostic read after an account test exception', async () => {
+test('shutdown during a diagnostic read does not invent dispatch evidence for a plain test error', async () => {
   const account = oauthTestAccount(29, 'active', true);
   const controller = new AbortController();
   let reads = 0;
@@ -1516,7 +1534,8 @@ test('shutdown cancels the diagnostic read after an account test exception', asy
         assert.equal(id, 29);
         reads += 1;
         if (reads === 1) return { ...account };
-        assert.equal(options.signal, controller.signal);
+        assert.notEqual(options.signal, controller.signal);
+        assert.equal(options.signal.aborted, false);
         markDiagnosticStarted();
         return new Promise((resolve, reject) => {
           options.signal.addEventListener('abort', () => {
@@ -1535,11 +1554,67 @@ test('shutdown cancels the diagnostic read after an account test exception', asy
   });
   await diagnosticStarted;
   controller.abort();
-  await assert.rejects(running, (error) => error.code === 'JOB_INTERRUPTED');
+  const outcome = await running;
   assert.equal(reads, 2);
+  assert.equal(outcome.failed, 0);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.jobStatus, 'interrupted');
+  assert.equal(outcome.requiresReconciliation, false);
+  assert.equal(outcome.results[0].code, 'account_test_not_attempted_interrupted');
+  assert.equal(outcome.results[0].attempted, false);
 });
 
-test('account-test job deadline skips remaining accounts instead of holding the control lock indefinitely', async () => {
+test('pre-dispatch account-test interruption stays not attempted without reconciliation', async () => {
+  const controller = new AbortController();
+  const accounts = [
+    oauthTestAccount(61, 'active', true),
+    oauthTestAccount(62, 'active', true),
+  ];
+  let clientInvocations = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: accounts.map((account) => account.id),
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-probe-pre-dispatch-interruption',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id) {
+        return { ...accounts.find((account) => account.id === id) };
+      },
+      async testAccount(id, options) {
+        assert.equal(id, 61);
+        clientInvocations += 1;
+        // Mirror the adapter's pre-dispatch boundary: shutdown wins after the
+        // worker calls the client but before fetch is entered, so the error has
+        // no reconciliation/outcome-unknown marker.
+        controller.abort();
+        assert.equal(options.signal.aborted, true);
+        const error = new Error('test stopped before dispatch');
+        error.code = 'JOB_INTERRUPTED';
+        throw error;
+      },
+    },
+  });
+
+  assert.equal(clientInvocations, 1);
+  assert.equal(outcome.requiresReconciliation, false);
+  assert.equal(outcome.reconciliationCount, 0);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 2);
+  assert.equal(outcome.interruptedCount, 2);
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.jobStatus, 'interrupted');
+  assert.deepEqual(outcome.results.map((item) => item.code), [
+    'account_test_not_attempted_interrupted',
+    'account_test_not_attempted_interrupted',
+  ]);
+});
+
+test('account-test job deadline aborts a dispatched probe and requires reconciliation', async () => {
   const accounts = [
     oauthTestAccount(16, 'active', true),
     oauthTestAccount(17, 'active', true),
@@ -1550,22 +1625,385 @@ test('account-test job deadline skips remaining accounts instead of holding the 
     targetBaselines: targetBaselines(...accounts),
     db: fakeWorkerDb(),
     jobId: 'test-job-deadline',
-    jobTimeoutMs: 200,
+    jobTimeoutMs: 30,
     client: {
       async listAccounts() { return accounts; },
       async getAccount(id) { return { ...accounts.find((item) => item.id === id) }; },
-      async testAccount(id) {
+      async testAccount(id, options) {
         tested.push(id);
-        await new Promise((resolve) => setTimeout(resolve, 250));
-        return { success: true };
+        try {
+          return await rejectWhenAborted(options.signal);
+        } catch (error) {
+          error.requiresReconciliation = true;
+          error.testOutcomeUnknown = true;
+          error.reconciliationScope = 'test';
+          error.reconciliationReason = 'timeout';
+          throw error;
+        }
       },
       async setSchedulable() { throw new Error('active accounts must not be modified'); },
     },
   });
   assert.deepEqual(tested, [16]);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testOutcomeUnknown, true);
+  assert.equal(outcome.results[0].reconciliationReason, 'job_timeout');
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.equal(outcome.results[1].interruptionReason, 'timeout');
+});
+
+test('account-test total deadline aborts a slow account-list read before any account is attempted', async () => {
+  const accounts = [
+    oauthTestAccount(52, 'active', true),
+    oauthTestAccount(53, 'active', true),
+  ];
+  let listSignal = null;
+  let listAborted = false;
+  let accountCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: accounts.map((account) => account.id),
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-list-deadline',
+    jobTimeoutMs: 25,
+    client: {
+      async listAccounts(options) {
+        listSignal = options.signal;
+        return rejectWhenAborted(options.signal, () => { listAborted = true; });
+      },
+      async getAccount() { accountCalls += 1; },
+      async testAccount() { accountCalls += 1; },
+    },
+  });
+
+  assert.equal(listSignal?.aborted, true);
+  assert.equal(listAborted, true);
+  assert.equal(accountCalls, 0);
+  assert.equal(outcome.requested, 2);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 2);
+  assert.equal(outcome.timeoutCount, 2);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.executionStarted, false);
+  assert.equal(outcome.executionComplete, false);
+  assert.equal(outcome.jobStatus, 'failed');
+  assert.deepEqual(outcome.results.map((item) => item.code), [
+    'account_test_job_timeout',
+    'account_test_job_timeout',
+  ]);
+});
+
+test('account-test total deadline aborts a slow preflight read without dispatching a probe', async () => {
+  const accounts = [
+    oauthTestAccount(54, 'active', true),
+    oauthTestAccount(55, 'active', true),
+  ];
+  let preflightAborted = false;
+  let testCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: accounts.map((account) => account.id),
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-preflight-deadline',
+    jobTimeoutMs: 25,
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id, options) {
+        assert.equal(id, 54);
+        return rejectWhenAborted(options.signal, () => { preflightAborted = true; });
+      },
+      async testAccount() { testCalls += 1; },
+    },
+  });
+
+  assert.equal(preflightAborted, true);
+  assert.equal(testCalls, 0);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 2);
+  assert.equal(outcome.timeoutCount, 2);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.results[0].code, 'account_test_job_timeout');
+  assert.equal(outcome.results[1].code, 'account_test_job_timeout');
+});
+
+test('account-test total deadline turns a slow postflight into a known-test reconciliation hold', async () => {
+  const accounts = [
+    oauthTestAccount(56, 'active', true),
+    oauthTestAccount(57, 'active', true),
+  ];
+  let reads = 0;
+  let postflightAborted = false;
+  const outcome = await runAccountTestJobNow({
+    accountIds: accounts.map((account) => account.id),
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-postflight-deadline',
+    jobTimeoutMs: 25,
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id, options) {
+        reads += 1;
+        if (reads === 1) return { ...accounts[0] };
+        assert.equal(id, 56);
+        return rejectWhenAborted(options.signal, () => { postflightAborted = true; });
+      },
+      async testAccount() { return { success: true }; },
+    },
+  });
+
+  assert.equal(postflightAborted, true);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].testOutcomeUnknown, false);
+  assert.equal(outcome.results[0].reconciliationReason, 'post_test_timeout');
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+  assert.equal(outcome.results[1].interruptionReason, 'timeout');
+});
+
+test('account-test total deadline covers a dispatched scheduler restore and keeps its outcome unknown', async () => {
+  let account = oauthTestAccount(58, 'error', false);
+  let reads = 0;
+  const schedulerWrites = [];
+  let restoreAborted = false;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [58],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-scheduler-restore-deadline',
+    jobTimeoutMs: 35,
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() {
+        reads += 1;
+        return { ...account };
+      },
+      async testAccount() {
+        account = {
+          ...account,
+          status: 'active',
+          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+        };
+        return { success: true };
+      },
+      async setSchedulable(id, value, options) {
+        schedulerWrites.push({ id, value });
+        if (value === true) {
+          account = { ...account, schedulable: true };
+          return { ...account };
+        }
+        try {
+          return await rejectWhenAborted(options.signal, () => { restoreAborted = true; });
+        } catch (error) {
+          error.requiresReconciliation = true;
+          error.writeOutcomeUnknown = true;
+          error.writeOutcomeReason = 'timeout';
+          throw error;
+        }
+      },
+    },
+  });
+
+  assert.equal(reads, 4);
+  assert.deepEqual(schedulerWrites, [
+    { id: 58, value: true },
+    { id: 58, value: false },
+  ]);
+  assert.equal(restoreAborted, true);
+  assert.equal(outcome.stopReason, 'timeout');
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, true);
+  assert.equal(outcome.results[0].reconciliationReason, 'job_timeout');
+});
+
+test('pre-dispatch scheduler-enable interruption records the known test without a hold', async () => {
+  const controller = new AbortController();
+  let first = oauthTestAccount(63, 'error', false);
+  const second = oauthTestAccount(64, 'active', true);
+  const submittedAccounts = [{ ...first }, { ...second }];
+  const schedulerCalls = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [63, 64],
+    targetBaselines: targetBaselines(...submittedAccounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-enable-pre-dispatch-interruption',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return [{ ...first }, { ...second }]; },
+      async getAccount(id) { return id === 63 ? { ...first } : { ...second }; },
+      async testAccount(id) {
+        assert.equal(id, 63);
+        first = {
+          ...first,
+          status: 'active',
+          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+        };
+        return { success: true };
+      },
+      async setSchedulable(id, value, options) {
+        schedulerCalls.push({ id, value });
+        controller.abort();
+        assert.equal(options.signal.aborted, true);
+        const error = new Error('scheduler enable stopped before dispatch');
+        error.code = 'JOB_INTERRUPTED';
+        throw error;
+      },
+    },
+  });
+
+  assert.deepEqual(schedulerCalls, [{ id: 63, value: true }]);
+  assert.equal(outcome.requiresReconciliation, false);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.skipped, 1);
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.jobStatus, 'partial');
+  assert.equal(outcome.results[0].code, 'account_scheduler_enable_not_attempted_interrupted');
+  assert.equal(outcome.results[0].testSuccess, true);
+  assert.equal(outcome.results[0].testSuccessKnown, true);
+  assert.equal(outcome.results[0].enabled, false);
+  assert.equal(outcome.results[0].enabledKnown, true);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_interrupted');
+});
+
+test('pre-dispatch scheduler rollback still holds known unrestored enable for reconciliation', async () => {
+  const controller = new AbortController();
+  let first = oauthTestAccount(65, 'error', false);
+  const second = oauthTestAccount(66, 'active', true);
+  const submittedAccounts = [{ ...first }, { ...second }];
+  const schedulerCalls = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: [65, 66],
+    targetBaselines: targetBaselines(...submittedAccounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-rollback-pre-dispatch-interruption',
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return [{ ...first }, { ...second }]; },
+      async getAccount(id) { return id === 65 ? { ...first } : { ...second }; },
+      async testAccount(id) {
+        assert.equal(id, 65);
+        first = {
+          ...first,
+          status: 'active',
+          tempUnschedulableUntil: '2099-01-01T00:00:00.000Z',
+        };
+        return { success: true };
+      },
+      async setSchedulable(id, value, options) {
+        schedulerCalls.push({ id, value });
+        if (value === true) {
+          first = { ...first, schedulable: true };
+          return { ...first };
+        }
+        controller.abort();
+        assert.equal(options.signal.aborted, true);
+        const error = new Error('scheduler rollback stopped before dispatch');
+        error.code = 'JOB_INTERRUPTED';
+        throw error;
+      },
+    },
+  });
+
+  assert.deepEqual(schedulerCalls, [
+    { id: 65, value: true },
+    { id: 65, value: false },
+  ]);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.reconciliationCount, 1);
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.jobStatus, 'partial');
+  assert.equal(outcome.results[0].code, 'account_scheduler_reconciliation_required');
+  assert.equal(outcome.results[0].reconciliationScope, 'scheduler');
+  assert.equal(outcome.results[0].reconciliationReason, 'rollback_not_dispatched_interrupted');
+  assert.equal(outcome.results[0].writeOutcomeUnknown, false);
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_reconciliation');
+});
+
+test('shutdown between accounts preserves completed results and marks the rest not attempted', async () => {
+  const controller = new AbortController();
+  const accounts = [
+    oauthTestAccount(59, 'active', true),
+    oauthTestAccount(60, 'active', true),
+  ];
+  let firstReads = 0;
+  const tested = [];
+  const outcome = await runAccountTestJobNow({
+    accountIds: accounts.map((account) => account.id),
+    targetBaselines: targetBaselines(...accounts),
+    db: fakeWorkerDb(),
+    jobId: 'test-between-account-shutdown',
+    jobTimeoutMs: 500,
+    signal: controller.signal,
+    client: {
+      async listAccounts() { return accounts.map((account) => ({ ...account })); },
+      async getAccount(id) {
+        if (id === 59) {
+          firstReads += 1;
+          if (firstReads === 2) controller.abort();
+        }
+        return { ...accounts.find((account) => account.id === id) };
+      },
+      async testAccount(id) {
+        tested.push(id);
+        return { success: true };
+      },
+    },
+  });
+
+  assert.deepEqual(tested, [59]);
   assert.equal(outcome.succeeded, 1);
   assert.equal(outcome.skipped, 1);
-  assert.equal(outcome.results[1].code, 'account_test_job_timeout');
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.jobStatus, 'partial');
+  assert.equal(outcome.results[0].code, 'account_test_succeeded');
+  assert.equal(outcome.results[1].code, 'account_test_not_attempted_interrupted');
+  assert.equal(outcome.results[1].interruptionReason, 'interrupted');
+});
+
+test('accountTestJobStatus distinguishes zero-attempt interruption and partial execution', () => {
+  assert.equal(accountTestJobStatus({
+    requested: 2,
+    succeeded: 0,
+    failed: 0,
+    skipped: 2,
+    attemptedCount: 0,
+    notAttemptedCount: 2,
+    stopReason: 'interrupted',
+  }), 'interrupted');
+  assert.equal(accountTestJobStatus({
+    requested: 2,
+    succeeded: 1,
+    failed: 0,
+    skipped: 1,
+    attemptedCount: 1,
+    notAttemptedCount: 1,
+    stopReason: 'timeout',
+  }), 'partial');
+  assert.equal(accountTestJobStatus({
+    requested: 2,
+    succeeded: 0,
+    failed: 0,
+    skipped: 2,
+    attemptedCount: 2,
+    notAttemptedCount: 0,
+  }), 'failed');
 });
 
 test('SSE parsing keeps account test completion and error events without raw credentials', () => {

@@ -99,6 +99,80 @@ function boundedJobDuration(value) {
   return Math.max(60 * 1000, Math.min(2 * 60 * 60 * 1000, Math.floor(number)));
 }
 
+function accountTestStopError(reason) {
+  const timedOut = reason === 'timeout';
+  const error = new Error(timedOut
+    ? '账号测试任务达到总时限'
+    : '面板正在停止，账号测试任务已中断');
+  error.code = timedOut ? 'ACCOUNT_TEST_JOB_TIMEOUT' : 'JOB_INTERRUPTED';
+  return error;
+}
+
+function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = Date.now()) {
+  const controller = new AbortController();
+  const deadline = startedAt + timeoutMs;
+  let stopReason = null;
+  let timer = null;
+
+  const stop = (reason) => {
+    if (stopReason) return;
+    stopReason = reason;
+    controller.abort(accountTestStopError(reason));
+  };
+  const onExternalAbort = () => stop('interrupted');
+  if (externalSignal && typeof externalSignal.addEventListener === 'function') {
+    externalSignal.addEventListener('abort', onExternalAbort, { once: true });
+    if (externalSignal.aborted) onExternalAbort();
+  }
+  if (!stopReason) {
+    timer = setTimeout(() => stop('timeout'), Math.max(1, deadline - Date.now()));
+    timer.unref?.();
+  }
+
+  return {
+    signal: controller.signal,
+    reason() {
+      // Do not depend solely on timer scheduling: a synchronous boundary may
+      // observe the deadline before the timer callback gets a turn.
+      if (!stopReason && Date.now() >= deadline) stop('timeout');
+      return stopReason;
+    },
+    dispose() {
+      if (timer) clearTimeout(timer);
+      if (externalSignal && typeof externalSignal.removeEventListener === 'function') {
+        try { externalSignal.removeEventListener('abort', onExternalAbort); } catch {}
+      }
+    },
+  };
+}
+
+function accountTestJobStatus(result = {}) {
+  const requested = Number.isSafeInteger(result.requested) && result.requested >= 0
+    ? result.requested
+    : 0;
+  const succeeded = Number.isSafeInteger(result.succeeded) && result.succeeded >= 0
+    ? result.succeeded
+    : 0;
+  const failed = Number.isSafeInteger(result.failed) && result.failed >= 0
+    ? result.failed
+    : 0;
+  const skipped = Number.isSafeInteger(result.skipped) && result.skipped >= 0
+    ? result.skipped
+    : 0;
+  const notAttempted = Number.isSafeInteger(result.notAttemptedCount)
+    && result.notAttemptedCount >= 0
+    ? result.notAttemptedCount
+    : 0;
+  const attempted = Number.isSafeInteger(result.attemptedCount) && result.attemptedCount >= 0
+    ? result.attemptedCount
+    : Math.max(0, requested - notAttempted);
+  if (result.stopReason === 'interrupted' && attempted === 0) return 'interrupted';
+  if (notAttempted > 0 && attempted > 0) return 'partial';
+  if (failed > 0) return succeeded > 0 ? 'partial' : 'failed';
+  if (skipped > 0) return succeeded > 0 ? 'partial' : 'failed';
+  return requested === succeeded ? 'succeeded' : 'failed';
+}
+
 function normalizeAccountTestRequest(body) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
     const error = new Error('请求体必须是 JSON 对象');
@@ -487,6 +561,8 @@ async function auditResult(db, logger, result, actor, jobId, modelId) {
         code: result.code || null,
         message: result.message || null,
         durationMs: result.durationMs || 0,
+        attempted: result.attempted !== false,
+        interruptionReason: result.interruptionReason || null,
         testSuccess: testSuccessKnown ? result.testSuccess : null,
         testSuccessKnown,
         enabled: enabledKnown ? result.enabled : null,
@@ -532,11 +608,27 @@ async function rollbackOwnedSchedulableMutation(client, id, mutation, options = 
     expectedSchedulable: mutation.original,
   });
   throwIfJobInterrupted(options.signal);
-  const writeResponse = await client.setSchedulable(
-    id,
-    mutation.original,
-    { signal: options.signal },
-  );
+  let writeResponse;
+  try {
+    writeResponse = await client.setSchedulable(
+      id,
+      mutation.original,
+      { signal: options.signal },
+    );
+  } catch (error) {
+    if (options.signal?.aborted && !writeRequiresReconciliation(error)) {
+      const stopReason = typeof options.stopReason === 'function'
+        ? options.stopReason()
+        : 'interrupted';
+      throw schedulerReconciliationError(
+        error,
+        stopReason === 'timeout'
+          ? 'rollback_not_dispatched_timeout'
+          : 'rollback_not_dispatched_interrupted',
+      );
+    }
+    throw error;
+  }
   if (!writeResponse
       || !sameAccountOwnership(mutation.after, writeResponse)
       || writeResponse.schedulable !== mutation.original) {
@@ -571,18 +663,21 @@ async function runAccountTestJobNow({
   logger = null,
   client: providedClient = null,
   jobTimeoutMs: requestedJobTimeoutMs = null,
-  signal = null,
+  signal: externalSignal = null,
   persistResult = null,
 }) {
-  throwIfJobInterrupted(signal);
+  throwIfJobInterrupted(externalSignal);
   const startedAt = Date.now();
   const jobTimeoutMs = Number.isFinite(Number(requestedJobTimeoutMs))
     && Number(requestedJobTimeoutMs) > 0
     ? Math.floor(Number(requestedJobTimeoutMs))
     : boundedJobDuration(process.env.PANEL_ACCOUNT_TEST_JOB_TIMEOUT_MS);
   const deadline = startedAt + jobTimeoutMs;
-  const normalizedModelId = normalizeAccountTestModelId(modelId);
-  const baselineByAccountId = accountTestBaselineMap(targetBaselines, accountIds);
+  const jobSignal = createAccountTestJobSignal(externalSignal, jobTimeoutMs, startedAt);
+  const signal = jobSignal.signal;
+  try {
+    const normalizedModelId = normalizeAccountTestModelId(modelId);
+    const baselineByAccountId = accountTestBaselineMap(targetBaselines, accountIds);
   if (db && jobId) {
     if (typeof db.startMutationJob !== 'function') {
       const error = new Error('任务执行安全检查不可用，尚未开始账号测试');
@@ -598,36 +693,101 @@ async function runAccountTestJobNow({
     model: normalizedModelId || null,
   });
 
-  const client = providedClient || new Sub2ApiAdminClient({ logger, logContext: { jobId, actor } });
-  const initialAccounts = await client.listAccounts({
-    platform: 'openai',
-    type: 'oauth',
-    pageSize: 200,
-    requireTotal: true,
-    requirePaginationMetadata: true,
-    signal,
-  });
-  const results = [];
-  let reconciliationStopIndex = null;
-  for (let itemIndex = 0; itemIndex < accountIds.length; itemIndex += 1) {
-    const id = accountIds[itemIndex];
-    throwIfJobInterrupted(signal);
-    const itemStartedAt = Date.now();
-    const listedAccount = initialAccounts.find((candidate) => candidate.id === id) || null;
-    const submittedBaseline = baselineByAccountId.get(id);
-    if (itemStartedAt >= deadline) {
+    const client = providedClient || new Sub2ApiAdminClient({ logger, logContext: { jobId, actor } });
+    const results = [];
+    const appendReconciliationResult = async ({
+      error,
+      accountId,
+      account,
+      statusBefore,
+      testSucceeded,
+      itemStartedAt,
+    }) => {
+      const scope = error.reconciliationScope === 'test' ? 'test' : 'scheduler';
+      const testOutcomeUnknown = scope === 'test' && error.testOutcomeUnknown === true;
+      const reconciledTestSuccess = error.testSuccessKnown === true
+        && typeof error.testSuccess === 'boolean'
+        ? error.testSuccess
+        : testSucceeded;
+      const causeCode = typeof error.code === 'string' && /^[A-Z0-9_]{1,96}$/.test(error.code)
+        ? error.code
+        : null;
       const result = {
-        accountId: id,
-        accountName: listedAccount?.name || null,
-        status: 'skipped',
-        code: 'account_test_job_timeout',
-        message: '账号测试任务达到总时限，剩余账号已跳过',
-        durationMs: 0,
+        accountId,
+        accountName: account?.name || null,
+        status: 'failed',
+        code: scope === 'test'
+          ? 'account_test_reconciliation_required'
+          : 'account_scheduler_reconciliation_required',
+        causeCode,
+        message: scope === 'test'
+          ? (testOutcomeUnknown
+            ? '账号测试请求已发出，但结果无法确认；已停止后续测试，请人工核对该账号状态'
+            : '账号测试已完成，但恢复状态或后续调度流程未能安全确认；已停止后续测试，请人工核对')
+          : '测试成功，但调度设置写入或回滚结果无法确认；已停止后续测试，请人工核对该账号调度状态',
+        testSuccess: testOutcomeUnknown ? null : reconciledTestSuccess,
+        testSuccessKnown: !testOutcomeUnknown,
+        enabled: null,
+        enabledKnown: false,
+        requiresReconciliation: true,
+        writeOutcomeUnknown: error.writeOutcomeUnknown === true,
+        testOutcomeUnknown,
+        reconciliationScope: scope,
+        reconciliationReason: normalizedReconciliationReason(
+          error.reconciliationReason || error.writeOutcomeReason,
+        ),
+        interruptionReason: stopReason,
+        statusBefore,
+        statusAfter: null,
+        statusAfterKnown: false,
+        durationMs: Date.now() - itemStartedAt,
       };
       results.push(result);
       await auditResult(db, logger, result, actor, jobId, normalizedModelId);
-      continue;
+      writeLog(logger, 'error', scope === 'test'
+        ? 'account_test.test_reconciliation_required'
+        : 'account_test.scheduler_reconciliation_required', {
+        jobId,
+        actor,
+        accountId,
+        accountName: account?.name || null,
+        code: causeCode,
+        reconciliationScope: scope,
+        reconciliationReason: result.reconciliationReason,
+        durationMs: result.durationMs,
+      });
+      return result;
+    };
+    let initialAccounts = [];
+    let stopReason = null;
+    let executionStopIndex = null;
+    try {
+      initialAccounts = await client.listAccounts({
+        platform: 'openai',
+        type: 'oauth',
+        pageSize: 200,
+        requireTotal: true,
+        requirePaginationMetadata: true,
+        signal,
+      });
+    } catch (error) {
+      stopReason = jobSignal.reason();
+      if (!stopReason) throw error;
+      executionStopIndex = 0;
     }
+    let reconciliationStopIndex = null;
+    if (!stopReason) {
+  for (let itemIndex = 0; itemIndex < accountIds.length; itemIndex += 1) {
+    const id = accountIds[itemIndex];
+    const boundaryStopReason = jobSignal.reason();
+    if (boundaryStopReason) {
+      stopReason = boundaryStopReason;
+      executionStopIndex = itemIndex;
+      break;
+    }
+    const itemStartedAt = Date.now();
+    const listedAccount = initialAccounts.find((candidate) => candidate.id === id) || null;
+    const submittedBaseline = baselineByAccountId.get(id);
     let account = listedAccount;
     let statusBefore = submittedBaseline?.status || account?.status || null;
     let schedulableBefore = submittedBaseline?.schedulableKnown === true
@@ -637,6 +797,8 @@ async function runAccountTestJobNow({
     let recoveryMutation = null;
     let testSucceeded = false;
     let testSuccessKnown = false;
+    let confirmedPostTestState = null;
+    let schedulerEnablePending = false;
     try {
       if (listedAccount) assertAccountTestSubmittedBaseline(submittedBaseline, listedAccount);
       // Re-read immediately before testing so a deleted account or concurrent
@@ -687,8 +849,8 @@ async function runAccountTestJobNow({
       // silently relabelling it as an ordinary interrupted job.
       if (signal?.aborted && testSuccessKnown) {
         throw accountTestReconciliationError(
-          new Error('账号测试后状态确认流程因面板停机中断'),
-          'post_test_interrupted',
+          accountTestStopError(jobSignal.reason()),
+          jobSignal.reason() === 'timeout' ? 'post_test_timeout' : 'post_test_interrupted',
           { testSuccess: testSucceeded },
         );
       }
@@ -702,7 +864,7 @@ async function runAccountTestJobNow({
           if (readError?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
             throw accountTestReconciliationError(
               readError,
-              'post_test_interrupted',
+              jobSignal.reason() === 'timeout' ? 'post_test_timeout' : 'post_test_interrupted',
               { testSuccess: false },
             );
           }
@@ -837,6 +999,7 @@ async function runAccountTestJobNow({
         error.code = 'ACCOUNT_TEST_TARGET_CHANGED';
         throw error;
       }
+      confirmedPostTestState = afterTest;
       const availabilityAfterTest = getAccountAvailability(afterTest);
       if (availabilityAfterTest.key === 'available') {
         const result = {
@@ -898,6 +1061,7 @@ async function runAccountTestJobNow({
         error.code = 'ACCOUNT_TEST_STATE_CHANGED';
         throw error;
       }
+      schedulerEnablePending = true;
 
       assertAuditLogCheckpoint(logger, 'account_test.scheduler_enable_checkpoint', {
         jobId,
@@ -917,9 +1081,9 @@ async function runAccountTestJobNow({
       try {
         writeResponse = await client.setSchedulable(id, true, { signal });
       } catch (error) {
-        // A pre-dispatch interruption is safe: no scheduler write occurred.
-        // Once dispatched, however, retrying or rolling back an unconfirmed
-        // enable could race the original write, so persist it for reconciliation.
+        // The adapter marks dispatched writes whose outcome is unknown. A
+        // plain interruption is therefore a confirmed pre-dispatch stop and
+        // must not be promoted to an unknown scheduler mutation here.
         if (!writeRequiresReconciliation(error)) recoveryMutation = null;
         throw error;
       }
@@ -961,7 +1125,7 @@ async function runAccountTestJobNow({
             client,
             id,
             recoveryMutation,
-            { signal, logger, jobId, actor },
+            { signal, logger, jobId, actor, stopReason: () => jobSignal.reason() },
           );
         } catch (rollbackError) {
           writeLog(logger, 'error', 'account_test.recovery_rollback_failed', {
@@ -1035,16 +1199,66 @@ async function runAccountTestJobNow({
         durationMs: result.durationMs,
       });
     } catch (error) {
+      const caughtStopReason = jobSignal.reason();
+      if (caughtStopReason) stopReason = caughtStopReason;
       let reconciliationError = writeRequiresReconciliation(error)
         ? schedulerReconciliationError(error)
         : null;
+      if (reconciliationError && caughtStopReason === 'timeout') {
+        if (reconciliationError.reconciliationScope === 'test') {
+          reconciliationError.reconciliationReason = 'job_timeout';
+        } else if (reconciliationError.writeOutcomeUnknown === true) {
+          reconciliationError.reconciliationReason = 'job_timeout';
+          reconciliationError.writeOutcomeReason = 'job_timeout';
+        }
+      }
+      if (!reconciliationError
+          && caughtStopReason
+          && testSuccessKnown
+          && confirmedPostTestState
+          && schedulerEnablePending
+          && !recoveryMutation) {
+        const result = {
+          accountId: id,
+          accountName: confirmedPostTestState.name || account?.name || null,
+          status: 'failed',
+          code: caughtStopReason === 'timeout'
+            ? 'account_scheduler_enable_not_attempted_timeout'
+            : 'account_scheduler_enable_not_attempted_interrupted',
+          message: caughtStopReason === 'timeout'
+            ? '账号测试已完成且测试后状态已确认，但总时限到达前未发送调度启用请求'
+            : '账号测试已完成且测试后状态已确认，但面板停止前未发送调度启用请求',
+          attempted: true,
+          interruptionReason: caughtStopReason,
+          testSuccess: testSucceeded,
+          testSuccessKnown: true,
+          enabled: confirmedPostTestState.schedulable === true,
+          enabledKnown: true,
+          statusBefore,
+          statusAfter: confirmedPostTestState.status || null,
+          statusAfterKnown: true,
+          durationMs: Date.now() - itemStartedAt,
+        };
+        results.push(result);
+        await auditResult(db, logger, result, actor, jobId, normalizedModelId);
+        writeLog(logger, 'warn', 'account_test.scheduler_enable_not_attempted', {
+          jobId,
+          actor,
+          accountId: id,
+          accountName: result.accountName,
+          interruptionReason: caughtStopReason,
+          durationMs: result.durationMs,
+        });
+        executionStopIndex = itemIndex + 1;
+        break;
+      }
       if (!reconciliationError
           && testSuccessKnown
           && !recoveryMutation) {
         reconciliationError = accountTestReconciliationError(
           error,
           error?.code === 'JOB_INTERRUPTED' || signal?.aborted
-            ? 'post_test_interrupted'
+            ? (caughtStopReason === 'timeout' ? 'post_test_timeout' : 'post_test_interrupted')
             : 'post_test_state_unconfirmed',
           { testSuccess: testSucceeded },
         );
@@ -1055,7 +1269,7 @@ async function runAccountTestJobNow({
             client,
             id,
             recoveryMutation,
-            { signal, logger, jobId, actor },
+            { signal, logger, jobId, actor, stopReason: () => jobSignal.reason() },
           );
           if (rollback.succeeded) {
             writeLog(logger, 'warn', 'account_test.recovery_rolled_back', {
@@ -1091,62 +1305,13 @@ async function runAccountTestJobNow({
       }
       recoveryMutation = null;
       if (reconciliationError) {
-        const scope = reconciliationError.reconciliationScope === 'test'
-          ? 'test'
-          : 'scheduler';
-        const testOutcomeUnknown = scope === 'test'
-          && reconciliationError.testOutcomeUnknown === true;
-        const reconciledTestSuccess = reconciliationError.testSuccessKnown === true
-          && typeof reconciliationError.testSuccess === 'boolean'
-          ? reconciliationError.testSuccess
-          : testSucceeded;
-        const causeCode = typeof reconciliationError.code === 'string'
-          && /^[A-Z0-9_]{1,96}$/.test(reconciliationError.code)
-          ? reconciliationError.code
-          : null;
-        const result = {
+        await appendReconciliationResult({
+          error: reconciliationError,
           accountId: id,
-          accountName: account?.name || null,
-          status: 'failed',
-          code: scope === 'test'
-            ? 'account_test_reconciliation_required'
-            : 'account_scheduler_reconciliation_required',
-          causeCode,
-          message: scope === 'test'
-            ? (testOutcomeUnknown
-              ? '账号测试请求已发出，但结果无法确认；已停止后续测试，请人工核对该账号状态'
-              : '账号测试已完成，但恢复状态或后续调度流程未能安全确认；已停止后续测试，请人工核对')
-            : '测试成功，但调度设置写入或回滚结果无法确认；已停止后续测试，请人工核对该账号调度状态',
-          testSuccess: testOutcomeUnknown ? null : reconciledTestSuccess,
-          testSuccessKnown: !testOutcomeUnknown,
-          enabled: null,
-          enabledKnown: false,
-          requiresReconciliation: true,
-          writeOutcomeUnknown: reconciliationError.writeOutcomeUnknown === true,
-          testOutcomeUnknown,
-          reconciliationScope: scope,
-          reconciliationReason: normalizedReconciliationReason(
-            reconciliationError.reconciliationReason
-              || reconciliationError.writeOutcomeReason,
-          ),
+          account,
           statusBefore,
-          statusAfter: null,
-          statusAfterKnown: false,
-          durationMs: Date.now() - itemStartedAt,
-        };
-        results.push(result);
-        await auditResult(db, logger, result, actor, jobId, normalizedModelId);
-        writeLog(logger, 'error', scope === 'test'
-          ? 'account_test.test_reconciliation_required'
-          : 'account_test.scheduler_reconciliation_required', {
-          jobId,
-          actor,
-          accountId: id,
-          accountName: account?.name || null,
-          code: causeCode,
-          reconciliationScope: scope,
-          reconciliationReason: result.reconciliationReason,
-          durationMs: result.durationMs,
+          testSucceeded,
+          itemStartedAt,
         });
         reconciliationStopIndex = itemIndex;
         break;
@@ -1154,17 +1319,23 @@ async function runAccountTestJobNow({
       // Cancellation is a job-level terminal outcome when no scheduler state
       // is ambiguous. A confirmed mutation that could not be safely rolled
       // back has already been converted into a persisted reconciliation result.
-      if (error?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
-        throwIfJobInterrupted(signal);
-        throw error;
+      if (caughtStopReason) {
+        executionStopIndex = itemIndex;
+        break;
       }
       let afterFailure = null;
       try {
         afterFailure = await client.getAccount(id, { signal });
       } catch (readError) {
-        if (readError?.code === 'JOB_INTERRUPTED' || signal?.aborted) {
-          throwIfJobInterrupted(signal);
-          throw readError;
+        const diagnosticStopReason = jobSignal.reason();
+        if (diagnosticStopReason) {
+          stopReason = diagnosticStopReason;
+          // A plain test error carries no adapter evidence that the request
+          // was dispatched. If its diagnostic read is then cancelled, keep
+          // the current account in the not-attempted set instead of inventing
+          // an unknown remote test outcome.
+          executionStopIndex = itemIndex;
+          break;
         }
       }
       const afterFailureOwned = sameAccountOwnership(account, afterFailure);
@@ -1198,6 +1369,7 @@ async function runAccountTestJobNow({
       });
     }
   }
+    }
 
   if (reconciliationStopIndex !== null) {
     for (let index = reconciliationStopIndex + 1; index < accountIds.length; index += 1) {
@@ -1209,11 +1381,43 @@ async function runAccountTestJobNow({
         status: 'skipped',
         code: 'account_test_not_attempted_reconciliation',
         message: '前一账号需要人工核对，本账号未执行测试',
+        attempted: false,
+        interruptionReason: stopReason,
         durationMs: 0,
       };
       results.push(result);
       await auditResult(db, logger, result, actor, jobId, normalizedModelId);
     }
+  }
+  if (reconciliationStopIndex === null && executionStopIndex !== null) {
+    const interruptionCode = stopReason === 'timeout'
+      ? 'account_test_job_timeout'
+      : 'account_test_not_attempted_interrupted';
+    const interruptionMessage = stopReason === 'timeout'
+      ? '账号测试任务达到总时限，本账号未执行'
+      : '面板停机中断了批量任务，本账号未执行测试';
+    for (let index = executionStopIndex; index < accountIds.length; index += 1) {
+      const accountId = accountIds[index];
+      const listedAccount = initialAccounts.find((candidate) => candidate.id === accountId) || null;
+      const result = {
+        accountId,
+        accountName: listedAccount?.name || null,
+        status: 'skipped',
+        code: interruptionCode,
+        message: interruptionMessage,
+        attempted: false,
+        interruptionReason: stopReason,
+        durationMs: 0,
+      };
+      results.push(result);
+      await auditResult(db, logger, result, actor, jobId, normalizedModelId);
+    }
+  }
+
+  if (results.length !== accountIds.length) {
+    const error = new Error('账号测试结果数量与请求数量不一致');
+    error.code = 'ACCOUNT_TEST_RESULT_COUNT_MISMATCH';
+    throw error;
   }
 
   const succeeded = results.filter((item) => item.status === 'succeeded').length;
@@ -1222,8 +1426,14 @@ async function runAccountTestJobNow({
   const reconciliationCount = results.filter(
     (item) => item.requiresReconciliation === true,
   ).length;
-  const notAttemptedCount = results.filter(
+  const attemptedCount = results.filter((item) => item.attempted !== false).length;
+  const notAttemptedCount = results.length - attemptedCount;
+  const reconciliationNotAttemptedCount = results.filter(
     (item) => item.code === 'account_test_not_attempted_reconciliation',
+  ).length;
+  const timeoutCount = results.filter((item) => item.interruptionReason === 'timeout').length;
+  const interruptedCount = results.filter(
+    (item) => item.interruptionReason === 'interrupted',
   ).length;
   const result = {
     model: normalizedModelId || null,
@@ -1233,11 +1443,19 @@ async function runAccountTestJobNow({
     skipped,
     requiresReconciliation: reconciliationCount > 0,
     reconciliationCount,
+    attemptedCount,
     notAttemptedCount,
+    reconciliationNotAttemptedCount,
+    timeoutCount,
+    interruptedCount,
+    stopReason,
+    executionStarted: attemptedCount > 0,
+    executionComplete: notAttemptedCount === 0,
     durationMs: Date.now() - startedAt,
     results,
   };
-  writeLog(logger, failed > 0 ? 'warn' : 'info', 'account_test.completed', {
+  result.jobStatus = accountTestJobStatus(result);
+  writeLog(logger, result.jobStatus === 'succeeded' ? 'info' : 'warn', 'account_test.completed', {
     jobId,
     actor,
     requested: result.requested,
@@ -1246,7 +1464,12 @@ async function runAccountTestJobNow({
     skipped,
     requiresReconciliation: result.requiresReconciliation,
     reconciliationCount,
+    attemptedCount,
     notAttemptedCount,
+    timeoutCount,
+    interruptedCount,
+    stopReason,
+    jobStatus: result.jobStatus,
     durationMs: result.durationMs,
   });
   if (typeof persistResult === 'function') {
@@ -1264,6 +1487,9 @@ async function runAccountTestJobNow({
     }
   }
   return result;
+  } finally {
+    jobSignal.dispose();
+  }
 }
 
 function runAccountTestJob(args = {}) {
@@ -1295,6 +1521,7 @@ function runAccountTestJob(args = {}) {
 }
 
 module.exports = {
+  accountTestJobStatus,
   accountTestTargetBaseline,
   activeAccountTestJobs,
   assertAccountTestTargetRevisions,

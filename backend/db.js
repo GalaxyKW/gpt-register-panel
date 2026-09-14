@@ -100,6 +100,19 @@ function storedJobOwnerIsDefinitelyGone(job) {
   return !storedJobOwnerIsAlive(job);
 }
 
+function storedJobOwnedBy(job, owner) {
+  if (Number(job?.owner_pid) !== Number(owner?.pid)) return false;
+  const startMatches = owner?.processStartId
+    ? String(job?.owner_start_id || '') === String(owner.processStartId)
+    : job?.owner_start_id === null || job?.owner_start_id === undefined
+      || String(job.owner_start_id) === '';
+  const bootMatches = owner?.processBootId
+    ? String(job?.owner_boot_id || '') === String(owner.processBootId)
+    : job?.owner_boot_id === null || job?.owner_boot_id === undefined
+      || String(job.owner_boot_id) === '';
+  return startMatches && bootMatches;
+}
+
 function jsonString(value) {
   return JSON.stringify(value === undefined ? null : value);
 }
@@ -691,6 +704,7 @@ function recoveredJobResult(job) {
       code: 'JOB_OWNER_EXITED_BEFORE_START',
       outcome: 'not_started',
       executionOutcome: 'not_started',
+      blockedBeforeStart: true,
       retryAllowed: true,
       doNotRetry: false,
       requiresReconciliation: false,
@@ -2689,6 +2703,132 @@ class PanelDb {
         previousStatus: currentStatus,
         currentStatus: hasRequestedStatus ? requestedStatus : currentStatus,
       };
+    });
+  }
+
+  interruptOwnedQueuedJobsBeforeDispatch(ids, options = {}) {
+    let jobIds;
+    let code;
+    let resultJson;
+    let safeReason;
+    try {
+      if (!Array.isArray(ids) || ids.length === 0
+          || ids.length > MAX_MUTATION_RECEIPT_JOBS) {
+        throw claimIntegrityError('待中断的入队任务清单无效');
+      }
+      jobIds = ids.map((id) => typeof id === 'string' ? id.trim() : '');
+      if (jobIds.some((id) => !/^[A-Za-z0-9_-]{1,128}$/.test(id))
+          || new Set(jobIds).size !== jobIds.length) {
+        throw claimIntegrityError('待中断的入队任务标识无效或重复');
+      }
+      const requestedCode = typeof options?.code === 'string'
+        ? options.code.trim().toUpperCase()
+        : '';
+      code = /^[A-Z0-9_]{1,96}$/.test(requestedCode)
+        ? requestedCode
+        : 'JOB_ADMISSION_DISPATCH_FAILED';
+      const result = {
+        code,
+        outcome: 'not_started',
+        executionOutcome: 'not_started',
+        blockedBeforeStart: true,
+        requiresReconciliation: false,
+        retryAllowed: true,
+        doNotRetry: false,
+      };
+      resultJson = boundedJsonString('sync_jobs.result_json', result, MAX_JOB_RESULT_BYTES);
+      safeReason = assertStoredByteLength(
+        'sync_jobs.error',
+        '任务已持久入队，但未能交给执行器；已确认未开始并安全中断',
+        MAX_JOB_ERROR_BYTES,
+      );
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    const owner = currentProcessOwner();
+    const finishedAt = new Date().toISOString();
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
+        const rows = [];
+        for (const jobId of jobIds) {
+          const row = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
+              owner_pid, owner_start_id, owner_boot_id, started_at, finished_at,
+              result_json, error, reconciliation_hold, reconciliation_scope,
+              reconciliation_claim_digest, reconciliation_acknowledged_at,
+              reconciliation_resolution, reconciliation_acknowledged_by,
+              (SELECT COUNT(*) FROM job_claims
+                WHERE job_id = sync_jobs.id) AS active_claim_count
+            FROM sync_jobs WHERE id = ${sqlString(jobId)} LIMIT 1`))[0];
+          if (!row) {
+            const error = new Error('已提交任务在派发恢复期间不存在');
+            error.code = 'JOB_NOT_FOUND';
+            throw error;
+          }
+          if (!storedJobOwnedBy(row, owner)) {
+            const error = new Error('已提交任务的进程归属发生变化，拒绝中断');
+            error.code = 'JOB_OWNER_CONFLICT';
+            throw error;
+          }
+          if (row.status === 'queued' && jobExecutionOutcomeUnknown(row)) {
+            const error = new Error('排队任务包含执行痕迹，拒绝标记为未开始');
+            error.code = 'JOB_QUEUED_STATE_INCONSISTENT';
+            throw error;
+          }
+          rows.push(row);
+        }
+
+        const interrupted = [];
+        const skipped = [];
+        const update = database.prepare(`UPDATE sync_jobs
+          SET status = 'interrupted', result_json = ?, error = ?, finished_at = ?,
+            reconciliation_hold = 0, reconciliation_scope = NULL,
+            reconciliation_claim_digest = NULL, reconciliation_acknowledged_at = NULL,
+            reconciliation_resolution = NULL, reconciliation_acknowledged_by = NULL
+          WHERE id = ? AND status = 'queued'`);
+        const release = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
+        try {
+          for (const row of rows) {
+            if (row.status !== 'queued') {
+              let storedResult = null;
+              if (row.status === 'interrupted') {
+                try { storedResult = parseStoredResult(row); } catch {}
+              }
+              const safeNotStarted = row.status === 'interrupted'
+                && row.started_at === null
+                && isCanonicalIsoTimestamp(row.finished_at)
+                && storedResult?.blockedBeforeStart === true
+                && storedResult?.executionOutcome === 'not_started'
+                && storedResult?.requiresReconciliation === false
+                && row.reconciliation_hold === 0
+                && row.active_claim_count === 0;
+              skipped.push({ id: row.id, status: row.status, safeNotStarted });
+              continue;
+            }
+            const expectedClaims = parseStoredClaimKeys(row).length;
+            update.run([resultJson, safeReason, finishedAt, row.id]);
+            if (database.getRowsModified() !== 1) {
+              const error = new Error('任务状态在派发恢复期间发生变化');
+              error.code = 'JOB_STATUS_CONFLICT';
+              throw error;
+            }
+            release.run([row.id]);
+            if (database.getRowsModified() !== expectedClaims) {
+              throw claimIntegrityError('任务保护键在派发恢复期间发生变化');
+            }
+            interrupted.push(row.id);
+          }
+        } finally {
+          release.free();
+          update.free();
+        }
+        database.run('COMMIT');
+        return { interrupted, skipped, code };
+      } catch (error) {
+        try { database.run('ROLLBACK'); } catch {}
+        throw error;
+      }
     });
   }
 

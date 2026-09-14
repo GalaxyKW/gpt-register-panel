@@ -187,7 +187,7 @@ test('token-import adapter methods forward shutdown cancellation to fetch', asyn
   }
 });
 
-test('account-test worker propagates shutdown cancellation as a job interruption', async () => {
+test('account-test worker records reconciliation when shutdown follows test dispatch', async () => {
   const account = {
     id: 17,
     name: 'free00017',
@@ -210,6 +210,12 @@ test('account-test worker propagates shutdown cancellation as a job interruption
         options.signal.addEventListener('abort', () => {
           const error = new Error('stopped');
           error.code = 'JOB_INTERRUPTED';
+          // Mirror the adapter contract: this mock has crossed its dispatch
+          // boundary, so an abort leaves the remote test outcome unknown.
+          error.requiresReconciliation = true;
+          error.testOutcomeUnknown = true;
+          error.reconciliationScope = 'test';
+          error.reconciliationReason = 'external_abort';
           reject(error);
         }, { once: true });
       });
@@ -226,7 +232,15 @@ test('account-test worker propagates shutdown cancellation as a job interruption
   });
   await started;
   controller.abort();
-  await assert.rejects(run, (error) => error.code === 'JOB_INTERRUPTED');
+  const outcome = await run;
+  assert.equal(outcome.jobStatus, 'failed');
+  assert.equal(outcome.stopReason, 'interrupted');
+  assert.equal(outcome.attemptedCount, 1);
+  assert.equal(outcome.notAttemptedCount, 0);
+  assert.equal(outcome.requiresReconciliation, true);
+  assert.equal(outcome.results[0].code, 'account_test_reconciliation_required');
+  assert.equal(outcome.results[0].testOutcomeUnknown, true);
+  assert.equal(outcome.results[0].reconciliationReason, 'external_abort');
 });
 
 test('account-test cancellation after a successful probe records reconciliation without scheduler mutation', async () => {
@@ -355,6 +369,24 @@ test('shutdown timeout retains an active job claim until its real terminal outco
     claimKeys: [protectedClaim],
   });
   await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
+});
+
+test('shutdown does not exclude a begun job until its observer promise is tracked', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-shutdown-untracked-'));
+  const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
+  const job = await db.createJob('token_import', {}, 'tester', { claimKeys: ['token_import'] });
+  const manager = createBackgroundJobManager({ db });
+  const record = manager.begin(job, 'token_import');
+
+  const result = await manager.shutdown({ timeoutMs: 0 });
+  assert.equal(result.remaining, 1);
+  assert.deepEqual(result.interrupted, [job.id]);
+  const persisted = await db.getJob(job.id);
+  assert.equal(persisted.status, 'interrupted');
+  assert.equal(persisted.result.executionOutcome, 'not_started');
+  assert.equal(persisted.result.blockedBeforeStart, true);
+  assert.equal(manager.abandon(record), true);
+  assert.equal(manager.activeCount, 0);
 });
 
 test('shutdown aborts admission callers while tracking their underlying unwind', async () => {
