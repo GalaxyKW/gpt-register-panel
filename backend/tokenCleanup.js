@@ -56,11 +56,111 @@ function sameInode(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
 }
 
+function safeCleanupErrorCode(value) {
+  const code = String(value || '').trim().toUpperCase();
+  return /^[A-Z0-9_]{1,96}$/.test(code) ? code : null;
+}
+
+function cleanupWriteOutcomeUnknown(error, { code, message, reason }) {
+  // Do not retain the original message or cause: filesystem diagnostics can
+  // contain deployment paths. The fixed code and reconciliation fields are
+  // sufficient for callers to stop and inspect the two pinned locations.
+  const wrapped = new Error(message);
+  wrapped.code = code;
+  wrapped.writeOutcomeUnknown = true;
+  wrapped.requiresReconciliation = true;
+  wrapped.retryAllowed = false;
+  wrapped.doNotRetry = true;
+  wrapped.reconciliationScope = 'expired_token_cleanup';
+  wrapped.reconciliationReason = reason;
+  wrapped.outcome = 'unknown';
+  const causeCode = safeCleanupErrorCode(error?.code);
+  if (causeCode) wrapped.causeCode = causeCode;
+  return wrapped;
+}
+
+function cleanupRecoveryInvalid(reason) {
+  const error = new Error('检测到无法安全验证的过期 token 清理 claim；请人工核验，禁止自动重试');
+  error.code = 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM';
+  error.recoveryReason = reason;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'expired_token_cleanup';
+  error.reconciliationReason = reason;
+  return error;
+}
+
+function compareCleanupPaths(left, right) {
+  const leftPath = String(left?.relativePath ?? left ?? '');
+  const rightPath = String(right?.relativePath ?? right ?? '');
+  const natural = leftPath.localeCompare(
+    rightPath,
+    'en',
+    { numeric: true, sensitivity: 'base' },
+  );
+  if (natural !== 0) return natural;
+  const utf8 = Buffer.compare(Buffer.from(leftPath, 'utf8'), Buffer.from(rightPath, 'utf8'));
+  if (utf8 !== 0 || leftPath === rightPath) return utf8;
+  // Distinct unpaired UTF-16 surrogates encode to the same UTF-8 replacement
+  // byte sequence. Compare the original code units as the final deterministic
+  // tie-breaker so even malformed JS strings retain a strict total order.
+  const maximumLength = Math.max(leftPath.length, rightPath.length);
+  for (let index = 0; index < maximumLength; index += 1) {
+    const leftUnit = index < leftPath.length ? leftPath.charCodeAt(index) : -1;
+    const rightUnit = index < rightPath.length ? rightPath.charCodeAt(index) : -1;
+    if (leftUnit !== rightUnit) return leftUnit < rightUnit ? -1 : 1;
+  }
+  return 0;
+}
+
+function pathEntryExists(filePath) {
+  try {
+    fs.lstatSync(filePath);
+    return true;
+  } catch (error) {
+    if (error?.code === 'ENOENT') return false;
+    throw error;
+  }
+}
+
 function unlinkIfSameInode(filePath, expectedStat) {
   try {
     const latest = fs.lstatSync(filePath);
     if (sameInode(latest, expectedStat)) fs.unlinkSync(filePath);
   } catch {}
+}
+
+function rollbackOwnedPath(filePath, expectedStat) {
+  if (!expectedStat) return false;
+  let latest;
+  try {
+    latest = fs.lstatSync(filePath);
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return false;
+    // A previous unlink may have succeeded before reporting an error. Flush
+    // even an already-absent entry so that retrying this confirmation can
+    // establish durability instead of silently accepting an unflushed rename.
+    try {
+      syncDirectory(path.dirname(filePath));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+  if (!sameInode(latest, expectedStat)) return false;
+  try {
+    fs.unlinkSync(filePath);
+    syncDirectory(path.dirname(filePath));
+  } catch {
+    return false;
+  }
+  try {
+    latest = fs.lstatSync(filePath);
+    return !sameInode(latest, expectedStat);
+  } catch (error) {
+    return error?.code === 'ENOENT';
+  }
 }
 
 function cleanupRoot(options = {}) {
@@ -119,6 +219,11 @@ function moveToQuarantine(sourcePath, targetPath) {
     // Hard-link + unlink is a no-overwrite move on one filesystem. If the
     // process crashes between the two operations, both names still reference
     // the same recoverable inode instead of losing the only copy.
+    const sourceBeforeLink = fs.lstatSync(sourcePath);
+    if (sourceBeforeLink.isSymbolicLink() || !sourceBeforeLink.isFile()) {
+      throw new Error('隔离来源必须是普通文件');
+    }
+    targetIdentity = sourceBeforeLink;
     fs.linkSync(sourcePath, targetPath);
     targetLinked = true;
     const sourceStat = fs.lstatSync(sourcePath);
@@ -157,8 +262,21 @@ function moveToQuarantine(sourcePath, targetPath) {
       try { fs.closeSync(linkedTargetDescriptor); } catch {}
       linkedTargetDescriptor = undefined;
     }
+    if (sourceRemoved) {
+      throw cleanupWriteOutcomeUnknown(error, {
+        code: 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN',
+        message: 'token 已从原路径移除，但隔离持久化结果无法确认；请人工对账，禁止自动重试',
+        reason: 'quarantine_move_outcome_unknown',
+      });
+    }
     if (error?.code !== 'EXDEV' || targetLinked) {
-      if (!sourceRemoved && targetLinked && targetIdentity) unlinkIfSameInode(targetPath, targetIdentity);
+      if (targetLinked && !rollbackOwnedPath(targetPath, targetIdentity)) {
+        throw cleanupWriteOutcomeUnknown(error, {
+          code: 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN',
+          message: 'token 隔离失败后的目标回滚无法确认；请人工对账，禁止自动重试',
+          reason: 'quarantine_rollback_outcome_unknown',
+        });
+      }
       throw error;
     }
   }
@@ -194,14 +312,19 @@ function moveToQuarantine(sourcePath, targetPath) {
     const temporaryStat = fs.fstatSync(targetDescriptor);
     temporaryIdentity = temporaryStat;
     fs.linkSync(temporaryPath, targetPath);
+    published = true;
+    publishedIdentity = temporaryStat;
     const publishedStat = fs.lstatSync(targetPath);
     if (!publishedStat.isFile() || publishedStat.isSymbolicLink()
         || !sameInode(publishedStat, temporaryStat)) {
       throw new Error('跨文件系统隔离目标发布后身份校验失败');
     }
     publishedIdentity = publishedStat;
-    published = true;
-    unlinkIfSameInode(temporaryPath, temporaryIdentity);
+    if (!rollbackOwnedPath(temporaryPath, temporaryIdentity)) {
+      const error = new Error('跨文件系统隔离临时文件回滚失败');
+      error.code = 'TOKEN_CLEANUP_ROLLBACK_FAILED';
+      throw error;
+    }
     syncDirectory(path.dirname(targetPath));
     const finalSource = fs.fstatSync(sourceDescriptor);
     const latest = fs.lstatSync(sourcePath);
@@ -221,9 +344,26 @@ function moveToQuarantine(sourcePath, targetPath) {
     copiedSourceRemoved = true;
     syncDirectory(path.dirname(sourcePath));
   } catch (error) {
-    if (temporaryIdentity) unlinkIfSameInode(temporaryPath, temporaryIdentity);
-    if (published && !copiedSourceRemoved) {
-      unlinkIfSameInode(targetPath, publishedIdentity);
+    let rollbackUnconfirmed = temporaryIdentity
+      ? !rollbackOwnedPath(temporaryPath, temporaryIdentity)
+      : false;
+    if (copiedSourceRemoved) {
+      throw cleanupWriteOutcomeUnknown(error, {
+        code: 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN',
+        message: 'token 已从原路径移除，但跨文件系统隔离持久化结果无法确认；请人工对账，禁止自动重试',
+        reason: 'quarantine_move_outcome_unknown',
+      });
+    }
+    if (published
+        && (!publishedIdentity || !rollbackOwnedPath(targetPath, publishedIdentity))) {
+      rollbackUnconfirmed = true;
+    }
+    if (rollbackUnconfirmed) {
+      throw cleanupWriteOutcomeUnknown(error, {
+        code: 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN',
+        message: 'token 隔离失败后的跨文件系统回滚无法确认；请人工对账，禁止自动重试',
+        reason: 'quarantine_rollback_outcome_unknown',
+      });
     }
     throw error;
   } finally {
@@ -268,8 +408,21 @@ function claimSourcePath(sourcePath, expectedHash) {
     }
     const claimPath = path.join(directory, claimName);
     if (fs.existsSync(claimPath)) continue;
-    fs.renameSync(sourcePath, claimPath);
-    syncDirectory(directory);
+    let replacementStarted = false;
+    try {
+      replacementStarted = true;
+      fs.renameSync(sourcePath, claimPath);
+      syncDirectory(directory);
+    } catch (error) {
+      if (replacementStarted) {
+        throw cleanupWriteOutcomeUnknown(error, {
+          code: 'TOKEN_CLEANUP_CLAIM_OUTCOME_UNKNOWN',
+          message: 'token claim 创建结果无法确认；请人工对账，禁止自动重试',
+          reason: 'token_claim_outcome_unknown',
+        });
+      }
+      throw error;
+    }
     return claimPath;
   }
   throw new Error('无法创建唯一的 token 隔离暂存路径');
@@ -330,27 +483,117 @@ function parseClaimName(fileName) {
   };
 }
 
-function restoreClaimedPath(claimPath, sourcePath) {
+function sameClaimSnapshot(stat, snapshot) {
+  if (!snapshot) return true;
+  return Boolean(stat
+    && stat.dev === snapshot.dev
+    && stat.ino === snapshot.ino
+    && stat.size === snapshot.size
+    && stat.mtimeMs === snapshot.mtimeMs
+    && stat.ctimeMs === snapshot.ctimeMs
+    && stat.nlink === snapshot.nlink
+    && stat.uid === snapshot.uid
+    && stat.mode === snapshot.mode);
+}
+
+function cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat) {
+  try {
+    const latestClaim = fs.lstatSync(claimPath);
+    if (!sameInode(latestClaim, claimStat)) return false;
+    let latestSource;
+    try { latestSource = fs.lstatSync(sourcePath); } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+    if (!sameInode(latestSource, claimStat)) return false;
+    fs.unlinkSync(sourcePath);
+    syncDirectory(path.dirname(sourcePath));
+    try {
+      const after = fs.lstatSync(sourcePath);
+      return !sameInode(after, claimStat);
+    } catch (error) {
+      return error?.code === 'ENOENT';
+    }
+  } catch {
+    // If the claim itself disappeared or changed identity, the source link may
+    // be its last remaining name. Leave it for reconciliation instead of
+    // risking deletion of the only recoverable copy.
+    return false;
+  }
+}
+
+function restoreOutcomeUnknown(error) {
+  return cleanupWriteOutcomeUnknown(error, {
+    code: 'TOKEN_CLEANUP_RESTORE_OUTCOME_UNKNOWN',
+    message: 'token claim 恢复的命名空间结果无法确认；请人工对账，禁止自动重试',
+    reason: 'token_claim_restore_outcome_unknown',
+  });
+}
+
+function restoreClaimedPath(claimPath, sourcePath, expectedSnapshot = null) {
+  let claimStat = null;
+  let sourceLinkCreated = false;
+  let claimRemoved = false;
   try {
     // linkSync refuses to overwrite a fresh token recreated at the original
     // path while cleanup was validating the claimed inode.
-    const claimStat = fs.lstatSync(claimPath);
-    if (claimStat.isSymbolicLink() || !claimStat.isFile()) return false;
+    claimStat = fs.lstatSync(claimPath);
+    if (claimStat.isSymbolicLink() || !claimStat.isFile()
+        || !sameClaimSnapshot(claimStat, expectedSnapshot)) return false;
     fs.linkSync(claimPath, sourcePath);
+    sourceLinkCreated = true;
     const restoredStat = fs.lstatSync(sourcePath);
     if (restoredStat.isSymbolicLink() || !restoredStat.isFile()
-        || !sameInode(restoredStat, claimStat)) return false;
+        || !sameInode(restoredStat, claimStat)) {
+      if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+        sourceLinkCreated = false;
+        return false;
+      }
+      throw restoreOutcomeUnknown();
+    }
     syncDirectory(path.dirname(sourcePath));
+    const latestSource = fs.lstatSync(sourcePath);
+    if (latestSource.isSymbolicLink() || !latestSource.isFile()
+        || !sameInode(latestSource, claimStat)) {
+      if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+        sourceLinkCreated = false;
+        return false;
+      }
+      throw restoreOutcomeUnknown();
+    }
     unlinkIfSameInode(claimPath, claimStat);
     try {
       const latestClaim = fs.lstatSync(claimPath);
-      if (sameInode(latestClaim, claimStat)) return false;
+      if (sameInode(latestClaim, claimStat)) {
+        if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+          sourceLinkCreated = false;
+          return false;
+        }
+      }
+      throw restoreOutcomeUnknown();
     } catch (error) {
-      if (error?.code !== 'ENOENT') return false;
+      if (error?.writeOutcomeUnknown === true) throw error;
+      if (error?.code !== 'ENOENT') {
+        if (cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+          sourceLinkCreated = false;
+          return false;
+        }
+        throw restoreOutcomeUnknown(error);
+      }
+      claimRemoved = true;
     }
     syncDirectory(path.dirname(claimPath));
+    sourceLinkCreated = false;
     return true;
-  } catch {
+  } catch (error) {
+    if (error?.writeOutcomeUnknown === true) throw error;
+    if (claimRemoved) {
+      throw restoreOutcomeUnknown(error);
+    }
+    if (sourceLinkCreated && claimStat) {
+      if (!cleanupCreatedRestoreLink(sourcePath, claimPath, claimStat)) {
+        throw restoreOutcomeUnknown(error);
+      }
+    }
     return false;
   }
 }
@@ -412,6 +655,10 @@ function regularFileSnapshot(filePath) {
       ino: after.ino,
       size: after.size,
       mtimeMs: after.mtimeMs,
+      ctimeMs: after.ctimeMs,
+      nlink: after.nlink,
+      uid: after.uid,
+      mode: after.mode,
       contentHash: hash.digest('hex'),
     };
   } finally {
@@ -435,44 +682,136 @@ function safeItem(record, snapshot) {
 }
 
 function recoverTokenCleanupClaims(rootDirectory) {
-  const recovered = [];
+  const discovered = [];
+  // Discovery and validation are deliberately separated from restoration.
+  // A conflict in the last directory must not be able to surface only after
+  // an earlier claim has already been moved back into the producer namespace.
   for (const source of SOURCES) {
     const directory = path.join(rootDirectory, source);
     ensureDirectory(directory, source + ' 目录');
     let names;
-    try { names = fs.readdirSync(directory); } catch { continue; }
+    try {
+      names = fs.readdirSync(directory).sort(compareCleanupPaths);
+    } catch {
+      const error = new Error('无法完整预检 token 清理 claim');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
+      throw error;
+    }
     for (const fileName of names) {
       const claim = parseClaimName(fileName);
-      if (!claim || isProcessOwnerAlive(
-        claim.pid,
-        claim.processStartId,
-        claim.processBootId,
-      )) continue;
+      if (!claim) continue;
       const claimPath = safeAbsolutePath(directory, fileName);
       const sourcePath = safeAbsolutePath(directory, claim.originalFileName);
       if (!claimPath || !sourcePath) continue;
-      let snapshot;
-      try { snapshot = regularFileSnapshot(claimPath); } catch { continue; }
-      if (snapshot.contentHash !== claim.contentHash) continue;
-      if (fs.existsSync(sourcePath)) {
-        const error = new Error('检测到过期 token 清理 claim 与新文件冲突，需要人工核验');
-        error.code = 'TOKEN_CLEANUP_RECOVERY_CONFLICT';
-        throw error;
-      }
-      if (!restoreClaimedPath(claimPath, sourcePath)) {
-        const error = new Error('无法恢复上次中断的 token 清理 claim');
-        error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
-        throw error;
-      }
-      recovered.push(path.join(source, claim.originalFileName));
+      discovered.push({
+        source,
+        claim,
+        claimPath,
+        sourcePath,
+        relativePath: path.join(source, claim.originalFileName),
+      });
     }
+  }
+  discovered.sort((left, right) => compareCleanupPaths(left.relativePath, right.relativePath)
+    || compareCleanupPaths(left.claimPath, right.claimPath));
+
+  const claimsByOriginal = new Map();
+  for (const item of discovered) {
+    const key = item.sourcePath;
+    const count = (claimsByOriginal.get(key) || 0) + 1;
+    claimsByOriginal.set(key, count);
+    if (count > 1) {
+      const error = new Error('检测到多个 token 清理 claim 指向同一原路径，需要人工核验');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_CONFLICT';
+      error.recoveryReason = 'duplicate_claims';
+      throw error;
+    }
+  }
+
+  const planned = [];
+  for (const item of discovered) {
+    if (isProcessOwnerAlive(
+      item.claim.pid,
+      item.claim.processStartId,
+      item.claim.processBootId,
+    )) continue;
+    let snapshot;
+    try {
+      snapshot = regularFileSnapshot(item.claimPath);
+    } catch {
+      throw cleanupRecoveryInvalid('claim_snapshot_unavailable');
+    }
+    if (snapshot.contentHash !== item.claim.contentHash) {
+      throw cleanupRecoveryInvalid('claim_content_hash_mismatch');
+    }
+    let sourceExists;
+    try { sourceExists = pathEntryExists(item.sourcePath); } catch {
+      const error = new Error('无法完整预检 token 清理 claim 的原路径');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
+      throw error;
+    }
+    if (sourceExists) {
+      const error = new Error('检测到过期 token 清理 claim 与新文件冲突，需要人工核验');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_CONFLICT';
+      error.recoveryReason = 'original_path_occupied';
+      throw error;
+    }
+    planned.push({ ...item, snapshot });
+  }
+
+  // Revalidate the complete plan once more after discovery. No mutation is
+  // allowed until every recoverable claim and every destination passes this
+  // final read-only barrier.
+  for (const item of planned) {
+    let latest;
+    try { latest = regularFileSnapshot(item.claimPath); } catch {
+      const error = new Error('token 清理 claim 在恢复预检期间发生变化');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_CHANGED';
+      throw error;
+    }
+    if (latest.contentHash !== item.snapshot.contentHash
+        || !sameClaimSnapshot(latest, item.snapshot)) {
+      const error = new Error('token 清理 claim 在恢复预检期间发生变化');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_CHANGED';
+      throw error;
+    }
+    let sourceExists;
+    try { sourceExists = pathEntryExists(item.sourcePath); } catch {
+      const error = new Error('无法完整确认 token 清理 claim 的恢复目标');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
+      throw error;
+    }
+    if (sourceExists) {
+      const error = new Error('检测到过期 token 清理 claim 与新文件冲突，需要人工核验');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_CONFLICT';
+      error.recoveryReason = 'original_path_occupied';
+      throw error;
+    }
+  }
+
+  const recovered = [];
+  for (const item of planned) {
+    if (!restoreClaimedPath(item.claimPath, item.sourcePath, item.snapshot)) {
+      const error = new Error('无法恢复上次中断的 token 清理 claim');
+      error.code = 'TOKEN_CLEANUP_RECOVERY_FAILED';
+      if (recovered.length > 0) {
+        error.requiresReconciliation = true;
+        error.retryAllowed = false;
+        error.doNotRetry = true;
+        error.reconciliationScope = 'expired_token_cleanup';
+        error.reconciliationReason = 'claim_recovery_partially_completed';
+        error.recoveredCount = recovered.length;
+      }
+      throw error;
+    }
+    recovered.push(item.relativePath);
   }
   return recovered;
 }
 
 function versionForItems(items) {
   return crypto.createHash('sha256')
-    .update(JSON.stringify(items.map((item) => ({
+    .update(JSON.stringify([...items].sort(compareCleanupPaths).map((item) => ({
       source: item.source,
       relativePath: item.relativePath,
       email: item.email,
@@ -527,9 +866,7 @@ function listExpiredTokens(options = {}) {
       // Files that disappear or cannot be read are left untouched.
     }
   }
-  items.sort((left, right) => String(left.relativePath).localeCompare(
-    String(right.relativePath), 'en', { numeric: true, sensitivity: 'base' },
-  ));
+  items.sort(compareCleanupPaths);
   const listing = {
     generatedAt: new Date(nowMs).toISOString(),
     rootDirectory,
@@ -591,6 +928,7 @@ function deleteExpiredTokens(options = {}) {
       continue;
     }
     let claimPath = null;
+    let quarantinedPath = null;
     try {
       const sourceSnapshot = regularFileSnapshot(absolutePath);
       if (sourceSnapshot.contentHash !== item.contentHash) {
@@ -600,7 +938,7 @@ function deleteExpiredTokens(options = {}) {
       const sourceFolder = path.join(batchDirectory, item.source);
       ensurePrivateDirectory(sourceFolder, 'token 隔离子目录', true);
       createdSourceFolders.add(sourceFolder);
-      const quarantinedPath = path.join(sourceFolder, path.basename(item.relativePath));
+      quarantinedPath = path.join(sourceFolder, path.basename(item.relativePath));
       // A rename is recoverable and stays on the same filesystem in normal
       // deployments. Never overwrite an existing quarantine file.
       if (fs.existsSync(quarantinedPath)) {
@@ -644,7 +982,24 @@ function deleteExpiredTokens(options = {}) {
         mtimeMs: item.mtimeMs,
         quarantinePath: path.relative(quarantineRoot, quarantinedPath),
       });
-    } catch {
+    } catch (error) {
+      if (error?.writeOutcomeUnknown === true
+          || error?.requiresReconciliation === true
+          || error?.doNotRetry === true) {
+        error.requiresReconciliation = true;
+        error.retryAllowed = false;
+        error.doNotRetry = true;
+        error.currentItem = {
+          source: item.source,
+          relativePath: item.relativePath,
+        };
+        error.completedCount = deleted.length;
+        error.skippedCount = skipped.length;
+        if (error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN' && quarantinedPath) {
+          error.quarantinePath = path.relative(quarantineRoot, quarantinedPath);
+        }
+        throw error;
+      }
       if (claimPath && !restoreClaimedPath(claimPath, absolutePath)) {
         try {
           const sourceFolder = path.join(batchDirectory, item.source);
@@ -662,7 +1017,11 @@ function deleteExpiredTokens(options = {}) {
             quarantinePath: path.relative(quarantineRoot, recoveryPath),
           });
           continue;
-        } catch {}
+        } catch (recoveryError) {
+          if (recoveryError?.writeOutcomeUnknown === true
+              || recoveryError?.requiresReconciliation === true
+              || recoveryError?.doNotRetry === true) throw recoveryError;
+        }
       }
       skipped.push({ ...item, reason: 'file_unavailable' });
     }
@@ -685,9 +1044,11 @@ module.exports = {
   CONFIRMATION,
   listExpiredTokens,
   deleteExpiredTokens,
+  compareCleanupPaths,
   moveToQuarantine,
   claimSourcePath,
   recoverTokenCleanupClaims,
+  restoreClaimedPath,
   quarantineDirectory,
   versionForItems,
 };

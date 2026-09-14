@@ -10,11 +10,14 @@ require('./test-isolation');
 
 const {
   CONFIRMATION,
+  compareCleanupPaths,
   listExpiredTokens,
   deleteExpiredTokens,
   moveToQuarantine,
   claimSourcePath,
   recoverTokenCleanupClaims,
+  restoreClaimedPath,
+  versionForItems,
 } = require('../backend/tokenCleanup');
 const { buildImportPlan, compareTokenRecordFreshness } = require('../backend/sync');
 const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
@@ -33,6 +36,17 @@ function makeRoot() {
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
   return root;
+}
+
+function deadClaimPath(directory, originalFileName, content, nonce = '0123456789abcdef') {
+  const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+  const encodedName = Buffer.from(originalFileName, 'utf8').toString('base64url');
+  const claimPath = path.join(
+    directory,
+    '.panel-token-cleanup-claim-v1-999999-0-' + contentHash + '-' + encodedName + '-' + nonce,
+  );
+  fs.writeFileSync(claimPath, content, { mode: 0o600 });
+  return claimPath;
 }
 
 function waitForClaimChild(child, timeoutMs = 5000) {
@@ -181,6 +195,57 @@ test('expired token cleanup is scoped, versioned, and does not expose credential
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'active.json')), true);
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'invalid.json')), true);
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'unknown.json')), true);
+});
+
+test('expired token listing uses a strict total path order and an order-independent version', () => {
+  const root = makeRoot();
+  const lowerPath = path.join(root, 'tokens', 'a1.json');
+  const upperPath = path.join(root, 'tokens', 'A01.json');
+  const document = (suffix) => JSON.stringify({
+    access_token: jwt({ user: 'ordering-' + suffix, suffix: '-' + suffix }),
+    email: 'ordering-' + suffix + '@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  // Create the lowercase path first so a stable sort with the old comparator
+  // would preserve the wrong insertion order when the natural comparison ties.
+  fs.writeFileSync(lowerPath, document('lower'), { mode: 0o600 });
+  fs.writeFileSync(upperPath, document('upper'), { mode: 0o600 });
+  assert.equal('tokens/a1.json'.localeCompare(
+    'tokens/A01.json',
+    'en',
+    { numeric: true, sensitivity: 'base' },
+  ), 0);
+  assert.equal(compareCleanupPaths('tokens/A01.json', 'tokens/a1.json') < 0, true);
+  const malformedLeft = 'tokens/malformed-\ud800.json';
+  const malformedRight = 'tokens/malformed-\ud801.json';
+  assert.equal(Buffer.compare(Buffer.from(malformedLeft), Buffer.from(malformedRight)), 0);
+  const originalLocaleCompare = String.prototype.localeCompare;
+  String.prototype.localeCompare = function forceMalformedLocaleTie(other, ...args) {
+    const current = String(this);
+    const alternate = String(other);
+    if ((current === malformedLeft && alternate === malformedRight)
+        || (current === malformedRight && alternate === malformedLeft)) return 0;
+    return originalLocaleCompare.call(current, alternate, ...args);
+  };
+  try {
+    assert.equal(compareCleanupPaths(malformedLeft, malformedRight) < 0, true);
+    assert.equal(compareCleanupPaths(malformedRight, malformedLeft) > 0, true);
+  } finally {
+    String.prototype.localeCompare = originalLocaleCompare;
+  }
+
+  const listing = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  assert.deepEqual(
+    listing.items.map((item) => item.relativePath),
+    ['tokens/A01.json', 'tokens/a1.json'],
+  );
+  assert.equal(
+    versionForItems([...listing._internalItems].reverse()),
+    listing.version,
+  );
 });
 
 test('cleanup mutation guard runs before recovering an abandoned claim', () => {
@@ -455,6 +520,341 @@ test('a dead cleanup process leaves a self-describing claim that the next delete
   assert.equal(fs.readdirSync(path.join(root, 'tokens')).some((name) => name.startsWith('.panel-token-cleanup-claim-')), false);
 });
 
+test('claim recovery completes its conflict preflight before restoring any earlier claim', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const firstContent = JSON.stringify({ marker: 'first-claim' });
+  const laterContent = JSON.stringify({ marker: 'later-claim' });
+  const firstClaim = deadClaimPath(directory, 'a-first.json', firstContent);
+  const laterClaim = deadClaimPath(
+    directory,
+    'z-later.json',
+    laterContent,
+    'fedcba9876543210',
+  );
+  const firstSource = path.join(directory, 'a-first.json');
+  const laterSource = path.join(directory, 'z-later.json');
+  fs.writeFileSync(laterSource, JSON.stringify({ marker: 'new-file' }), { mode: 0o600 });
+
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_CONFLICT'
+      && error.recoveryReason === 'original_path_occupied',
+  );
+  assert.equal(fs.existsSync(firstSource), false);
+  assert.equal(fs.existsSync(firstClaim), true);
+  assert.equal(fs.existsSync(laterClaim), true);
+  assert.deepEqual(JSON.parse(fs.readFileSync(laterSource, 'utf8')), { marker: 'new-file' });
+});
+
+test('claim recovery rejects duplicate claims for one original before changing either', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const content = JSON.stringify({ marker: 'duplicate-claim' });
+  const firstClaim = deadClaimPath(directory, 'same.json', content);
+  const secondClaim = deadClaimPath(
+    directory,
+    'same.json',
+    content,
+    '1111111111111111',
+  );
+  const sourcePath = path.join(directory, 'same.json');
+
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_CONFLICT'
+      && error.recoveryReason === 'duplicate_claims',
+  );
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(firstClaim), true);
+  assert.equal(fs.existsSync(secondClaim), true);
+});
+
+test('claim recovery fails closed on a dead claim hash mismatch before restoring earlier claims', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const firstContent = JSON.stringify({ marker: 'valid-earlier-claim' });
+  const invalidContent = JSON.stringify({ marker: 'invalid-later-claim' });
+  const firstClaim = deadClaimPath(directory, 'a-valid.json', firstContent);
+  const invalidClaim = deadClaimPath(directory, 'z-invalid.json', invalidContent);
+  const firstSource = path.join(directory, 'a-valid.json');
+  fs.writeFileSync(invalidClaim, JSON.stringify({ marker: 'changed-after-claim' }), { mode: 0o600 });
+
+  let failure;
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => {
+      failure = error;
+      return error.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+        && error.recoveryReason === 'claim_content_hash_mismatch';
+    },
+  );
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(firstSource), false);
+  assert.equal(fs.existsSync(firstClaim), true);
+  assert.equal(fs.existsSync(invalidClaim), true);
+});
+
+test('claim recovery fails closed on an unreadable dead claim before restoring earlier claims', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const firstContent = JSON.stringify({ marker: 'valid-earlier-claim' });
+  const invalidContent = JSON.stringify({ marker: 'non-regular-later-claim' });
+  const firstClaim = deadClaimPath(directory, 'a-valid.json', firstContent);
+  const invalidClaim = deadClaimPath(directory, 'z-invalid.json', invalidContent);
+  const firstSource = path.join(directory, 'a-valid.json');
+  fs.unlinkSync(invalidClaim);
+  fs.mkdirSync(invalidClaim, { mode: 0o700 });
+
+  let failure;
+  assert.throws(
+    () => recoverTokenCleanupClaims(root),
+    (error) => {
+      failure = error;
+      return error.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+        && error.recoveryReason === 'claim_snapshot_unavailable';
+    },
+  );
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(firstSource), false);
+  assert.equal(fs.existsSync(firstClaim), true);
+  assert.equal(fs.lstatSync(invalidClaim).isDirectory(), true);
+});
+
+test('claim restore removes only its own mismatched hard link', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const claimPath = path.join(directory, 'claim.json');
+  const sourcePath = path.join(directory, 'restored.json');
+  fs.writeFileSync(claimPath, 'claim-content', { mode: 0o600 });
+  const originalLstatSync = fs.lstatSync;
+  let sourceStats = 0;
+  fs.lstatSync = function reportOneMismatchedSource(filePath) {
+    const stat = originalLstatSync.call(fs, filePath);
+    if (filePath === sourcePath && sourceStats++ === 0) {
+      return new Proxy(stat, {
+        get(target, property) {
+          if (property === 'ino') return Number(target.ino) + 1;
+          const value = Reflect.get(target, property, target);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+    }
+    return stat;
+  };
+  try {
+    assert.equal(restoreClaimedPath(claimPath, sourcePath), false);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(claimPath), true);
+
+  const replacementClaim = path.join(directory, 'replacement-claim.json');
+  const replacementSource = path.join(directory, 'replacement-source.json');
+  const displacedLink = replacementSource + '.created-link';
+  fs.writeFileSync(replacementClaim, 'original-claim', { mode: 0o600 });
+  let replaced = false;
+  fs.lstatSync = function replaceCreatedSource(filePath) {
+    if (!replaced && filePath === replacementSource) {
+      replaced = true;
+      fs.renameSync(replacementSource, displacedLink);
+      fs.writeFileSync(replacementSource, 'unrelated-replacement', { mode: 0o600 });
+    }
+    return originalLstatSync.call(fs, filePath);
+  };
+  let replacementFailure;
+  try {
+    assert.throws(
+      () => restoreClaimedPath(replacementClaim, replacementSource),
+      (error) => {
+        replacementFailure = error;
+        return error.code === 'TOKEN_CLEANUP_RESTORE_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+  assert.equal(replacementFailure.requiresReconciliation, true);
+  assert.equal(replacementFailure.doNotRetry, true);
+  assert.equal(replaced, true);
+  assert.equal(fs.readFileSync(replacementSource, 'utf8'), 'unrelated-replacement');
+  assert.equal(fs.readFileSync(displacedLink, 'utf8'), 'original-claim');
+  assert.equal(fs.existsSync(replacementClaim), true);
+});
+
+test('claim restore cleans its created source link after a transient claim lstat error', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const claimPath = path.join(directory, 'transient-claim.json');
+  const sourcePath = path.join(directory, 'transient-source.json');
+  fs.writeFileSync(claimPath, 'recoverable-content', { mode: 0o600 });
+  const originalLstatSync = fs.lstatSync;
+  const originalUnlinkSync = fs.unlinkSync;
+  let rejectClaimUnlink = true;
+  let injectClaimLstat = false;
+  fs.unlinkSync = function rejectOneClaimUnlink(filePath) {
+    if (filePath === claimPath && rejectClaimUnlink) {
+      rejectClaimUnlink = false;
+      injectClaimLstat = true;
+      const error = new Error('simulated claim unlink failure');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return originalUnlinkSync.call(fs, filePath);
+  };
+  fs.lstatSync = function rejectOneClaimLstat(filePath) {
+    if (filePath === claimPath && injectClaimLstat) {
+      injectClaimLstat = false;
+      const error = new Error('simulated claim stat failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalLstatSync.call(fs, filePath);
+  };
+  try {
+    assert.equal(restoreClaimedPath(claimPath, sourcePath), false);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+    fs.unlinkSync = originalUnlinkSync;
+  }
+  assert.equal(rejectClaimUnlink, false);
+  assert.equal(injectClaimLstat, false);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(claimPath), true);
+  assert.equal(fs.readFileSync(claimPath, 'utf8'), 'recoverable-content');
+});
+
+test('claim restore removes its hard link when the first source lstat throws', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const claimPath = path.join(directory, 'source-stat-claim.json');
+  const sourcePath = path.join(directory, 'source-stat-restored.json');
+  fs.writeFileSync(claimPath, 'recoverable-content', { mode: 0o600 });
+  const originalLstatSync = fs.lstatSync;
+  let injectSourceLstat = true;
+  fs.lstatSync = function rejectOneSourceLstat(filePath) {
+    if (filePath === sourcePath && injectSourceLstat) {
+      injectSourceLstat = false;
+      const error = new Error('simulated source stat failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalLstatSync.call(fs, filePath);
+  };
+  try {
+    assert.equal(restoreClaimedPath(claimPath, sourcePath), false);
+  } finally {
+    fs.lstatSync = originalLstatSync;
+  }
+  assert.equal(injectSourceLstat, false);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(claimPath), true);
+  assert.equal(fs.readFileSync(claimPath, 'utf8'), 'recoverable-content');
+});
+
+test('claim creation and restoration expose post-rename fsync ambiguity', () => {
+  const root = makeRoot();
+  const directory = path.join(root, 'tokens');
+  const sourcePath = path.join(directory, 'claim-fsync.json');
+  const content = JSON.stringify({ marker: 'claim-fsync' });
+  const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+  fs.writeFileSync(sourcePath, content, { mode: 0o600 });
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const openedPaths = new Map();
+  let failClaimFsync = true;
+  fs.openSync = function trackPath(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') openedPaths.set(descriptor, path.resolve(filePath));
+    return descriptor;
+  };
+  fs.closeSync = function forgetPath(descriptor) {
+    openedPaths.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function rejectSelectedDirectorySync(descriptor) {
+    const names = openedPaths.get(descriptor) === directory
+      ? fs.readdirSync(directory)
+      : [];
+    const hasClaim = names.some((name) => name.startsWith('.panel-token-cleanup-claim-'));
+    if (failClaimFsync && hasClaim && !fs.existsSync(sourcePath)) {
+      failClaimFsync = false;
+      const error = new Error('simulated claim directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let claimFailure;
+  try {
+    assert.throws(
+      () => claimSourcePath(sourcePath, contentHash),
+      (error) => {
+        claimFailure = error;
+        return error.code === 'TOKEN_CLEANUP_CLAIM_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  const [claimName] = fs.readdirSync(directory);
+  const claimPath = path.join(directory, claimName);
+  assert.equal(claimFailure.writeOutcomeUnknown, true);
+  assert.equal(claimFailure.doNotRetry, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.match(claimName, /^\.panel-token-cleanup-claim-/);
+
+  const restoredPath = path.join(directory, 'restored-fsync.json');
+  const restoreOpenedPaths = new Map();
+  fs.openSync = function trackRestorePath(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') restoreOpenedPaths.set(descriptor, path.resolve(filePath));
+    return descriptor;
+  };
+  fs.closeSync = function forgetRestorePath(descriptor) {
+    restoreOpenedPaths.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function rejectRestoreDirectorySync(descriptor) {
+    if (restoreOpenedPaths.get(descriptor) === directory
+        && fs.existsSync(restoredPath)
+        && !fs.existsSync(claimPath)) {
+      const error = new Error('simulated restore directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let restoreFailure;
+  try {
+    assert.throws(
+      () => restoreClaimedPath(claimPath, restoredPath),
+      (error) => {
+        restoreFailure = error;
+        return error.code === 'TOKEN_CLEANUP_RESTORE_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(restoreFailure.writeOutcomeUnknown, true);
+  assert.equal(restoreFailure.requiresReconciliation, true);
+  assert.equal(restoreFailure.retryAllowed, false);
+  assert.equal(restoreFailure.doNotRetry, true);
+  assert.equal(fs.existsSync(restoredPath), true);
+  assert.equal(fs.existsSync(claimPath), false);
+});
+
 test('cleanup claim recovery binds a live PID to the current system boot', (context) => {
   const owner = currentProcessOwner();
   if (!owner.processBootId) {
@@ -540,6 +940,87 @@ test('cross-filesystem cleanup never unlinks a newly reusable original source pa
   }
 });
 
+test('cleanup reports an unknown outcome instead of file_unavailable after source unlink', () => {
+  const root = makeRoot();
+  const tokensDirectory = path.join(root, 'tokens');
+  const sourcePath = path.join(tokensDirectory, 'expired-unknown.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: jwt({ suffix: '-move-outcome-unknown' }),
+    email: 'move-outcome-unknown@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }), { mode: 0o600 });
+  const options = {
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  };
+  const listing = listExpiredTokens(options);
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const openedDirectories = new Map();
+  let injected = false;
+  fs.openSync = function trackOpenedDirectory(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') {
+      openedDirectories.set(descriptor, path.resolve(filePath));
+    }
+    return descriptor;
+  };
+  fs.closeSync = function forgetOpenedDirectory(descriptor) {
+    openedDirectories.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function failAfterClaimUnlink(descriptor) {
+    if (!injected
+        && openedDirectories.get(descriptor) === tokensDirectory
+        && fs.readdirSync(tokensDirectory).length === 0) {
+      injected = true;
+      const error = new Error('simulated directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => deleteExpiredTokens({
+        ...options,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  assert.equal(injected, true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(failure.reconciliationReason, 'quarantine_move_outcome_unknown');
+  assert.deepEqual(failure.currentItem, {
+    source: 'tokens',
+    relativePath: 'tokens/expired-unknown.json',
+  });
+  assert.equal(failure.completedCount, 0);
+  assert.notEqual(failure.message, 'file_unavailable');
+  assert.equal(fs.existsSync(path.join(
+    root,
+    '.panel-quarantine',
+    'expired-tokens',
+    failure.quarantinePath,
+  )), true);
+});
+
 test('cross-filesystem quarantine refuses oversized files without leaving a partial target', () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'oversized.json');
@@ -573,7 +1054,239 @@ test('cross-filesystem quarantine refuses oversized files without leaving a part
   }
 });
 
-test('same-filesystem cleanup rechecks the published target inode before removing its claim', () => {
+test('same-filesystem target rollback becomes unknown when its directory flush fails', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'rollback-source.json');
+  const targetDirectory = path.join(root, 'quarantine-target');
+  const targetPath = path.join(targetDirectory, 'rollback-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'rollback-content', { mode: 0o600 });
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFchmodSync = fs.fchmodSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const openedPaths = new Map();
+  let operationFailureInjected = false;
+  let rollbackFlushFailureInjected = false;
+  fs.openSync = function trackRollbackPath(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') openedPaths.set(descriptor, path.resolve(filePath));
+    return descriptor;
+  };
+  fs.closeSync = function forgetRollbackPath(descriptor) {
+    openedPaths.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fchmodSync = function failPublishedTargetPermissionChange() {
+    operationFailureInjected = true;
+    const error = new Error('simulated target operation failure');
+    error.code = 'EIO';
+    throw error;
+  };
+  fs.fsyncSync = function failRollbackDirectoryFlush(descriptor) {
+    if (!rollbackFlushFailureInjected
+        && openedPaths.get(descriptor) === targetDirectory
+        && !fs.existsSync(targetPath)) {
+      rollbackFlushFailureInjected = true;
+      const error = new Error('simulated rollback directory flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => moveToQuarantine(sourcePath, targetPath),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+          && error.reconciliationReason === 'quarantine_rollback_outcome_unknown';
+      },
+    );
+  } finally {
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fchmodSync = originalFchmodSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(operationFailureInjected, true);
+  assert.equal(rollbackFlushFailureInjected, true);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.existsSync(targetPath), false);
+});
+
+test('cross-filesystem published target rollback becomes unknown when its flush fails', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'published-source.json');
+  const targetDirectory = path.join(root, 'quarantine-target');
+  const targetPath = path.join(targetDirectory, 'published-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'published-content', { mode: 0o600 });
+  const originalLinkSync = fs.linkSync;
+  const originalLstatSync = fs.lstatSync;
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const openedPaths = new Map();
+  let forcedCrossDevice = false;
+  let sourceCheckFailureInjected = false;
+  let rollbackFlushFailureInjected = false;
+  fs.linkSync = function forceCrossDeviceOnce(from, to) {
+    if (!forcedCrossDevice && from === sourcePath && to === targetPath) {
+      forcedCrossDevice = true;
+      const error = new Error('simulated cross-device link');
+      error.code = 'EXDEV';
+      throw error;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+  fs.lstatSync = function failSourceCheckAfterPublish(filePath) {
+    if (!sourceCheckFailureInjected
+        && forcedCrossDevice
+        && filePath === sourcePath
+        && fs.existsSync(targetPath)) {
+      sourceCheckFailureInjected = true;
+      const error = new Error('simulated source recheck failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalLstatSync.call(fs, filePath);
+  };
+  fs.openSync = function trackPublishedRollbackPath(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') openedPaths.set(descriptor, path.resolve(filePath));
+    return descriptor;
+  };
+  fs.closeSync = function forgetPublishedRollbackPath(descriptor) {
+    openedPaths.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function failPublishedRollbackFlush(descriptor) {
+    if (!rollbackFlushFailureInjected
+        && openedPaths.get(descriptor) === targetDirectory
+        && !fs.existsSync(targetPath)) {
+      rollbackFlushFailureInjected = true;
+      const error = new Error('simulated published rollback flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => moveToQuarantine(sourcePath, targetPath),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+          && error.reconciliationReason === 'quarantine_rollback_outcome_unknown';
+      },
+    );
+  } finally {
+    fs.linkSync = originalLinkSync;
+    fs.lstatSync = originalLstatSync;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(forcedCrossDevice, true);
+  assert.equal(sourceCheckFailureInjected, true);
+  assert.equal(rollbackFlushFailureInjected, true);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.existsSync(targetPath), false);
+  assert.deepEqual(fs.readdirSync(targetDirectory), []);
+});
+
+test('cross-filesystem temporary target rollback becomes unknown when its flush fails', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'temporary-source.json');
+  const targetDirectory = path.join(root, 'quarantine-target');
+  const targetPath = path.join(targetDirectory, 'temporary-target.json');
+  fs.mkdirSync(targetDirectory);
+  fs.writeFileSync(sourcePath, 'temporary-content', { mode: 0o600 });
+  const originalLinkSync = fs.linkSync;
+  const originalWriteSync = fs.writeSync;
+  const originalOpenSync = fs.openSync;
+  const originalCloseSync = fs.closeSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const openedPaths = new Map();
+  let forcedCrossDevice = false;
+  let copyFailureInjected = false;
+  let rollbackFlushFailureInjected = false;
+  fs.linkSync = function forceCrossDeviceOnce(from, to) {
+    if (!forcedCrossDevice && from === sourcePath && to === targetPath) {
+      forcedCrossDevice = true;
+      const error = new Error('simulated cross-device link');
+      error.code = 'EXDEV';
+      throw error;
+    }
+    return originalLinkSync.call(fs, from, to);
+  };
+  fs.writeSync = function failTemporaryCopy() {
+    copyFailureInjected = true;
+    const error = new Error('simulated temporary copy failure');
+    error.code = 'EIO';
+    throw error;
+  };
+  fs.openSync = function trackTemporaryRollbackPath(filePath, ...args) {
+    const descriptor = originalOpenSync.call(fs, filePath, ...args);
+    if (typeof filePath === 'string') openedPaths.set(descriptor, path.resolve(filePath));
+    return descriptor;
+  };
+  fs.closeSync = function forgetTemporaryRollbackPath(descriptor) {
+    openedPaths.delete(descriptor);
+    return originalCloseSync.call(fs, descriptor);
+  };
+  fs.fsyncSync = function failTemporaryRollbackFlush(descriptor) {
+    if (!rollbackFlushFailureInjected
+        && openedPaths.get(descriptor) === targetDirectory
+        && fs.readdirSync(targetDirectory).length === 0) {
+      rollbackFlushFailureInjected = true;
+      const error = new Error('simulated temporary rollback flush failure');
+      error.code = 'EIO';
+      throw error;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  let failure;
+  try {
+    assert.throws(
+      () => moveToQuarantine(sourcePath, targetPath),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+          && error.reconciliationReason === 'quarantine_rollback_outcome_unknown';
+      },
+    );
+  } finally {
+    fs.linkSync = originalLinkSync;
+    fs.writeSync = originalWriteSync;
+    fs.openSync = originalOpenSync;
+    fs.closeSync = originalCloseSync;
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(forcedCrossDevice, true);
+  assert.equal(copyFailureInjected, true);
+  assert.equal(rollbackFlushFailureInjected, true);
+  assert.equal(failure.writeOutcomeUnknown, true);
+  assert.equal(failure.requiresReconciliation, true);
+  assert.equal(failure.retryAllowed, false);
+  assert.equal(failure.doNotRetry, true);
+  assert.equal(fs.existsSync(sourcePath), true);
+  assert.equal(fs.existsSync(targetPath), false);
+  assert.deepEqual(fs.readdirSync(targetDirectory), []);
+});
+
+test('same-filesystem cleanup reports unknown when the published target identity changes', () => {
   const root = makeRoot();
   const sourcePath = path.join(root, 'tokens', 'expired.json');
   fs.writeFileSync(sourcePath, JSON.stringify({
@@ -599,17 +1312,30 @@ test('same-filesystem cleanup rechecks the published target inode before removin
     }
     return originalLstatSync(filePath);
   };
+  let failure;
   try {
-    const result = deleteExpiredTokens({
-      rootDirectory: root,
-      expectedVersion: listing.version,
-      confirmation: CONFIRMATION,
-      nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
-    });
+    assert.throws(
+      () => deleteExpiredTokens({
+        rootDirectory: root,
+        expectedVersion: listing.version,
+        confirmation: CONFIRMATION,
+        nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+      }),
+      (error) => {
+        failure = error;
+        return error.code === 'TOKEN_CLEANUP_MOVE_OUTCOME_UNKNOWN'
+          && error.reconciliationReason === 'quarantine_rollback_outcome_unknown';
+      },
+    );
     assert.equal(targetChecks >= 2, true);
-    assert.equal(result.count, 0);
-    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(failure.requiresReconciliation, true);
+    assert.equal(failure.doNotRetry, true);
+    assert.equal(fs.existsSync(sourcePath), false);
     assert.equal(fs.readFileSync(replacementPath, 'utf8'), 'unrelated replacement');
+    assert.equal(fs.existsSync(replacementPath + '.original-link'), true);
+    assert.equal(fs.readdirSync(path.join(root, 'tokens')).some(
+      (name) => name.startsWith('.panel-token-cleanup-claim-'),
+    ), true);
   } finally {
     fs.lstatSync = originalLstatSync;
   }
