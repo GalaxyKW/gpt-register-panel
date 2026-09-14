@@ -14,6 +14,9 @@ const initializationPromises = new Map();
 const DB_LOCK_KIND = 'gpt-register-panel-db-lock';
 const DEFAULT_DB_MAX_BYTES = 128 * 1024 * 1024;
 const HARD_DB_MAX_BYTES = 512 * 1024 * 1024;
+const ACTIVE_JOB_STATUSES = new Set(['queued', 'running']);
+const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
+const JOB_STATUSES = new Set([...ACTIVE_JOB_STATUSES, ...TERMINAL_JOB_STATUSES]);
 
 function sameInode(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
@@ -447,9 +450,11 @@ class PanelDb {
   }
 
   async persist() {
-    await this.withFileLock(async () => {
-      this.persistUnlocked();
-    });
+    // Compatibility entrypoint for older embedded callers. Never export this
+    // instance's cached database directly: another PanelDb/process may have
+    // committed newer rows since the last local read. A no-op write reloads
+    // the current file under the lease before persisting schema/pruning work.
+    await this.write(() => undefined);
   }
 
   async write(callback) {
@@ -596,38 +601,89 @@ class PanelDb {
     add('started_at', patch.startedAt);
     add('finished_at', patch.finishedAt);
     if (fields.length === 0) return Promise.resolve();
-    const terminalStatus = patch.status
-      && ['succeeded', 'partial', 'failed', 'interrupted'].includes(patch.status)
-      ? patch.status
+    const hasRequestedStatus = patch.status !== undefined;
+    const requestedStatus = hasRequestedStatus ? patch.status : null;
+    if (hasRequestedStatus && !JOB_STATUSES.has(requestedStatus)) {
+      const error = new Error('任务状态无效');
+      error.code = 'JOB_STATUS_INVALID';
+      return Promise.reject(error);
+    }
+    const terminalStatus = TERMINAL_JOB_STATUSES.has(requestedStatus)
+      ? requestedStatus
       : null;
-    values.push(id);
     return this.write((database) => {
-      // A late observer must never overwrite an `interrupted` shutdown result
-      // (or another already-persisted terminal outcome). Retrying the same
-      // terminal patch remains safe and idempotent.
-      const statusGuard = terminalStatus
-        ? ` AND (status IN ('queued', 'running') OR status = ${sqlString(terminalStatus)})`
-        : patch.status === 'running'
-          ? " AND status IN ('queued', 'running')"
-          : '';
+      const row = resultRows(database.exec(
+        'SELECT status FROM sync_jobs WHERE id = ' + sqlString(id) + ' LIMIT 1',
+      ))[0];
+      if (!row) {
+        const error = new Error('任务不存在');
+        error.code = 'JOB_NOT_FOUND';
+        throw error;
+      }
+      const currentStatus = String(row.status || '');
+      if (!JOB_STATUSES.has(currentStatus)) {
+        const error = new Error('数据库中的任务状态无效');
+        error.code = 'JOB_STORED_STATUS_INVALID';
+        error.currentStatus = currentStatus || null;
+        throw error;
+      }
+      if (TERMINAL_JOB_STATUSES.has(currentStatus)) {
+        if (terminalStatus === currentStatus) {
+          // A retry after an ambiguous local persistence response may replay
+          // the same terminal state. Confirm it without replacing the first
+          // terminal result, error, or timestamp.
+          return {
+            applied: false,
+            idempotent: true,
+            previousStatus: currentStatus,
+            currentStatus,
+          };
+        }
+        const error = new Error('任务已经结束，拒绝重新打开或覆盖终态');
+        error.code = 'JOB_STATUS_CONFLICT';
+        error.currentStatus = currentStatus;
+        error.requestedStatus = requestedStatus;
+        throw error;
+      }
+      const transitionAllowed = !hasRequestedStatus
+        || (currentStatus === 'queued'
+          && (requestedStatus === 'running' || terminalStatus !== null))
+        || (currentStatus === 'running'
+          && (requestedStatus === 'running' || terminalStatus !== null));
+      if (!transitionAllowed) {
+        const error = new Error('任务状态转换无效');
+        error.code = 'JOB_STATUS_CONFLICT';
+        error.currentStatus = currentStatus;
+        error.requestedStatus = requestedStatus;
+        throw error;
+      }
       const statement = database.prepare(
-        'UPDATE sync_jobs SET ' + fields.join(', ') + ' WHERE id = ?' + statusGuard,
+        'UPDATE sync_jobs SET ' + fields.join(', ') + ' WHERE id = ? AND status = ?',
       );
-      statement.run(values);
+      statement.run([...values, id, currentStatus]);
       const applied = database.getRowsModified() > 0;
       statement.free();
+      if (!applied) {
+        const latestStatus = resultRows(database.exec(
+          'SELECT status FROM sync_jobs WHERE id = ' + sqlString(id) + ' LIMIT 1',
+        ))[0]?.status || null;
+        const error = new Error('任务状态在更新期间发生变化');
+        error.code = latestStatus ? 'JOB_STATUS_CONFLICT' : 'JOB_NOT_FOUND';
+        error.currentStatus = latestStatus;
+        error.requestedStatus = requestedStatus;
+        throw error;
+      }
       if (terminalStatus && applied) {
         const claimStatement = database.prepare('DELETE FROM job_claims WHERE job_id = ?');
         claimStatement.run([id]);
         claimStatement.free();
       }
-      let currentStatus = patch.status || null;
-      if (!applied) {
-        currentStatus = resultRows(database.exec(
-          'SELECT status FROM sync_jobs WHERE id = ' + sqlString(id) + ' LIMIT 1',
-        ))[0]?.status || null;
-      }
-      return { applied, currentStatus };
+      return {
+        applied: true,
+        idempotent: false,
+        previousStatus: currentStatus,
+        currentStatus: hasRequestedStatus ? requestedStatus : currentStatus,
+      };
     });
   }
 

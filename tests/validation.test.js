@@ -329,6 +329,96 @@ test('two PanelDb instances cannot claim the same target', async () => {
   assert.equal((await firstDb.listJobs(10)).filter((job) => job.status === 'queued').length, 1);
 });
 
+test('PanelDb persist reloads the latest file instead of overwriting another instance', async () => {
+  const file = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-fresh-persist-')),
+    'panel.sqlite3',
+  );
+  const firstDb = new PanelDb(file);
+  const secondDb = new PanelDb(file);
+  await Promise.all([firstDb.ready, secondDb.ready]);
+  const job = await secondDb.createJob('phase3', {}, 'second', {
+    claimKeys: ['phase3:fresh-persist'],
+  });
+
+  await firstDb.persist();
+
+  assert.equal((await secondDb.getJob(job.id)).status, 'queued');
+  await assert.rejects(
+    firstDb.createJob('phase3', {}, 'first', { claimKeys: ['phase3:fresh-persist'] }),
+    (error) => error.code === 'JOB_ALREADY_CLAIMED'
+      && error.existingJobId === job.id,
+  );
+  await secondDb.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+});
+
+test('PanelDb enforces job status transitions and preserves the first terminal result', async () => {
+  const file = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-job-state-')),
+    'panel.sqlite3',
+  );
+  const db = new PanelDb(file);
+  const claimKey = 'phase3:strict-state-machine';
+  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+
+  await assert.rejects(
+    db.updateJob(job.id, { status: 'unknown-status' }),
+    (error) => error.code === 'JOB_STATUS_INVALID',
+  );
+  await assert.rejects(
+    db.updateJob('job_does_not_exist', { status: 'running' }),
+    (error) => error.code === 'JOB_NOT_FOUND',
+  );
+  await assert.rejects(
+    db.updateJob(job.id, { status: 'queued' }),
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
+      && error.currentStatus === 'queued',
+  );
+
+  const running = await db.updateJob(job.id, {
+    status: 'running',
+    startedAt: '2026-09-14T00:00:00.000Z',
+  });
+  assert.equal(running.applied, true);
+  assert.equal(running.previousStatus, 'queued');
+  assert.equal(running.currentStatus, 'running');
+  const runningReplay = await db.updateJob(job.id, { status: 'running' });
+  assert.equal(runningReplay.applied, true);
+  assert.equal(runningReplay.previousStatus, 'running');
+
+  const terminal = await db.updateJob(job.id, {
+    status: 'failed',
+    result: { first: true },
+    error: 'first terminal error',
+    finishedAt: '2026-09-14T00:01:00.000Z',
+  });
+  assert.equal(terminal.applied, true);
+  assert.equal(terminal.previousStatus, 'running');
+  assert.equal(terminal.currentStatus, 'failed');
+  const replay = await db.updateJob(job.id, {
+    status: 'failed',
+    result: { replacement: true },
+    error: 'replacement terminal error',
+    finishedAt: '2026-09-14T00:02:00.000Z',
+  });
+  assert.equal(replay.applied, false);
+  assert.equal(replay.idempotent, true);
+  const persisted = await db.getJob(job.id);
+  assert.deepEqual(persisted.result, { first: true });
+  assert.equal(persisted.error, 'first terminal error');
+  assert.equal(persisted.finishedAt, '2026-09-14T00:01:00.000Z');
+
+  await assert.rejects(
+    db.updateJob(job.id, { status: 'queued' }),
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
+      && error.currentStatus === 'failed',
+  );
+  assert.equal((await db.getJob(job.id)).status, 'failed');
+  const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+  assert.equal(replacement.status, 'queued');
+  await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
+});
+
 test('PanelDb rejects oversized or multiply linked database files before loading them', async () => {
   const previousMaximum = process.env.PANEL_DB_MAX_BYTES;
   process.env.PANEL_DB_MAX_BYTES = String(1024 * 1024);

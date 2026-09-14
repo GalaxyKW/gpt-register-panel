@@ -528,24 +528,35 @@ test('PanelDb terminal transitions cannot overwrite an earlier shutdown interrup
   });
   assert.equal(interruption.applied, true);
   assert.equal(interruption.currentStatus, 'interrupted');
-  const lateSuccess = await db.updateJob(job.id, {
-    status: 'succeeded',
-    result: { shouldNotReplace: true },
-    finishedAt: new Date().toISOString(),
+  const replay = await updateTerminalJob(db, job.id, {
+    status: 'interrupted',
+    error: 'must not replace the first terminal error',
+    result: { mustNotBeStored: true },
   });
-  assert.equal(lateSuccess.applied, false);
-  assert.equal(lateSuccess.currentStatus, 'interrupted');
+  assert.equal(replay.applied, false);
+  assert.equal(replay.idempotent, true);
+  assert.equal(replay.currentStatus, 'interrupted');
+  await assert.rejects(
+    db.updateJob(job.id, {
+      status: 'succeeded',
+      result: { shouldNotReplace: true },
+      finishedAt: new Date().toISOString(),
+    }),
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
+      && error.currentStatus === 'interrupted',
+  );
   await assert.rejects(
     updateTerminalJob(db, job.id, {
       status: 'succeeded',
       result: { shouldNotReplace: true },
     }),
-    (error) => error.code === 'JOB_TERMINAL_STATUS_CONFLICT'
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
       && error.currentStatus === 'interrupted',
   );
   const persisted = await db.getJob(job.id);
   assert.equal(persisted.status, 'interrupted');
   assert.equal(persisted.result, null);
+  assert.equal(persisted.error, 'service stopped');
 
   const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
   assert.equal(replacement.status, 'queued');

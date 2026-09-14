@@ -39,7 +39,10 @@ async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
       const result = await db.updateJob(jobId, terminalPatch);
-      if (result?.applied === false) {
+      const alreadyPersisted = result?.applied === false
+        && result?.idempotent === true
+        && result?.currentStatus === patch.status;
+      if (result?.applied === false && !alreadyPersisted) {
         const error = new Error('任务终态已由其他执行路径写入，拒绝覆盖');
         error.code = 'JOB_TERMINAL_STATUS_CONFLICT';
         error.jobId = jobId;
@@ -50,7 +53,13 @@ async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
       return result;
     } catch (error) {
       lastError = error;
-      if (attempt >= attempts || error?.code === 'JOB_TERMINAL_STATUS_CONFLICT') break;
+      if (attempt >= attempts || [
+        'JOB_NOT_FOUND',
+        'JOB_STATUS_CONFLICT',
+        'JOB_STATUS_INVALID',
+        'JOB_STORED_STATUS_INVALID',
+        'JOB_TERMINAL_STATUS_CONFLICT',
+      ].includes(error?.code)) break;
       if (typeof options.onRetry === 'function') {
         try { options.onRetry(error, attempt); } catch {}
       }
