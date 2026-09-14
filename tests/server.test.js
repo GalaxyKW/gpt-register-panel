@@ -2,6 +2,7 @@ const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const os = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
@@ -534,6 +535,7 @@ test('HTTP server applies bounded slow-request and connection limits', () => {
   assert.equal(server.requestTimeout, 30_000);
   assert.equal(server.headersTimeout, 15_000);
   assert.equal(server.keepAliveTimeout, 5_000);
+  assert.equal(server.connectionsCheckingInterval, 1_000);
   assert.equal(server.maxHeadersCount, 100);
   assert.equal(server.maxRequestsPerSocket, 100);
 });
@@ -563,6 +565,7 @@ test('HTTP limits treat blank values as defaults and clamp explicit bounds', () 
     assert.equal(server.requestTimeout, 30_000);
     assert.equal(server.headersTimeout, 30_000);
     assert.equal(server.keepAliveTimeout, 1_000);
+    assert.equal(server.connectionsCheckingInterval, 1_000);
     assert.equal(server.maxHeadersCount, 100);
     assert.equal(server.maxRequestsPerSocket, 1);
   } finally {
@@ -570,6 +573,119 @@ test('HTTP limits treat blank values as defaults and clamp explicit bounds', () 
       if (previous[name] === undefined) delete process.env[name];
       else process.env[name] = previous[name];
     }
+  }
+});
+
+test('minimum slow-header timeout is enforced by a bounded connection sweep', async () => {
+  const previous = {
+    requestTimeout: process.env.PANEL_HTTP_REQUEST_TIMEOUT_MS,
+    headersTimeout: process.env.PANEL_HTTP_HEADERS_TIMEOUT_MS,
+  };
+  process.env.PANEL_HTTP_REQUEST_TIMEOUT_MS = '1000';
+  process.env.PANEL_HTTP_HEADERS_TIMEOUT_MS = '1000';
+  let server;
+  let socket;
+  try {
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-slow-header-test.sqlite3' },
+      logger: {
+        requestId: () => 'slow-header-test',
+        info() {},
+        warn() {},
+        error() {},
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const responseText = await new Promise((resolve, reject) => {
+      let received = '';
+      const timer = setTimeout(() => {
+        socket?.destroy();
+        reject(new Error('slow header connection outlived configured timeout sweep'));
+      }, 5_000);
+      socket = net.connect(server.address().port, '127.0.0.1', () => {
+        socket.write('GET /api/health HTTP/1.1\r\nHost: 127.0.0.1');
+      });
+      socket.setEncoding('utf8');
+      socket.on('data', (chunk) => { received += chunk; });
+      socket.once('error', (error) => {
+        clearTimeout(timer);
+        reject(error);
+      });
+      socket.once('close', () => {
+        clearTimeout(timer);
+        resolve(received);
+      });
+    });
+    assert.match(responseText, /^HTTP\/1\.1 408 Request Timeout\r\n/);
+  } finally {
+    socket?.destroy();
+    await closeHttpServer(server);
+    if (previous.requestTimeout === undefined) delete process.env.PANEL_HTTP_REQUEST_TIMEOUT_MS;
+    else process.env.PANEL_HTTP_REQUEST_TIMEOUT_MS = previous.requestTimeout;
+    if (previous.headersTimeout === undefined) delete process.env.PANEL_HTTP_HEADERS_TIMEOUT_MS;
+    else process.env.PANEL_HTTP_HEADERS_TIMEOUT_MS = previous.headersTimeout;
+  }
+});
+
+test('known routes return an exact Allow method while unknown targets remain 404', async () => {
+  let server;
+  try {
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-method-routing-test.sqlite3' },
+      logger: {
+        requestId: () => 'method-routing-test',
+        info() {},
+        warn() {},
+        error() {},
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const issue = (method, pathname) => new Promise((resolve, reject) => {
+      const requestObject = http.request({
+        host: '127.0.0.1',
+        port: server.address().port,
+        method,
+        path: pathname,
+      }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({
+          status: response.statusCode,
+          allow: response.headers.allow,
+          body,
+        }));
+      });
+      requestObject.once('error', reject);
+      requestObject.end();
+    });
+    const jobId = 'job_' + 'a'.repeat(24);
+    for (const [method, pathname, allow] of [
+      ['GET', '/api/phase3', 'POST'],
+      ['PUT', '/api/phase3', 'POST'],
+      ['POST', '/api/health', 'GET'],
+      ['POST', '/api/jobs', 'GET'],
+      ['POST', '/api/account-tests/models?accountId=1', 'GET'],
+      ['POST', '/api/jobs/' + jobId + '/reconciliation', 'GET'],
+      ['GET', '/api/jobs/' + jobId + '/reconciliation/acknowledge', 'POST'],
+      ['POST', '/app.js', 'GET'],
+    ]) {
+      const response = await issue(method, pathname);
+      assert.equal(response.status, 405, method + ' ' + pathname);
+      assert.equal(response.allow, allow, method + ' ' + pathname);
+      assert.equal(JSON.parse(response.body).error, 'method_not_allowed');
+    }
+    const unknown = await issue('PATCH', '/api/not-a-route');
+    assert.equal(unknown.status, 404);
+    assert.equal(unknown.allow, undefined);
+  } finally {
+    await closeHttpServer(server);
   }
 });
 
@@ -731,6 +847,11 @@ test('listen loopback exemption requires an unbracketed numeric loopback address
 });
 
 test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject aborted streams', async () => {
+  const assertBodyListenersReleased = (stream) => {
+    for (const event of ['data', 'end', 'aborted', 'error', 'close']) {
+      assert.equal(stream.listenerCount(event), 0, event + ' listener was not released');
+    }
+  };
   const requestStream = new EventEmitter();
   requestStream.setEncoding = () => { throw new Error('must retain raw request bytes'); };
   requestStream.resume = () => {};
@@ -739,6 +860,7 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   requestStream.emit('data', Buffer.from('"value"}'));
   requestStream.emit('end');
   assert.deepEqual(await parsedPromise, { part: 'value' });
+  assertBodyListenersReleased(requestStream);
 
   const splitUtf8Stream = new EventEmitter();
   splitUtf8Stream.resume = () => {};
@@ -749,6 +871,7 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   splitUtf8Stream.emit('data', splitUtf8Body.subarray(characterStart + 1));
   splitUtf8Stream.emit('end');
   assert.deepEqual(await splitUtf8Promise, { part: '值' });
+  assertBodyListenersReleased(splitUtf8Stream);
 
   const invalidUtf8Stream = new EventEmitter();
   invalidUtf8Stream.resume = () => {};
@@ -758,6 +881,7 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   invalidUtf8Stream.emit('data', Buffer.from('"}'));
   invalidUtf8Stream.emit('end');
   await assert.rejects(invalidUtf8Promise, (error) => error.code === 'INVALID_JSON_BODY');
+  assertBodyListenersReleased(invalidUtf8Stream);
 
   const byteLimitStream = new EventEmitter();
   byteLimitStream.resume = () => {};
@@ -765,6 +889,9 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   byteLimitStream.emit('data', Buffer.from('值'));
   byteLimitStream.emit('data', Buffer.from('a'));
   await assert.rejects(byteLimitPromise, (error) => error.code === 'REQUEST_BODY_TOO_LARGE');
+  assert.equal(byteLimitStream.listenerCount('data'), 0);
+  byteLimitStream.emit('end');
+  assertBodyListenersReleased(byteLimitStream);
 
   const abortedStream = new EventEmitter();
   abortedStream.resume = () => {};
@@ -772,6 +899,17 @@ test('JSON request bodies preserve raw bytes, decode UTF-8 strictly, and reject 
   abortedStream.emit('data', '{"partial":');
   abortedStream.emit('aborted');
   await assert.rejects(abortedPromise, (error) => error.code === 'REQUEST_ABORTED');
+  assert.equal(abortedStream.listenerCount('data'), 0);
+  abortedStream.emit('close');
+  assertBodyListenersReleased(abortedStream);
+
+  const streamError = new Error('request stream failed');
+  const failedStream = new EventEmitter();
+  failedStream.resume = () => {};
+  const failedPromise = readJsonBody(failedStream, 64);
+  failedStream.emit('error', streamError);
+  await assert.rejects(failedPromise, (error) => error === streamError);
+  assertBodyListenersReleased(failedStream);
 });
 
 test('client disconnect aborts an admitted mutation before durable enqueue or dispatch', async () => {

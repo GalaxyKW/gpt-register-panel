@@ -94,6 +94,15 @@ const JSON_BODY_ENDPOINTS = new Set([
   '/api/tokens/expired/delete',
   '/api/account-tests',
 ]);
+const GET_API_ENDPOINTS = new Set([
+  '/api/health',
+  '/api/snapshot',
+  '/api/account-tests/models',
+  '/api/tokens/expired',
+  '/api/jobs',
+  '/api/audit',
+  '/api/logs',
+]);
 const RECONCILIATION_ACK_RESOLUTION_SET = new Set(RECONCILIATION_ACK_RESOLUTIONS);
 const PHASE3_RECONCILIATION_SCOPES = new Set([
   'phase3_account_disposition',
@@ -790,12 +799,22 @@ function readJsonBody(request, limit = 1024 * 1024) {
     const chunks = [];
     let bodyBytes = 0;
     let settled = false;
-    const fail = (error) => {
+    const cleanup = () => {
+      request.removeListener('data', onData);
+      request.removeListener('end', onEnd);
+      request.removeListener('aborted', onAborted);
+      request.removeListener('error', onError);
+      request.removeListener('close', onClose);
+    };
+    const fail = (error, waitForStreamEnd = false) => {
       if (settled) return;
       settled = true;
+      chunks.length = 0;
+      request.removeListener('data', onData);
+      if (!waitForStreamEnd) cleanup();
       reject(error);
     };
-    request.on('data', (chunk) => {
+    function onData(chunk) {
       if (settled) return;
       // Keep the original octets until the complete body is available.
       // IncomingMessage#setEncoding uses a replacement character for malformed
@@ -806,14 +825,21 @@ function readJsonBody(request, limit = 1024 * 1024) {
       if (bodyBytes > limit) {
         const error = new Error('request body too large');
         error.code = 'REQUEST_BODY_TOO_LARGE';
-        fail(error);
+        // Keep only terminal/error listeners while the oversized request is
+        // drained. Removing the data listener releases buffered chunks, while
+        // retaining the error listener prevents a later socket reset from
+        // becoming an unhandled EventEmitter error.
+        fail(error, true);
         request.resume();
         return;
       }
       chunks.push(bytes);
-    });
-    request.on('end', () => {
-      if (settled) return;
+    }
+    function onEnd() {
+      if (settled) {
+        cleanup();
+        return;
+      }
       let body;
       try {
         body = new TextDecoder('utf-8', {
@@ -830,25 +856,45 @@ function readJsonBody(request, limit = 1024 * 1024) {
       }
       if (!body.trim()) {
         settled = true;
+        cleanup();
         resolve({});
         return;
       }
       try {
         const parsed = JSON.parse(body);
         settled = true;
+        cleanup();
         resolve(parsed);
       } catch {
         const error = new Error('invalid JSON body');
         error.code = 'INVALID_JSON_BODY';
         fail(error);
       }
-    });
-    request.on('aborted', () => {
+    }
+    function onAborted() {
       const error = new Error('request aborted');
       error.code = 'REQUEST_ABORTED';
-      fail(error);
-    });
-    request.on('error', fail);
+      // IncomingMessage can emit ECONNRESET after `aborted`; retain the error
+      // listener until its terminal `error`/`close` event.
+      fail(error, true);
+    }
+    function onError(error) {
+      if (!settled) fail(error);
+      cleanup();
+    }
+    function onClose() {
+      if (!settled) {
+        const error = new Error('request closed before body completed');
+        error.code = 'REQUEST_ABORTED';
+        fail(error);
+      }
+      cleanup();
+    }
+    request.on('data', onData);
+    request.once('end', onEnd);
+    request.once('aborted', onAborted);
+    request.once('error', onError);
+    request.once('close', onClose);
   });
 }
 
@@ -939,6 +985,14 @@ function reconciliationReviewPath(pathname) {
   try { jobId = decodeURIComponent(encoded); } catch {}
   if (!/^job_[a-f0-9]{24}$/.test(String(jobId || ''))) jobId = null;
   return { matched: true, jobId };
+}
+
+function allowedRequestMethod(pathname, reconciliationAck, reconciliationReview) {
+  if (JSON_BODY_ENDPOINTS.has(pathname) || reconciliationAck.matched) return 'POST';
+  if (GET_API_ENDPOINTS.has(pathname) || reconciliationReview.matched
+      || pathParam(pathname, '/api/jobs/')) return 'GET';
+  if (pathname === '/' || STATIC_ALLOWLIST.has(pathname)) return 'GET';
+  return null;
 }
 
 const HTTP_LOG_FIXED_PATHS = new Set([
@@ -2581,6 +2635,11 @@ function createServer(options = {}) {
       requestPath = requestLogPath(requestUrl.pathname);
       const reconciliationAckPath = reconciliationAcknowledgePath(requestUrl.pathname);
       const reconciliationReviewRoute = reconciliationReviewPath(requestUrl.pathname);
+      const allowedMethod = allowedRequestMethod(
+        requestUrl.pathname,
+        reconciliationAckPath,
+        reconciliationReviewRoute,
+      );
       if (jobManager.shuttingDown) {
         response.setHeader('connection', 'close');
         jsonResponse(response, 503, {
@@ -2589,7 +2648,6 @@ function createServer(options = {}) {
         });
         return;
       }
-      const isReadOnlyGet = request.method === 'GET';
       const requiresWrite = request.method === 'POST'
         && (reconciliationAckPath.matched
           || ['/api/sync/import', '/api/phase3', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
@@ -2609,6 +2667,21 @@ function createServer(options = {}) {
         jsonResponse(response, authError.status, authError);
         return;
       }
+      if (allowedMethod && request.method !== allowedMethod) {
+        writeLog(logger, 'warn', 'http.method_not_allowed', {
+          requestId,
+          actor,
+          method: request.method,
+          path: requestPath,
+          allowedMethod,
+        });
+        response.setHeader('allow', allowedMethod);
+        jsonResponse(response, 405, {
+          error: 'method_not_allowed',
+          message: '该接口只允许 ' + allowedMethod + ' 请求',
+        });
+        return;
+      }
       if (request.method === 'POST'
           && (JSON_BODY_ENDPOINTS.has(requestUrl.pathname) || reconciliationAckPath.matched)
           && !hasJsonContentType(request)) {
@@ -2624,29 +2697,6 @@ function createServer(options = {}) {
         });
         return;
       }
-      if (!isReadOnlyGet && request.method !== 'POST') {
-        writeLog(logger, 'warn', 'http.method_not_allowed', {
-          requestId,
-          actor,
-          method: request.method,
-          path: requestPath,
-        });
-        response.setHeader('allow', 'GET');
-        jsonResponse(response, 405, { error: 'read_only_endpoint' });
-        return;
-      }
-      if (!requestUrl.pathname.startsWith('/api/') && request.method !== 'GET') {
-        writeLog(logger, 'warn', 'http.static_method_not_allowed', {
-          requestId,
-          actor,
-          method: request.method,
-          path: requestPath,
-        });
-        response.setHeader('allow', 'GET');
-        jsonResponse(response, 405, { error: 'read_only_endpoint' });
-        return;
-      }
-
       // A mutating workflow without a writable audit sink would violate the
       // panel's recovery trail. Probe only after authentication and basic
       // method/content-type checks so unauthenticated traffic cannot amplify
@@ -3697,13 +3747,29 @@ function createServer(options = {}) {
       }
     }
   });
-  const requestTimeout = boundedEnvNumber('PANEL_HTTP_REQUEST_TIMEOUT_MS', 30_000, 1_000, 300_000);
-  server.requestTimeout = requestTimeout;
+  // Node's requestTimeout covers receipt of request headers/body; it is not a
+  // deadline for the asynchronous route handler after the body is complete.
+  // Long upstream/worker operations keep their own abortable timeouts.
+  const requestReceiveTimeout = boundedEnvNumber(
+    'PANEL_HTTP_REQUEST_TIMEOUT_MS',
+    30_000,
+    1_000,
+    300_000,
+  );
+  server.requestTimeout = requestReceiveTimeout;
   server.headersTimeout = Math.min(
-    requestTimeout,
+    requestReceiveTimeout,
     boundedEnvNumber('PANEL_HTTP_HEADERS_TIMEOUT_MS', 15_000, 1_000, 120_000),
   );
   server.keepAliveTimeout = boundedEnvNumber('PANEL_HTTP_KEEP_ALIVE_TIMEOUT_MS', 5_000, 1_000, 60_000);
+  // Node checks headersTimeout/requestTimeout on a periodic sweep whose
+  // default is 30 seconds. Without tightening that interval, a configured
+  // 1-second boundary can remain open for roughly 30 seconds.
+  server.connectionsCheckingInterval = Math.min(
+    1_000,
+    server.headersTimeout,
+    server.requestTimeout,
+  );
   server.maxHeadersCount = boundedEnvNumber('PANEL_HTTP_MAX_HEADERS', 100, 16, 1_000);
   server.maxRequestsPerSocket = boundedEnvNumber('PANEL_HTTP_MAX_REQUESTS_PER_SOCKET', 100, 1, 10_000);
   server.panelLogger = logger;
