@@ -568,8 +568,11 @@ function aggregateIdentityKeys(records = []) {
   return keys;
 }
 
-function candidateIdentityKey(records, selected) {
-  const keys = aggregateIdentityKeys(records);
+function candidateIdentityKey(selected) {
+  // Audit/link keys must describe the credential version that can actually be
+  // written. An older copy may contribute useful conflict evidence, but must
+  // never lend its account/user identity to the selected winner.
+  const keys = aggregateIdentityKeys([selected]);
   // A ChatGPT user can belong to multiple workspaces. Prefer user ID for the
   // candidate key so two members of the same workspace are not collapsed.
   return keys.find((key) => key.startsWith('user:'))
@@ -641,14 +644,19 @@ function collectCandidates(sources, options = {}) {
     const recordsByFreshness = [...groupRecords];
     recordsByFreshness.sort((left, right) => compareTokenRecordFreshness(left, right, nowMs));
     const selected = recordsByFreshness[0];
-    const sourceIdentityKeys = aggregateIdentityKeys(groupRecords);
-    const summary = identitySummary(sourceIdentityKeys);
-    const identityKey = candidateIdentityKey(groupRecords, selected);
+    const sourceIdentityKeys = aggregateIdentityKeys([selected]);
+    const groupIdentityKeys = aggregateIdentityKeys(groupRecords);
+    const summary = identitySummary(groupIdentityKeys);
+    const identityKey = candidateIdentityKey(selected);
     const identityConflict = summary.account.size > 1 || summary.user.size > 1;
     const candidate = {
       key: candidateKey(selected),
       identityKey,
       sourceIdentityKeys,
+      // This aggregate is deliberately diagnostic-only. It may make an
+      // otherwise actionable mapping fail closed, but no account match,
+      // payload field or post-write verification may be authorized by it.
+      groupIdentityKeys,
       record: selected,
       duplicates: groupRecords.length > 1,
       // Different fingerprints are normal when a token was refreshed. The
@@ -686,8 +694,8 @@ function collectCandidates(sources, options = {}) {
         const right = bucket[rightIndex];
         const comparable = (left._identitySummary.account.size > 0 && right._identitySummary.account.size > 0)
           || (left._identitySummary.user.size > 0 && right._identitySummary.user.size > 0);
-        if (!comparable && hasStrongIdentity(left.sourceIdentityKeys)
-            && hasStrongIdentity(right.sourceIdentityKeys)) {
+        if (!comparable && hasStrongIdentity(left.groupIdentityKeys)
+            && hasStrongIdentity(right.groupIdentityKeys)) {
           markIdentityConflict(left, 'incomparable_strong_identity');
           markIdentityConflict(right, 'incomparable_strong_identity');
         }
@@ -986,11 +994,27 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   assertImportSelectionCovered(candidates, selectedKeys);
   const entries = candidates.map((candidate) => {
     const matches = accountMatches(candidate, accounts);
+    const matchedAccount = matches.length === 1 ? matches[0] : null;
+    const accountIdentity = matchedAccount
+      ? (matchedAccount.identityKeys?.length
+        ? matchedAccount.identityKeys
+        : accountKeys(matchedAccount))
+      : [];
+    // Aggregated identities can only tighten the decision. For example, if
+    // an old complete token knows A/U while the winner and remote expose
+    // only A, keep the existing fail-closed behavior without allowing the
+    // old U value to authorize an A/U update.
+    const groupIdentityAmbiguous = Boolean(matchedAccount
+      && !strongIdentitiesFullyMatch(candidate.groupIdentityKeys || [], accountIdentity));
     return {
       candidate,
       matches,
       ambiguousHints: matches.length === 0 ? ambiguousAccountHints(candidate, accounts) : [],
-      account: matches.length === 1 ? matches[0] : null,
+      // Do not retain an operational target for an aggregate-only match. The
+      // matched row remains visible through `matches` solely as diagnostic
+      // evidence for the conflict reason.
+      account: groupIdentityAmbiguous ? null : matchedAccount,
+      groupIdentityAmbiguous,
     };
   });
   const entriesByAccount = new Map();
@@ -1005,8 +1029,8 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
     const contradictory = bucket.some((left, leftIndex) => bucket.some((right, rightIndex) => (
       rightIndex > leftIndex
         && strongIdentityContradiction(
-          left.candidate.sourceIdentityKeys,
-          right.candidate.sourceIdentityKeys,
+          left.candidate.groupIdentityKeys,
+          right.candidate.groupIdentityKeys,
         )
     )));
     // A remote row that omits one strong-ID dimension can otherwise make two
@@ -1056,7 +1080,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
     } else if (ambiguousHints.length > 0) {
       action = 'conflict';
       reason = 'ambiguous_sub2api_identity';
-    } else if (entry.remoteIdentityAmbiguous) {
+    } else if (entry.remoteIdentityAmbiguous || entry.groupIdentityAmbiguous) {
       action = 'conflict';
       reason = 'ambiguous_sub2api_identity';
     } else if (account) {
@@ -1520,11 +1544,10 @@ function verifiedIdentityValue(item, recordKey, prefix) {
   if (recordValue) return recordValue;
   const sourceValues = identityValues(item?.sourceIdentityKeys || [], prefix);
   if (sourceValues.size === 1) return [...sourceValues][0];
-  const account = item?._verifiedAccount || item?._account;
-  const directValue = sourceCredentialValue(account || {}, recordKey, recordKey, 512);
-  if (directValue) return directValue;
-  const values = identityValues(account?.identityKeys || accountKeys(account), prefix);
-  return values.size === 1 ? [...values][0] : '';
+  // A remote target and an older grouped token are verification evidence, not
+  // sources for a winner's credential document. Omitting an unproven field is
+  // safer than copying a stale account/user ID into the new OAuth material.
+  return '';
 }
 
 function credentialFingerprintExtra(raw) {
@@ -1702,8 +1725,9 @@ function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
   return record;
 }
 
-async function preflightUpdateAccount(client, item, nowMs = Date.now(), options = {}) {
+async function preflightUpdateAccount(client, item, options = {}) {
   const signal = options.signal;
+  const now = typeof options.now === 'function' ? options.now : Date.now;
   throwIfJobInterrupted(signal);
   const expectedId = Number(item?.accountId);
   if (!Number.isSafeInteger(expectedId) || expectedId <= 0) {
@@ -1713,6 +1737,14 @@ async function preflightUpdateAccount(client, item, nowMs = Date.now(), options 
   throwIfJobInterrupted(signal);
   verifyTargetIdentity(item, account, expectedId);
   verifyPlannedTargetIdentity(item, account);
+  // Evaluate transient scheduler state only after the remote read completes.
+  // A reset/overload window can expire while GET is in flight; using a
+  // timestamp captured before the await can overwrite an account that is
+  // already available by the time its response arrives.
+  const nowMs = Number(now());
+  if (!Number.isFinite(nowMs)) {
+    throw targetVerificationError('无法安全确认当前时间', 'CURRENT_TIME_INVALID');
+  }
   const availability = getAccountAvailability(account, nowMs);
   if (availability.key !== 'unavailable') {
     return { account, skipReason: availability.reason || 'sub2api_availability_unknown' };
@@ -1824,12 +1856,13 @@ async function executeImportPlanItem({
   context = {},
   sourceRoot = null,
   signal = null,
+  now = Date.now,
 }) {
   throwIfJobInterrupted(signal);
   if (item.action === 'update') {
     let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot) : null;
     throwIfJobInterrupted(signal);
-    let preflight = await preflightUpdateAccount(client, item, Date.now(), { signal });
+    let preflight = await preflightUpdateAccount(client, item, { signal, now });
     if (preflight.skipReason) {
       return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
     }
@@ -1840,7 +1873,7 @@ async function executeImportPlanItem({
       // strong-identity and availability check of the remote target.
       freshRecord = revalidateSourceToken(item, sourceRoot);
       throwIfJobInterrupted(signal);
-      preflight = await preflightUpdateAccount(client, item, Date.now(), { signal });
+      preflight = await preflightUpdateAccount(client, item, { signal, now });
       if (preflight.skipReason) {
         return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
       }

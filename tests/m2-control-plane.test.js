@@ -3283,16 +3283,81 @@ test('aggregated source dimensions do not authorize an update to a partial remot
     identityKeys: ['account:aggregate-account'],
     tokenFingerprints: { access: 'remote-old-fingerprint' },
   };
-  const plan = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [before]);
-  assert.equal(plan.length, 1);
-  assert.equal(plan[0].relativePath, freshest.relativePath);
-  assert.deepEqual(plan[0].sourceIdentityKeys, [
+  const candidate = collectCandidates({ tokens: [freshest, older] })[0];
+  assert.deepEqual(candidate.sourceIdentityKeys, ['account:aggregate-account']);
+  assert.deepEqual(candidate.groupIdentityKeys, [
     'account:aggregate-account',
     'user:aggregate-user',
   ]);
+  const plan = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [before]);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].relativePath, freshest.relativePath);
+  assert.deepEqual(plan[0].sourceIdentityKeys, ['account:aggregate-account']);
   assert.equal(plan[0].action, 'conflict');
   assert.equal(plan[0].reason, 'ambiguous_sub2api_identity');
   assert.equal(plan[0].accountId, null);
+
+  const payload = buildOAuthUpdatePayload({ ...plan[0], _verifiedAccount: before });
+  assert.equal(payload.credentials.chatgpt_account_id, 'aggregate-account');
+  assert.equal(Object.hasOwn(payload.credentials, 'chatgpt_user_id'), false);
+});
+
+test('an older token cannot lend a missing strong identity to the freshest winner', () => {
+  const freshest = syntheticToken(
+    'tokens/freshest-user-only.json',
+    ['user:winner-user'],
+    {
+      userId: 'winner-user',
+      accessFingerprint: 'winner-new-fingerprint',
+      accessToken: 'winner-test-access',
+      mtimeMs: 20,
+    },
+  );
+  const older = syntheticToken(
+    'use_token/older-workspace.json',
+    ['account:old-workspace', 'user:winner-user'],
+    {
+      source: 'use_token',
+      accountId: 'old-workspace',
+      userId: 'winner-user',
+      accessFingerprint: 'older-fingerprint',
+      mtimeMs: 10,
+    },
+  );
+  const remote = {
+    id: 124,
+    name: 'free00124',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    accountId: 'old-workspace',
+    userId: 'winner-user',
+    identityKeys: ['account:old-workspace', 'user:winner-user'],
+    tokenFingerprints: { access: 'remote-fingerprint' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+  };
+
+  const candidate = collectCandidates({ tokens: [freshest, older] })[0];
+  assert.deepEqual(candidate.sourceIdentityKeys, ['user:winner-user']);
+  assert.deepEqual(candidate.groupIdentityKeys, [
+    'account:old-workspace',
+    'user:winner-user',
+  ]);
+  assert.equal(candidate.identityKey, 'user:winner-user');
+
+  const item = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [remote])[0];
+  assert.equal(item.relativePath, freshest.relativePath);
+  assert.equal(item.action, 'conflict');
+  assert.equal(item.reason, 'ambiguous_sub2api_identity');
+  assert.equal(item.accountId, null);
+
+  const payload = buildOAuthUpdatePayload({ ...item, _verifiedAccount: remote });
+  assert.equal(Object.hasOwn(payload.credentials, 'chatgpt_account_id'), false);
+  assert.equal(payload.credentials.chatgpt_user_id, 'winner-user');
 });
 
 test('source token changes after remote preflight block every mutation', async () => {
@@ -3387,6 +3452,68 @@ test('final remote preflight skips a target that becomes available before mutati
   });
   assert.equal(reads, 2);
   assert.equal(mutations, 0);
+  assert.equal(outcome.skipped, true);
+  assert.equal(outcome.reason, 'sub2api_available');
+});
+
+test('update preflight evaluates transient availability after the account GET resolves', async () => {
+  const beforeReset = Date.parse('2030-01-01T00:00:00.000Z');
+  const resetAt = '2030-01-01T00:00:01.000Z';
+  const afterReset = Date.parse('2030-01-01T00:00:02.000Z');
+  let currentTime = beforeReset;
+  const identityKeys = ['account:clock-account', 'user:clock-user'];
+  const source = syntheticToken('tokens/clock.json', identityKeys, {
+    accountId: 'clock-account',
+    userId: 'clock-user',
+    accessFingerprint: 'clock-new-fingerprint',
+    accessToken: 'clock-test-access',
+  });
+  const planned = {
+    id: 125,
+    name: 'free00125',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    identityKeys,
+    tokenFingerprints: { access: 'clock-old-fingerprint' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+  };
+  const current = {
+    ...planned,
+    status: 'active',
+    schedulable: true,
+    rateLimitResetAt: resetAt,
+    rateLimitResetStatus: 'valid',
+  };
+  const afterWrite = {
+    ...current,
+    tokenFingerprints: { access: source.fingerprints.access },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [planned])[0];
+  assert.equal(item.action, 'update');
+  let reads = 0;
+  let writes = 0;
+  const outcome = await executeImportPlanItem({
+    item,
+    now: () => currentTime,
+    client: {
+      async getAccount() {
+        reads += 1;
+        if (reads === 1) {
+          currentTime = afterReset;
+          return current;
+        }
+        return afterWrite;
+      },
+      async applyOAuthCredentials() { writes += 1; },
+    },
+  });
+  assert.equal(reads, 1);
+  assert.equal(writes, 0);
   assert.equal(outcome.skipped, true);
   assert.equal(outcome.reason, 'sub2api_available');
 });
