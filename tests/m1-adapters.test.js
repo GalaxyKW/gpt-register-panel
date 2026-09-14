@@ -789,6 +789,45 @@ test('Sub2API account listing follows server-capped pages and rejects incomplete
   );
 });
 
+test('Sub2API account exports require a complete supported backup envelope', async () => {
+  const client = new Sub2ApiAdminClient({ baseUrl: 'http://127.0.0.1:8080', apiKey: 'test-key' });
+  const validPayloads = [
+    { accounts: [], proxies: [] },
+    { type: '', version: 0, accounts: [], proxies: [] },
+    { type: 'sub2api-data', version: 1, accounts: [{}], proxies: [{}] },
+    { type: 'sub2api-bundle', version: 1, accounts: [], proxies: [] },
+  ];
+  for (const payload of validPayloads) {
+    client.request = async () => payload;
+    assert.equal(await client.exportAccounts(), payload);
+  }
+
+  const secretMarker = 'Bearer export-response-must-not-leak';
+  const invalidPayloads = [
+    null,
+    [],
+    {},
+    { accounts: [] },
+    { proxies: [] },
+    { accounts: {}, proxies: [] },
+    { accounts: [], proxies: {} },
+    { accounts: [], proxies: [], type: secretMarker },
+    { accounts: [], proxies: [], type: null },
+    { accounts: [], proxies: [], version: 2 },
+    { accounts: [], proxies: [], version: '1' },
+    new Date(),
+    Object.assign(Object.create(null), { accounts: [], proxies: [] }),
+  ];
+  for (const payload of invalidPayloads) {
+    client.request = async () => payload;
+    await assert.rejects(
+      client.exportAccounts(),
+      (error) => error.code === 'SUB2API_EXPORT_SCHEMA_INVALID'
+        && !error.message.includes(secretMarker),
+    );
+  }
+});
+
 test('safe accounts preserve unknown status and malformed expiry metadata', () => {
   const safe = safeAccount({
     id: 22,

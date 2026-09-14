@@ -11,6 +11,31 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
 const DEFAULT_TEST_TIMEOUT_MS = 120000;
 const MAX_TEST_TIMEOUT_MS = 600000;
+const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
+const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  try {
+    return Object.getPrototypeOf(value) === Object.prototype;
+  } catch {
+    return false;
+  }
+}
+
+function isValidExportPayload(value) {
+  if (!isPlainObject(value)) return false;
+  if (!Object.prototype.hasOwnProperty.call(value, 'accounts')
+      || !Array.isArray(value.accounts)) return false;
+  if (!Object.prototype.hasOwnProperty.call(value, 'proxies')
+      || !Array.isArray(value.proxies)) return false;
+  if (Object.prototype.hasOwnProperty.call(value, 'type')
+      && (typeof value.type !== 'string' || !SUB2API_EXPORT_TYPES.has(value.type))) return false;
+  if (Object.prototype.hasOwnProperty.call(value, 'version')
+      && (!Number.isSafeInteger(value.version)
+        || !SUB2API_EXPORT_VERSIONS.has(value.version))) return false;
+  return true;
+}
 
 function asList(value) {
   if (Array.isArray(value)) return value;
@@ -1256,7 +1281,7 @@ class Sub2ApiAdminClient {
       undefined,
       { signal: options.signal },
     );
-    if (!value || typeof value !== 'object') {
+    if (!isValidExportPayload(value)) {
       const error = new Error('Sub2API 导出响应结构无效');
       error.code = 'SUB2API_EXPORT_SCHEMA_INVALID';
       throw error;
