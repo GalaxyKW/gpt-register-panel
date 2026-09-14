@@ -15,8 +15,8 @@ const {
   normalizeTableUsageStats,
 } = require('../backend/adapters/sub2apiAdmin');
 const { buildDiff } = require('../backend/diff');
-const { buildRows, rowFromDiffItem } = require('../backend/view');
-const { buildImportPlan } = require('../backend/sync');
+const { buildRows, filterRows, rowFromDiffItem } = require('../backend/view');
+const { buildImportPlan, buildSnapshot } = require('../backend/sync');
 
 function makeJwt(payload) {
   return [
@@ -401,6 +401,124 @@ test('partial remote identities cannot collapse distinct source rows onto one se
   assert.equal(remoteOnlyRows.length, 1);
   assert.equal(remoteOnlyRows[0].key, 'account:266');
   assert.equal(remoteOnlyRows[0].accountId, 266);
+});
+
+test('token rows join one username phone without changing sync identity', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/email-only.json',
+    fileName: 'email-only.json',
+    email: ' Source@Example.test ',
+    parseStatus: 'ok',
+    expiryStatus: 'missing',
+    identityKeys: ['email:source@example.test'],
+    fingerprints: { access: tokenFingerprint('synthetic-access') },
+    raw: {},
+  };
+  const usernames = [{
+    email: 'source@example.test',
+    phone: '+86 138-0013-8000',
+    hasPassword: true,
+    status: 'oauth_done',
+  }];
+  const rows = buildRows({
+    items: [{ kind: 'token_only', token, account: null, issues: [] }],
+  }, { usernames });
+
+  assert.equal(rows[0].usernameMatch, 'unique');
+  assert.equal(rows[0].phone, '+86 138-0013-8000');
+  assert.equal(rows[0].phase3Email, 'source@example.test');
+  assert.equal(rows[0].phase3Eligible, true);
+  assert.deepEqual(filterRows(rows, { search: '13800138000' }).map((row) => row.key), [rows[0].key]);
+  assert.equal(Object.prototype.hasOwnProperty.call(rows[0], 'identityKeys'), false);
+
+  const plan = buildImportPlan({ tokens: [token], usernames }, [], [rows[0].key]);
+  assert.equal(plan.length, 1);
+  assert.equal(plan[0].action, 'conflict');
+  assert.equal(plan[0].reason, 'source_identity_insufficient');
+});
+
+test('username phone joins fail closed for ambiguous, missing, passwordless, and terminal accounts', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/phase3.json',
+    fileName: 'phase3.json',
+    email: 'phase3@example.test',
+    identityKeys: ['account:workspace-one', 'email:phase3@example.test'],
+    fingerprints: {},
+  };
+  const item = { kind: 'token_only', token, account: null, issues: [] };
+  const rowFor = (usernames) => buildRows({ items: [item] }, { usernames })[0];
+
+  const ambiguous = rowFor([
+    { email: token.email, phone: '15550000001', hasPassword: true, status: 'oauth_done' },
+    { email: token.email.toUpperCase(), phone: '15550000002', hasPassword: true, status: 'oauth_done' },
+  ]);
+  assert.equal(ambiguous.usernameMatch, 'ambiguous');
+  assert.equal(ambiguous.phone, '');
+  assert.equal(ambiguous.phase3Eligible, false);
+  assert.equal(ambiguous.phase3Reason, 'username_ambiguous');
+
+  const missing = rowFor([]);
+  assert.equal(missing.usernameMatch, 'missing');
+  assert.equal(missing.phase3Eligible, false);
+  assert.equal(missing.phase3Reason, 'username_missing');
+
+  const passwordless = rowFor([{
+    email: token.email,
+    phone: '15550000003',
+    hasPassword: false,
+    status: 'oauth_done',
+  }]);
+  assert.equal(passwordless.phone, '15550000003');
+  assert.equal(passwordless.phase3Eligible, false);
+  assert.equal(passwordless.phase3Reason, 'username_password_missing');
+
+  for (const status of ['account_deleted', 'account_deactivated', 'account_disabled']) {
+    const terminal = rowFor([{ email: token.email, hasPassword: true, status }]);
+    assert.equal(terminal.phase3Eligible, false);
+    assert.equal(terminal.phase3Reason, 'username_terminal');
+  }
+});
+
+test('remote-only rows never inherit username phone by email', () => {
+  const rows = buildRows({
+    items: [{
+      kind: 'sub2api_only',
+      token: null,
+      account: { id: 8, email: 'shared@example.test', status: 'error' },
+      issues: [],
+    }],
+  }, {
+    usernames: [{
+      email: 'shared@example.test',
+      phone: '15550000008',
+      hasPassword: true,
+      status: 'oauth_done',
+    }],
+  });
+  assert.equal(rows[0].phone, '');
+  assert.equal(rows[0].phase3Email, '');
+  assert.equal(rows[0].phase3Eligible, false);
+  assert.equal(rows[0].usernameMatch, 'not_applicable');
+});
+
+test('snapshot rows receive safe username phone and Phase3 eligibility', async () => {
+  const fixture = fixtureRoot();
+  fs.writeFileSync(path.join(fixture.root, 'username.json'), JSON.stringify([{
+    email: 'example@email.test',
+    phone: '+86 138-0013-8000',
+    password: 'fixture-only',
+    status: 'oauth_done',
+  }]));
+  const snapshot = await buildSnapshot(new URLSearchParams(), {
+    rootDirectory: fixture.root,
+    readSub2Api: false,
+  });
+  const row = snapshot.rows.find((item) => item.fileName === 'b.json');
+  assert.equal(row.phone, '+86 138-0013-8000');
+  assert.equal(row.phase3Email, 'example@email.test');
+  assert.equal(row.phase3Eligible, true);
 });
 
 test('classifies old_codex files as hidden historical backups', () => {

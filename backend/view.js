@@ -1,8 +1,94 @@
 const { getAccountAvailability } = require('./accountAvailability');
+const { normalizeEmail } = require('./lib/token');
 
-function rowFromDiffItem(item) {
+const TERMINAL_USERNAME_STATUSES = new Set([
+  'account_deactivated',
+  'account_deleted',
+  'account_disabled',
+]);
+
+function buildUsernameIndex(usernames = []) {
+  const index = new Map();
+  if (!Array.isArray(usernames)) return index;
+  for (const record of usernames) {
+    const email = normalizeEmail(record?.email);
+    if (!email) continue;
+    const matches = index.get(email) || [];
+    // Only uniqueness matters. Keeping at most two records also bounds the
+    // per-email memory cost for a malformed username.json full of duplicates.
+    if (matches.length < 2) matches.push(record);
+    index.set(email, matches);
+  }
+  return index;
+}
+
+function usernameAssociation(token, usernameIndex) {
+  if (!token) {
+    return {
+      phone: '',
+      phase3Email: '',
+      phase3Eligible: false,
+      phase3Reason: 'token_missing',
+      usernameMatch: 'not_applicable',
+    };
+  }
+  const email = normalizeEmail(token.email);
+  const matches = email ? (usernameIndex.get(email) || []) : [];
+  if (matches.length === 0) {
+    return {
+      phone: '',
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_missing',
+      usernameMatch: 'missing',
+    };
+  }
+  if (matches.length !== 1) {
+    return {
+      phone: '',
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_ambiguous',
+      usernameMatch: 'ambiguous',
+    };
+  }
+  const username = matches[0];
+  const phone = String(username?.phone || '').trim();
+  const status = String(username?.status || '').trim().toLowerCase();
+  if (username?.hasPassword !== true) {
+    return {
+      phone,
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_password_missing',
+      usernameMatch: 'unique',
+    };
+  }
+  if (TERMINAL_USERNAME_STATUSES.has(status)) {
+    return {
+      phone,
+      phase3Email: email,
+      phase3Eligible: false,
+      phase3Reason: 'username_terminal',
+      usernameMatch: 'unique',
+    };
+  }
+  return {
+    phone,
+    phase3Email: email,
+    phase3Eligible: true,
+    phase3Reason: null,
+    usernameMatch: 'unique',
+  };
+}
+
+function rowFromDiffItem(item, options = {}) {
   const token = item.token;
   const account = item.account;
+  const usernameIndex = options.usernameIndex instanceof Map
+    ? options.usernameIndex
+    : buildUsernameIndex(options.usernames);
+  const username = usernameAssociation(token, usernameIndex);
   const source = token ? token.source : 'sub2api';
   const availability = item?.availability
     ? { key: item.availability, reason: item.availabilityReason || null }
@@ -18,6 +104,11 @@ function rowFromDiffItem(item) {
     accountId: account?.id ?? null,
     accountName: account?.name || '',
     email: account?.email || token?.email || '',
+    phone: username.phone,
+    phase3Email: username.phase3Email,
+    phase3Eligible: username.phase3Eligible,
+    phase3Reason: username.phase3Reason,
+    usernameMatch: username.usernameMatch,
     userId: account?.userId || token?.userId || '',
     chatgptAccountId: account?.accountId || token?.accountId || '',
     platform: account?.platform || '',
@@ -44,8 +135,10 @@ function rowFromDiffItem(item) {
   };
 }
 
-function buildRows(diff) {
-  return (diff?.items || []).map(rowFromDiffItem).sort((left, right) => {
+function buildRows(diff, options = {}) {
+  const usernameIndex = buildUsernameIndex(options.usernames);
+  const rowOptions = { ...options, usernameIndex };
+  return (diff?.items || []).map((item) => rowFromDiffItem(item, rowOptions)).sort((left, right) => {
     const leftName = left.accountName || left.email || left.fileName || '';
     const rightName = right.accountName || right.email || right.fileName || '';
     return leftName.localeCompare(rightName, 'zh-CN', { numeric: true, sensitivity: 'base' });
@@ -58,20 +151,25 @@ function filterRows(rows, filters = {}) {
   const source = String(filters.source || '').trim();
   const diffKind = String(filters.diffKind || '').trim();
   const availability = String(filters.availability || '').trim();
+  const phoneSearch = /^[+\d\s().-]+$/.test(search) ? search.replace(/[^0-9]/g, '') : '';
   return rows.filter((row) => {
     if (status && row.status !== status) return false;
     if (source && row.source !== source) return false;
     if (diffKind && row.diffKind !== diffKind) return false;
     if (availability && row.availability !== availability) return false;
     if (!search) return true;
-    return [
+    const textMatch = [
       row.accountName,
       row.email,
+      row.phone,
       row.chatgptAccountId,
       row.userId,
       row.fileName,
       row.relativePath,
     ].some((value) => String(value || '').toLowerCase().includes(search));
+    const phoneMatch = phoneSearch
+      && String(row.phone || '').replace(/[^0-9]/g, '').includes(phoneSearch);
+    return textMatch || Boolean(phoneMatch);
   });
 }
 

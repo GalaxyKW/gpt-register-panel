@@ -664,6 +664,101 @@ test('frontend account search includes phone numbers', () => {
   assert.deepEqual([...context.result], ['phone']);
 });
 
+test('frontend Phase3 uses the token email plus uniquely joined phone and rejects explicit ineligibility', () => {
+  const reasonContract = sourceSection('function phase3ReasonLabel', 'function effectivePlanAction');
+  const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
+  const context = {};
+  vm.runInNewContext(reasonContract + '\n' + targetContract + `
+    const eligible = {
+      key: 'eligible',
+      email: 'stale-remote@example.test',
+      phase3Email: 'source-token@example.test',
+      phone: '+86 138-0013-8000',
+      phase3Eligible: true,
+    };
+    const rejected = {
+      key: 'ambiguous',
+      email: 'ambiguous@example.test',
+      phase3Email: 'ambiguous@example.test',
+      phase3Eligible: false,
+      phase3Reason: 'username_ambiguous',
+    };
+    result = {
+      eligible: phase3TargetsFromRows([eligible]),
+      rejected: phase3TargetsFromRows([rejected]),
+      rejectedProblem: phase3SelectionProblem([rejected], 1),
+      legacy: phase3TargetsFromRows([{
+        key: 'legacy',
+        source: 'tokens',
+        email: 'legacy@example.test',
+      }]),
+      legacyRemote: phase3TargetsFromRows([{
+        key: 'legacy-remote',
+        source: 'sub2api',
+        email: 'remote-only@example.test',
+      }]),
+      malformedEligibility: phase3TargetsFromRows([{
+        key: 'malformed',
+        source: 'tokens',
+        email: 'malformed@example.test',
+        phase3Eligible: null,
+      }]),
+    };
+  `, context);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.result.eligible)), [{
+    email: 'source-token@example.test',
+    phone: '8613800138000',
+    selectedKey: 'eligible',
+  }]);
+  assert.deepEqual([...context.result.rejected], []);
+  assert.match(context.result.rejectedProblem, /匹配到多个账号/);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.result.legacy)), [{
+    email: 'legacy@example.test',
+    phone: '',
+    selectedKey: 'legacy',
+  }]);
+  assert.deepEqual([...context.result.legacyRemote], []);
+  assert.deepEqual([...context.result.malformedEligibility], []);
+});
+
+test('frontend disables Phase3 and explains a backend-rejected selected row', () => {
+  const reasonContract = sourceSection('function phase3ReasonLabel', 'function effectivePlanAction');
+  const targetContract = sourceSection('function selectedRowsFromView', 'function invalidatePlan');
+  const updateContract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  const context = {
+    state: {
+      selected: new Set(['row-one']),
+      snapshot: {
+        readOnly: false,
+        rows: [{
+          key: 'row-one',
+          phase3Email: 'source@example.test',
+          phase3Eligible: false,
+          phase3Reason: 'username_password_missing',
+        }],
+      },
+    },
+    elements: {
+      phase3Button: {},
+      accountTestButton: null,
+      clearSelectionButton: {},
+      selectAll: {},
+      previewButton: {},
+      cleanupButton: {},
+    },
+    document: { querySelectorAll: () => [] },
+    accountTestRows: () => [],
+    actionsLocked: () => false,
+    updateImportButtonState() {},
+    comparisonAvailable: () => true,
+  };
+  vm.runInNewContext(reasonContract + '\n' + targetContract + '\n' + updateContract
+    + '\nupdateActionState(); result = { disabled: elements.phase3Button.disabled, title: elements.phase3Button.title };', context);
+  assert.equal(context.result.disabled, true);
+  assert.match(context.result.title, /缺少密码/);
+  assert.match(source, /Phase 3：.*phase3ReasonLabel/);
+});
+
 test('frontend administrator credential uses an origin-labelled password dialog', () => {
   assert.match(htmlSource, /<dialog id="adminTokenDialog"[^>]*aria-labelledby="adminTokenTitle"/);
   assert.match(htmlSource, /<input id="adminTokenInput"[^>]*type="password"[^>]*required>/);

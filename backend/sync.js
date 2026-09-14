@@ -283,7 +283,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       includeHistorical: query.get('includeHistorical') === '1',
       sub2apiReadStatus: readStatus,
     });
-    const allRows = buildRows(diff);
+    const allRows = buildRows(diff, { usernames: sources.usernames });
     const rows = filterRows(allRows, {
       search: query.get('search'),
       status: query.get('status'),

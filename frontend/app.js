@@ -189,6 +189,16 @@ function actionReasonLabel(reason) {
   }[reason] || reason || '-';
 }
 
+function phase3ReasonLabel(reason) {
+  return {
+    token_missing: '该行仅来自 Sub2API，缺少对应 token 文件',
+    username_missing: 'token 邮箱在 username.json 中没有对应账号',
+    username_ambiguous: 'token 邮箱在 username.json 中匹配到多个账号',
+    username_password_missing: 'username.json 对应账号缺少密码',
+    username_terminal: 'username.json 对应账号已删除、停用或禁用',
+  }[reason] || '该账号不符合 Phase 3 条件';
+}
+
 function effectivePlanAction(item) {
   return item?.action === 'conflict' || item?.conflictingVersions === true
     ? 'conflict'
@@ -522,11 +532,28 @@ function selectedRowsFromSelection() {
   return (state.snapshot?.rows || []).filter((row) => state.selected.has(row.key));
 }
 
+function phase3EmailFromRow(row) {
+  const value = Object.prototype.hasOwnProperty.call(row || {}, 'phase3Email')
+    ? row.phase3Email
+    : row?.email;
+  return String(value || '').trim().toLowerCase();
+}
+
+function phase3RowRejected(row) {
+  if (Object.prototype.hasOwnProperty.call(row || {}, 'phase3Eligible')) {
+    return row.phase3Eligible !== true;
+  }
+  return !['tokens', 'use_token'].includes(String(row?.source || ''));
+}
+
 function phase3TargetsFromRows(rows) {
   const targets = [];
   const seen = new Set();
   for (const row of rows || []) {
-    const email = String(row.email || '').trim().toLowerCase();
+    // Old snapshots did not expose phase3Eligible/phase3Email. Keep their
+    // email-only behavior only for rows that still prove a local token source.
+    if (phase3RowRejected(row)) continue;
+    const email = phase3EmailFromRow(row);
     const phone = String(row.phone || '').trim();
     if (!email && !phone) continue;
     const phoneKey = phone.replace(/[^0-9]/g, '');
@@ -536,6 +563,17 @@ function phase3TargetsFromRows(rows) {
     targets.push({ email: email || '', phone: phoneKey || phone || '', selectedKey: row.key });
   }
   return targets;
+}
+
+function phase3SelectionProblem(rows, selectedCount) {
+  if (selectedCount === 0) return '请至少选择一个账号';
+  if (rows.length !== selectedCount) return '所选账号已不在当前快照中，请刷新后重选';
+  const rejected = rows.find(phase3RowRejected);
+  if (rejected) return phase3ReasonLabel(rejected.phase3Reason || 'token_missing');
+  const missingTarget = rows.some((row) => (
+    !phase3EmailFromRow(row) && !String(row?.phone || '').trim()
+  ));
+  return missingTarget ? '所选账号缺少可用于 Phase 3 的邮箱或手机号' : '';
 }
 
 function invalidatePlan() {
@@ -573,10 +611,13 @@ function renderRows() {
     const displayName = row.accountName || row.fileName || '(未命名)';
     const issueText = row.issues?.length ? ' title="' + escapeHtml(row.issues.join(', ')) + '"' : '';
     const usageTitle = row.usageError ? ' title="' + escapeHtml(row.usageError) + '"' : '';
+    const phase3Note = row.phase3Eligible === false
+      ? '<small class="availability-note">Phase 3：' + escapeHtml(phase3ReasonLabel(row.phase3Reason)) + '</small>'
+      : (row.phone ? '<small>手机号 ' + escapeHtml(row.phone) + '</small>' : '');
     return '<tr class="' + (state.selected.has(row.key) ? 'is-selected' : '') + '">'
       + '<td class="check-col"><input class="row-check" data-key="' + escapeHtml(row.key) + '" type="checkbox" aria-label="选择 ' + escapeHtml(displayName) + '"' + checked + checkboxDisabled + '></td>'
       + '<td><strong>' + escapeHtml(displayName) + '</strong><small>' + escapeHtml(row.chatgptAccountId || row.userId || row.relativePath || '-') + '</small></td>'
-      + '<td>' + escapeHtml(row.email || '-') + '</td>'
+      + '<td>' + escapeHtml(row.email || '-') + phase3Note + '</td>'
       + '<td><span class="status-text ' + statusClass(row.status) + '"><span class="status-dot" aria-hidden="true"></span>' + escapeHtml(statusLabel(row.status)) + '</span>'
       + (row.availability === 'unavailable' ? '<small class="availability-note">不可用</small>'
         : row.availability === 'unknown' ? '<small class="availability-note">可用性未知</small>' : '') + '</td>'
@@ -1072,9 +1113,9 @@ elements.phase3Button.addEventListener('click', async () => {
   if (state.phase3RequestPending) return;
   const selectedRows = selectedRowsFromSelection();
   const targets = phase3TargetsFromRows(selectedRows);
-  const missingTarget = selectedRows.some((row) => !String(row.email || '').trim() && !String(row.phone || '').trim());
-  if (state.selected.size === 0 || targets.length === 0 || selectedRows.length !== state.selected.size || missingTarget) {
-    showNotice('Phase 3 需要选择至少一个包含邮箱或手机号的账号。', 'notice-warning');
+  const selectionProblem = phase3SelectionProblem(selectedRows, state.selected.size);
+  if (selectionProblem || targets.length === 0) {
+    showNotice('无法提交 Phase 3：' + (selectionProblem || '没有符合条件的账号'), 'notice-warning');
     return;
   }
   if (!window.confirm('确认排队更新已选的 ' + targets.length + ' 个账号 token？任务会按顺序执行。')) return;
@@ -1203,7 +1244,7 @@ if (elements.historicalToggle) {
 function updateActionState() {
   const selectedRows = selectedRowsFromSelection();
   const phase3Targets = phase3TargetsFromRows(selectedRows);
-  const missingTarget = selectedRows.some((row) => !String(row.email || '').trim() && !String(row.phone || '').trim());
+  const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
   const testTargets = accountTestRows(selectedRows);
   const invalidTestRow = selectedRows.some((row) => (
     !Number.isSafeInteger(Number(row?.accountId)) || Number(row.accountId) <= 0
@@ -1216,7 +1257,7 @@ function updateActionState() {
   const canRunPhase3 = state.selected.size > 0
     && selectedRows.length === state.selected.size
     && phase3Targets.length > 0
-    && !missingTarget
+    && !phase3Problem
     && !state.snapshot?.readOnly;
   const locked = actionsLocked();
   elements.phase3Button.disabled = locked || !canRunPhase3;
@@ -1240,10 +1281,8 @@ function updateActionState() {
   }
   if (locked) {
     elements.phase3Button.title = '另一个任务或请求执行中';
-  } else if (state.selected.size > 1 && !canRunPhase3) {
-    elements.phase3Button.title = '所选账号中存在无邮箱/手机号的项目，无法批量提交';
   } else if (!canRunPhase3) {
-    elements.phase3Button.title = '请选择至少一个有邮箱或手机号的账号';
+    elements.phase3Button.title = phase3Problem || '请选择至少一个符合条件的账号';
   } else {
     elements.phase3Button.title = '按顺序为已选账号运行 Phase 3';
   }
