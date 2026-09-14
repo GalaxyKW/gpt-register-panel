@@ -18,6 +18,7 @@ const {
   createServer,
   hasJsonContentType,
   openVerifiedStaticFile,
+  parseRequestTarget,
   phase3ClaimKeys,
   phase3FailureMetadata,
   mutationFailureMetadata,
@@ -69,6 +70,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
     [400, [
       'INVALID_JSON_BODY',
       'INVALID_REQUEST_BODY',
+      'INVALID_REQUEST_TARGET',
       'IDEMPOTENCY_KEY_REQUIRED',
       'IDEMPOTENCY_KEY_INVALID',
       'SNAPSHOT_VERSION_REQUIRED',
@@ -264,6 +266,123 @@ test('request log paths use fixed templates without raw dynamic or unknown segme
   );
   assert.equal(requestLogPath('/api/%65ncoded-private'), '/api/<unknown>');
   assert.equal(requestLogPath('/%65ncoded-private'), '<unknown-path>');
+});
+
+test('request targets reject forms that can be normalized onto a different route', () => {
+  const jobId = 'job_' + 'a'.repeat(24);
+  for (const [target, pathname, query] of [
+    ['/', '/', ''],
+    ['/api/health', '/api/health', ''],
+    ['/api/snapshot?withSub2api=1&search=a%2Fb', '/api/snapshot', 'withSub2api=1&search=a%2Fb'],
+    ['/api/jobs/' + jobId, '/api/jobs/' + jobId, ''],
+    ['/%E8%B4%A6%E5%8F%B7?q=%E6%B5%8B%E8%AF%95', '/%E8%B4%A6%E5%8F%B7',
+      'q=%E6%B5%8B%E8%AF%95'],
+    ['/api/snapshot?literal=%252e%252e', '/api/snapshot', 'literal=%252e%252e'],
+  ]) {
+    const parsed = parseRequestTarget(target);
+    assert.equal(parsed.pathname, pathname, target);
+    assert.equal(parsed.search.slice(1), query, target);
+  }
+
+  for (const target of [
+    '',
+    '*',
+    'http://attacker.invalid/api/phase3',
+    '//attacker.invalid/api/phase3',
+    '/api//phase3',
+    '/api\\phase3',
+    '/api/./phase3',
+    '/api/ignored/../phase3',
+    '/api/%2e/phase3',
+    '/api/%2E%2E/api/phase3',
+    '/api/%252e%252e/api/phase3',
+    '/api/%25252e%25252e/api/phase3',
+    '/api/%2fphase3',
+    '/api/%255cphase3',
+    '/api/phase3#fragment',
+    '/api/%00phase3',
+    '/api/%ZZphase3',
+    '/api/phase3?bad=%',
+    '/api/phase3?bad=%0d%0aInjected',
+    '/api/phase3?bad=%c2%80',
+  ]) {
+    assert.throws(
+      () => parseRequestTarget(target),
+      (error) => error?.code === 'INVALID_REQUEST_TARGET'
+        && error.message === '请求目标必须是无歧义的 origin-form',
+      target,
+    );
+  }
+});
+
+test('HTTP routing rejects ambiguous raw targets before audit or business dispatch', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  delete process.env.PANEL_ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let probes = 0;
+  let businessCalls = 0;
+  const server = createServer({
+    db: {
+      dbPath: '/tmp/unused-request-target-test.sqlite3',
+      async getMutationReceipt() { businessCalls += 1; return null; },
+    },
+    logger: {
+      requestId: () => 'request-target-test',
+      info() {},
+      warn() {},
+      error() {},
+      probe() { probes += 1; return true; },
+    },
+  });
+  const issue = (target, method = 'GET') => new Promise((resolve, reject) => {
+    const requestObject = http.request({
+      host: '127.0.0.1',
+      port: server.address().port,
+      path: target,
+      method,
+      headers: method === 'POST' ? { 'content-type': 'application/json' } : {},
+    }, (response) => {
+      let body = '';
+      response.setEncoding('utf8');
+      response.on('data', (chunk) => { body += chunk; });
+      response.on('end', () => resolve({ status: response.statusCode, body }));
+    });
+    requestObject.on('error', reject);
+    requestObject.end(method === 'POST' ? '{}' : undefined);
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    for (const response of [
+      await issue('//attacker.invalid/api/health'),
+      await issue('/api//phase3', 'POST'),
+      await issue('/api/ignored/../phase3', 'POST'),
+    ]) {
+      assert.equal(response.status, 400);
+      assert.equal(JSON.parse(response.body).error, 'INVALID_REQUEST_TARGET');
+    }
+    assert.equal(probes, 0);
+    assert.equal(businessCalls, 0);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
 });
 
 test('Phase3 failures persist only bounded reconciliation metadata', () => {

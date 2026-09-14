@@ -263,6 +263,7 @@ function sendMutationReceipt(response, receipt, replayed = false) {
 const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'INVALID_JSON_BODY',
   'INVALID_REQUEST_BODY',
+  'INVALID_REQUEST_TARGET',
   'IDEMPOTENCY_KEY_REQUIRED',
   'IDEMPOTENCY_KEY_INVALID',
   'SNAPSHOT_VERSION_REQUIRED',
@@ -352,6 +353,7 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   REQUEST_BODY_TOO_LARGE: '请求体超过允许的大小上限',
   INVALID_JSON_BODY: '请求体不是有效的 JSON',
   INVALID_REQUEST_BODY: '请求体必须是 JSON 对象',
+  INVALID_REQUEST_TARGET: '请求目标格式无效',
   IDEMPOTENCY_KEY_REQUIRED: '写请求必须提供 Idempotency-Key',
   IDEMPOTENCY_KEY_INVALID: 'Idempotency-Key 格式无效',
   IDEMPOTENCY_KEY_REUSED: '该 Idempotency-Key 已用于不同请求',
@@ -812,6 +814,56 @@ function hasJsonContentType(request) {
   const header = singleRequestHeader(request, 'content-type');
   if (!header.present || !header.valid) return false;
   return header.value.split(';', 1)[0].trim().toLowerCase() === 'application/json';
+}
+
+function invalidRequestTargetError() {
+  const error = new Error('请求目标必须是无歧义的 origin-form');
+  error.code = 'INVALID_REQUEST_TARGET';
+  return error;
+}
+
+function decodedPathSegmentIsAmbiguous(rawSegment) {
+  let candidate = rawSegment;
+  for (let depth = 0; depth < 3; depth += 1) {
+    let decoded;
+    try { decoded = decodeURIComponent(candidate); } catch { return true; }
+    if (decoded === '.' || decoded === '..'
+        || /[\\/?#\u0000-\u001f\u007f-\u009f]/u.test(decoded)) return true;
+    if (decoded === candidate || !/%[0-9a-f]{2}/i.test(decoded)) {
+      return false;
+    }
+    candidate = decoded;
+  }
+  // More than three nested encodings is never needed by the panel and leaves
+  // too much room for a proxy and the application to select different routes.
+  return true;
+}
+
+function parseRequestTarget(value) {
+  if (typeof value !== 'string' || !value.startsWith('/') || value.startsWith('//')
+      || /[\\#\u0000-\u001f\u007f-\u009f]/u.test(value)
+      || /%(?![0-9a-f]{2})/i.test(value)
+      || /%(?:0[0-9a-f]|1[0-9a-f]|7f)/i.test(value)) {
+    throw invalidRequestTargetError();
+  }
+  const queryOffset = value.indexOf('?');
+  const rawPath = queryOffset < 0 ? value : value.slice(0, queryOffset);
+  const rawQuery = queryOffset < 0 ? '' : value.slice(queryOffset + 1);
+  let decodedQuery;
+  try { decodedQuery = decodeURIComponent(rawQuery); } catch { throw invalidRequestTargetError(); }
+  if (!rawPath || rawPath.includes('//')
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(decodedQuery)
+      || rawPath.split('/').some(decodedPathSegmentIsAmbiguous)) {
+    throw invalidRequestTargetError();
+  }
+  try {
+    const parsed = new URL(value, 'http://localhost');
+    if (parsed.origin !== 'http://localhost') throw invalidRequestTargetError();
+    return parsed;
+  } catch (error) {
+    if (storedErrorCode(error) === 'INVALID_REQUEST_TARGET') throw error;
+    throw invalidRequestTargetError();
+  }
 }
 
 function pathParam(pathname, prefix) {
@@ -2379,8 +2431,8 @@ function importRequestError(body) {
   return null;
 }
 
-function serveStatic(request, response) {
-  const filePath = safeStaticPath(new URL(request.url, 'http://localhost').pathname);
+function serveStatic(pathname, response) {
+  const filePath = safeStaticPath(pathname);
   let opened;
   try { opened = filePath ? openVerifiedStaticFile(filePath) : null; } catch {}
   if (!opened) {
@@ -2459,8 +2511,10 @@ function createServer(options = {}) {
         });
       }
     });
+    let parsedRequestUrl = null;
     try {
-      requestPath = requestLogPath(new URL(request.url || '/', 'http://localhost').pathname);
+      parsedRequestUrl = parseRequestTarget(request.url);
+      requestPath = requestLogPath(parsedRequestUrl.pathname);
     } catch {}
     writeLog(logger, 'info', 'http.request_started', {
       requestId,
@@ -2469,7 +2523,7 @@ function createServer(options = {}) {
       path: requestPath,
     });
     try {
-      const requestUrl = new URL(request.url || '/', 'http://localhost');
+      const requestUrl = parsedRequestUrl || parseRequestTarget(request.url);
       requestPath = requestLogPath(requestUrl.pathname);
       const reconciliationAckPath = reconciliationAcknowledgePath(requestUrl.pathname);
       const reconciliationReviewRoute = reconciliationReviewPath(requestUrl.pathname);
@@ -3568,7 +3622,7 @@ function createServer(options = {}) {
       return;
     }
 
-    serveStatic(request, response);
+    serveStatic(requestUrl.pathname, response);
     } catch (error) {
       const publicError = publicApiError(error, {
         write: request.method !== 'GET',
@@ -3775,6 +3829,7 @@ module.exports = {
   validateListenConfiguration,
   normalizedSelectedKeys,
   openVerifiedStaticFile,
+  parseRequestTarget,
   publicApiError,
   publicTokenCleanupErrorFields,
   requestBodyObjectError,
