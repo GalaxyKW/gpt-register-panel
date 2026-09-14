@@ -31,7 +31,7 @@ const {
 } = require('./view');
 const { getAccountAvailability } = require('./accountAvailability');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
-const { redactText } = require('./logger');
+const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { parseJwtPayload, normalizeIdentityValue } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
@@ -1675,12 +1675,24 @@ async function executeImportPlanItem({
       ...(freshRecord ? { _record: freshRecord, _raw: freshRecord.raw } : {}),
       _verifiedAccount: preflight.account,
     };
+    const payload = buildOAuthUpdatePayload(writeItem);
     throwIfJobInterrupted(signal);
     let writeResponseReceived = false;
     try {
+      assertAuditLogCheckpoint(logger, 'import.oauth_update_checkpoint', {
+        jobId: context?.jobId || null,
+        actor: context?.actor || null,
+        action: 'update',
+        accountId: item.accountId,
+        accountName: item.accountName || preflight.account?.name || null,
+        source: item.source || null,
+        relativePath: item.relativePath || null,
+        beforeFingerprint: preflight.account?.tokenFingerprints?.access || null,
+        afterFingerprint: item.fingerprints?.access || null,
+      });
       await client.applyOAuthCredentials(
         item.accountId,
-        buildOAuthUpdatePayload(writeItem),
+        payload,
         { signal },
       );
       writeResponseReceived = true;
@@ -1759,12 +1771,24 @@ async function executeImportPlanItem({
     skip_default_group_bind: false,
     confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
   };
+  const idempotencyKey = buildCodexImportIdempotencyKey(writeItem, context);
   throwIfJobInterrupted(signal);
   let writeResponseReceived = false;
   let rawResult = null;
   try {
+    assertAuditLogCheckpoint(logger, 'import.codex_create_checkpoint', {
+      jobId: context?.jobId || null,
+      actor: context?.actor || null,
+      action: 'create',
+      accountId: null,
+      accountName: item.accountName || null,
+      source: item.source || null,
+      relativePath: item.relativePath || null,
+      beforeFingerprint: null,
+      afterFingerprint: item.fingerprints?.access || null,
+    });
     rawResult = await client.importCodexSession(payload, {
-      idempotencyKey: buildCodexImportIdempotencyKey(writeItem, context),
+      idempotencyKey,
       signal,
     });
     writeResponseReceived = true;

@@ -14,8 +14,8 @@ const {
   buildCodexSessionDocument,
   buildCodexImportIdempotencyKey,
   collectCandidates,
-  executeImport,
-  executeImportPlanItem,
+  executeImport: executeImportWithAuditCheckpoint,
+  executeImportPlanItem: executeImportPlanItemWithAuditCheckpoint,
   importPlanSummary,
   buildSnapshot,
   confirmedSub2ApiRead,
@@ -41,6 +41,20 @@ const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const successfulCheckpointLogger = Object.freeze({
   checkpoint() { return true; },
 });
+
+function executeImport(options = {}) {
+  return executeImportWithAuditCheckpoint({
+    logger: successfulCheckpointLogger,
+    ...options,
+  });
+}
+
+function executeImportPlanItem(options = {}) {
+  return executeImportPlanItemWithAuditCheckpoint({
+    logger: successfulCheckpointLogger,
+    ...options,
+  });
+}
 
 function processIsRunning(pid) {
   if (process.platform !== 'linux' || !Number.isSafeInteger(pid) || pid <= 1) return false;
@@ -2264,6 +2278,134 @@ test('OAuth update payload preserves refresh metadata without exposing it in sum
   assert.match(payload.extra.access_token_sha256, /^[a-f0-9]{64}$/);
   assert.match(payload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
   assert.notEqual(payload.extra.access_token_sha256, payload.extra.refresh_token_sha256);
+});
+
+test('update preflight refuses the remote write when its audit checkpoint is unavailable', async () => {
+  const identityKeys = ['account:audit-update-account', 'user:audit-update-user'];
+  const source = syntheticToken('tokens/audit-update.json', identityKeys, {
+    accountId: 'audit-update-account',
+    userId: 'audit-update-user',
+    accessFingerprint: 'audit-update-new-fingerprint',
+    accessToken: 'audit-update-secret-value',
+  });
+  const before = {
+    id: 812,
+    name: 'free00812',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys,
+    tokenFingerprints: { access: 'audit-update-old-fingerprint' },
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [before])[0];
+  assert.equal(item.action, 'update');
+
+  for (const mode of ['missing', 'failed']) {
+    let preflightReads = 0;
+    let writeCalls = 0;
+    let checkpoint = null;
+    const logger = mode === 'missing' ? {} : {
+      checkpoint(event, fields) {
+        assert.equal(preflightReads, 1, 'checkpoint must run after the final target preflight');
+        checkpoint = { event, fields };
+        return false;
+      },
+    };
+    await assert.rejects(
+      executeImportPlanItem({
+        client: {
+          async getAccount() {
+            preflightReads += 1;
+            return before;
+          },
+          async applyOAuthCredentials() {
+            writeCalls += 1;
+          },
+        },
+        item,
+        logger,
+        context: { jobId: 'audit-update-job', actor: 'tester' },
+      }),
+      (error) => error.code === 'AUDIT_LOG_UNAVAILABLE',
+    );
+    assert.equal(preflightReads, 1);
+    assert.equal(writeCalls, 0);
+    if (mode === 'failed') {
+      assert.equal(checkpoint.event, 'import.oauth_update_checkpoint');
+      assert.deepEqual(Object.keys(checkpoint.fields).sort(), [
+        'accountId',
+        'accountName',
+        'action',
+        'actor',
+        'afterFingerprint',
+        'beforeFingerprint',
+        'jobId',
+        'relativePath',
+        'source',
+      ]);
+      assert.equal(JSON.stringify(checkpoint.fields).includes(source.raw.access_token), false);
+    }
+  }
+});
+
+test('create preflight refuses the remote write when its audit checkpoint is unavailable', async () => {
+  const identityKeys = ['account:audit-create-account', 'user:audit-create-user'];
+  const source = syntheticToken('tokens/audit-create.json', identityKeys, {
+    accountId: 'audit-create-account',
+    userId: 'audit-create-user',
+    accessFingerprint: 'audit-create-fingerprint',
+    accessToken: 'audit-create-secret-value',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  assert.equal(item.action, 'create');
+
+  for (const mode of ['missing', 'failed']) {
+    let preflightReads = 0;
+    let writeCalls = 0;
+    let checkpoint = null;
+    const logger = mode === 'missing' ? {} : {
+      checkpoint(event, fields) {
+        assert.equal(preflightReads, 1, 'checkpoint must run after the final create preflight');
+        checkpoint = { event, fields };
+        return false;
+      },
+    };
+    await assert.rejects(
+      executeImportPlanItem({
+        client: {
+          async listAccounts() {
+            preflightReads += 1;
+            return [];
+          },
+          async importCodexSession() {
+            writeCalls += 1;
+          },
+        },
+        item,
+        logger,
+        context: { jobId: 'audit-create-job', actor: 'tester' },
+      }),
+      (error) => error.code === 'AUDIT_LOG_UNAVAILABLE',
+    );
+    assert.equal(preflightReads, 1);
+    assert.equal(writeCalls, 0);
+    if (mode === 'failed') {
+      assert.equal(checkpoint.event, 'import.codex_create_checkpoint');
+      assert.deepEqual(Object.keys(checkpoint.fields).sort(), [
+        'accountId',
+        'accountName',
+        'action',
+        'actor',
+        'afterFingerprint',
+        'beforeFingerprint',
+        'jobId',
+        'relativePath',
+        'source',
+      ]);
+      assert.equal(JSON.stringify(checkpoint.fields).includes(source.raw.access_token), false);
+    }
+  }
 });
 
 test('update plan uses the ID-scoped OAuth endpoint and rechecks availability', async () => {
