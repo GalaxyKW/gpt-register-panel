@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict');
 const { spawn, spawnSync } = require('node:child_process');
+const crypto = require('node:crypto');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -180,6 +181,43 @@ test('expired token cleanup is scoped, versioned, and does not expose credential
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'active.json')), true);
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'invalid.json')), true);
   assert.equal(fs.existsSync(path.join(root, 'tokens', 'unknown.json')), true);
+});
+
+test('cleanup mutation guard runs before recovering an abandoned claim', () => {
+  const root = makeRoot();
+  const sourcePath = path.join(root, 'tokens', 'guarded.json');
+  const content = JSON.stringify({
+    access_token: jwt({ suffix: '-guarded' }),
+    email: 'guarded@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  });
+  const contentHash = crypto.createHash('sha256').update(content).digest('hex');
+  const encodedName = Buffer.from(path.basename(sourcePath), 'utf8').toString('base64url');
+  const claimPath = path.join(
+    path.dirname(sourcePath),
+    '.panel-token-cleanup-claim-v1-999999-0-' + contentHash + '-' + encodedName + '-0123456789abcdef',
+  );
+  fs.writeFileSync(claimPath, content, { mode: 0o600 });
+  let guardCalls = 0;
+  const guardError = new Error('audit checkpoint unavailable');
+  guardError.code = 'AUDIT_LOG_UNAVAILABLE';
+
+  assert.throws(
+    () => deleteExpiredTokens({
+      rootDirectory: root,
+      expectedVersion: '0'.repeat(64),
+      confirmation: CONFIRMATION,
+      beforeMutation() {
+        guardCalls += 1;
+        throw guardError;
+      },
+    }),
+    (error) => error === guardError,
+  );
+  assert.equal(guardCalls, 1);
+  assert.equal(fs.existsSync(claimPath), true);
+  assert.equal(fs.existsSync(sourcePath), false);
+  assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
 });
 
 test('cleanup refuses a source that becomes writable by other users after listing', () => {

@@ -463,6 +463,48 @@ class PanelLogger {
     }
   }
 
+  checkpoint(event, fields = {}) {
+    let descriptor;
+    const checkpointEvent = String(event || 'logger.audit_checkpoint');
+    try {
+      const timestamp = new Date().toISOString();
+      const safeFields = fields && typeof fields === 'object' && !Array.isArray(fields)
+        ? redactValue(fields)
+        : {};
+      const line = JSON.stringify({
+        ...safeFields,
+        timestamp,
+        level: 'info',
+        event: redactText(checkpointEvent),
+        pid: this.pid,
+      }) + '\n';
+      this.assertDirectorySafe();
+      this.rotateIfNeeded(Buffer.byteLength(line));
+      descriptor = this.openValidatedFile();
+      fs.fchmodSync(descriptor, 0o600);
+      fs.writeFileSync(descriptor, line);
+      fs.fsyncSync(descriptor);
+      this.fileHealthy = true;
+      this.consecutiveWriteFailures = 0;
+      this.lastWriteSucceededAt = timestamp;
+      return true;
+    } catch (error) {
+      this.fileHealthy = false;
+      this.failedWrites += 1;
+      this.consecutiveWriteFailures += 1;
+      this.lastWriteFailureAt = new Date().toISOString();
+      this.fallback('error', 'logger.checkpoint_failed', {
+        checkpointEvent,
+        error: error.message,
+      });
+      return false;
+    } finally {
+      if (descriptor !== undefined) {
+        try { fs.closeSync(descriptor); } catch {}
+      }
+    }
+  }
+
   health() {
     return {
       healthy: this.fileHealthy && this.directoryIdentity !== null,
@@ -664,9 +706,27 @@ function createLogger(options = {}) {
   return new PanelLogger(options);
 }
 
+function assertAuditLogCheckpoint(logger, event, fields = {}) {
+  let succeeded = false;
+  try {
+    if (logger && typeof logger.checkpoint === 'function') {
+      succeeded = logger.checkpoint(event, fields) === true;
+    } else if (logger && typeof logger.probe === 'function') {
+      // Compatibility for injected loggers while every production
+      // PanelLogger writes the contextual, fsynced checkpoint above.
+      succeeded = logger.probe() === true;
+    }
+  } catch {}
+  if (succeeded) return true;
+  const error = new Error('审计日志不可写，已在文件变更前停止操作');
+  error.code = 'AUDIT_LOG_UNAVAILABLE';
+  throw error;
+}
+
 module.exports = {
   LEVELS,
   PanelLogger,
+  assertAuditLogCheckpoint,
   createLogger,
   redactText,
   redactValue,

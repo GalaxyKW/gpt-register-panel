@@ -7,7 +7,12 @@ const test = require('node:test');
 
 require('./test-isolation');
 
-const { PanelLogger, redactText, redactValue } = require('../backend/logger');
+const {
+  PanelLogger,
+  assertAuditLogCheckpoint,
+  redactText,
+  redactValue,
+} = require('../backend/logger');
 
 test('structured logger redacts token-like fields and process output', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
@@ -225,6 +230,74 @@ test('logger startup writes and fsyncs one valid JSONL preflight record', () => 
   assert.equal(entry.pid, process.pid);
   assert.ok(Number.isFinite(Date.parse(entry.timestamp)));
   assert.ok(fileFsyncCalls >= 1);
+});
+
+test('audit checkpoints are contextual, redacted, and fsynced before returning success', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false });
+  const originalFsyncSync = fs.fsyncSync;
+  let checkpointFsyncs = 0;
+  fs.fsyncSync = function trackedFsync(descriptor) {
+    if (fs.fstatSync(descriptor).isFile()) checkpointFsyncs += 1;
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    assert.equal(assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_checkpoint', {
+      requestId: 'checkpoint-request',
+      credential: 'checkpoint-secret-value',
+      event: 'spoofed-event',
+      pid: -1,
+    }), true);
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+
+  const entry = logger.tail(1)[0];
+  assert.equal(entry.event, 'token_cleanup.mutation_checkpoint');
+  assert.equal(entry.requestId, 'checkpoint-request');
+  assert.equal(entry.credential, '[redacted]');
+  assert.equal(entry.pid, process.pid);
+  assert.equal(JSON.stringify(entry).includes('checkpoint-secret-value'), false);
+  assert.ok(checkpointFsyncs >= 1);
+});
+
+test('audit checkpoint assertion fails closed for missing, rejected, or throwing sinks', () => {
+  for (const logger of [
+    null,
+    { checkpoint() { return false; } },
+    { checkpoint() { throw new Error('simulated checkpoint failure'); } },
+    { probe() { return false; } },
+  ]) {
+    assert.throws(
+      () => assertAuditLogCheckpoint(logger, 'test.checkpoint'),
+      (error) => error?.code === 'AUDIT_LOG_UNAVAILABLE'
+        && !String(error.message).includes('simulated checkpoint failure'),
+    );
+  }
+  assert.equal(assertAuditLogCheckpoint({ probe() { return true; } }, 'test.compatibility'), true);
+});
+
+test('a checkpoint fsync failure marks the logger unhealthy and fails closed', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false });
+  const originalFsyncSync = fs.fsyncSync;
+  fs.fsyncSync = function failingCheckpointFsync(descriptor) {
+    if (fs.fstatSync(descriptor).isFile()) throw new Error('simulated checkpoint fsync failure');
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  try {
+    assert.throws(
+      () => assertAuditLogCheckpoint(logger, 'test.fsync_failure'),
+      (error) => error?.code === 'AUDIT_LOG_UNAVAILABLE'
+        && !String(error.message).includes('simulated checkpoint fsync failure'),
+    );
+  } finally {
+    fs.fsyncSync = originalFsyncSync;
+  }
+  assert.equal(logger.health().healthy, false);
+  assert.equal(logger.health().consecutiveWriteFailures, 1);
 });
 
 test('structured logger rotates files, supports tail, and uses restrictive permissions', () => {

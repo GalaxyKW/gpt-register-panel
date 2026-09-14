@@ -3,6 +3,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const { readGptRegisterSources } = require('./adapters/gptRegisterFs');
+const { throwIfJobInterrupted } = require('./jobLifecycle');
 const { ensureDirectoryTree, assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
 
@@ -549,6 +550,11 @@ function deleteExpiredTokens(options = {}) {
     error.code = 'TOKEN_CLEANUP_CONFIRMATION_REQUIRED';
     throw error;
   }
+  throwIfJobInterrupted(options.signal);
+  if (typeof options.beforeMutation === 'function') options.beforeMutation();
+  throwIfJobInterrupted(options.signal);
+  // Claim recovery can rename or relink files, so no validation or audit
+  // checkpoint that protects mutations may be placed below this line.
   recoverTokenCleanupClaims(cleanupRoot(options));
   const current = listExpiredTokens(options);
   if (!/^[a-f0-9]{64}$/i.test(String(options.expectedVersion || ''))

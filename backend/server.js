@@ -36,7 +36,7 @@ const {
   safeErrorMessage: safeAccountTestErrorMessage,
   withAccountTestSubmissionLock,
 } = require('./accountTestWorker');
-const { createLogger, safeErrorText } = require('./logger');
+const { assertAuditLogCheckpoint, createLogger, safeErrorText } = require('./logger');
 const { CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION, listExpiredTokens, deleteExpiredTokens } = require('./tokenCleanup');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree } = require('./lib/safeFs');
@@ -1679,6 +1679,9 @@ function createServer(options = {}) {
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/tokens/expired/delete') {
       const cleanupStartedAt = Date.now();
+      // Once deleteExpiredTokens returns, retries are unsafe even if shutdown,
+      // lock release, or completion auditing fails before the HTTP response.
+      let completedMutationResult = null;
       try {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
@@ -1688,44 +1691,145 @@ function createServer(options = {}) {
           error.code = 'TOKEN_CLEANUP_CONFIRMATION_REQUIRED';
           throw error;
         }
-        const result = await withControlPlaneLock(() => deleteExpiredTokens({
-          expectedVersion: body.version,
-          confirmation: body.confirmation,
-        }));
-        const details = {
-          count: result.count,
-          skipped: result.skipped,
-          items: result.deleted,
-        };
-        try {
-          await db.audit({
-            actor,
-            action: 'expired_token_cleanup',
-            targetKey: 'gpt_register:expired_tokens',
-            result: result.skipped.length > 0 ? 'partial' : 'ok',
-            details,
+        if (!/^[a-f0-9]{64}$/i.test(String(body.version || ''))) {
+          const error = new Error('缺少有效的过期 token 清单版本，请重新扫描');
+          error.code = 'TOKEN_CLEANUP_VERSION_REQUIRED';
+          throw error;
+        }
+        const cleanup = await jobManager.withAdmission((signal) => withControlPlaneLock(async () => {
+          throwIfJobInterrupted(signal);
+          try {
+            await db.audit({
+              actor,
+              action: 'expired_token_cleanup',
+              targetKey: 'gpt_register:expired_tokens',
+              result: 'intent',
+              details: {
+                requestId,
+                expectedVersion: body.version,
+              },
+            });
+          } catch {
+            const error = new Error('过期 token 删除审计意图无法持久化，未修改任何 token 文件');
+            error.code = 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED';
+            throw error;
+          }
+          throwIfJobInterrupted(signal);
+          const result = deleteExpiredTokens({
+            expectedVersion: body.version,
+            confirmation: body.confirmation,
+            signal,
+            beforeMutation() {
+              assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_checkpoint', {
+                requestId,
+                actor,
+                expectedVersion: body.version,
+              });
+            },
           });
-        } catch (auditError) {
-          writeLog(logger, 'error', 'token_cleanup.audit_failed', {
+          completedMutationResult = result;
+          const details = {
+            requestId,
+            count: result.count,
+            skipped: result.skipped,
+            items: result.deleted,
+          };
+          let databaseAuditFailed = false;
+          try {
+            await db.audit({
+              actor,
+              action: 'expired_token_cleanup',
+              targetKey: 'gpt_register:expired_tokens',
+              result: result.skipped.length > 0 ? 'partial' : 'ok',
+              details,
+            });
+          } catch (auditError) {
+            databaseAuditFailed = true;
+            writeLog(logger, 'error', 'token_cleanup.audit_failed_after_mutation', {
+              requestId,
+              actor,
+              error: safeErrorMessage(auditError),
+            });
+          }
+          let logCheckpointFailed = false;
+          try {
+            assertAuditLogCheckpoint(logger, 'token_cleanup.mutation_completed', {
+              requestId,
+              actor,
+              deletedCount: result.count,
+              skippedCount: result.skipped.length,
+              databaseAuditFailed,
+            });
+          } catch {
+            logCheckpointFailed = true;
+          }
+          return {
+            result,
+            auditCompletionFailed: databaseAuditFailed || logCheckpointFailed,
+            databaseAuditFailed,
+            logCheckpointFailed,
+          };
+        }, { signal }));
+        const { result } = cleanup;
+        writeLog(
+          logger,
+          cleanup.auditCompletionFailed ? 'error' : (result.skipped.length > 0 ? 'warn' : 'info'),
+          cleanup.auditCompletionFailed
+            ? 'token_cleanup.audit_reconciliation_required'
+            : 'token_cleanup.completed',
+          {
             requestId,
             actor,
-            error: safeErrorMessage(auditError),
-          });
-        }
-        writeLog(logger, result.skipped.length > 0 ? 'warn' : 'info', 'token_cleanup.completed', {
-          requestId,
-          actor,
-          deletedCount: result.count,
-          skippedCount: result.skipped.length,
-          durationMs: Date.now() - cleanupStartedAt,
-        });
-        jsonResponse(response, 200, {
+            deletedCount: result.count,
+            skippedCount: result.skipped.length,
+            auditCompletionFailed: cleanup.auditCompletionFailed,
+            durationMs: Date.now() - cleanupStartedAt,
+          },
+        );
+        const responseBody = {
           status: result.skipped.length > 0 ? 'partial' : 'succeeded',
           count: result.count,
           deleted: result.deleted.map(safeExpiredTokenItem),
           skipped: result.skipped.map(safeExpiredTokenItem),
-        });
+        };
+        if (cleanup.auditCompletionFailed) {
+          jsonResponse(response, 409, {
+            ...responseBody,
+            status: 'requires_reconciliation',
+            error: 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED',
+            message: '过期 token 已完成隔离，但完成审计未能全部持久化；请人工核对，禁止重试本次删除',
+            mutationCompleted: true,
+            requiresReconciliation: true,
+            retryAllowed: false,
+            doNotRetry: true,
+          });
+          return;
+        }
+        jsonResponse(response, 200, responseBody);
       } catch (error) {
+        if (completedMutationResult) {
+          writeLog(logger, 'error', 'token_cleanup.post_mutation_reconciliation_required', {
+            requestId,
+            actor,
+            deletedCount: completedMutationResult.count,
+            skippedCount: completedMutationResult.skipped.length,
+            code: error?.code || null,
+            durationMs: Date.now() - cleanupStartedAt,
+          });
+          jsonResponse(response, 409, {
+            status: 'requires_reconciliation',
+            error: 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED',
+            message: '过期 token 已完成隔离，但请求在完成确认前中断；请人工核对，禁止重试本次删除',
+            mutationCompleted: true,
+            requiresReconciliation: true,
+            retryAllowed: false,
+            doNotRetry: true,
+            count: completedMutationResult.count,
+            deleted: completedMutationResult.deleted.map(safeExpiredTokenItem),
+            skipped: completedMutationResult.skipped.map(safeExpiredTokenItem),
+          });
+          return;
+        }
         writeLog(logger, 'error', 'token_cleanup.failed', {
           requestId,
           actor,
@@ -1733,7 +1837,10 @@ function createServer(options = {}) {
           error: safeErrorMessage(error),
           durationMs: Date.now() - cleanupStartedAt,
         });
-        const status = ['TOKEN_CLEANUP_STALE', 'JOB_ALREADY_CLAIMED'].includes(error?.code) ? 409 : 400;
+        const status = ['TOKEN_CLEANUP_STALE', 'JOB_ALREADY_CLAIMED'].includes(error?.code) ? 409
+          : ['AUDIT_LOG_UNAVAILABLE', 'JOB_INTERRUPTED', 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED'].includes(error?.code)
+            ? 503
+            : 400;
         jsonResponse(response, status, {
           error: error?.code || 'token_cleanup_failed',
           message: safeErrorMessage(error),

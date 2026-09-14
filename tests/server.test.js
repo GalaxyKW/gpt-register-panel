@@ -20,9 +20,12 @@ const {
   readJsonBody,
   resetAuthFailureBuckets,
   safeStaticPath,
+  shutdownServer,
   startServer,
   validateRuntimeConfiguration,
 } = require('../backend/server');
+const { listExpiredTokens } = require('../backend/tokenCleanup');
+const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 
 test('static routing exposes only the three declared frontend assets', () => {
@@ -380,6 +383,14 @@ async function waitForTerminalJob(baseUrl, jobId) {
   throw new Error('timed out waiting for test job ' + jobId);
 }
 
+async function waitForAdmission(server) {
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    if (server?.panelJobManager?.admissionCount > 0) return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error('timed out waiting for request admission');
+}
+
 test('importing the server does not load deployment environment files', () => {
   const script = [
     "const configPath = require.resolve('./backend/config');",
@@ -646,6 +657,8 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
         info() {},
         warn() {},
         error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
         requestId(value) { return value || 'test-request'; },
         tail() { return []; },
       },
@@ -774,5 +787,398 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
         else process.env[environmentName] = previous[key];
       }
     }
+  }
+});
+
+test('expired token deletion fails closed when its durable audit intent cannot be stored', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-intent-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: 'expired-access',
+    email: 'intent@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let server;
+  let checkpoints = 0;
+  try {
+    const listing = listExpiredTokens();
+    assert.equal(listing.count, 1);
+    server = createServer({
+      db: {
+        dbPath: path.join(root, 'unused.sqlite3'),
+        async audit() { throw new Error('simulated audit storage failure'); },
+      },
+      logger: {
+        requestId: () => 'cleanup-intent-failure',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { checkpoints += 1; return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const response = await postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    assert.equal(response.status, 503);
+    assert.equal(JSON.parse(response.body).error, 'TOKEN_CLEANUP_AUDIT_INTENT_FAILED');
+    assert.equal(checkpoints, 0);
+    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('expired token deletion reports reconciliation and forbids retry when completion audit fails', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-audit-result-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: 'expired-access',
+    email: 'completion@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let server;
+  const audits = [];
+  const checkpoints = [];
+  try {
+    const listing = listExpiredTokens();
+    server = createServer({
+      db: {
+        dbPath: path.join(root, 'unused.sqlite3'),
+        async audit(entry) {
+          audits.push(entry);
+          if (audits.length === 2) throw new Error('simulated completion audit failure');
+        },
+      },
+      logger: {
+        requestId: () => 'cleanup-completion-failure',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint(event) { checkpoints.push(event); return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const response = await postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    const body = JSON.parse(response.body);
+    assert.equal(response.status, 409);
+    assert.equal(body.error, 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED');
+    assert.equal(body.status, 'requires_reconciliation');
+    assert.equal(body.mutationCompleted, true);
+    assert.equal(body.requiresReconciliation, true);
+    assert.equal(body.retryAllowed, false);
+    assert.equal(body.doNotRetry, true);
+    assert.equal(body.count, 1);
+    assert.equal(fs.existsSync(sourcePath), false);
+    assert.equal(audits[0].result, 'intent');
+    assert.deepEqual(checkpoints, [
+      'token_cleanup.mutation_checkpoint',
+      'token_cleanup.mutation_completed',
+    ]);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('expired token deletion rechecks its log checkpoint after waiting for the control lock', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-checkpoint-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: 'expired-access',
+    email: 'checkpoint@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let releaseBlocker;
+  let markBlockerEntered;
+  const blockerEntered = new Promise((resolve) => { markBlockerEntered = resolve; });
+  const blocker = withControlPlaneLock(async () => {
+    markBlockerEntered();
+    await new Promise((resolve) => { releaseBlocker = resolve; });
+  });
+  let server;
+  let checkpointHealthy = true;
+  const audits = [];
+  try {
+    await blockerEntered;
+    const listing = listExpiredTokens();
+    server = createServer({
+      db: {
+        dbPath: path.join(root, 'unused.sqlite3'),
+        async audit(entry) { audits.push(entry); },
+      },
+      logger: {
+        requestId: () => 'cleanup-checkpoint-after-queue',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return checkpointHealthy; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const responsePromise = postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    await waitForAdmission(server);
+    checkpointHealthy = false;
+    releaseBlocker();
+    releaseBlocker = null;
+    await blocker;
+    const response = await responsePromise;
+    assert.equal(response.status, 503);
+    assert.equal(JSON.parse(response.body).error, 'AUDIT_LOG_UNAVAILABLE');
+    assert.equal(audits.length, 1);
+    assert.equal(audits[0].result, 'intent');
+    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+  } finally {
+    if (releaseBlocker) releaseBlocker();
+    await Promise.allSettled([blocker]);
+    await withControlPlaneLock(async () => {});
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('shutdown cancels a queued expired token deletion before any audit or file mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-shutdown-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: 'expired-access',
+    email: 'shutdown@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let releaseBlocker;
+  let markBlockerEntered;
+  const blockerEntered = new Promise((resolve) => { markBlockerEntered = resolve; });
+  const blocker = withControlPlaneLock(async () => {
+    markBlockerEntered();
+    await new Promise((resolve) => { releaseBlocker = resolve; });
+  });
+  let server;
+  let auditCalls = 0;
+  let checkpointCalls = 0;
+  let shutdownPromise = null;
+  try {
+    await blockerEntered;
+    const listing = listExpiredTokens();
+    server = createServer({
+      db: {
+        dbPath: path.join(root, 'unused.sqlite3'),
+        async audit() { auditCalls += 1; },
+        async interruptOwnedActiveJobs() { return []; },
+      },
+      logger: {
+        requestId: () => 'cleanup-shutdown-queued',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { checkpointCalls += 1; return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const responsePromise = postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    await waitForAdmission(server);
+    shutdownPromise = shutdownServer(server, { signal: 'test', timeoutMs: 500 });
+    const response = await responsePromise;
+    assert.equal(response.status, 503);
+    assert.equal(JSON.parse(response.body).error, 'JOB_INTERRUPTED');
+    releaseBlocker();
+    releaseBlocker = null;
+    await blocker;
+    await shutdownPromise;
+    await withControlPlaneLock(async () => {});
+    assert.equal(auditCalls, 0);
+    assert.equal(checkpointCalls, 0);
+    assert.equal(fs.existsSync(sourcePath), true);
+    assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+  } finally {
+    if (releaseBlocker) releaseBlocker();
+    await Promise.allSettled([blocker]);
+    if (shutdownPromise) await Promise.allSettled([shutdownPromise]);
+    await withControlPlaneLock(async () => {});
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('shutdown after expired token mutation reports reconciliation instead of a retryable interruption', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-shutdown-after-mutation-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const sourcePath = path.join(root, 'tokens', 'expired.json');
+  fs.writeFileSync(sourcePath, JSON.stringify({
+    access_token: 'expired-access',
+    email: 'shutdown-after-mutation@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  let markCompletionAuditEntered;
+  let releaseCompletionAudit;
+  const completionAuditEntered = new Promise((resolve) => { markCompletionAuditEntered = resolve; });
+  const completionAuditBlocker = new Promise((resolve) => { releaseCompletionAudit = resolve; });
+  let server;
+  let shutdownPromise = null;
+  let auditCalls = 0;
+  try {
+    const listing = listExpiredTokens();
+    server = createServer({
+      db: {
+        dbPath: path.join(root, 'unused.sqlite3'),
+        async audit() {
+          auditCalls += 1;
+          if (auditCalls === 2) {
+            markCompletionAuditEntered();
+            await completionAuditBlocker;
+          }
+        },
+        async interruptOwnedActiveJobs() { return []; },
+      },
+      logger: {
+        requestId: () => 'cleanup-shutdown-after-mutation',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const responsePromise = postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version: listing.version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    await completionAuditEntered;
+    assert.equal(fs.existsSync(sourcePath), false);
+    shutdownPromise = shutdownServer(server, { signal: 'test', timeoutMs: 1000 });
+    const response = await responsePromise;
+    const body = JSON.parse(response.body);
+    assert.equal(response.status, 409);
+    assert.equal(body.error, 'TOKEN_CLEANUP_AUDIT_RECONCILIATION_REQUIRED');
+    assert.equal(body.mutationCompleted, true);
+    assert.equal(body.requiresReconciliation, true);
+    assert.equal(body.retryAllowed, false);
+    assert.equal(body.doNotRetry, true);
+    assert.equal(body.count, 1);
+    releaseCompletionAudit();
+    releaseCompletionAudit = null;
+    await shutdownPromise;
+    assert.equal(auditCalls, 2);
+  } finally {
+    if (releaseCompletionAudit) releaseCompletionAudit();
+    if (shutdownPromise) await Promise.allSettled([shutdownPromise]);
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
   }
 });
