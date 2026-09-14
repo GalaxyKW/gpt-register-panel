@@ -204,6 +204,7 @@ function actionReasonLabel(reason) {
     source_account_terminal: '来源账号已处置，跳过',
     superseded_by_newer_source: '已有更新来源，跳过旧文件',
     token_changed: 'Sub2API 不可用且 token 不同',
+    missing_refresh_token: 'Sub2API 不可用且缺少续期凭据',
     multiple_sub2api_accounts: '匹配到多个 Sub2API 账号',
     duplicate_token_versions: '来源存在多个冲突版本',
     conflicting_token_versions: '来源 token 版本冲突，禁止导入',
@@ -938,6 +939,60 @@ function validImportPlanIntentVersion(value) {
     && /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/.test(value);
 }
 
+function importPlanContractProblem(plan) {
+  if (!Array.isArray(plan?.items)) {
+    return '服务器返回的导入计划项目无效，请重新检查差异';
+  }
+  const reasonsByAction = {
+    create: new Set(['token_only']),
+    update: new Set(['token_changed', 'missing_refresh_token']),
+    skip: new Set([
+      'already_in_sync',
+      'sub2api_available',
+      'source_token_expired',
+      'source_expiry_invalid',
+      'source_disabled',
+      'source_account_terminal',
+      'superseded_by_newer_source',
+      'sub2api_availability_unknown',
+      'sub2api_status_unknown',
+      'sub2api_status_missing',
+      'sub2api_schedulable_missing',
+      'sub2api_auto_pause_invalid',
+      'sub2api_expiry_invalid',
+      'sub2api_temp_unschedulable_invalid',
+      'sub2api_rate_limit_invalid',
+      'sub2api_overload_invalid',
+    ]),
+    conflict: new Set([
+      'multiple_sub2api_accounts',
+      'duplicate_token_versions',
+      'conflicting_token_versions',
+      'source_identity_insufficient',
+      'conflicting_strong_identity',
+      'incomparable_strong_identity',
+      'ambiguous_sub2api_identity',
+      'free_name_exhausted',
+      'free_name_conflict',
+      'sub2api_account_schema_invalid',
+      'sub2api_target_kind_invalid',
+    ]),
+  };
+  for (const item of plan.items) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return '服务器返回的导入计划项目无效，请重新检查差异';
+    }
+    const reasons = reasonsByAction[item.action];
+    if (!reasons) {
+      return '导入计划包含无法识别的操作，请重新检查差异';
+    }
+    if (!reasons.has(item.reason)) {
+      return '导入计划包含无法识别或与操作不匹配的原因，请重新检查差异';
+    }
+  }
+  return '';
+}
+
 function planItemCreatesAccount(item) {
   return item?.action === 'create' && item?.conflictingVersions !== true;
 }
@@ -1025,6 +1080,7 @@ function syncSelectionProblem(selectedKeys = state.selected) {
 function updateImportButtonState() {
   const items = state.plan?.items || [];
   const hasBlockingConflict = items.some((item) => effectivePlanAction(item) === 'conflict');
+  const planContractProblem = state.plan ? importPlanContractProblem(state.plan) : '';
   const hiddenSelection = hiddenSelectionProblem(state.plan?.selectedKeys);
   const selectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   const groupBindingProblem = importGroupBindingProblem(state.plan);
@@ -1034,6 +1090,7 @@ function updateImportButtonState() {
     || Boolean(hiddenSelection)
     || Boolean(selectionProblem)
     || Boolean(groupBindingProblem)
+    || Boolean(planContractProblem)
     || !comparisonAvailable()
     || Boolean(state.snapshot?.readOnly)
     || !validImportPlanIntentVersion(state.plan?.planIntentVersion)
@@ -2741,6 +2798,8 @@ async function previewSelection() {
     if (!validImportPlanIntentVersion(body.planIntentVersion)) {
       throw new Error('差异预览缺少有效的导入计划版本，请刷新后重试');
     }
+    const planContractProblem = importPlanContractProblem(body);
+    if (planContractProblem) throw new Error(planContractProblem);
     const groupBindingProblem = importGroupBindingProblem(body);
     if (groupBindingProblem) throw new Error(groupBindingProblem);
     renderPlan({ ...body, selectedKeys });
@@ -2769,6 +2828,11 @@ elements.previewButton.addEventListener('click', previewSelection);
 
 elements.importButton.addEventListener('click', async () => {
   if (!state.plan || state.importRequestPending) return;
+  const planContractProblem = importPlanContractProblem(state.plan);
+  if (planContractProblem) {
+    showNotice('无法确认导入：' + planContractProblem + '。', 'notice-warning');
+    return;
+  }
   const selectionVisibilityProblem = hiddenSelectionProblem(state.plan.selectedKeys);
   if (selectionVisibilityProblem) {
     showNotice('无法确认导入：' + selectionVisibilityProblem + '。', 'notice-warning');
@@ -2931,9 +2995,14 @@ if (elements.cleanupButton) {
       const scanResponse = await apiFetch('/api/tokens/expired');
       const listing = await scanResponse.json();
       if (!scanResponse.ok) throw new Error(listing.message || listing.error || '过期 token 扫描失败');
-      const expiredCount = Number(listing.count);
-      if (!Number.isSafeInteger(expiredCount) || expiredCount < 0 || expiredCount > 1_000_000
-          || !Array.isArray(listing.items)) {
+      const expiredCount = listing.count;
+      if (typeof expiredCount !== 'number'
+          || !Number.isSafeInteger(expiredCount)
+          || expiredCount < 0
+          || expiredCount > 1_000_000
+          || !Array.isArray(listing.items)
+          || listing.items.length !== expiredCount
+          || listing.items.length > 1_000_000) {
         throw new Error('服务器返回的过期 token 清单无效，已停止活动目录清理');
       }
       if (listing.recoveryRequired === true) {

@@ -105,6 +105,132 @@ test('frontend treats every blocking plan item as a conflict and explains termin
   assert.match(source, /所选旧副本将改用预览所示的排序首选版本/);
 });
 
+test('frontend fail-closes unknown sync plan actions and reasons', async () => {
+  const effectivePlanContract = sourceSection('function effectivePlanAction', 'function statusClass');
+  const comparisonContract = sourceSection('function sub2ApiReadStatus', 'function renderMetrics');
+  const previewContract = sourceSection(
+    'async function previewSelection',
+    "elements.previewButton.addEventListener('click', previewSelection);",
+  );
+  const importHandler = sourceSection(
+    "elements.importButton.addEventListener('click'",
+    "elements.phase3Button.addEventListener('click'",
+  );
+  const planIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
+  const selectedKeys = ['token:tokens:tokens/current.json'];
+  const knownItem = { action: 'update', reason: 'token_changed' };
+  const baseState = () => ({
+    snapshot: {
+      readOnly: false,
+      sub2api: { readStatus: 'ok' },
+      diff: { comparisonStatus: 'complete' },
+    },
+    plan: null,
+  });
+  const buttonContext = {
+    state: baseState(),
+    elements: { importButton: {} },
+    actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
+    hiddenSelectionProblem: () => '',
+  };
+  vm.runInNewContext(effectivePlanContract + '\n' + comparisonContract + `
+    state.plan = {
+      planIntentVersion: ${JSON.stringify(planIntentVersion)},
+      selectedKeys: ${JSON.stringify(selectedKeys)},
+      items: [${JSON.stringify(knownItem)}, { action: 'future_action', reason: 'token_changed' }],
+    };
+    updateImportButtonState();
+    unknownActionDisabled = elements.importButton.disabled;
+    state.plan = {
+      planIntentVersion: ${JSON.stringify(planIntentVersion)},
+      selectedKeys: ${JSON.stringify(selectedKeys)},
+      items: [${JSON.stringify(knownItem)}, { action: 'skip', reason: 'future_reason' }],
+    };
+    updateImportButtonState();
+    unknownReasonDisabled = elements.importButton.disabled;
+    state.plan = {
+      planIntentVersion: ${JSON.stringify(planIntentVersion)},
+      selectedKeys: ${JSON.stringify(selectedKeys)},
+      items: [${JSON.stringify(knownItem)}],
+    };
+    updateImportButtonState();
+    knownPlanDisabled = elements.importButton.disabled;
+  `, buttonContext);
+  assert.equal(buttonContext.unknownActionDisabled, true);
+  assert.equal(buttonContext.unknownReasonDisabled, true);
+  assert.equal(buttonContext.knownPlanDisabled, false);
+
+  const previewNotices = [];
+  const renderedPlans = [];
+  const previewContext = {
+    state: {
+      ...baseState(),
+      selected: new Set(selectedKeys),
+      selectionRevision: 3,
+      previewRequestPending: false,
+    },
+    elements: { importButton: {} },
+    actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
+    hiddenSelectionProblem: () => '',
+    selectionStillCurrent: () => true,
+    renderPlan: (plan) => renderedPlans.push(plan),
+    updateActionState() {},
+    apiFetch: async () => ({
+      ok: true,
+      async json() {
+        return {
+          planIntentVersion,
+          items: [knownItem, { action: 'skip', reason: 'future_reason' }],
+        };
+      },
+    }),
+    showNotice: (...args) => previewNotices.push(args),
+  };
+  vm.runInNewContext(comparisonContract + '\n' + previewContract
+    + '\npreviewPromise = previewSelection();', previewContext);
+  assert.equal(await previewContext.previewPromise, false);
+  assert.deepEqual(renderedPlans, [null]);
+  assert.match(previewNotices.at(-1)[0], /无法识别或与操作不匹配的原因/);
+
+  let importClickHandler;
+  let confirmations = 0;
+  let mutationRequests = 0;
+  const importNotices = [];
+  const importContext = {
+    state: {
+      ...baseState(),
+      plan: {
+        version: 'b'.repeat(64),
+        planIntentVersion,
+        selectedKeys,
+        items: [knownItem, { action: 'skip', reason: 'future_reason' }],
+      },
+      importRequestPending: false,
+    },
+    elements: {
+      importButton: {
+        addEventListener(event, handler) {
+          assert.equal(event, 'click');
+          importClickHandler = handler;
+        },
+      },
+    },
+    actionsLocked: () => false,
+    reconciliationWriteBlocked: () => false,
+    hiddenSelectionProblem: () => '',
+    showNotice: (...args) => importNotices.push(args),
+    idempotentMutationFetch: async () => { mutationRequests += 1; },
+    window: { confirm: () => { confirmations += 1; return true; } },
+  };
+  vm.runInNewContext(comparisonContract + '\n' + importHandler, importContext);
+  await importClickHandler();
+  assert.equal(confirmations, 0);
+  assert.equal(mutationRequests, 0);
+  assert.match(importNotices.at(-1)[0], /无法识别或与操作不匹配的原因/);
+});
+
 test('frontend rejects create previews without an exact group binding', () => {
   const actionContracts = sourceSection('function actionReasonLabel', 'function statusClass');
   const lockingContracts = sourceSection('function actionRequestPending', 'function renderMetrics');
@@ -202,6 +328,7 @@ test('frontend import confirmation calls out selected superseded token files', a
     },
     comparisonAvailable: () => true,
     validImportPlanIntentVersion: () => true,
+    importPlanContractProblem: () => '',
     importGroupBindingProblem: () => '',
     hiddenSelectionProblem: () => '',
     syncSelectionProblem: () => '',
@@ -253,6 +380,7 @@ test('frontend submits the exact preview intent version with the ordered selecti
     },
     comparisonAvailable: () => true,
     validImportPlanIntentVersion: () => true,
+    importPlanContractProblem: () => '',
     importGroupBindingProblem: () => '',
     hiddenSelectionProblem: () => '',
     syncSelectionProblem: () => '',
@@ -1331,6 +1459,49 @@ test('frontend treats expired token cleanup as a durable polled task', () => {
   assert.match(resumeContract, /state\.cleanupRequestPending = true/);
 });
 
+test('frontend rejects inconsistent, non-numeric, or oversized expired token listings', async () => {
+  const cleanupHandler = sourceSection(
+    "if (elements.cleanupButton) {",
+    "elements.clearSelectionButton.addEventListener",
+  );
+  const oversizedItems = [];
+  oversizedItems.length = 1_000_001;
+  const scenarios = [
+    { version: 'a'.repeat(64), count: 2, items: [{ relativePath: 'tokens/one.json' }] },
+    { version: 'a'.repeat(64), count: '1', items: [{ relativePath: 'tokens/one.json' }] },
+    { version: 'a'.repeat(64), count: 1_000_001, items: oversizedItems },
+  ];
+  for (const listing of scenarios) {
+    let clickHandler;
+    let confirmations = 0;
+    let mutationRequests = 0;
+    const notices = [];
+    const context = {
+      elements: {
+        cleanupButton: {
+          addEventListener(event, handler) {
+            assert.equal(event, 'click');
+            clickHandler = handler;
+          },
+        },
+      },
+      state: { cleanupRequestPending: false },
+      updateActionState() {},
+      apiFetch: async () => ({ ok: true, async json() { return listing; } }),
+      idempotentMutationFetch: async () => { mutationRequests += 1; },
+      showNotice: (...args) => notices.push(args),
+      watchJob: async () => {},
+      window: { confirm: () => { confirmations += 1; return true; } },
+    };
+    vm.runInNewContext(cleanupHandler, context);
+    await clickHandler();
+    assert.equal(confirmations, 0);
+    assert.equal(mutationRequests, 0);
+    assert.equal(context.state.cleanupRequestPending, false);
+    assert.match(notices.at(-1)[0], /过期 token 清单无效/);
+  }
+});
+
 test('frontend blocks global cleanup when stranded quarantine claims require recovery', async () => {
   const cleanupHandler = sourceSection(
     "if (elements.cleanupButton) {",
@@ -2188,7 +2359,11 @@ test('frontend discards a preview when the selected keys or revision changes in 
     json: async () => ({
       version: 'current',
       planIntentVersion: 'sync-plan-v1.' + 'A'.repeat(43),
-      items: [{ selectedSourceSuperseded: true }],
+      items: [{
+        action: 'update',
+        reason: 'token_changed',
+        selectedSourceSuperseded: true,
+      }],
     }),
   });
   assert.equal(await context.supersededPromise, true);
