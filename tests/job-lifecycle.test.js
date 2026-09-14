@@ -110,6 +110,48 @@ test('Sub2API requests distinguish an external shutdown abort from a timeout', a
   }
 });
 
+test('token-import adapter methods forward shutdown cancellation to fetch', async () => {
+  const originalFetch = global.fetch;
+  try {
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      timeoutMs: 10_000,
+    });
+    const calls = [
+      (signal) => client.listAccounts({ signal }),
+      (signal) => client.getAccount(1, { signal }),
+      (signal) => client.listGroups({ signal }),
+      (signal) => client.getBatchTableUsageStats([1], { signal }),
+      (signal) => client.exportAccounts([], { signal }),
+      (signal) => client.importCodexSession(
+        { content: '{}' },
+        { idempotencyKey: 'test-import-key', signal },
+      ),
+      (signal) => client.applyOAuthCredentials(
+        1,
+        { type: 'oauth', credentials: {} },
+        { signal },
+      ),
+    ];
+    for (const invoke of calls) {
+      const controller = new AbortController();
+      global.fetch = async (url, options) => new Promise((resolve, reject) => {
+        options.signal.addEventListener('abort', () => {
+          const error = new Error('aborted');
+          error.name = 'AbortError';
+          reject(error);
+        }, { once: true });
+      });
+      const request = invoke(controller.signal);
+      controller.abort();
+      await assert.rejects(request, (error) => error.code === 'JOB_INTERRUPTED');
+    }
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('account-test worker propagates shutdown cancellation as a job interruption', async () => {
   const account = {
     id: 17,

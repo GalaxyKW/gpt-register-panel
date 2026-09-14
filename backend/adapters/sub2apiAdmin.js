@@ -793,8 +793,13 @@ class Sub2ApiAdminClient {
     return [...rows.values()];
   }
 
-  async listGroups() {
-    const value = await this.request('GET', '/api/v1/admin/groups/all');
+  async listGroups(options = {}) {
+    const value = await this.request(
+      'GET',
+      '/api/v1/admin/groups/all',
+      undefined,
+      { signal: options.signal },
+    );
     const rows = asList(value);
     if (!rows) {
       const error = new Error('Sub2API 分组列表响应结构无效');
@@ -1062,11 +1067,14 @@ class Sub2ApiAdminClient {
     return normalized;
   }
 
-  async getBatchTableUsageStats(ids) {
+  async getBatchTableUsageStats(ids, options = {}) {
     const requestedIds = normalizedAccountIds(ids);
-    const value = await this.request('POST', '/api/v1/admin/accounts/table-usage-stats/batch', {
-      account_ids: requestedIds,
-    });
+    const value = await this.request(
+      'POST',
+      '/api/v1/admin/accounts/table-usage-stats/batch',
+      { account_ids: requestedIds },
+      { signal: options.signal },
+    );
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       const error = new Error('Sub2API 账号统计响应结构无效');
       error.code = 'SUB2API_STATS_SCHEMA_INVALID';
@@ -1094,9 +1102,14 @@ class Sub2ApiAdminClient {
     };
   }
 
-  async exportAccounts(ids = []) {
+  async exportAccounts(ids = [], options = {}) {
     const query = ids.length > 0 ? '?ids=' + encodeURIComponent(ids.join(',')) : '';
-    const value = await this.request('GET', '/api/v1/admin/accounts/data' + query);
+    const value = await this.request(
+      'GET',
+      '/api/v1/admin/accounts/data' + query,
+      undefined,
+      { signal: options.signal },
+    );
     if (!value || typeof value !== 'object') {
       const error = new Error('Sub2API 导出响应结构无效');
       error.code = 'SUB2API_EXPORT_SCHEMA_INVALID';
@@ -1111,7 +1124,7 @@ class Sub2ApiAdminClient {
       'POST',
       '/api/v1/admin/accounts/import/codex-session',
       payload,
-      { idempotencyKey },
+      { idempotencyKey, signal: options.signal },
     );
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       const error = new Error('Sub2API 导入响应结构无效');
@@ -1128,7 +1141,7 @@ class Sub2ApiAdminClient {
     return value;
   }
 
-  async applyOAuthCredentials(id, payload) {
+  async applyOAuthCredentials(id, payload, options = {}) {
     const accountId = positiveAccountId(id);
     if (!accountId) {
       const error = new Error('Sub2API 凭证更新缺少有效账号 ID');
@@ -1139,6 +1152,7 @@ class Sub2ApiAdminClient {
       'POST',
       '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/apply-oauth-credentials',
       payload,
+      { signal: options.signal },
     );
     const account = safeAccount(value);
     if (!account) {

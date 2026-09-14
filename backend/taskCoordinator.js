@@ -3,6 +3,7 @@ const path = require('node:path');
 
 const { acquireBakeryLease, releaseBakeryLease } = require('./lib/bakeryLock');
 const { ensureDirectoryTree } = require('./lib/safeFs');
+const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 
 const CONTROL_LOCK_KIND = 'gpt-register-panel-control-lock';
 
@@ -120,7 +121,7 @@ function openControlPlaneDirectory(lockPath) {
   }
 }
 
-async function acquireControlPlaneLease() {
+async function acquireControlPlaneLease(options = {}) {
   const lockPath = controlPlaneLockPath();
   const timeoutMs = boundedMilliseconds(
     process.env.PANEL_CONTROL_LOCK_TIMEOUT_MS,
@@ -148,6 +149,7 @@ async function acquireControlPlaneLease() {
       changedMessage: '控制面锁租约在操作期间发生变化',
       timeoutMessage: '等待控制面全局锁超时',
       releaseMessage: '控制面锁租约释放失败，当前进程已停止接受新的全局锁任务',
+      signal: options.signal,
     });
     return { ...lease, directoryDescriptor: pinnedDirectory.descriptor };
   } catch (error) {
@@ -167,19 +169,62 @@ function releaseControlPlaneLease(lease) {
   }
 }
 
-async function runWithGlobalLease(callback) {
-  const lease = await acquireControlPlaneLease();
+async function runWithGlobalLease(callback, options = {}) {
+  const lease = await acquireControlPlaneLease(options);
   try {
+    throwIfJobInterrupted(options.signal);
     return await callback();
   } finally {
     releaseControlPlaneLease(lease);
   }
 }
 
-function withControlPlaneLock(callback) {
-  const run = queue.then(() => runWithGlobalLease(callback));
+function queueCancelableRun(predecessor, callback, options = {}) {
+  const signal = options.signal;
+  let started = false;
+  let stopListening = () => {};
+  const run = predecessor.then(async () => {
+    started = true;
+    stopListening();
+    throwIfJobInterrupted(signal);
+    return callback();
+  });
+  if (!signal || typeof signal.addEventListener !== 'function') {
+    return { run, result: run };
+  }
+  const result = new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callbackFn, value) => {
+      if (settled) return;
+      settled = true;
+      stopListening();
+      callbackFn(value);
+    };
+    const onAbort = () => {
+      if (!started) settle(reject, interruptedJobError());
+    };
+    stopListening = () => {
+      try { signal.removeEventListener('abort', onAbort); } catch {}
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    run.then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error),
+    );
+  });
+  return { run, result };
+}
+
+function withControlPlaneLock(callback, options = {}) {
+  const queued = queueCancelableRun(
+    queue,
+    () => runWithGlobalLease(callback, options),
+    options,
+  );
+  const run = queued.run;
   queue = run.catch(() => {});
-  return run;
+  return queued.result;
 }
 
 module.exports = {

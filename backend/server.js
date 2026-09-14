@@ -1169,6 +1169,7 @@ function createServer(options = {}) {
             db,
             jobId: job.id,
             logger,
+            signal: trackedImport.controller.signal,
           });
         }).then(async (result) => {
           const status = tokenImportJobStatus(result);
@@ -1206,7 +1207,8 @@ function createServer(options = {}) {
           });
         }).catch(async (error) => {
           const message = safeErrorMessage(error);
-          const interrupted = trackedImport.controller.signal.aborted;
+          const interrupted = error?.code === 'JOB_INTERRUPTED'
+            || trackedImport.controller.signal.aborted;
           try {
             await db.audit({
               jobId: job.id,

@@ -25,6 +25,7 @@ const {
   availabilityOptions,
 } = require('./view');
 const { getAccountAvailability } = require('./accountAvailability');
+const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 const { redactText } = require('./logger');
 const { parseJwtPayload, normalizeIdentityValue } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
@@ -62,10 +63,52 @@ function writeLog(logger, level, event, fields = {}) {
   }
 }
 
-function withSyncLock(callback) {
-  const run = syncQueue.then(callback);
+function rethrowIfJobInterrupted(error, signal) {
+  if (error?.code === 'JOB_INTERRUPTED') throw error;
+  throwIfJobInterrupted(signal);
+}
+
+function queueCancelableRun(predecessor, callback, signal) {
+  let started = false;
+  let stopListening = () => {};
+  const run = predecessor.then(async () => {
+    started = true;
+    stopListening();
+    throwIfJobInterrupted(signal);
+    return callback();
+  });
+  if (!signal || typeof signal.addEventListener !== 'function') {
+    return { run, result: run };
+  }
+  const result = new Promise((resolve, reject) => {
+    let settled = false;
+    const settle = (callbackFn, value) => {
+      if (settled) return;
+      settled = true;
+      stopListening();
+      callbackFn(value);
+    };
+    const onAbort = () => {
+      if (!started) settle(reject, interruptedJobError());
+    };
+    stopListening = () => {
+      try { signal.removeEventListener('abort', onAbort); } catch {}
+    };
+    signal.addEventListener('abort', onAbort, { once: true });
+    if (signal.aborted) onAbort();
+    run.then(
+      (value) => settle(resolve, value),
+      (error) => settle(reject, error),
+    );
+  });
+  return { run, result };
+}
+
+function withSyncLock(callback, options = {}) {
+  const queued = queueCancelableRun(syncQueue, callback, options.signal);
+  const run = queued.run;
   syncQueue = run.catch(() => {});
-  return run;
+  return queued.result;
 }
 
 function configuredForSub2Api() {
@@ -204,17 +247,22 @@ function safeAccountForSnapshot(account) {
   };
 }
 
-async function readSub2ApiAccounts(client) {
+async function readSub2ApiAccounts(client, options = {}) {
+  const signal = options.signal;
+  throwIfJobInterrupted(signal);
   const accounts = await client.listAccounts({
     platform: 'openai',
     type: 'oauth',
     pageSize: 200,
+    signal,
   });
+  throwIfJobInterrupted(signal);
   let statsError = null;
   const ids = accounts.map((account) => account.id).filter((id) => Number.isFinite(id) && id > 0);
   if (ids.length > 0) {
     try {
-      const tableStats = await client.getBatchTableUsageStats(ids);
+      const tableStats = await client.getBatchTableUsageStats(ids, { signal });
+      throwIfJobInterrupted(signal);
       for (const account of accounts) {
         account.usage = tableStats.stats[String(account.id)] || normalizeAccountUsage(account);
         if (tableStats.errors?.[String(account.id)]) {
@@ -224,6 +272,7 @@ async function readSub2ApiAccounts(client) {
       const failedCount = Object.keys(tableStats.errors || {}).length;
       if (failedCount > 0) statsError = failedCount + ' 个账号统计读取失败';
     } catch (error) {
+      rethrowIfJobInterrupted(error, signal);
       statsError = safeErrorMessage(error);
       for (const account of accounts) account.usage = normalizeAccountUsage(account);
     }
@@ -234,6 +283,7 @@ async function readSub2ApiAccounts(client) {
 async function buildSnapshot(query = new URLSearchParams(), options = {}) {
   const startedAt = Date.now();
   const logger = options.logger;
+  const signal = options.signal;
   const logContext = {
     requestId: options.requestId || null,
     jobId: options.jobId || null,
@@ -247,10 +297,12 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     includeRaw: options.includeRaw === true,
   });
   try {
+    throwIfJobInterrupted(signal);
     const sources = readGptRegisterSources({
       includeRaw: options.includeRaw === true,
       rootDirectory: options.rootDirectory,
     });
+    throwIfJobInterrupted(signal);
     let accounts = [];
     let apiError = null;
     let statsError = null;
@@ -259,11 +311,12 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     if (shouldReadSub2Api) {
       try {
         const client = options.client || new Sub2ApiAdminClient({ logger, logContext });
-        const loaded = await readSub2ApiAccounts(client);
+        const loaded = await readSub2ApiAccounts(client, { signal });
         accounts = loaded.accounts;
         statsError = loaded.statsError;
         readStatus = 'ok';
       } catch (error) {
+        rethrowIfJobInterrupted(error, signal);
         readStatus = 'failed';
         apiError = safeErrorMessage(error);
         writeLog(logger, 'warn', 'snapshot.sub2api_failed', { ...logContext, error: apiError });
@@ -315,6 +368,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
       },
       _internal: options.includeInternal === true ? internal : undefined,
     };
+    throwIfJobInterrupted(signal);
     writeLog(logger, 'info', 'snapshot.completed', {
       ...logContext,
       version,
@@ -855,13 +909,16 @@ function configuredGroupIds() {
   return [...new Set(ids)];
 }
 
-async function resolveGroupIds(client) {
+async function resolveGroupIds(client, options = {}) {
+  const signal = options.signal;
+  throwIfJobInterrupted(signal);
   const configured = configuredGroupIds();
   if (configured.length > 0) return configured;
   const wanted = String(process.env.SUB2API_GROUP_NAME || 'share').trim().toLowerCase();
   if (!wanted) return [];
   try {
-    const groups = await client.listGroups();
+    const groups = await client.listGroups({ signal });
+    throwIfJobInterrupted(signal);
     const resolved = groups
       .filter((group) => [group?.name, group?.slug, group?.code]
         .some((value) => String(value || '').trim().toLowerCase() === wanted))
@@ -886,6 +943,7 @@ async function resolveGroupIds(client) {
     }
     return unique;
   } catch (error) {
+    rethrowIfJobInterrupted(error, signal);
     if (['SUB2API_GROUP_NOT_FOUND', 'SUB2API_GROUP_AMBIGUOUS'].includes(error?.code)) throw error;
     const wrapped = new Error('读取 Sub2API 分组失败：' + safeErrorMessage(error));
     wrapped.code = 'SUB2API_GROUP_RESOLVE_FAILED';
@@ -948,15 +1006,20 @@ function assertImportResultSucceeded(result) {
   throw error;
 }
 
-async function verifyImportedAccount(client, item, result, logger, context = {}) {
+async function verifyImportedAccount(client, item, result, logger, context = {}, options = {}) {
+  const signal = options.signal;
+  throwIfJobInterrupted(signal);
   const reportedId = importResultAccountId(result);
   let account = Number.isSafeInteger(reportedId) && reportedId > 0
-    ? await client.getAccount(reportedId)
+    ? await client.getAccount(reportedId, { signal })
     : null;
+  throwIfJobInterrupted(signal);
   if (!account) {
     const accounts = await client.listAccounts({
       platform: 'openai', type: 'oauth', pageSize: 200, sortBy: 'id', sortOrder: 'asc',
+      signal,
     });
+    throwIfJobInterrupted(signal);
     const matches = accounts.filter((candidate) => identitiesStronglyCompatible(
       item.sourceIdentityKeys?.length ? item.sourceIdentityKeys : item._account?.identityKeys || [item.identityKey],
       candidate.identityKeys || accountKeys(candidate),
@@ -985,7 +1048,13 @@ async function verifyImportedAccount(client, item, result, logger, context = {})
   // unless both the strong identity and allocated free name resolve uniquely
   // to the reported row. Do not attempt an unsafe automatic rollback or
   // deletion here.
-  const accounts = await client.listAccounts({ pageSize: 200, sortBy: 'id', sortOrder: 'asc' });
+  const accounts = await client.listAccounts({
+    pageSize: 200,
+    sortBy: 'id',
+    sortOrder: 'asc',
+    signal,
+  });
+  throwIfJobInterrupted(signal);
   const identityMatches = accountMatches({ sourceIdentityKeys: expectedIdentity }, accounts);
   if (identityMatches.length !== 1 || Number(identityMatches[0]?.id) !== Number(account.id)) {
     throw targetVerificationError(
@@ -1334,12 +1403,15 @@ function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
   return record;
 }
 
-async function preflightUpdateAccount(client, item, nowMs = Date.now()) {
+async function preflightUpdateAccount(client, item, nowMs = Date.now(), options = {}) {
+  const signal = options.signal;
+  throwIfJobInterrupted(signal);
   const expectedId = Number(item?.accountId);
   if (!Number.isSafeInteger(expectedId) || expectedId <= 0) {
     throw targetVerificationError('更新计划缺少有效的 Sub2API 账号 ID', 'SUB2API_TARGET_ID_REQUIRED');
   }
-  const account = await client.getAccount(expectedId);
+  const account = await client.getAccount(expectedId, { signal });
+  throwIfJobInterrupted(signal);
   verifyTargetIdentity(item, account, expectedId);
   verifyPlannedTargetIdentity(item, account);
   const availability = getAccountAvailability(account, nowMs);
@@ -1359,11 +1431,19 @@ async function preflightUpdateAccount(client, item, nowMs = Date.now()) {
   return { account, skipReason: null };
 }
 
-async function preflightCreateAccount(client, item) {
+async function preflightCreateAccount(client, item, options = {}) {
+  const signal = options.signal;
+  throwIfJobInterrupted(signal);
   if (!hasStrongIdentity(item.sourceIdentityKeys || [])) {
     throw targetVerificationError('新建账号缺少强身份，已拒绝写入', 'SOURCE_STRONG_IDENTITY_REQUIRED');
   }
-  const accounts = await client.listAccounts({ platform: 'openai', type: 'oauth', pageSize: 200 });
+  const accounts = await client.listAccounts({
+    platform: 'openai',
+    type: 'oauth',
+    pageSize: 200,
+    signal,
+  });
+  throwIfJobInterrupted(signal);
   const strongMatches = accounts.filter((account) => identitiesStronglyCompatible(
     item.sourceIdentityKeys || [],
     account.identityKeys || accountKeys(account),
@@ -1416,10 +1496,13 @@ async function executeImportPlanItem({
   logger = null,
   context = {},
   sourceRoot = null,
+  signal = null,
 }) {
+  throwIfJobInterrupted(signal);
   if (item.action === 'update') {
     let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot) : null;
-    let preflight = await preflightUpdateAccount(client, item);
+    throwIfJobInterrupted(signal);
+    let preflight = await preflightUpdateAccount(client, item, Date.now(), { signal });
     if (preflight.skipReason) {
       return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
     }
@@ -1429,7 +1512,8 @@ async function executeImportPlanItem({
       // final operation immediately preceding the write is an exact-ID,
       // strong-identity and availability check of the remote target.
       freshRecord = revalidateSourceToken(item, sourceRoot);
-      preflight = await preflightUpdateAccount(client, item);
+      throwIfJobInterrupted(signal);
+      preflight = await preflightUpdateAccount(client, item, Date.now(), { signal });
       if (preflight.skipReason) {
         return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
       }
@@ -1439,8 +1523,15 @@ async function executeImportPlanItem({
       ...(freshRecord ? { _record: freshRecord, _raw: freshRecord.raw } : {}),
       _verifiedAccount: preflight.account,
     };
-    await client.applyOAuthCredentials(item.accountId, buildOAuthUpdatePayload(writeItem));
-    const account = await client.getAccount(item.accountId);
+    throwIfJobInterrupted(signal);
+    await client.applyOAuthCredentials(
+      item.accountId,
+      buildOAuthUpdatePayload(writeItem),
+      { signal },
+    );
+    throwIfJobInterrupted(signal);
+    const account = await client.getAccount(item.accountId, { signal });
+    throwIfJobInterrupted(signal);
     const accountId = verifyTargetIdentity(item, account, item.accountId);
     verifyUpdatedTargetIdentity(writeItem, account);
     const fingerprint = verifyTargetFingerprint(item, account);
@@ -1458,6 +1549,7 @@ async function executeImportPlanItem({
       verification,
     };
   }
+  throwIfJobInterrupted(signal);
   if (item.action !== 'create') {
     throw targetVerificationError('不支持的导入计划动作', 'IMPORT_ACTION_INVALID');
   }
@@ -1470,10 +1562,12 @@ async function executeImportPlanItem({
     };
   }
   let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot) : null;
-  let knownAccountIds = await preflightCreateAccount(client, item);
+  throwIfJobInterrupted(signal);
+  let knownAccountIds = await preflightCreateAccount(client, item, { signal });
   if (sourceRoot) {
     freshRecord = revalidateSourceToken(item, sourceRoot);
-    const finalKnownAccountIds = await preflightCreateAccount(client, item);
+    throwIfJobInterrupted(signal);
+    const finalKnownAccountIds = await preflightCreateAccount(client, item, { signal });
     knownAccountIds = new Set([...knownAccountIds, ...finalKnownAccountIds]);
   }
   const writeItem = freshRecord ? { ...item, _record: freshRecord, _raw: freshRecord.raw } : item;
@@ -1490,11 +1584,22 @@ async function executeImportPlanItem({
     skip_default_group_bind: false,
     confirm_mixed_channel_risk: process.env.SUB2API_CONFIRM_MIXED_CHANNEL_RISK === '1',
   };
+  throwIfJobInterrupted(signal);
   const rawResult = await client.importCodexSession(payload, {
     idempotencyKey: buildCodexImportIdempotencyKey(writeItem, context),
+    signal,
   });
+  throwIfJobInterrupted(signal);
   assertCreatedImportResult(rawResult, knownAccountIds);
-  const verification = await verifyImportedAccount(client, item, rawResult, logger, context);
+  const verification = await verifyImportedAccount(
+    client,
+    item,
+    rawResult,
+    logger,
+    context,
+    { signal },
+  );
+  throwIfJobInterrupted(signal);
   return {
     skipped: false,
     reason: null,
@@ -1680,7 +1785,16 @@ function writeBackup(payload) {
   return logicalFilePath;
 }
 
-async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = [], actor = 'local', db, jobId = null, logger = null }) {
+async function executeImport({
+  snapshotVersion: expectedVersion,
+  selectedKeys = [],
+  actor = 'local',
+  db,
+  jobId = null,
+  logger = null,
+  signal = null,
+  client: providedClient = null,
+}) {
   const startedAt = Date.now();
   writeLog(logger, 'info', 'import.started', {
     jobId,
@@ -1689,6 +1803,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
     selectedCount: Array.isArray(selectedKeys) ? selectedKeys.length : 0,
   });
   try {
+    throwIfJobInterrupted(signal);
     if (process.env.PANEL_WRITE_ENABLED !== '1') {
       const error = new Error('写操作未启用，请设置 PANEL_WRITE_ENABLED=1 后重启面板');
       error.code = 'WRITE_DISABLED';
@@ -1706,7 +1821,9 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
       throw error;
     }
     const result = await withControlPlaneLock(() => withSyncLock(async () => {
-      const client = new Sub2ApiAdminClient({ logger, logContext: { jobId, actor } });
+      throwIfJobInterrupted(signal);
+      const client = providedClient
+        || new Sub2ApiAdminClient({ logger, logContext: { jobId, actor } });
       const current = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
         includeRaw: true,
         includeInternal: true,
@@ -1714,7 +1831,9 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
         logger,
         jobId,
         actor,
+        signal,
       });
+      throwIfJobInterrupted(signal);
       if (!confirmedSub2ApiRead(current)) {
         const readError = current?._internal?.apiError
           || current?.sub2api?.apiError
@@ -1728,7 +1847,9 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
         error.code = 'SNAPSHOT_STALE';
         throw error;
       }
+      throwIfJobInterrupted(signal);
       await db?.updateJob(jobId, { status: 'running', startedAt: new Date().toISOString() });
+      throwIfJobInterrupted(signal);
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
       const fullSummary = importPlanSummary(fullPlan);
       writeLog(logger, 'info', 'import.plan_built', {
@@ -1772,14 +1893,18 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
         }
         throw new Error('存在身份或版本冲突，已停止导入');
       }
+      throwIfJobInterrupted(signal);
       if (plan.length === 0) return { ...importPlanSummary([]), imported: [], skipped: true };
 
       let backupPath = null;
       writeLog(logger, 'info', 'import.backup_started', { jobId, actor });
       try {
-        backupPath = writeBackup(await client.exportAccounts());
+        const exported = await client.exportAccounts([], { signal });
+        throwIfJobInterrupted(signal);
+        backupPath = writeBackup(exported);
         writeLog(logger, 'info', 'import.backup_succeeded', { jobId, actor, backupPath });
       } catch (error) {
+        rethrowIfJobInterrupted(error, signal);
         const message = safeErrorMessage(error);
         writeLog(logger, process.env.PANEL_ALLOW_UNBACKED_WRITES === '1' ? 'warn' : 'error', 'import.backup_failed', {
           jobId,
@@ -1793,8 +1918,9 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
       }
 
       const groups = plan.some((item) => item.action === 'create')
-        ? await resolveGroupIds(client)
+        ? await resolveGroupIds(client, { signal })
         : [];
+      throwIfJobInterrupted(signal);
       writeLog(logger, 'info', 'import.accounts_started', {
         jobId,
         actor,
@@ -1803,6 +1929,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
       });
       const imported = [];
       for (const item of plan) {
+        throwIfJobInterrupted(signal);
         const itemStartedAt = Date.now();
         const baseFields = {
           jobId,
@@ -1825,6 +1952,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
             logger,
             context: baseFields,
             sourceRoot: current._internal.sources.rootDirectory,
+            signal,
           });
           if (outcome.skipped) {
             const skippedItem = { ...item, action: 'skip', reason: outcome.reason };
@@ -1903,6 +2031,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
             sub2apiAccountId: verification.accountId,
           });
         } catch (error) {
+          rethrowIfJobInterrupted(error, signal);
           const message = safeErrorMessage(error);
           imported.push({ ...safeImportItem(item), result: null, error: message, code: error?.code || null });
           try {
@@ -1929,6 +2058,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
           });
         }
       }
+      throwIfJobInterrupted(signal);
       const failed = imported.filter((item) => item.error).length;
       const runtimeSkipped = imported.filter((item) => item.skipped).length;
       writeLog(logger, failed > 0 ? 'warn' : 'info', 'import.accounts_completed', {
@@ -1946,7 +2076,7 @@ async function executeImport({ snapshotVersion: expectedVersion, selectedKeys = 
         failed,
         runtimeSkipped,
       };
-    }));
+    }, { signal }), { signal });
     writeLog(logger, result.failed > 0 ? 'warn' : 'info', 'import.completed', {
       jobId,
       actor,

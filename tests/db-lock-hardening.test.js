@@ -9,6 +9,7 @@ require('./test-isolation');
 
 const { PanelDb } = require('../backend/db');
 const { currentProcessOwner, withControlPlaneLock } = require('../backend/taskCoordinator');
+const { acquireBakeryLease, releaseBakeryLease } = require('../backend/lib/bakeryLock');
 
 function queryRows(database, sql) {
   const result = database.exec(sql);
@@ -36,6 +37,11 @@ function cleanupLeaseEntries(root, lockName, originalUnlink) {
     if (!name.startsWith(lockName + '.lease-v2-')) continue;
     try { originalUnlink.call(fs, path.join(root, name)); } catch {}
   }
+}
+
+function leaseEntries(root, lockName) {
+  return fs.readdirSync(root)
+    .filter((name) => name.startsWith(lockName + '.lease-v2-'));
 }
 
 async function writeLegacyDatabase(file) {
@@ -133,6 +139,79 @@ test('PanelDb persists boot identity and rejects a live PID from another boot', 
     status: 'failed',
     error: 'test cleanup',
   });
+});
+
+test('bakery lock cancellation interrupts polling and removes only its own lease', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-abort-'));
+  const lockName = 'abortable.lock';
+  const descriptor = fs.openSync(
+    root,
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0),
+  );
+  const accessDirectory = process.platform === 'linux'
+    ? '/proc/self/fd/' + descriptor
+    : root;
+  const baseOptions = {
+    directoryDescriptor: descriptor,
+    accessDirectory,
+    lockName,
+    kind: 'test-abortable-bakery-lock',
+    owner: currentProcessOwner(),
+    isOwnerAlive: () => true,
+    timeoutMs: 10_000,
+    // A long poll proves abort wakes the waiter instead of waiting for the
+    // next timeout tick.
+    pollMs: 5_000,
+  };
+  let firstLease;
+  try {
+    firstLease = await acquireBakeryLease(baseOptions);
+    const controller = new AbortController();
+    const waiting = acquireBakeryLease({ ...baseOptions, signal: controller.signal });
+    const publishDeadline = Date.now() + 1_000;
+    while (leaseEntries(root, lockName).length < 2 && Date.now() < publishDeadline) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    assert.equal(leaseEntries(root, lockName).length, 2);
+    const abortedAt = Date.now();
+    controller.abort();
+    await assert.rejects(waiting, (error) => error.code === 'JOB_INTERRUPTED');
+    assert.ok(Date.now() - abortedAt < 1_000, 'abort should wake a bakery lock waiter promptly');
+    assert.equal(leaseEntries(root, lockName).length, 1);
+    releaseBakeryLease(firstLease);
+    firstLease = null;
+    assert.deepEqual(leaseEntries(root, lockName), []);
+  } finally {
+    if (firstLease) releaseBakeryLease(firstLease);
+    fs.closeSync(descriptor);
+  }
+});
+
+test('control-plane in-process queue cancellation never runs the queued callback', async () => {
+  let releaseFirst;
+  let markFirstEntered;
+  const firstEntered = new Promise((resolve) => { markFirstEntered = resolve; });
+  const first = withControlPlaneLock(async () => {
+    markFirstEntered();
+    await new Promise((resolve) => { releaseFirst = resolve; });
+  });
+  await firstEntered;
+
+  const controller = new AbortController();
+  let queuedCallbacks = 0;
+  const queued = withControlPlaneLock(async () => {
+    queuedCallbacks += 1;
+  }, { signal: controller.signal });
+  const abortedAt = Date.now();
+  controller.abort();
+  await assert.rejects(queued, (error) => error.code === 'JOB_INTERRUPTED');
+  assert.ok(Date.now() - abortedAt < 1_000, 'queued abort should not wait for the preceding callback');
+  assert.equal(queuedCallbacks, 0);
+
+  releaseFirst();
+  await first;
+  await withControlPlaneLock(async () => {});
+  assert.equal(queuedCallbacks, 0);
 });
 
 test('control-plane lease release retries bounded transient unlink failures', async () => {

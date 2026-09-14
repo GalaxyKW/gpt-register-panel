@@ -13,6 +13,7 @@ const {
   buildCodexSessionDocument,
   buildCodexImportIdempotencyKey,
   collectCandidates,
+  executeImport,
   executeImportPlanItem,
   importPlanSummary,
   buildSnapshot,
@@ -178,6 +179,28 @@ test('snapshot distinguishes unavailable Sub2API reads from a confirmed empty ac
   assert.equal(confirmedEmpty.rows[0].diffKind, 'token_only');
   assert.equal(confirmedEmpty.rows[0].availability, 'not_present');
   assert.equal(confirmedEmpty.rows[0].availabilityReason, 'not_in_sub2api');
+});
+
+test('snapshot propagates shutdown cancellation instead of downgrading it to a remote read error', async () => {
+  const { root } = fixture();
+  const controller = new AbortController();
+  await assert.rejects(
+    buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      readSub2Api: true,
+      signal: controller.signal,
+      client: {
+        async listAccounts(options) {
+          assert.equal(options.signal, controller.signal);
+          controller.abort();
+          const error = new Error('stopped');
+          error.code = 'JOB_INTERRUPTED';
+          throw error;
+        },
+      },
+    }),
+    (error) => error.code === 'JOB_INTERRUPTED',
+  );
 });
 
 test('unavailable remote comparison preserves local duplicate-token facts', () => {
@@ -1920,6 +1943,276 @@ test('final remote preflight skips a target that becomes available before mutati
   assert.equal(mutations, 0);
   assert.equal(outcome.skipped, true);
   assert.equal(outcome.reason, 'sub2api_available');
+});
+
+test('import plan items pass one cancellation signal through update and create requests', async () => {
+  const controller = new AbortController();
+  const signal = controller.signal;
+  const updateIdentity = ['account:signal-update-account', 'user:signal-update-user'];
+  const updateSource = syntheticToken('tokens/signal-update.json', updateIdentity, {
+    accountId: 'signal-update-account',
+    userId: 'signal-update-user',
+    accessFingerprint: 'signal-update-new-fingerprint',
+  });
+  const updateBefore = {
+    id: 301,
+    name: 'free00301',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    identityKeys: updateIdentity,
+    tokenFingerprints: { access: 'signal-update-old-fingerprint' },
+  };
+  const updateAfter = {
+    ...updateBefore,
+    tokenFingerprints: { access: updateSource.fingerprints.access },
+  };
+  const updateItem = buildImportPlan(
+    { tokens: [updateSource], usernames: [] },
+    [updateBefore],
+  )[0];
+  let updateReads = 0;
+  let updateWrites = 0;
+  await executeImportPlanItem({
+    item: updateItem,
+    signal,
+    client: {
+      async getAccount(id, options) {
+        assert.equal(id, 301);
+        assert.equal(options.signal, signal);
+        updateReads += 1;
+        return updateReads === 1 ? updateBefore : updateAfter;
+      },
+      async applyOAuthCredentials(id, payload, options) {
+        assert.equal(id, 301);
+        assert.equal(typeof payload.credentials.access_token, 'string');
+        assert.equal(options.signal, signal);
+        updateWrites += 1;
+        return updateAfter;
+      },
+    },
+  });
+  assert.equal(updateReads, 2);
+  assert.equal(updateWrites, 1);
+
+  const createIdentity = ['account:signal-create-account', 'user:signal-create-user'];
+  const createSource = syntheticToken('tokens/signal-create.json', createIdentity, {
+    accountId: 'signal-create-account',
+    userId: 'signal-create-user',
+    accessFingerprint: 'signal-create-fingerprint',
+  });
+  const createItem = buildImportPlan({ tokens: [createSource], usernames: [] }, [])[0];
+  const createdAccount = {
+    id: 302,
+    name: createItem.accountName,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    identityKeys: createIdentity,
+    tokenFingerprints: { ...createSource.fingerprints },
+  };
+  let createLists = 0;
+  let createWrites = 0;
+  let createReads = 0;
+  await executeImportPlanItem({
+    item: createItem,
+    signal,
+    context: { jobId: 'signal-create-job' },
+    client: {
+      async listAccounts(options) {
+        assert.equal(options.signal, signal);
+        createLists += 1;
+        return createLists === 1 ? [] : [createdAccount];
+      },
+      async importCodexSession(payload, options) {
+        assert.equal(payload.update_existing, false);
+        assert.equal(options.signal, signal);
+        createWrites += 1;
+        return {
+          total: 1,
+          created: 1,
+          updated: 0,
+          skipped: 0,
+          failed: 0,
+          items: [{ index: 0, action: 'created', account_id: 302 }],
+        };
+      },
+      async getAccount(id, options) {
+        assert.equal(id, 302);
+        assert.equal(options.signal, signal);
+        createReads += 1;
+        return createdAccount;
+      },
+    },
+  });
+  assert.equal(createLists, 2);
+  assert.equal(createWrites, 1);
+  assert.equal(createReads, 1);
+});
+
+test('create cancellation after the POST starts no postflight request', async () => {
+  const identityKeys = ['account:cancel-create-account', 'user:cancel-create-user'];
+  const source = syntheticToken('tokens/cancel-create.json', identityKeys, {
+    accountId: 'cancel-create-account',
+    userId: 'cancel-create-user',
+    accessFingerprint: 'cancel-create-fingerprint',
+  });
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  const controller = new AbortController();
+  let listCalls = 0;
+  let importCalls = 0;
+  let postflightReads = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      signal: controller.signal,
+      client: {
+        async listAccounts(options) {
+          assert.equal(options.signal, controller.signal);
+          listCalls += 1;
+          return [];
+        },
+        async importCodexSession(payload, options) {
+          assert.equal(payload.update_existing, false);
+          assert.equal(options.signal, controller.signal);
+          importCalls += 1;
+          controller.abort();
+          return {
+            total: 1,
+            created: 1,
+            updated: 0,
+            skipped: 0,
+            failed: 0,
+            items: [{ index: 0, action: 'created', account_id: 303 }],
+          };
+        },
+        async getAccount() {
+          postflightReads += 1;
+          throw new Error('postflight must not start after cancellation');
+        },
+      },
+    }),
+    (error) => error.code === 'JOB_INTERRUPTED',
+  );
+  assert.equal(listCalls, 1);
+  assert.equal(importCalls, 1);
+  assert.equal(postflightReads, 0);
+});
+
+test('token import does not swallow cancellation or start the next account', async () => {
+  const { root } = fixture();
+  const secondAccess = [
+    'header',
+    Buffer.from(JSON.stringify({
+      sub: 'u-2',
+      email: 'two@example.test',
+      'https://api.openai.com/auth': {
+        chatgpt_account_id: 'a-2',
+        chatgpt_user_id: 'u-2',
+      },
+    })).toString('base64url'),
+    'signature',
+  ].join('.');
+  fs.writeFileSync(path.join(root, 'tokens', 'two.json'), JSON.stringify({
+    access_token: secondAccess,
+    refresh_token: 'fixture-refresh-two',
+    email: 'two@example.test',
+  }));
+  const backupRoot = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-import-abort-')),
+    'backups',
+  );
+  fs.mkdirSync(backupRoot, { mode: 0o700 });
+  const environment = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    baseUrl: process.env.SUB2API_BASE_URL,
+    apiKey: process.env.SUB2API_ADMIN_API_KEY,
+    groupIds: process.env.SUB2API_GROUP_IDS,
+    backupDirectory: process.env.PANEL_BACKUP_DIR,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.SUB2API_GROUP_IDS = '7';
+  process.env.PANEL_BACKUP_DIR = backupRoot;
+  try {
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      client: { async listAccounts() { return []; } },
+    });
+    const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
+      .map((item) => item.key);
+    assert.equal(selectedKeys.length, 2);
+
+    const controller = new AbortController();
+    let importCalls = 0;
+    let postflightReads = 0;
+    const client = {
+      async listAccounts(options) {
+        assert.equal(options.signal, controller.signal);
+        return [];
+      },
+      async exportAccounts(ids, options) {
+        assert.deepEqual(ids, []);
+        assert.equal(options.signal, controller.signal);
+        return { accounts: [] };
+      },
+      async importCodexSession(payload, options) {
+        assert.equal(payload.update_existing, false);
+        assert.equal(options.signal, controller.signal);
+        importCalls += 1;
+        controller.abort();
+        return {
+          total: 1,
+          created: 1,
+          updated: 0,
+          skipped: 0,
+          failed: 0,
+          items: [{ index: 0, action: 'created', account_id: 401 }],
+        };
+      },
+      async getAccount() {
+        postflightReads += 1;
+        throw new Error('postflight must not run after cancellation');
+      },
+    };
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        selectedKeys,
+        actor: 'tester',
+        db: {
+          async updateJob() {},
+          async audit() {},
+          async saveLink() {},
+        },
+        jobId: 'token-import-abort-job',
+        signal: controller.signal,
+        client,
+      }),
+      (error) => error.code === 'JOB_INTERRUPTED',
+    );
+    assert.equal(importCalls, 1);
+    assert.equal(postflightReads, 0);
+  } finally {
+    for (const [name, value] of [
+      ['GPT_REGISTER_ROOT', environment.root],
+      ['PANEL_WRITE_ENABLED', environment.writeEnabled],
+      ['SUB2API_BASE_URL', environment.baseUrl],
+      ['SUB2API_ADMIN_API_KEY', environment.apiKey],
+      ['SUB2API_GROUP_IDS', environment.groupIds],
+      ['PANEL_BACKUP_DIR', environment.backupDirectory],
+    ]) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
 });
 
 test('create verification consumes the nested Codex import account ID', async () => {

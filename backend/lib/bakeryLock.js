@@ -284,18 +284,55 @@ function hasPriority(leftTicket, leftToken, rightTicket, rightToken) {
     || (leftTicket === rightTicket && leftToken < rightToken);
 }
 
-async function sleep(milliseconds) {
-  await new Promise((resolve) => setTimeout(resolve, milliseconds));
+function interruptedLockError(context) {
+  const reason = context.signal?.reason;
+  if (reason instanceof Error && reason.code === context.interruptedCode) return reason;
+  return lockError(context.interruptedCode, context.interruptedMessage);
+}
+
+function throwIfLockInterrupted(context) {
+  if (context.signal?.aborted) throw interruptedLockError(context);
+}
+
+async function sleep(milliseconds, context) {
+  if (!context?.signal) {
+    await new Promise((resolve) => setTimeout(resolve, milliseconds));
+    return;
+  }
+  throwIfLockInterrupted(context);
+  await new Promise((resolve, reject) => {
+    let timer;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      try { context.signal.removeEventListener('abort', onAbort); } catch {}
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(interruptedLockError(context));
+    };
+    context.signal.addEventListener('abort', onAbort, { once: true });
+    if (context.signal.aborted) {
+      onAbort();
+      return;
+    }
+    timer = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, milliseconds);
+  });
 }
 
 async function retryChanged(context, startedAt, callback) {
   while (true) {
+    throwIfLockInterrupted(context);
     try {
-      return callback();
+      const result = callback();
+      throwIfLockInterrupted(context);
+      return result;
     } catch (error) {
       if (error?.code !== context.changedCode) throw error;
       if (Date.now() - startedAt >= context.timeoutMs) throw error;
-      await sleep(context.pollMs);
+      await sleep(context.pollMs, context);
     }
   }
 }
@@ -307,6 +344,11 @@ function normalizeContext(options) {
   if (!options.accessDirectory || !options.lockName || !options.kind
       || typeof options.isOwnerAlive !== 'function') {
     throw new TypeError('incomplete bakery lock options');
+  }
+  if (options.signal !== undefined && options.signal !== null
+      && (typeof options.signal.addEventListener !== 'function'
+        || typeof options.signal.removeEventListener !== 'function')) {
+    throw new TypeError('signal must be an AbortSignal');
   }
   const directory = fs.fstatSync(options.directoryDescriptor);
   const namespaceKey = [directory.dev, directory.ino, options.kind, options.lockName].join(':');
@@ -321,6 +363,8 @@ function normalizeContext(options) {
     changedMessage: options.changedMessage || '锁文件在操作期间发生变化',
     timeoutMessage: options.timeoutMessage || '等待全局锁超时',
     releaseMessage: options.releaseMessage || '锁租约释放失败，当前进程拒绝继续使用该锁命名空间',
+    interruptedCode: options.interruptedCode || 'JOB_INTERRUPTED',
+    interruptedMessage: options.interruptedMessage || '面板正在停止，锁等待已中断',
     timeoutMs: Math.max(1, Number(options.timeoutMs) || 30000),
     pollMs: Math.max(1, Number(options.pollMs) || 25),
   };
@@ -366,6 +410,7 @@ function removeLeaseEntries(entries, context, token) {
 
 async function acquireBakeryLease(options) {
   const context = normalizeContext(options);
+  throwIfLockInterrupted(context);
   assertNamespaceHealthy(context);
   const token = crypto.randomBytes(16).toString('hex');
   const startedAt = Date.now();
@@ -420,6 +465,7 @@ async function acquireBakeryLease(options) {
         }
       }
       if (!blocked) {
+        throwIfLockInterrupted(context);
         return {
           token,
           ticket,
@@ -432,7 +478,7 @@ async function acquireBakeryLease(options) {
       if (Date.now() - startedAt >= context.timeoutMs) {
         throw lockError(context.timeoutCode, context.timeoutMessage);
       }
-      await sleep(context.pollMs);
+      await sleep(context.pollMs, context);
     }
   } catch (error) {
     try {
