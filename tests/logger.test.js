@@ -276,6 +276,9 @@ test('redaction and log serialization are bounded for deep, sparse, and oversize
   assert.ok(safeSparse.length <= 2);
   assert.match(JSON.stringify(safeSparse), /truncated/);
 
+  const storedArray = Array.from({ length: 2_000 }, (_, index) => ({ index }));
+  assert.equal(redactValue(storedArray).length, storedArray.length);
+
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-bounded-'));
   const filePath = path.join(directory, 'panel.log');
   const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024 });

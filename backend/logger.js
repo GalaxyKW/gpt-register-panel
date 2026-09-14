@@ -9,11 +9,20 @@ const MAX_LOG_ROTATIONS = 100;
 const MAX_LOG_TOTAL_BYTES = 512 * 1024 * 1024;
 const LOG_TAIL_BLOCK_BYTES = 64 * 1024;
 const LOG_TAIL_MAX_BYTES = 4 * 1024 * 1024;
-const MAX_REDACTION_DEPTH = 20;
-const MAX_REDACTION_NODES = 4096;
-const MAX_REDACTION_ENTRIES = 512;
-const MAX_REDACTION_TEXT_CHARS = 128 * 1024;
-const MAX_REDACTION_TOTAL_CHARS = 256 * 1024;
+const LOG_REDACTION_LIMITS = Object.freeze({
+  depth: 20,
+  nodes: 4096,
+  entries: 512,
+  valueChars: 128 * 1024,
+  totalChars: 256 * 1024,
+});
+const STORED_REDACTION_LIMITS = Object.freeze({
+  depth: 64,
+  nodes: 200_000,
+  entries: 100_000,
+  valueChars: 2 * 1024 * 1024,
+  totalChars: 4 * 1024 * 1024,
+});
 const MAX_LOG_ENTRY_BYTES = 256 * 1024;
 const MAX_LOG_NAMESPACE_FILES = 1000;
 const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?$/i;
@@ -240,7 +249,6 @@ function redactUrlUserinfo(value) {
 
 function redactText(value) {
   let text = String(value === undefined || value === null ? '' : value);
-  if (text.length > MAX_REDACTION_TEXT_CHARS) return '[oversized text omitted]';
   const structured = jsonRedaction(text);
   if (structured !== null) return structured;
 
@@ -307,12 +315,13 @@ function readTailText(descriptor, fileSize, lineLimit) {
   return bytes.toString('utf8');
 }
 
-function redactionContext(candidate) {
+function redactionContext(candidate, limits) {
   if (candidate && candidate.seen instanceof WeakSet) return candidate;
   return {
     seen: candidate instanceof WeakSet ? candidate : new WeakSet(),
     nodes: 0,
     textChars: 0,
+    limits,
   };
 }
 
@@ -329,9 +338,10 @@ function redactValueAt(value, key, context, depth) {
   const normalizedKey = normalizeSecretKey(key);
   if (SECRET_KEY.test(normalizedKey)) return '[redacted]';
   context.nodes += 1;
-  if (context.nodes > MAX_REDACTION_NODES) return '[redaction limit reached]';
+  if (context.nodes > context.limits.nodes) return '[redaction limit reached]';
   if (typeof value === 'string') {
-    if (context.textChars + value.length > MAX_REDACTION_TOTAL_CHARS) {
+    if (value.length > context.limits.valueChars) return '[oversized text omitted]';
+    if (context.textChars + value.length > context.limits.totalChars) {
       return '[redaction text budget reached]';
     }
     context.textChars += value.length;
@@ -347,7 +357,7 @@ function redactValueAt(value, key, context, depth) {
       || value instanceof ArrayBuffer)) return '[binary redacted]';
   if (Array.isArray(value)) {
     if (context.seen.has(value)) return '[circular]';
-    if (depth >= MAX_REDACTION_DEPTH) return '[redaction depth reached]';
+    if (depth >= context.limits.depth) return '[redaction depth reached]';
     context.seen.add(value);
     let descriptors;
     try { descriptors = Object.getOwnPropertyDescriptors(value); } catch {
@@ -356,7 +366,7 @@ function redactValueAt(value, key, context, depth) {
     const indexes = Object.keys(descriptors)
       .filter((childKey) => /^(?:0|[1-9][0-9]*)$/.test(childKey))
       .sort((left, right) => Number(left) - Number(right));
-    const selected = indexes.slice(0, MAX_REDACTION_ENTRIES);
+    const selected = indexes.slice(0, context.limits.entries);
     const output = [];
     for (const childKey of selected) {
       const descriptor = descriptors[childKey];
@@ -369,14 +379,14 @@ function redactValueAt(value, key, context, depth) {
   }
   if (value && typeof value === 'object') {
     if (context.seen.has(value)) return '[circular]';
-    if (depth >= MAX_REDACTION_DEPTH) return '[redaction depth reached]';
+    if (depth >= context.limits.depth) return '[redaction depth reached]';
     context.seen.add(value);
     let descriptors;
     try { descriptors = Object.getOwnPropertyDescriptors(value); } catch {
       return '[uninspectable]';
     }
     const descriptorEntries = Object.entries(descriptors);
-    const entries = descriptorEntries.slice(0, MAX_REDACTION_ENTRIES);
+    const entries = descriptorEntries.slice(0, context.limits.entries);
     const output = {};
     let keyIndex = 0;
     for (const [childKey, descriptor] of entries) {
@@ -412,9 +422,32 @@ function redactValueAt(value, key, context, depth) {
 }
 
 function redactValue(value, key = '', candidateContext) {
-  try { return redactValueAt(value, key, redactionContext(candidateContext), 0); } catch {
+  try {
+    return redactValueAt(
+      value,
+      key,
+      redactionContext(candidateContext, STORED_REDACTION_LIMITS),
+      0,
+    );
+  } catch {
     return '[uninspectable]';
   }
+}
+
+function redactLogValue(value, key = '') {
+  try {
+    return redactValueAt(value, key, redactionContext(null, LOG_REDACTION_LIMITS), 0);
+  } catch {
+    return '[uninspectable]';
+  }
+}
+
+function redactLogText(value) {
+  if (!['string', 'number', 'boolean', 'bigint'].includes(typeof value)) return '';
+  const text = String(value);
+  return text.length <= LOG_REDACTION_LIMITS.valueChars
+    ? redactText(text)
+    : '[oversized text omitted]';
 }
 
 function serializeLogEntry(entry, maximumBytes = MAX_LOG_ENTRY_BYTES) {
@@ -446,7 +479,7 @@ function ownPrimitive(object, property) {
 
 function safeEventText(value, fallback = 'event') {
   return ['string', 'number', 'boolean', 'bigint'].includes(typeof value)
-    ? redactText(String(value))
+    ? redactLogText(value)
     : fallback;
 }
 
@@ -466,7 +499,11 @@ function safeErrorText(error, limit = 8192) {
   stack = String(stack);
   const candidate = String(code ?? '').trim();
   code = /^[A-Za-z0-9_.-]{1,100}$/.test(candidate) ? candidate : '';
-  return redactText((code ? 'code=' + code + '\n' : '') + stack).slice(0, safeLimit);
+  const combined = (code ? 'code=' + code + '\n' : '') + stack;
+  if (combined.length > LOG_REDACTION_LIMITS.valueChars) {
+    return ((code ? 'code=' + code + '\n' : '') + '[oversized error omitted]').slice(0, safeLimit);
+  }
+  return redactText(combined).slice(0, safeLimit);
 }
 
 function numberFromEnv(value, fallback, minimum = 0, maximum = Number.MAX_SAFE_INTEGER) {
@@ -771,7 +808,7 @@ class PanelLogger {
     try {
       const timestamp = new Date().toISOString();
       const safeFields = fields && typeof fields === 'object' && !Array.isArray(fields)
-        ? redactValue(fields)
+        ? redactLogValue(fields)
         : {};
       const serialized = serializeLogEntry({
         ...safeFields,
@@ -908,7 +945,7 @@ class PanelLogger {
     this.fallbackReports += 1;
     try {
       const serialized = serializeLogEntry({
-        ...redactValue(fields),
+        ...redactLogValue(fields),
         timestamp: new Date().toISOString(),
         level,
         event: safeEventText(event),
@@ -925,7 +962,7 @@ class PanelLogger {
     let line;
     try {
       entry = {
-        ...redactValue(fields),
+        ...redactLogValue(fields),
         timestamp: new Date().toISOString(),
         level: normalizedLevel,
         event: safeEventText(event),
@@ -1024,7 +1061,7 @@ class PanelLogger {
       }
     }
     return text.split(/\r?\n/).filter(Boolean).slice(-safeLimit).map((line) => {
-      try { return redactValue(JSON.parse(line)); } catch {
+      try { return redactLogValue(JSON.parse(line)); } catch {
         return { level: 'error', event: 'logger.invalid_line', message: redactText(line) };
       }
     });
