@@ -953,23 +953,40 @@ function normalizePhase3Requests(body) {
     error.code = 'PHASE3_BATCH_INVALID';
     throw error;
   }
-  if (body.selectedKeys !== undefined) {
-    const selectedKeys = normalizedSelectedKeys(body.selectedKeys, { allowEmpty: true });
-    if (!selectedKeys) {
-      const error = new Error('selectedKeys 必须是字符串数组');
-      error.code = 'PHASE3_SELECTION_INVALID';
-      throw error;
-    }
+  const rawSelectedKeys = body?.selectedKeys;
+  if (!Array.isArray(rawSelectedKeys)
+      || rawSelectedKeys.length !== rawItems.length
+      || rawSelectedKeys.some((value) => typeof value !== 'string')) {
+    const error = new Error('selectedKeys 必须与 Phase 3 账号逐项对应');
+    error.code = 'PHASE3_SELECTION_INVALID';
+    throw error;
+  }
+  const selectedKeys = rawSelectedKeys.map((value) => value.trim());
+  if (selectedKeys.some((value) => !value || value.length > 512)
+      || new Set(selectedKeys).size !== selectedKeys.length) {
+    const error = new Error('Phase 3 账号选择键不能为空或重复');
+    error.code = 'PHASE3_SELECTION_INVALID';
+    throw error;
   }
   const requests = [];
   const duplicateIndexes = [];
   const seenKeys = new Set();
+  const itemSelectedKeys = new Set();
   rawItems.forEach((rawItem, index) => {
     if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
       const error = new Error('Phase 3 账号项必须是对象');
       error.code = 'PHASE3_ACCOUNT_INVALID';
       throw error;
     }
+    const selectedKey = typeof rawItem.selectedKey === 'string'
+      ? rawItem.selectedKey.trim()
+      : '';
+    if (!selectedKey || selectedKey.length > 512 || itemSelectedKeys.has(selectedKey)) {
+      const error = new Error('每个 Phase 3 账号必须提供唯一的 selectedKey');
+      error.code = 'PHASE3_SELECTION_INVALID';
+      throw error;
+    }
+    itemSelectedKeys.add(selectedKey);
     const email = typeof rawItem.email === 'string' ? rawItem.email.trim().toLowerCase() : '';
     const phone = typeof rawItem.phone === 'string' ? rawItem.phone.trim() : '';
     const normalizedPhone = phone.replace(/[^0-9]/g, '');
@@ -994,9 +1011,15 @@ function normalizePhase3Requests(body) {
       originalIndex: index,
       email,
       phone: normalizedPhone || phone,
-      selectedKey: typeof rawItem.selectedKey === 'string' ? rawItem.selectedKey.trim().slice(0, 512) : null,
+      selectedKey,
     });
   });
+  if (selectedKeys.some((key) => !itemSelectedKeys.has(key))
+      || [...itemSelectedKeys].some((key) => !selectedKeys.includes(key))) {
+    const error = new Error('selectedKeys 与 Phase 3 账号项不一致');
+    error.code = 'PHASE3_SELECTION_INVALID';
+    throw error;
+  }
   if (requests.length === 0) {
     const error = new Error('Phase 3 账号均为重复项，未创建任务');
     error.code = 'PHASE3_BATCH_EMPTY';
@@ -1501,6 +1524,7 @@ function observePhase3Job({
   email,
   phone,
   canonicalKeys,
+  executionBinding,
   actor,
   db,
   logger,
@@ -1546,6 +1570,8 @@ function observePhase3Job({
     email,
     phone,
     canonicalKeys,
+    executionBinding,
+    requireExecutionBinding: true,
     actor,
     db,
     jobId: job.id,
@@ -2351,7 +2377,11 @@ function createServer(options = {}) {
               });
               continue;
             }
-            queued.push({ ...requestItem, job });
+            queued.push({
+              ...requestItem,
+              executionBinding: requestItem.executionBinding,
+              job,
+            });
             activeCount += 1;
             writeLog(logger, 'info', 'phase3.job_queued', {
               requestId,
@@ -2380,6 +2410,7 @@ function createServer(options = {}) {
               email: item.email,
               phone: item.phone,
               canonicalKeys: item.canonicalKeys,
+              executionBinding: item.executionBinding,
               actor,
               db,
               logger,

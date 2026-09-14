@@ -64,6 +64,10 @@ const PHASE3_SUPERVISION_ENV_NAME = 'GPT_REGISTER_PANEL_SUPERVISION_ID';
 const PHASE3_SCRIPT_CHILD_FD = 3;
 const PHASE3_NODE_CHILD_FD = 4;
 const PHASE3_ROOT_CHILD_FD = 5;
+// Phase3 admission baselines may cover passwords and complete token files.
+// Keep their authentication key process-local so neither a persisted job nor
+// an API response exposes a reusable/offline-guessable content digest.
+const PHASE3_EXECUTION_BINDING_SECRET = crypto.randomBytes(32);
 const READ_ONLY_NOFOLLOW = fs.constants.O_RDONLY
   | (fs.constants.O_NOFOLLOW || 0)
   | (fs.constants.O_NONBLOCK || 0);
@@ -395,6 +399,88 @@ function recordFingerprint(record) {
     .digest('hex');
 }
 
+function phase3ExecutionDigest(scope, value) {
+  return crypto.createHmac('sha256', PHASE3_EXECUTION_BINDING_SECRET)
+    .update(String(scope))
+    .update('\0')
+    .update(JSON.stringify(value === undefined ? null : value))
+    .digest('hex');
+}
+
+function executionDigestsEqual(left, right) {
+  if (!/^[a-f0-9]{64}$/.test(String(left || ''))
+      || !/^[a-f0-9]{64}$/.test(String(right || ''))) return false;
+  return crypto.timingSafeEqual(Buffer.from(left, 'hex'), Buffer.from(right, 'hex'));
+}
+
+function phase3BindingError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
+}
+
+function usernameExecutionDigest(index, record) {
+  return phase3ExecutionDigest('phase3-username-record-v1', [index, record]);
+}
+
+function tokenSelectionKey(token) {
+  return 'token:' + String(token?.source || '') + ':' + String(token?.relativePath || '');
+}
+
+function tokenExecutionDigest(token) {
+  return phase3ExecutionDigest('phase3-token-record-v1', [
+    token?.source || null,
+    token?.relativePath || null,
+    token?.contentHash || null,
+    token?.parseStatus || null,
+    token?.historical === true,
+    normalizeEmail(token?.email) || null,
+    token?.accountId || null,
+    token?.userId || null,
+  ]);
+}
+
+function createTokenExecutionBinding(token, selectedKey) {
+  return Object.freeze({
+    version: 1,
+    selectedKey,
+    source: token.source,
+    relativePath: token.relativePath,
+    digest: tokenExecutionDigest(token),
+  });
+}
+
+function assertTokenExecutionBinding(binding, sources, entry, request = {}) {
+  if (!binding || binding.version !== 1
+      || !['tokens', 'use_token'].includes(binding.source)
+      || typeof binding.relativePath !== 'string'
+      || tokenSelectionKey(binding) !== binding.selectedKey
+      || !/^[a-f0-9]{64}$/.test(String(binding.digest || ''))) {
+    throw phase3BindingError(
+      'PHASE3_SOURCE_BINDING_INVALID',
+      'Phase3 本地 token 执行绑定无效，拒绝启动',
+    );
+  }
+  const matches = (sources?.tokens || []).filter((token) => (
+    tokenSelectionKey(token) === binding.selectedKey
+  ));
+  const token = matches.length === 1 ? matches[0] : null;
+  const tokenEmail = normalizeEmail(token?.email);
+  const requestEmail = normalizeEmail(request.email);
+  const requestPhone = normalizePhone(request.phone);
+  if (!token || token.historical === true || token.parseStatus !== 'ok'
+      || !executionDigestsEqual(binding.digest, tokenExecutionDigest(token))
+      || !tokenEmail || tokenEmail !== entry.email
+      || (requestEmail && requestEmail !== tokenEmail)
+      || (requestPhone && requestPhone !== entry.phone)) {
+    throw phase3BindingError(
+      'PHASE3_SOURCE_BINDING_CHANGED',
+      '所选本地 token 在排队期间已变化，拒绝启动 Phase3',
+    );
+  }
+  return token;
+}
+
 function phase3TransitionBaseFingerprint(record) {
   const stable = {};
   for (const [key, value] of Object.entries(record || {})) {
@@ -492,12 +578,26 @@ function usernameFilePath(rootHandle = null) {
   return path.join(rootHandle?.traversalPath || registerRoot(), 'username.json');
 }
 
-function findUsernameEntry({ email, phone } = {}, rootHandle = null) {
-  const records = readRegularJsonArraySnapshot(
+function findUsernameEntry({
+  email,
+  phone,
+  expectedFileContentHash = null,
+  createExecutionBinding = false,
+  expectedExecutionBinding = null,
+} = {}, rootHandle = null) {
+  const snapshot = readRegularJsonArraySnapshot(
     usernameFilePath(rootHandle),
     'username.json',
     { parentPinned: Boolean(rootHandle) },
-  ).records;
+  );
+  if (expectedFileContentHash !== null
+      && snapshot.contentHash !== expectedFileContentHash) {
+    throw phase3BindingError(
+      'PHASE3_USERNAME_CHANGED_DURING_ADMISSION',
+      'username.json 在 Phase3 入队检查期间发生变化',
+    );
+  }
+  const records = snapshot.records;
   const normalizedEmail = normalizeEmail(email);
   const normalizedPhone = normalizePhone(phone);
   const eligible = records.map((record, index) => ({ record, index })).filter(({ record }) => {
@@ -525,7 +625,7 @@ function findUsernameEntry({ email, phone } = {}, rootHandle = null) {
     error.accountStatus = status;
     throw error;
   }
-  return {
+  const entry = {
     index,
     email: normalizeEmail(record.email),
     phone: normalizePhone(record.phone),
@@ -534,6 +634,40 @@ function findUsernameEntry({ email, phone } = {}, rootHandle = null) {
     transitionBaseFingerprint: phase3TransitionBaseFingerprint(record),
     resolvedAtMs: Date.now(),
   };
+  const currentExecutionDigest = usernameExecutionDigest(index, record);
+  if (expectedExecutionBinding) {
+    const validBinding = expectedExecutionBinding.version === 1
+      && Number.isSafeInteger(expectedExecutionBinding.index)
+      && expectedExecutionBinding.index >= 0
+      && typeof expectedExecutionBinding.email === 'string'
+      && typeof expectedExecutionBinding.phone === 'string'
+      && /^[a-f0-9]{64}$/.test(String(expectedExecutionBinding.digest || ''));
+    if (!validBinding
+        || expectedExecutionBinding.index !== index
+        || expectedExecutionBinding.email !== entry.email
+        || expectedExecutionBinding.phone !== entry.phone
+        || !executionDigestsEqual(expectedExecutionBinding.digest, currentExecutionDigest)) {
+      throw phase3BindingError(
+        'PHASE3_USERNAME_BINDING_CHANGED',
+        'username.json 目标账号在排队期间已变化，拒绝启动 Phase3',
+      );
+    }
+  }
+  if (createExecutionBinding) {
+    Object.defineProperty(entry, 'executionBinding', {
+      value: Object.freeze({
+        version: 1,
+        index,
+        email: entry.email,
+        phone: entry.phone,
+        digest: currentExecutionDigest,
+      }),
+      enumerable: false,
+      configurable: false,
+      writable: false,
+    });
+  }
+  return entry;
 }
 
 function persistAccountDispositionWithHandle(entry, code, rootHandle) {
@@ -1236,6 +1370,8 @@ function runCommand(command, args, options = {}) {
 async function runPhase3JobNow({
   email,
   phone,
+  executionBinding = null,
+  requireExecutionBinding = false,
   actor = 'local',
   db,
   jobId,
@@ -1262,9 +1398,16 @@ async function runPhase3JobNow({
       error.code = 'PHASE3_DISABLED';
       throw error;
     }
+    if ((requireExecutionBinding && !executionBinding)
+        || (executionBinding && (executionBinding.version !== 1
+          || !executionBinding.token || !executionBinding.username))) {
+      throw phase3BindingError(
+        'PHASE3_EXECUTION_BINDING_INVALID',
+        'Phase3 执行目标绑定缺失或无效，拒绝启动',
+      );
+    }
     const root = registerRoot();
     rootHandle = openPinnedPhase3Root(root);
-    entry = findUsernameEntry({ email, phone }, rootHandle);
     const scriptPath = path.join(rootHandle.traversalPath, 'index.js');
     scriptHandle = openPinnedRegularFile(scriptPath, 'gpt_register/index.js', { parentPinned: true });
     const nodePath = path.resolve(process.env.GPT_REGISTER_NODE_PATH || process.execPath);
@@ -1274,6 +1417,14 @@ async function runPhase3JobNow({
       rootHandle,
       strictCompleteSnapshot: true,
     });
+    entry = findUsernameEntry({
+      email,
+      phone,
+      expectedExecutionBinding: executionBinding?.username || null,
+    }, rootHandle);
+    if (executionBinding) {
+      assertTokenExecutionBinding(executionBinding.token, beforeSources, entry, { email, phone });
+    }
     const beforeTokens = beforeSources.tokens
       .filter((item) => item.historical !== true && item.parseStatus === 'ok' && item.email === entry.email)
       .map((item) => ({
@@ -1591,6 +1742,15 @@ function resolvePhase3Requests(requests = []) {
   for (const request of requests) {
     const email = normalizeEmail(request?.email);
     const phone = normalizePhone(request?.phone);
+    const selectedKey = typeof request?.selectedKey === 'string'
+      ? request.selectedKey.trim()
+      : '';
+    const selectedTokenMatches = sources.tokens.filter((token) => (
+      tokenSelectionKey(token) === selectedKey
+    ));
+    const selectedToken = selectedTokenMatches.length === 1
+      ? selectedTokenMatches[0]
+      : null;
     const matches = records.filter((record) => {
       const emailMatches = email && normalizeEmail(record?.email) === email;
       const phoneMatches = phone && normalizePhone(record?.phone) === phone;
@@ -1600,7 +1760,20 @@ function resolvePhase3Requests(requests = []) {
     let code = null;
     let message = null;
     const record = matches.length === 1 ? matches[0] : null;
-    if (matches.length === 0) {
+    if (!selectedKey || selectedTokenMatches.length !== 1) {
+      code = 'phase3_source_not_found';
+      message = '所选本地 token 不存在或选择键无效';
+    } else if (selectedToken.historical === true) {
+      code = 'phase3_source_historical';
+      message = '历史 token 不能用于 Phase 3';
+    } else if (selectedToken.parseStatus !== 'ok'
+        || !/^[a-f0-9]{64}$/.test(String(selectedToken.contentHash || ''))) {
+      code = 'phase3_source_invalid';
+      message = '所选本地 token 无效，不能用于 Phase 3';
+    } else if (email && normalizeEmail(selectedToken.email) !== email) {
+      code = 'phase3_source_identity_mismatch';
+      message = '所选本地 token 与提交账号不一致';
+    } else if (matches.length === 0) {
       code = 'phase3_account_not_found';
       message = 'username.json 中未找到该账号';
     } else if (matches.length > 1) {
@@ -1625,13 +1798,48 @@ function resolvePhase3Requests(requests = []) {
     }
     const resolvedEmail = normalizeEmail(record.email) || email;
     const resolvedPhone = normalizePhone(record.phone) || phone;
+    if (!resolvedEmail || normalizeEmail(selectedToken.email) !== resolvedEmail) {
+      rejected.push({
+        index: request?.originalIndex,
+        email: email || null,
+        phone: phone || null,
+        error: 'phase3_source_identity_mismatch',
+        message: '所选本地 token 与 username.json 目标账号不一致',
+      });
+      continue;
+    }
+    const rawEntry = findUsernameEntry({
+      email: resolvedEmail,
+      phone: resolvedPhone,
+      expectedFileContentHash: sources.usernameContentHash,
+      createExecutionBinding: true,
+    });
+    if (rawEntry.index !== record.index
+        || rawEntry.email !== resolvedEmail
+        || rawEntry.phone !== resolvedPhone) {
+      throw phase3BindingError(
+        'PHASE3_USERNAME_CHANGED_DURING_ADMISSION',
+        'username.json 在 Phase3 入队检查期间发生变化',
+      );
+    }
     const canonicalKeys = phase3Keys({ email: resolvedEmail, phone: resolvedPhone }).sort();
-    eligible.push({
+    const resolvedRequest = {
       ...request,
       email: resolvedEmail,
       phone: resolvedPhone || null,
       canonicalKeys,
+    };
+    Object.defineProperty(resolvedRequest, 'executionBinding', {
+      value: Object.freeze({
+        version: 1,
+        token: createTokenExecutionBinding(selectedToken, selectedKey),
+        username: rawEntry.executionBinding,
+      }),
+      enumerable: false,
+      configurable: false,
+      writable: false,
     });
+    eligible.push(resolvedRequest);
   }
   return { eligible, rejected };
 }

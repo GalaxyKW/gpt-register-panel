@@ -810,6 +810,14 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
       email: 'server@example.test',
       expired: '2099-01-01T00:00:00.000Z',
     }));
+    fs.writeFileSync(path.join(root, 'tokens', 'token-duplicate.json'), JSON.stringify({
+      access_token: 'not-a-jwt-duplicate',
+      email: 'server@example.test',
+    }));
+    fs.writeFileSync(path.join(root, 'tokens', 'second.json'), JSON.stringify({
+      access_token: 'not-a-jwt-second',
+      email: 'second@example.test',
+    }));
     fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
       access_token: 'expired-access',
       refresh_token: 'expired-refresh-hidden',
@@ -918,11 +926,24 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
 
     const batchPhase3 = await postJson(baseUrl, '/api/phase3', {
       accounts: [
-        { email: 'server@example.test' },
-        { phone: '15550000001' },
-        { email: 'second@example.test' },
+        {
+          email: 'server@example.test',
+          selectedKey: 'token:tokens:tokens/token.json',
+        },
+        {
+          phone: '15550000001',
+          selectedKey: 'token:tokens:tokens/token-duplicate.json',
+        },
+        {
+          email: 'second@example.test',
+          selectedKey: 'token:tokens:tokens/second.json',
+        },
       ],
-      selectedKeys: ['account:one', 'account:two'],
+      selectedKeys: [
+        'token:tokens:tokens/token.json',
+        'token:tokens:tokens/token-duplicate.json',
+        'token:tokens:tokens/second.json',
+      ],
     });
     assert.equal(batchPhase3.status, 202);
     const batchBody = JSON.parse(batchPhase3.body);

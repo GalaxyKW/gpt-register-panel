@@ -30,6 +30,7 @@ const {
   comparePhase3TokenFreshness,
   findUsernameEntry,
   phase3TerminationBudget,
+  resolvePhase3Requests,
   sanitizeLog,
   runCommand,
   runPhase3Job,
@@ -494,6 +495,138 @@ test('phase3 jobs run serially, run the main-gated entrypoint, and reject duplic
       ));
       assert.equal(terminalIndex >= 0 && terminalIndex < auditFailureIndex, true);
     }
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('phase3 refuses a selected token path that changes account while queued', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-token-binding-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), JSON.stringify([{
+    email: 'bound-token@example.test',
+    password: 'original-password-secret',
+  }]));
+  const selectedKey = 'token:tokens:tokens/bound.json';
+  const tokenPath = path.join(root, 'tokens', 'bound.json');
+  fs.writeFileSync(tokenPath, JSON.stringify({
+    access_token: 'original-token-secret',
+    email: 'bound-token@example.test',
+  }));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "fs.writeFileSync(path.join(process.cwd(), 'phase3-executed'), 'yes');",
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const resolved = resolvePhase3Requests([{
+      originalIndex: 0,
+      email: 'bound-token@example.test',
+      phone: '',
+      selectedKey,
+    }]);
+    assert.equal(resolved.eligible.length, 1);
+    const target = resolved.eligible[0];
+    assert.equal(JSON.stringify(target).includes('executionBinding'), false);
+    assert.equal(JSON.stringify(target).includes('original-password-secret'), false);
+    assert.equal(JSON.stringify(target).includes('original-token-secret'), false);
+
+    fs.writeFileSync(tokenPath, JSON.stringify({
+      access_token: 'replacement-token-secret',
+      email: 'different-account@example.test',
+    }));
+    let failure = null;
+    try {
+      await runPhase3Job({
+        ...target,
+        executionBinding: target.executionBinding,
+        jobId: 'phase3-token-binding-change',
+        db: { async startMutationJob() {} },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.code, 'PHASE3_SOURCE_BINDING_CHANGED');
+    assert.equal(fs.existsSync(path.join(root, 'phase3-executed')), false);
+  } finally {
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.node === undefined) delete process.env.GPT_REGISTER_NODE_PATH;
+    else process.env.GPT_REGISTER_NODE_PATH = previous.node;
+    if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
+    else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
+  }
+});
+
+test('phase3 refuses a same-email username record replacement while queued', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-phase3-username-binding-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  const usernamePath = path.join(root, 'username.json');
+  fs.writeFileSync(usernamePath, JSON.stringify([{
+    email: 'bound-username@example.test',
+    phone: '138-0000',
+    password: 'original-password-secret',
+  }]));
+  const selectedKey = 'token:tokens:tokens/bound.json';
+  fs.writeFileSync(path.join(root, 'tokens', 'bound.json'), JSON.stringify({
+    access_token: 'bound-token-secret',
+    email: 'bound-username@example.test',
+  }));
+  fs.writeFileSync(path.join(root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "fs.writeFileSync(path.join(process.cwd(), 'phase3-executed'), 'yes');",
+  ].join('\n'));
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    node: process.env.GPT_REGISTER_NODE_PATH,
+    enabled: process.env.PANEL_PHASE3_ENABLED,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.GPT_REGISTER_NODE_PATH = process.execPath;
+  process.env.PANEL_PHASE3_ENABLED = '1';
+  try {
+    const resolved = resolvePhase3Requests([{
+      originalIndex: 0,
+      email: 'bound-username@example.test',
+      phone: '1380000',
+      selectedKey,
+    }]);
+    assert.equal(resolved.eligible.length, 1);
+    const target = resolved.eligible[0];
+    fs.writeFileSync(usernamePath, JSON.stringify([{
+      email: 'bound-username@example.test',
+      phone: '138-0000',
+      password: 'replacement-password-secret',
+    }]));
+    let failure = null;
+    try {
+      await runPhase3Job({
+        ...target,
+        executionBinding: target.executionBinding,
+        jobId: 'phase3-username-binding-change',
+        db: { async startMutationJob() {} },
+      });
+    } catch (error) {
+      failure = error;
+    }
+    assert.equal(failure?.code, 'PHASE3_USERNAME_BINDING_CHANGED');
+    assert.equal(fs.existsSync(path.join(root, 'phase3-executed')), false);
   } finally {
     if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previous.root;

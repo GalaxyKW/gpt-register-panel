@@ -86,19 +86,46 @@ test('JSON API body validation rejects scalar values', () => {
 test('Phase 3 accepts batches and removes duplicate email/phone targets', () => {
   const batch = normalizePhase3Requests({
     accounts: [
-      { email: ' One@example.test ', phone: '138-0000' },
-      { email: 'one@example.test' },
-      { phone: '1380000' },
-      { email: 'two@example.test' },
+      { email: ' One@example.test ', phone: '138-0000', selectedKey: 'token:tokens:tokens/one.json' },
+      { email: 'one@example.test', selectedKey: 'token:tokens:tokens/one-copy.json' },
+      { phone: '1380000', selectedKey: 'token:use_token:use_token/one.json' },
+      { email: 'two@example.test', selectedKey: 'token:tokens:tokens/two.json' },
+    ],
+    selectedKeys: [
+      'token:tokens:tokens/one.json',
+      'token:tokens:tokens/one-copy.json',
+      'token:use_token:use_token/one.json',
+      'token:tokens:tokens/two.json',
     ],
   });
   assert.equal(batch.requests.length, 2);
   assert.deepEqual(batch.requests.map((item) => item.email), ['one@example.test', 'two@example.test']);
   assert.deepEqual(batch.duplicateIndexes, [1, 2]);
   assert.throws(
-    () => normalizePhase3Requests({ accounts: [] }),
+    () => normalizePhase3Requests({ accounts: [], selectedKeys: [] }),
     (error) => error.code === 'PHASE3_BATCH_INVALID',
   );
+});
+
+test('Phase 3 requires an exact one-to-one selected-key set', () => {
+  const accounts = [{
+    email: 'one@example.test',
+    selectedKey: 'token:tokens:tokens/one.json',
+  }];
+  for (const body of [
+    { accounts },
+    { accounts, selectedKeys: [] },
+    { accounts, selectedKeys: ['token:tokens:tokens/other.json'] },
+    { accounts: [...accounts, { ...accounts[0] }], selectedKeys: [
+      'token:tokens:tokens/one.json',
+      'token:tokens:tokens/one.json',
+    ] },
+  ]) {
+    assert.throws(
+      () => normalizePhase3Requests(body),
+      (error) => error.code === 'PHASE3_SELECTION_INVALID',
+    );
+  }
 });
 
 test('token documents without usable credentials or identity are invalid', () => {
