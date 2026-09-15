@@ -68,6 +68,28 @@ test('terminal job updates retry a bounded number of times with one stable times
   assert.equal(failures, 2);
 });
 
+test('terminal job updates fail closed when durable storage is unavailable', async () => {
+  for (const db of [null, {}, { updateJob: true }]) {
+    await assert.rejects(
+      updateTerminalJob(db, 'job-missing-store', { status: 'failed' }),
+      (error) => error.code === 'JOB_TERMINAL_STORE_UNAVAILABLE'
+        && /\u7ec8\u6001存储不可用/.test(error.message),
+    );
+  }
+});
+
+test('background manager rejects duplicate active job IDs without losing the first observer', async () => {
+  const manager = createBackgroundJobManager({});
+  const first = manager.begin({ id: 'job-duplicate-active' }, 'phase3');
+  assert.throws(
+    () => manager.begin({ id: 'job-duplicate-active' }, 'phase3'),
+    (error) => error.code === 'JOB_ALREADY_ACTIVE',
+  );
+  assert.equal(manager.activeCount, 1);
+  await manager.track(first, Promise.resolve('completed'));
+  assert.equal(manager.activeCount, 0);
+});
+
 test('terminal job updates surface a rejected CAS without retrying it', async () => {
   let attempts = 0;
   let retries = 0;

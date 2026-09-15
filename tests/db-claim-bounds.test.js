@@ -183,6 +183,83 @@ test('shutdown interruption rejects an oversized reason before changing job stat
   await db.updateJob(later.id, { status: 'failed', error: 'test cleanup' });
 });
 
+test('shutdown interruption materializes only selected compact active-job references', async () => {
+  const db = new PanelDb(databasePath('interrupt-compact-reference'));
+  const interrupted = await db.createJob('diagnostic', {}, 'tester');
+  const excluded = await db.createJob('diagnostic', {}, 'tester');
+
+  assert.deepEqual(
+    await db.interruptOwnedActiveJobs('controlled shutdown', {
+      excludeJobIds: [excluded.id],
+    }),
+    [interrupted.id],
+  );
+  assert.equal((await db.getJob(interrupted.id)).status, 'interrupted');
+  assert.equal((await db.getJob(interrupted.id)).error, 'controlled shutdown');
+  assert.equal((await db.getJob(excluded.id)).status, 'queued');
+  await db.updateJob(excluded.id, { status: 'failed', error: 'test cleanup' });
+
+  const source = fs.readFileSync(path.join(__dirname, '..', 'backend', 'db.js'), 'utf8');
+  const start = source.indexOf('  interruptOwnedActiveJobs(');
+  const end = source.indexOf('\n  decodeJob(', start);
+  assert.ok(start >= 0 && end > start);
+  const implementation = source.slice(start, end);
+  assert.match(implementation, /recovery_reference: true/);
+  assert.doesNotMatch(implementation, /SELECT id, type, status, claim_keys_json/);
+  assert.doesNotMatch(implementation, /started_at, finished_at, result_json/);
+});
+
+test('all task admission paths stop at the durable restart recovery capacity', async () => {
+  const db = new PanelDb(databasePath('active-recovery-capacity'));
+  const template = await db.createJob('diagnostic', {}, 'tester');
+  await db.write((database) => {
+    const insert = database.prepare(`INSERT INTO sync_jobs
+      (id, type, status, requested_by, payload_json, created_at, claim_keys_json,
+        owner_pid, owner_start_id, owner_boot_id)
+      SELECT ?, type, status, requested_by, payload_json, created_at, claim_keys_json,
+        owner_pid, owner_start_id, owner_boot_id
+      FROM sync_jobs WHERE id = ?`);
+    try {
+      // The validator can materialize at most 2,000 active rows after their
+      // owner exits. Seed that exact boundary without exercising admission.
+      for (let index = 1; index < 2000; index += 1) {
+        insert.run([
+          'job_capacity_' + String(index).padStart(8, '0'),
+          template.id,
+        ]);
+      }
+    } finally {
+      insert.free();
+    }
+  });
+  assert.equal(
+    await scalar(db, "SELECT COUNT(*) FROM sync_jobs WHERE status IN ('queued', 'running')"),
+    2000,
+  );
+
+  await assert.rejects(
+    db.createJob('diagnostic', {}, 'tester'),
+    (error) => error.code === 'JOB_QUEUE_FULL'
+      && /可恢复安全上限/.test(error.message),
+  );
+  await assert.rejects(
+    db.createMutationSubmission({
+      workflow: 'diagnostic',
+      requestedBy: 'panel-admin',
+      idempotencyKey: 'idem_v1_recovery_capacity_1234567890',
+      requestDigest: 'a'.repeat(64),
+      jobs: [{ type: 'diagnostic', payload: {}, claimKeys: [] }],
+      responseFactory: ({ createdJobs }) => ({
+        jobId: createdJobs[0].job.id,
+        status: 'queued',
+      }),
+    }),
+    (error) => error.code === 'JOB_QUEUE_FULL'
+      && /可恢复安全上限/.test(error.message),
+  );
+  assert.equal(await scalar(db, 'SELECT COUNT(*) FROM mutation_receipts'), 0);
+});
+
 test('claim validation enforces the per-job claim limit without loading the graph', async () => {
   const file = databasePath('per-job-claim-count');
   const db = new PanelDb(file);

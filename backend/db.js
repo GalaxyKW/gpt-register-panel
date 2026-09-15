@@ -1504,6 +1504,19 @@ function firstRunningMutation(database) {
     ORDER BY COALESCE(started_at, created_at) ASC, id ASC LIMIT 1`))[0] || null;
 }
 
+function strictActiveJobCount(database) {
+  const row = resultRows(database.exec(`SELECT COUNT(*) AS count,
+    typeof(COUNT(*)) AS count_storage_type
+    FROM sync_jobs WHERE status IN ('queued', 'running')`))[0];
+  if (row?.count_storage_type !== 'integer'
+      || typeof row.count !== 'number'
+      || !Number.isSafeInteger(row.count)
+      || row.count < 0) {
+    throw claimIntegrityError('无法安全确认活跃任务数量，已拒绝提交');
+  }
+  return row.count;
+}
+
 function runningMutationError(job) {
   const error = new Error('已有写任务正在执行，已保守阻止新的写操作');
   error.code = 'JOB_ALREADY_CLAIMED';
@@ -2776,6 +2789,12 @@ class PanelDb {
           database.run('COMMIT');
           return { runningBlock: runningMutation };
         }
+        if (strictActiveJobCount(database) >= MAX_RECOVERABLE_ACTIVE_JOBS) {
+          throw mutationReceiptError(
+            'JOB_QUEUE_FULL',
+            '活跃任务已达到可恢复安全上限',
+          );
+        }
         let recoveryBlock = null;
         for (const claimKey of claimKeys) {
           let existing = resultRows(database.exec(
@@ -2981,6 +3000,7 @@ class PanelDb {
           database.run('COMMIT');
           return { runningBlock: runningMutation };
         }
+        let activeJobCount = strictActiveJobCount(database);
 
         const activeCounts = new Map();
         for (const type of maximumActiveByType.keys()) {
@@ -3006,6 +3026,16 @@ class PanelDb {
           (claim_key, job_id, job_type, created_at) VALUES (?, ?, ?, ?)`);
         try {
           for (const spec of jobSpecs) {
+            if (activeJobCount >= MAX_RECOVERABLE_ACTIVE_JOBS) {
+              if (!allowPartial) {
+                throw mutationReceiptError(
+                  'JOB_QUEUE_FULL',
+                  '活跃任务已达到可恢复安全上限',
+                );
+              }
+              rejections.push({ reason: 'queue_full', metadata: spec.metadata });
+              continue;
+            }
             const maximum = maximumActiveByType.get(spec.type);
             if (maximum !== undefined && (activeCounts.get(spec.type) || 0) >= maximum) {
               if (!allowPartial) {
@@ -3052,6 +3082,7 @@ class PanelDb {
             for (const claimKey of spec.claimKeys) insertClaim.run([claimKey, id, spec.type, now]);
             const job = { id, type: spec.type, status: 'queued', requestedBy, createdAt: now };
             createdJobs.push({ job, metadata: spec.metadata });
+            activeJobCount += 1;
             if (maximum !== undefined) {
               activeCounts.set(spec.type, (activeCounts.get(spec.type) || 0) + 1);
             }
@@ -3904,30 +3935,41 @@ class PanelDb {
         const bootCondition = owner.processBootId
           ? 'owner_boot_id = ' + sqlString(owner.processBootId)
           : 'owner_boot_id IS NULL';
-        const rows = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
-            owner_pid, owner_start_id, owner_boot_id, started_at, finished_at, result_json, error,
-            reconciliation_hold, reconciliation_scope, reconciliation_claim_digest, reconciliation_acknowledged_at,
-            reconciliation_resolution, reconciliation_acknowledged_by
+        const rows = resultRows(database.exec(`SELECT id, type, status,
+            owner_pid, typeof(owner_pid) AS owner_pid_storage_type,
+            owner_start_id, owner_boot_id
           FROM sync_jobs
           WHERE status IN ('queued', 'running')
             AND owner_pid = ${sqlString(owner.pid)}
             AND ${startCondition}
-            AND ${bootCondition}`))
-          .filter((row) => !excludedJobIds.has(String(row.id)));
-        for (const row of rows) {
-          const result = interruptDeadOwnerJob(database, row, finishedAt);
+            AND ${bootCondition}
+          ORDER BY rowid ASC
+          LIMIT ${MAX_RECOVERABLE_ACTIVE_JOBS + 1}`));
+        if (rows.length > MAX_RECOVERABLE_ACTIVE_JOBS) {
+          throw claimIntegrityError('待中断活动任务数量超过安全上限');
+        }
+        const references = rows
+          .filter((row) => !excludedJobIds.has(String(row.id)))
+          .map((row) => ({
+            ...row,
+            recovery_reference: true,
+            force_recovery: false,
+            force_unknown_recovery: false,
+          }));
+        for (const reference of references) {
+          const result = interruptDeadOwnerJob(database, reference, finishedAt);
           if (!result.requiresReconciliation && safeReason) {
             const statement = database.prepare(`UPDATE sync_jobs SET error = ?
               WHERE id = ? AND status = 'interrupted'`);
             try {
-              statement.run([safeReason, row.id]);
+              statement.run([safeReason, reference.id]);
             } finally {
               statement.free();
             }
           }
         }
         database.run('COMMIT');
-        return rows.map((row) => row.id);
+        return references.map((reference) => reference.id);
       } catch (error) {
         try { database.run('ROLLBACK'); } catch {}
         throw error;

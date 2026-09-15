@@ -551,6 +551,64 @@ test('a running token cleanup owned by a dead process recovers as an actionable 
   );
 });
 
+test('reconciliation review never coerces ambiguous stored account IDs', () => {
+  const digest = 'c'.repeat(64);
+  const detail = reconciliationReviewDetail({
+    id: 'job_' + 'd'.repeat(24),
+    type: 'account_test',
+    status: 'failed',
+    payload: {
+      accountIds: ['01', '1e0', '2', 3],
+      targetBaselines: [
+        { accountId: '01', identityDigest: '1'.repeat(64) },
+        { accountId: '1e0', identityDigest: '2'.repeat(64) },
+        { accountId: '2', identityDigest: '3'.repeat(64) },
+        { accountId: 3, identityDigest: '4'.repeat(64) },
+      ],
+    },
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: digest,
+      results: [],
+    },
+  });
+  assert.deepEqual(
+    detail.targetContext.targets.map((target) => target.remoteAccountId),
+    [2, 3],
+  );
+  assert.deepEqual(
+    detail.targetContext.targets.map((target) => target.identityDigest),
+    ['3'.repeat(64), '4'.repeat(64)],
+  );
+});
+
+test('reconciliation review preserves the bounded panel clock availability reason', () => {
+  const detail = reconciliationReviewDetail({
+    id: 'job_' + 'e'.repeat(24),
+    type: 'token_import',
+    status: 'failed',
+    payload: {},
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: 'f'.repeat(64),
+      imported: [{
+        source: 'tokens',
+        relativePath: 'clock-invalid.json',
+        availability: 'unknown',
+        availabilityReason: 'panel_clock_invalid',
+      }],
+    },
+  });
+  assert.equal(
+    detail.targetContext.targets[0].availabilityReason,
+    'panel_clock_invalid',
+  );
+});
+
 test('HTTP server applies bounded slow-request and connection limits', () => {
   const logger = {
     requestId: () => 'bounded-http-test',
@@ -712,6 +770,106 @@ test('known routes return an exact Allow method while unknown targets remain 404
     assert.equal(unknown.status, 404);
     assert.equal(unknown.allow, undefined);
   } finally {
+    await closeHttpServer(server);
+  }
+});
+
+test('API authentication remains authoritative while the server is draining', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+  };
+  const token = 'shutdown-auth-test-token';
+  let server;
+  resetAuthFailureBuckets();
+  try {
+    process.env.PANEL_ADMIN_TOKEN = token;
+    process.env.PANEL_REQUIRE_AUTH = '1';
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-shutdown-auth.sqlite3' },
+      jobManager: { shuttingDown: true },
+      logger: {
+        requestId: () => 'shutdown-auth-test',
+        info() {},
+        warn() {},
+        error() {},
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const issue = (headers = {}) => new Promise((resolve, reject) => {
+      const requestObject = http.get({
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: '/api/health',
+        headers,
+      }, (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => { body += chunk; });
+        response.on('end', () => resolve({ status: response.statusCode, body }));
+      });
+      requestObject.once('error', reject);
+    });
+
+    const unauthorized = await issue();
+    assert.equal(unauthorized.status, 401);
+    assert.equal(JSON.parse(unauthorized.body).error, 'panel_auth_required');
+    assert.equal(authFailureBucketCount(), 1);
+
+    const authorized = await issue({ 'x-panel-token': token });
+    assert.equal(authorized.status, 503);
+    assert.equal(JSON.parse(authorized.body).error, 'JOB_INTERRUPTED');
+    assert.equal(authFailureBucketCount(), 0);
+  } finally {
+    await closeHttpServer(server);
+    resetAuthFailureBuckets();
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+  }
+});
+
+test('HTTP lifecycle durations use a monotonic clock', async () => {
+  const originalDateNow = Date.now;
+  const records = [];
+  let server;
+  try {
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-http-duration.sqlite3' },
+      logger: {
+        requestId: () => 'http-duration-test',
+        info(event, fields) { records.push({ event, ...fields }); },
+        warn() {},
+        error() {},
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    let calls = 0;
+    Date.now = () => calls++ === 0 ? 60_000 : 0;
+    await new Promise((resolve, reject) => {
+      const requestObject = http.get({
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: '/',
+      }, (response) => {
+        response.resume();
+        response.once('end', resolve);
+      });
+      requestObject.once('error', reject);
+    });
+    const completed = records.find((entry) => entry.event === 'http.request_completed');
+    assert.ok(completed);
+    assert.equal(Number.isFinite(completed.durationMs), true);
+    assert.ok(completed.durationMs >= 0);
+  } finally {
+    Date.now = originalDateNow;
     await closeHttpServer(server);
   }
 });
@@ -1106,6 +1264,98 @@ test('client disconnect aborts an admitted mutation before durable enqueue or di
     else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
     if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
     else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
+test('client disconnect aborts snapshot-backed reads before preview persistence', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-preview-disconnect-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    registerRoot: process.env.GPT_REGISTER_ROOT,
+  };
+  delete process.env.PANEL_ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  process.env.GPT_REGISTER_ROOT = root;
+  let server;
+  let requestObject;
+  let observedSignal = null;
+  let snapshotSaves = 0;
+  let markAccountReadStarted;
+  let markRouteSettled;
+  const accountReadStarted = new Promise((resolve) => { markAccountReadStarted = resolve; });
+  const routeSettled = new Promise((resolve) => { markRouteSettled = resolve; });
+  try {
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-preview-disconnect.sqlite3',
+        async saveSnapshot() {
+          snapshotSaves += 1;
+          return 'unexpected-snapshot';
+        },
+      },
+      syncClientFactory() {
+        return {
+          async listAccounts(options = {}) {
+            observedSignal = options.signal;
+            markAccountReadStarted();
+            return new Promise((resolve) => {
+              const finish = () => resolve([]);
+              if (observedSignal?.aborted) finish();
+              else observedSignal?.addEventListener('abort', finish, { once: true });
+            });
+          },
+        };
+      },
+      logger: {
+        requestId: () => 'preview-disconnect-test',
+        info() {},
+        warn() {},
+        error(event) {
+          if (event === 'preview.failed') markRouteSettled();
+        },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const body = JSON.stringify({ selectedKeys: [] });
+    const clientSettled = new Promise((resolve) => {
+      requestObject = http.request({
+        host: '127.0.0.1',
+        port: server.address().port,
+        path: '/api/sync/preview',
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'content-length': Buffer.byteLength(body),
+        },
+      }, (response) => {
+        response.resume();
+        response.once('end', resolve);
+      });
+      requestObject.once('error', resolve);
+      requestObject.end(body);
+    });
+    await accountReadStarted;
+    requestObject.destroy();
+    await clientSettled;
+    await routeSettled;
+    assert.equal(observedSignal?.aborted, true);
+    assert.equal(snapshotSaves, 0);
+  } finally {
+    if (requestObject && !requestObject.destroyed) requestObject.destroy();
+    await closeHttpServer(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.registerRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.registerRoot;
   }
 });
 

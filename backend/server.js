@@ -1084,6 +1084,7 @@ const REVIEW_AVAILABILITY_REASONS = new Set([
   'sub2api_overload_invalid',
   'sub2api_overloaded',
   'sub2api_available',
+  'panel_clock_invalid',
 ]);
 
 function boundedReviewText(value, maximum = 256) {
@@ -1130,8 +1131,12 @@ function safeReviewSourcePath(value) {
 }
 
 function safeReviewAccountId(value) {
-  const id = Number(value);
-  return Number.isSafeInteger(id) && id > 0 ? id : null;
+  const canonical = typeof value === 'number'
+    ? Number.isSafeInteger(value) && value > 0 ? String(value) : null
+    : typeof value === 'string' && /^[1-9]\d*$/.test(value) ? value : null;
+  if (!canonical) return null;
+  const id = Number(canonical);
+  return Number.isSafeInteger(id) && id > 0 && String(id) === canonical ? id : null;
 }
 
 function safeReviewFingerprint(value) {
@@ -2613,7 +2618,7 @@ function createServer(options = {}) {
       ? logger.requestId(request.headers['x-request-id'])
       : crypto.randomUUID();
     const actor = requestActor(request);
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     let requestPath = '<unknown-path>';
     let completed = false;
     const requestDisconnectController = new AbortController();
@@ -2636,7 +2641,7 @@ function createServer(options = {}) {
         method: request.method,
         path: requestPath,
         statusCode: response.statusCode,
-        durationMs: Date.now() - startedAt,
+        durationMs: performance.now() - startedAt,
       });
     });
     response.once('close', () => {
@@ -2648,7 +2653,7 @@ function createServer(options = {}) {
           method: request.method,
           path: requestPath,
           statusCode: response.statusCode,
-          durationMs: Date.now() - startedAt,
+          durationMs: performance.now() - startedAt,
         });
       }
     });
@@ -2673,14 +2678,6 @@ function createServer(options = {}) {
         reconciliationAckPath,
         reconciliationReviewRoute,
       );
-      if (jobManager.shuttingDown) {
-        response.setHeader('connection', 'close');
-        jsonResponse(response, 503, {
-          error: 'JOB_INTERRUPTED',
-          message: '面板服务正在停止，请稍后重试',
-        });
-        return;
-      }
       const requiresWrite = request.method === 'POST'
         && (reconciliationAckPath.matched
           || ['/api/sync/import', '/api/phase3', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
@@ -2698,6 +2695,17 @@ function createServer(options = {}) {
         });
         if (authError.retryAfterSeconds) response.setHeader('retry-after', String(authError.retryAfterSeconds));
         jsonResponse(response, authError.status, authError);
+        return;
+      }
+      // Keep API authentication authoritative even while the service is
+      // draining. Otherwise an unauthenticated caller can distinguish the
+      // shutdown window and bypass the normal failure accounting entirely.
+      if (jobManager.shuttingDown) {
+        response.setHeader('connection', 'close');
+        jsonResponse(response, 503, {
+          error: 'JOB_INTERRUPTED',
+          message: '面板服务正在停止，请稍后重试',
+        });
         return;
       }
       if (allowedMethod && request.method !== allowedMethod) {
@@ -2790,6 +2798,7 @@ function createServer(options = {}) {
           logger,
           requestId,
           actor,
+          signal: requestDisconnectController.signal,
           // A missing token directory or damaged username file is not an
           // empty account set. Refuse the comparison instead of presenting a
           // misleading wave of Sub2API-only rows.
@@ -2816,7 +2825,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/sync/preview') {
-      const previewStartedAt = Date.now();
+      const previewStartedAt = performance.now();
       writeLog(logger, 'info', 'preview.started', { requestId, actor });
       try {
         const body = await readJsonBody(request);
@@ -2849,6 +2858,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           clientFactory: getSyncClient,
+          signal: requestDisconnectController.signal,
         });
         if (!confirmedSub2ApiRead(snapshot)) {
           const error = new Error('无法确认 Sub2API 当前账号列表，已停止生成导入计划');
@@ -2857,7 +2867,9 @@ function createServer(options = {}) {
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
         const client = getSyncClient({ logger, logContext: { requestId, actor } });
-        const groupBinding = await resolveImportGroupBinding(client, plan);
+        const groupBinding = await resolveImportGroupBinding(client, plan, {
+          signal: requestDisconnectController.signal,
+        });
         const executionBinding = resolveImportExecutionBinding(client, plan);
         const planIntentVersion = buildImportPlanIntentVersion(
           snapshot.version,
@@ -2866,6 +2878,7 @@ function createServer(options = {}) {
           groupBinding,
           executionBinding,
         );
+        throwIfJobInterrupted(requestDisconnectController.signal);
         const snapshotId = await db.saveSnapshot(snapshot);
         writeLog(logger, 'info', 'preview.completed', {
           requestId,
@@ -2874,7 +2887,7 @@ function createServer(options = {}) {
           version: snapshot.version,
           planIntentVersion,
           groupBinding,
-          durationMs: Date.now() - previewStartedAt,
+          durationMs: performance.now() - previewStartedAt,
           counts: importPlanSummary(plan).counts,
         });
         jsonResponse(response, 200, {
@@ -2891,7 +2904,7 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'preview.failed', {
           requestId,
           actor,
-          durationMs: Date.now() - previewStartedAt,
+          durationMs: performance.now() - previewStartedAt,
           error: safeHttpErrorMessage(error),
         });
         sendPublicApiError(response, error, {
@@ -2903,7 +2916,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/sync/import') {
-      const importRequestStartedAt = Date.now();
+      const importRequestStartedAt = performance.now();
       try {
         const body = await readJsonBody(request);
         const requestError = importRequestError(body);
@@ -2981,7 +2994,7 @@ function createServer(options = {}) {
               expectedVersion: normalizedSnapshotVersion,
               planIntentVersion,
               selectedCount: selectedKeys.length,
-              durationMs: Date.now() - importRequestStartedAt,
+              durationMs: performance.now() - importRequestStartedAt,
             });
             dispatch(createdJob, 'token_import', actor, (taskRecord) => observeImportJob({
               job: createdJob,
@@ -3008,7 +3021,7 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'import.request_failed', {
           requestId,
           actor,
-          durationMs: Date.now() - importRequestStartedAt,
+          durationMs: performance.now() - importRequestStartedAt,
           error: safeHttpErrorMessage(error),
         });
         sendPublicApiError(response, error, {
@@ -3021,7 +3034,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/phase3') {
-      const phase3RequestStartedAt = Date.now();
+      const phase3RequestStartedAt = performance.now();
       try {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
@@ -3188,7 +3201,7 @@ function createServer(options = {}) {
                 email: item.email || null,
                 phone: item.phone || null,
                 batch: resolvedRequests.length > 1,
-                durationMs: Date.now() - phase3RequestStartedAt,
+                durationMs: performance.now() - phase3RequestStartedAt,
               });
               dispatch(item.job, 'phase3', actor, (taskRecord) => observePhase3Job({
                 job: item.job,
@@ -3231,7 +3244,7 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'phase3.request_failed', {
           requestId,
           actor,
-          durationMs: Date.now() - phase3RequestStartedAt,
+          durationMs: performance.now() - phase3RequestStartedAt,
           error: safeHttpErrorMessage(error),
         });
         sendPublicApiError(response, error, {
@@ -3252,7 +3265,7 @@ function createServer(options = {}) {
         });
         return;
       }
-      const modelStartedAt = Date.now();
+      const modelStartedAt = performance.now();
       try {
         const client = new Sub2ApiAdminClient({ logger, logContext: { requestId, actor } });
         const models = await client.getAvailableModels(accountId);
@@ -3261,7 +3274,7 @@ function createServer(options = {}) {
           actor,
           accountId,
           count: models.length,
-          durationMs: Date.now() - modelStartedAt,
+          durationMs: performance.now() - modelStartedAt,
         });
         jsonResponse(response, 200, { models });
       } catch (error) {
@@ -3269,7 +3282,7 @@ function createServer(options = {}) {
           requestId,
           actor,
           accountId,
-          durationMs: Date.now() - modelStartedAt,
+          durationMs: performance.now() - modelStartedAt,
           error: safeHttpErrorMessage(error),
         });
         sendPublicApiError(response, error, {
@@ -3281,7 +3294,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/account-tests') {
-      const accountTestRequestStartedAt = Date.now();
+      const accountTestRequestStartedAt = performance.now();
       try {
         const body = await readJsonBody(request);
         const requestData = normalizeAccountTestRequest(body);
@@ -3406,7 +3419,7 @@ function createServer(options = {}) {
                 accountCount: submitted.accountIds.length,
                 rejectedCount: submitted.rejected.length,
                 model: requestData.modelId || null,
-                durationMs: Date.now() - accountTestRequestStartedAt,
+                durationMs: performance.now() - accountTestRequestStartedAt,
               });
               dispatch(submitted.job, 'account_test', actor, (taskRecord) => observeAccountTestJob({
                 job: submitted.job,
@@ -3436,7 +3449,7 @@ function createServer(options = {}) {
             requestId,
             actor,
             rejectedCount: submission.rejected.length,
-            durationMs: Date.now() - accountTestRequestStartedAt,
+            durationMs: performance.now() - accountTestRequestStartedAt,
           });
           jsonResponse(response, 409, {
             error: 'ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS',
@@ -3450,7 +3463,7 @@ function createServer(options = {}) {
         writeLog(logger, 'error', 'account_test.request_failed', {
           requestId,
           actor,
-          durationMs: Date.now() - accountTestRequestStartedAt,
+          durationMs: performance.now() - accountTestRequestStartedAt,
           code: storedErrorCode(error) || null,
           error: safeHttpErrorMessage(error),
         });
@@ -3490,7 +3503,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && requestUrl.pathname === '/api/tokens/expired/delete') {
-      const cleanupStartedAt = Date.now();
+      const cleanupStartedAt = performance.now();
       try {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
@@ -3588,7 +3601,7 @@ function createServer(options = {}) {
               jobId: createdJob.id,
               actor,
               expectedVersion,
-              durationMs: Date.now() - cleanupStartedAt,
+              durationMs: performance.now() - cleanupStartedAt,
             });
             dispatch(createdJob, TOKEN_CLEANUP_JOB_TYPE, actor, (taskRecord) => observeTokenCleanupJob({
               job: createdJob,
@@ -3615,7 +3628,7 @@ function createServer(options = {}) {
           actor,
           code: storedErrorCode(error) || null,
           error: safeHttpErrorMessage(error),
-          durationMs: Date.now() - cleanupStartedAt,
+          durationMs: performance.now() - cleanupStartedAt,
         });
         sendPublicApiError(response, error, {
           write: true,
@@ -3628,7 +3641,7 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'POST' && reconciliationAckPath.matched) {
-      const acknowledgeStartedAt = Date.now();
+      const acknowledgeStartedAt = performance.now();
       if (actor !== 'panel-admin') {
         writeLog(logger, 'warn', 'job.reconciliation_acknowledge_admin_required', {
           requestId,
@@ -3682,7 +3695,7 @@ function createServer(options = {}) {
           resolution: acknowledgement.resolution,
           releasedClaimCount: acknowledgement.releasedClaimCount,
           idempotent: acknowledgement.idempotent,
-          durationMs: Date.now() - acknowledgeStartedAt,
+          durationMs: performance.now() - acknowledgeStartedAt,
         });
         jsonResponse(response, 200, {
           ...acknowledgement,
@@ -3695,7 +3708,7 @@ function createServer(options = {}) {
           jobId: reconciliationAckPath.jobId,
           code: storedErrorCode(error) || null,
           error: safeHttpErrorMessage(error),
-          durationMs: Date.now() - acknowledgeStartedAt,
+          durationMs: performance.now() - acknowledgeStartedAt,
         });
         sendPublicApiError(response, error, {
           write: true,

@@ -370,7 +370,12 @@ function createAdmissionDispatchGuard({ db, jobManager, onRetry, onInterrupted }
 }
 
 async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
-  if (!db || typeof db.updateJob !== 'function') return;
+  if (!db || typeof db.updateJob !== 'function') {
+    throw admissionDispatchError(
+      'JOB_TERMINAL_STORE_UNAVAILABLE',
+      '任务终态存储不可用，拒绝将结果视为已持久化',
+    );
+  }
   if (!TERMINAL_JOB_STATUSES.has(patch.status)) {
     const error = new Error('任务终态更新必须提供有效的终态 status');
     error.code = 'JOB_TERMINAL_STATUS_INVALID';
@@ -436,15 +441,22 @@ function createBackgroundJobManager({ db } = {}) {
   function begin(job, type, actor = 'local') {
     if (shuttingDown) throw interruptedJobError();
     if (admissionHolds.size > 0) throw admissionRecoveryPendingError();
+    const id = String(job?.id || '');
+    if (!id) throw new Error('后台任务缺少 job id');
+    if (active.has(id)) {
+      throw admissionDispatchError(
+        'JOB_ALREADY_ACTIVE',
+        '同一任务已由本进程执行器跟踪，拒绝重复派发',
+      );
+    }
     const controller = new AbortController();
     const record = {
-      id: String(job?.id || ''),
+      id,
       type: String(type || job?.type || 'unknown'),
       actor,
       controller,
       promise: null,
     };
-    if (!record.id) throw new Error('后台任务缺少 job id');
     active.set(record.id, record);
     return record;
   }
