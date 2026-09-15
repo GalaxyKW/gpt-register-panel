@@ -2383,6 +2383,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-account-test-'));
   fs.mkdirSync(path.join(root, 'tokens'));
   fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n', { mode: 0o600 });
   const accounts = new Map([
     [1, oauthTestAccount(1, 'error', false, {
       account_id: 'test-account-1',
