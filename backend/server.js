@@ -3,6 +3,7 @@ const http = require('node:http');
 const net = require('node:net');
 const path = require('node:path');
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 const { URL } = require('node:url');
 const { TextDecoder } = require('node:util');
 
@@ -158,7 +159,9 @@ function tokensEqual(left, right) {
 }
 
 function authRateLimit(request) {
-  const now = Date.now();
+  // Buckets live only in this process, so civil-clock adjustments must not
+  // shorten or indefinitely extend their security window.
+  const now = performance.now();
   const windowMs = boundedEnvNumber('PANEL_AUTH_WINDOW_MS', 60_000, 1_000, 3_600_000);
   const blockMs = boundedEnvNumber('PANEL_AUTH_BLOCK_MS', 60_000, 1_000, 3_600_000);
   const maxFailures = boundedEnvNumber('PANEL_AUTH_MAX_FAILURES', 10, 1, 1_000);
@@ -198,7 +201,7 @@ function reserveAuthFailureBucket(key, now, windowMs) {
 }
 
 function recordAuthFailure(request) {
-  const now = Date.now();
+  const now = performance.now();
   const windowMs = boundedEnvNumber('PANEL_AUTH_WINDOW_MS', 60_000, 1_000, 3_600_000);
   const blockMs = boundedEnvNumber('PANEL_AUTH_BLOCK_MS', 60_000, 1_000, 3_600_000);
   const maxFailures = boundedEnvNumber('PANEL_AUTH_MAX_FAILURES', 10, 1, 1_000);

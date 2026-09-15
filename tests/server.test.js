@@ -2284,6 +2284,23 @@ test('authentication failure buckets remain strictly bounded for unique sources'
       headers: { authorization: 'Bearer incorrect' },
       socket: sharedSource,
     }).status, 429);
+
+    const clockJumpSource = { remoteAddress: '198.51.100.21' };
+    const originalDateNow = Date.now;
+    assert.equal(authorizationError({
+      headers: { authorization: 'Bearer incorrect' },
+      socket: clockJumpSource,
+    }).status, 401);
+    try {
+      Date.now = () => originalDateNow() + 60 * 60 * 1000;
+      assert.equal(authorizationError({
+        headers: { authorization: 'Bearer incorrect' },
+        socket: clockJumpSource,
+      }).status, 429);
+    } finally {
+      Date.now = originalDateNow;
+    }
+
     assert.equal(authorizationError({
       headers: { authorization: 'Bearer bounded-test-admin-token' },
       socket: sharedSource,
