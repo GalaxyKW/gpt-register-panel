@@ -2,6 +2,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
+const { performance } = require('node:perf_hooks');
 
 const {
   closeDirectoryHandle,
@@ -1575,13 +1576,13 @@ function runCommand(command, args, options = {}) {
       if (settled || cleanupStarted) return;
       cleanupStarted = true;
       const budget = phase3TerminationBudget(options);
-      const killAt = Date.now() + budget.graceMs;
+      const killAt = performance.now() + budget.graceMs;
       const hardDeadline = killAt + budget.finalWaitMs;
       let killSent = false;
       signalProcessTree('SIGTERM');
       const check = () => {
         if (settled || settleConfirmedCommand()) return;
-        const now = Date.now();
+        const now = performance.now();
         if (!killSent && now >= killAt) {
           killSent = true;
           signalProcessTree('SIGKILL');

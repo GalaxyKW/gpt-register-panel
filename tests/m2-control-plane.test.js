@@ -1724,6 +1724,41 @@ test('phase3 termination budgets leave a fixed reconciliation window before serv
   assert.deepEqual(minimum, { graceMs: 100, finalWaitMs: 100, totalMs: 200 });
 });
 
+test('phase3 cleanup deadlines are not extended by a frozen wall clock', async () => {
+  const originalDateNow = Date.now;
+  const frozenWallClock = originalDateNow();
+  const startedAt = process.hrtime.bigint();
+  let safetyRestoreTimer;
+  try {
+    Date.now = () => frozenWallClock;
+    safetyRestoreTimer = setTimeout(() => {
+      Date.now = originalDateNow;
+    }, 4000);
+    await assert.rejects(
+      runCommand(process.execPath, ['-e', [
+        "process.on('SIGTERM', () => {});",
+        'setInterval(() => {}, 1000);',
+      ].join('\n')], {
+        cwd: os.tmpdir(),
+        env: { PATH: process.env.PATH || '' },
+        timeoutMs: 1000,
+        terminationGraceMs: 100,
+        terminationHardDeadlineMs: 100,
+        maxOutputBytes: 4096,
+      }),
+      (error) => error.code === 'PHASE3_TIMEOUT'
+        && error.details?.requestedSignal === 'SIGKILL'
+        && error.details?.terminationConfirmed === true,
+    );
+    const elapsedMs = Number(process.hrtime.bigint() - startedAt) / 1e6;
+    assert.equal(elapsedMs >= 1000, true);
+    assert.equal(elapsedMs < 3000, true);
+  } finally {
+    Date.now = originalDateNow;
+    if (safetyRestoreTimer) clearTimeout(safetyRestoreTimer);
+  }
+});
+
 test('phase3 cleans a same-group helper before reporting successful command completion', async () => {
   let keeperPid = null;
   try {
