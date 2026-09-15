@@ -1,7 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
-const { ensureDirectoryTree, assertDirectoryTree } = require('./lib/safeFs');
+const { ensureDirectoryTree } = require('./lib/safeFs');
 
 const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
 const MAX_LOG_BYTES = 128 * 1024 * 1024;
@@ -60,6 +60,23 @@ function normalizeSecretKey(key) {
     // The generic acronym splitter turns OAuth into `o_auth`. Restore this
     // credential-domain acronym before matching normalized field names.
     .replace(/(^|_)o_auth(?=_|[\u4e00-\u9fff]|$)/g, '$1oauth');
+}
+
+function isSecretKey(normalizedKey) {
+  let candidate = String(normalizedKey || '');
+  // Indexed/versioned credential containers and derived credential material
+  // are still sensitive. Keep explicit fingerprints as non-secret metadata;
+  // callers intentionally use those for identity diagnostics.
+  for (let count = 0; count < 8 && candidate; count += 1) {
+    if (SECRET_KEY.test(candidate)) return true;
+    const stripped = candidate
+      .replace(/_(?:hash(?:es)?|digests?|checksums?|ids?|identifiers?|base64|b64|encoded|ciphertexts?)$/i, '')
+      .replace(/(?:_v?\d{1,6}|\d{1,6})$/i, '')
+      .replace(/_+$/, '');
+    if (stripped === candidate) break;
+    candidate = stripped;
+  }
+  return /(^|_)(?:client|saml|signed)_assertions?$/.test(candidate);
 }
 
 function jsonRedaction(value) {
@@ -149,7 +166,7 @@ function redactMultiwordAssignments(value) {
   let cursor = 0;
   let match;
   while ((match = pattern.exec(text))) {
-    if (!SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
+    if (!isSecretKey(normalizeSecretKey(match[3]))) continue;
     if (match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
     const normalizedKey = normalizeSecretKey(match[3]);
@@ -170,7 +187,7 @@ function redactAssignments(value) {
   let cursor = 0;
   let match;
   while ((match = pattern.exec(text))) {
-    if (!SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
+    if (!isSecretKey(normalizeSecretKey(match[3]))) continue;
     if (match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3] + match[4];
     const normalizedKey = normalizeSecretKey(match[3]);
@@ -195,7 +212,7 @@ function redactEncodedAssignments(value) {
     let decoded;
     try { decoded = decodeURIComponent(match[2]); } catch { continue; }
     const normalizedKey = normalizeSecretKey(decoded);
-    if (!SECRET_KEY.test(normalizedKey) || match.index < cursor) continue;
+    if (!isSecretKey(normalizedKey) || match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3];
     const span = assignedValueSpan(text, pattern.lastIndex, {
       allowSpaces: secretMayContainSpaces(normalizedKey),
@@ -220,7 +237,7 @@ function redactPercentEncodedAssignments(value) {
     let decoded;
     try { decoded = decodeURIComponent(match[2]); } catch { continue; }
     const normalizedKey = normalizeSecretKey(decoded);
-    if (!SECRET_KEY.test(normalizedKey) || match.index < cursor) continue;
+    if (!isSecretKey(normalizedKey) || match.index < cursor) continue;
     output += text.slice(cursor, match.index) + match[1] + match[2] + match[3];
     const tail = text.slice(pattern.lastIndex);
     const delimiter = secretMayContainSpaces(normalizedKey)
@@ -247,7 +264,7 @@ function redactSpaceSeparatedPattern(value, pattern) {
   let match;
   while ((match = pattern.exec(text))) {
     if (match.index < cursor) continue;
-    if (match[3].length > 128 || !SECRET_KEY.test(normalizeSecretKey(match[3]))) continue;
+    if (match[3].length > 128 || !isSecretKey(normalizeSecretKey(match[3]))) continue;
     let valueStart = pattern.lastIndex;
     const connector = /^(?:(?:(?:is|was|are|were)\b|是|为)[ \t]+|(?:=>|->|:=|[:=：＝→])[ \t]*)/i
       .exec(text.slice(valueStart));
@@ -286,7 +303,7 @@ function redactUrlUserinfo(value) {
   );
 }
 
-function redactText(value) {
+function redactTextCore(value) {
   let text = String(value === undefined || value === null ? '' : value);
   const structured = jsonRedaction(text);
   if (structured !== null) return structured;
@@ -304,7 +321,97 @@ function redactText(value) {
   ));
 }
 
-function readTailText(descriptor, fileSize, lineLimit) {
+function decodePercentLayers(value) {
+  let text = String(value);
+  for (let count = 0; count < 3; count += 1) {
+    const decoded = text.replace(/(?:%[0-9a-f]{2})+/gi, (segment) => {
+      try { return decodeURIComponent(segment); } catch { return segment; }
+    });
+    if (decoded === text) break;
+    text = decoded;
+  }
+  return text;
+}
+
+function decodeBackslashLayers(value) {
+  let text = String(value);
+  for (let count = 0; count < 3; count += 1) {
+    const decoded = text
+      .replace(/\\u([0-9a-f]{4})/gi, (_match, code) => String.fromCharCode(parseInt(code, 16)))
+      .replace(/\\x([0-9a-f]{2})/gi, (_match, code) => String.fromCharCode(parseInt(code, 16)))
+      .replace(/\\(["'\\/:=])/g, '$1');
+    if (decoded === text) break;
+    text = decoded;
+  }
+  return text;
+}
+
+function decodeHtmlCredentialEntities(value) {
+  const named = {
+    amp: '&', apos: "'", colon: ':', equals: '=', lowbar: '_', percnt: '%', quot: '"',
+  };
+  return String(value)
+    .replace(/&#(?:x([0-9a-f]{1,6})|([0-9]{1,7}));/gi, (match, hex, decimal) => {
+      const code = parseInt(hex || decimal, hex ? 16 : 10);
+      try {
+        return Number.isInteger(code) && code >= 0 && code <= 0x10ffff
+          ? String.fromCodePoint(code)
+          : match;
+      } catch {
+        return match;
+      }
+    })
+    .replace(/&(amp|apos|colon|equals|lowbar|percnt|quot);/gi,
+      (_match, name) => named[String(name).toLowerCase()]);
+}
+
+function encodedFormContainsSecret(original) {
+  const initial = String(original);
+  const seen = new Set([initial]);
+  let frontier = [initial];
+  const decoders = [decodePercentLayers, decodeBackslashLayers, decodeHtmlCredentialEntities];
+  // Encodings are sometimes nested across different schemes (for example a
+  // percent-encoded HTML entity which expands to an escaped JSON key). Check
+  // a bounded composition graph instead of testing each decoder in isolation.
+  for (let depth = 0; depth < 3 && frontier.length > 0; depth += 1) {
+    const next = [];
+    for (const candidate of frontier) {
+      for (const decoder of decoders) {
+        let decoded;
+        try { decoded = decoder(candidate); } catch { continue; }
+        if (decoded === candidate || seen.has(decoded)) continue;
+        if (redactTextCore(decoded) !== decoded) return true;
+        seen.add(decoded);
+        if (seen.size < 32) next.push(decoded);
+      }
+    }
+    frontier = next;
+  }
+  return false;
+}
+
+function redactResidualEncodedSecrets(value) {
+  let text = String(value);
+  // Preserve already-supported query-string diagnostics field by field. If a
+  // remaining encoded token only becomes recognizable after one or more
+  // decoding layers, omit that token instead of returning its raw secret.
+  text = text.replace(/\S+/g, (segment) => (
+    /(?:%[0-9a-f]{2}|\\(?:u[0-9a-f]{4}|x[0-9a-f]{2}|["'\\/:=])|&#(?:x[0-9a-f]{1,6}|[0-9]{1,7});|&(amp|apos|colon|equals|lowbar|percnt|quot);)/i.test(segment)
+      && encodedFormContainsSecret(segment)
+      ? '[redacted encoded text]'
+      : segment
+  ));
+  if (encodedFormContainsSecret(text)) {
+    return '[redacted encoded text]';
+  }
+  return text;
+}
+
+function redactText(value) {
+  return redactResidualEncodedSecrets(redactTextCore(value));
+}
+
+function readTailText(descriptor, fileSize, lineLimit, maximumBytes = LOG_TAIL_MAX_BYTES) {
   let position = Math.max(0, Math.floor(Number(fileSize) || 0));
   let totalRead = 0;
   let completeLines = 0;
@@ -312,11 +419,15 @@ function readTailText(descriptor, fileSize, lineLimit) {
   let startsAtLineBoundary = position === 0;
   const chunks = [];
 
-  while (position > 0 && totalRead < LOG_TAIL_MAX_BYTES) {
+  const readLimit = Math.max(0, Math.min(
+    LOG_TAIL_MAX_BYTES,
+    Math.floor(Number(maximumBytes) || 0),
+  ));
+  while (position > 0 && totalRead < readLimit) {
     const length = Math.min(
       LOG_TAIL_BLOCK_BYTES,
       position,
-      LOG_TAIL_MAX_BYTES - totalRead,
+      readLimit - totalRead,
     );
     const start = position - length;
     const buffer = Buffer.alloc(length);
@@ -351,7 +462,7 @@ function readTailText(descriptor, fileSize, lineLimit) {
     const firstNewline = bytes.indexOf(0x0a);
     bytes = firstNewline < 0 ? Buffer.alloc(0) : bytes.subarray(firstNewline + 1);
   }
-  return bytes.toString('utf8');
+  return { text: bytes.toString('utf8'), bytesRead: totalRead };
 }
 
 function redactionContext(candidate, limits) {
@@ -375,7 +486,7 @@ function safeRedactedKey(key, index) {
 
 function redactValueAt(value, key, context, depth) {
   const normalizedKey = normalizeSecretKey(key);
-  if (SECRET_KEY.test(normalizedKey)) return '[redacted]';
+  if (isSecretKey(normalizedKey)) return '[redacted]';
   context.nodes += 1;
   if (context.nodes > context.limits.nodes) return '[redaction limit reached]';
   if (typeof value === 'string') {
@@ -493,7 +604,7 @@ function serializeLogEntry(entry, maximumBytes = MAX_LOG_ENTRY_BYTES) {
   const safeMaximumBytes = Math.max(1024, Math.min(MAX_LOG_ENTRY_BYTES, maximumBytes));
   let line = JSON.stringify(entry) + '\n';
   if (Buffer.byteLength(line) <= safeMaximumBytes) return { entry, line };
-  const compact = {
+  let compact = {
     timestamp: entry.timestamp,
     level: entry.level,
     event: entry.event,
@@ -501,6 +612,16 @@ function serializeLogEntry(entry, maximumBytes = MAX_LOG_ENTRY_BYTES) {
     fields: '[oversized fields omitted]',
   };
   line = JSON.stringify(compact) + '\n';
+  if (Buffer.byteLength(line) > safeMaximumBytes) {
+    compact = {
+      timestamp: entry.timestamp,
+      level: entry.level,
+      event: '[oversized event omitted]',
+      pid: entry.pid,
+      fields: '[oversized fields omitted]',
+    };
+    line = JSON.stringify(compact) + '\n';
+  }
   return { entry: compact, line };
 }
 
@@ -699,7 +820,7 @@ class PanelLogger {
       if ((descriptorStat.mode & 0o077) !== 0) {
         throw new Error('日志文件权限必须不宽于 0600');
       }
-      return needsNormalization;
+      return { permissionsChanged: needsNormalization, size: descriptorStat.size };
     } finally {
       if (descriptor !== undefined) {
         try { fs.closeSync(descriptor); } catch {}
@@ -736,13 +857,20 @@ class PanelLogger {
     }
     this.assertPinnedDirectory(pinnedDirectory);
     let permissionsChanged = false;
+    let totalBytes = 0;
     for (const name of names) {
-      permissionsChanged = this.validateExistingLogFile(
+      const validation = this.validateExistingLogFile(
         pinnedDirectory,
         path.join(pinnedDirectory.accessDirectory, name),
         currentUid,
         true,
-      ) || permissionsChanged;
+      );
+      if (!Number.isSafeInteger(validation.size) || validation.size < 0
+          || validation.size > MAX_LOG_TOTAL_BYTES - totalBytes) {
+        throw new Error('日志轮转文件实际总大小超过安全上限');
+      }
+      totalBytes += validation.size;
+      permissionsChanged = validation.permissionsChanged || permissionsChanged;
     }
     return permissionsChanged;
   }
@@ -848,6 +976,7 @@ class PanelLogger {
       fs.fsyncSync(descriptor);
       this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
+      this.fallbackReports = 0;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = new Date().toISOString();
       return true;
@@ -893,6 +1022,7 @@ class PanelLogger {
       fs.fsyncSync(descriptor);
       this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
+      this.fallbackReports = 0;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = timestamp;
       return true;
@@ -990,6 +1120,10 @@ class PanelLogger {
       if (targetStat) this.validateExistingLogFile(pinnedDirectory, target, currentUid, false);
       fs.renameSync(currentPath, target);
       directoryChanged = true;
+      // Make the completed namespace transition durable before the caller
+      // attempts to recreate the current file. If that later open/write
+      // fails, a crash must not resurrect an ambiguous partial rotation.
+      this.syncPinnedDirectory(pinnedDirectory);
       return true;
     } catch (error) {
       // If a multi-file rotation stopped part way through, at least persist the
@@ -1061,6 +1195,7 @@ class PanelLogger {
       } finally { fs.closeSync(descriptor); }
       if (rotated || !currentExisted) this.syncPinnedDirectory(pinnedDirectory);
       this.fileHealthy = true;
+      this.fallbackReports = 0;
       this.consecutiveWriteFailures = 0;
       this.lastWriteSucceededAt = new Date().toISOString();
     } catch (error) {
@@ -1095,49 +1230,86 @@ class PanelLogger {
       : crypto.randomUUID();
   }
 
-  tail(limit = 200) {
-    const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 200)));
-    let text = '';
+  readTailFile(pinnedDirectory, name, lineLimit, byteLimit) {
+    this.assertPinnedDirectory(pinnedDirectory);
+    const candidatePath = path.join(pinnedDirectory.accessDirectory, name);
+    let initial;
+    try {
+      initial = fs.lstatSync(candidatePath);
+    } catch (error) {
+      if (error?.code === 'ENOENT') return { entries: [], bytesRead: 0 };
+      throw error;
+    }
+    const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
+    if (initial.isSymbolicLink() || !initial.isFile() || initial.nlink !== 1
+        || (currentUid !== null && initial.uid !== currentUid)
+        || (initial.mode & 0o077) !== 0) {
+      throw new Error('日志读取目标不安全');
+    }
     let descriptor;
     try {
-      const directory = path.dirname(this.filePath);
-      this.assertDirectorySafe();
-      assertDirectoryTree(directory, '日志目录');
-      const realDirectory = fs.realpathSync(directory);
-      const expectedPath = path.join(realDirectory, path.basename(this.filePath));
       descriptor = fs.openSync(
-        this.filePath,
+        candidatePath,
         fs.constants.O_RDONLY
           | (fs.constants.O_NOFOLLOW || 0)
           | (fs.constants.O_NONBLOCK || 0),
       );
-      const descriptorStat = fs.fstatSync(descriptor);
-      const currentUid = typeof process.getuid === 'function' ? process.getuid() : null;
-      if (!descriptorStat.isFile() || descriptorStat.nlink !== 1
-          || (currentUid !== null && descriptorStat.uid !== currentUid)
-          || (descriptorStat.mode & 0o077) !== 0) return [];
-      try {
-        if (fs.realpathSync('/proc/self/fd/' + descriptor) !== expectedPath) return [];
-      } catch {
-        const latest = fs.lstatSync(this.filePath);
-        const current = fs.statSync(this.filePath);
-        if (fs.realpathSync(directory) !== realDirectory
-            || latest.isSymbolicLink() || !latest.isFile()
-            || current.dev !== descriptorStat.dev || current.ino !== descriptorStat.ino) {
-          return [];
-        }
+      const opened = fs.fstatSync(descriptor);
+      if (!opened.isFile() || opened.nlink !== 1
+          || opened.dev !== initial.dev || opened.ino !== initial.ino
+          || (currentUid !== null && opened.uid !== currentUid)
+          || (opened.mode & 0o077) !== 0) {
+        throw new Error('日志读取目标在打开期间发生变化');
       }
-      text = readTailText(descriptor, descriptorStat.size, safeLimit);
-    } catch { return []; } finally {
+      const result = readTailText(descriptor, opened.size, lineLimit, byteLimit);
+      const latest = fs.lstatSync(candidatePath);
+      if (latest.isSymbolicLink() || !latest.isFile() || latest.nlink !== 1
+          || latest.dev !== opened.dev || latest.ino !== opened.ino) {
+        throw new Error('日志读取目标在读取期间发生变化');
+      }
+      this.assertPinnedDirectory(pinnedDirectory);
+      const entries = result.text.split(/\r?\n/).filter(Boolean).slice(-lineLimit).map((line) => {
+        try { return redactLogValue(JSON.parse(line)); } catch {
+          return { level: 'error', event: 'logger.invalid_line', message: redactText(line) };
+        }
+      });
+      return { entries, bytesRead: result.bytesRead };
+    } finally {
       if (descriptor !== undefined) {
         try { fs.closeSync(descriptor); } catch {}
       }
     }
-    return text.split(/\r?\n/).filter(Boolean).slice(-safeLimit).map((line) => {
-      try { return redactLogValue(JSON.parse(line)); } catch {
-        return { level: 'error', event: 'logger.invalid_line', message: redactText(line) };
+  }
+
+  tail(limit = 200) {
+    const safeLimit = Math.max(1, Math.min(2000, Math.floor(Number(limit) || 200)));
+    let pinnedDirectory;
+    try {
+      pinnedDirectory = this.openPinnedDirectory();
+      const baseName = path.basename(this.filePath);
+      let remainingBytes = LOG_TAIL_MAX_BYTES;
+      let entries = [];
+      for (let index = 0; index <= this.rotations
+          && entries.length < safeLimit && remainingBytes > 0; index += 1) {
+        const name = index === 0 ? baseName : baseName + '.' + index;
+        const result = this.readTailFile(
+          pinnedDirectory,
+          name,
+          safeLimit - entries.length,
+          remainingBytes,
+        );
+        remainingBytes -= result.bytesRead;
+        if (result.entries.length > 0) entries = result.entries.concat(entries);
       }
-    });
+      this.assertPinnedDirectory(pinnedDirectory);
+      return entries.slice(-safeLimit);
+    } catch {
+      return [];
+    } finally {
+      if (pinnedDirectory?.descriptor !== undefined) {
+        try { fs.closeSync(pinnedDirectory.descriptor); } catch {}
+      }
+    }
   }
 }
 

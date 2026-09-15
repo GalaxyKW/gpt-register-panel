@@ -206,6 +206,40 @@ test('redaction covers localized, composite, and URL-encoded credential forms', 
   assert.equal(structured.tokenFingerprint, 'safe-fingerprint');
 });
 
+test('redaction fails closed for nested encodings and derived or indexed credential fields', () => {
+  const marker = 'fake-layered-credential-marker-918273';
+  const encodedCases = [
+    `Authorization%3A%20Bearer%20${marker}%26status%3Dfailed`,
+    `Bearer%20${marker}%20rejected`,
+    `access%255Ftoken%253D${marker}%2526status%253Dfailed`,
+    `{\\"access_token\\":\\"${marker}\\"}`,
+    `prefix {\\"access_token\\":\\"${marker}\\"} suffix`,
+    `prefix {"access\\u005ftoken":"${marker}"} suffix`,
+    `access\\u005ftoken=${marker}`,
+    `api&#95;key=${marker}`,
+    `%26%23x61%3Bccess_token%26%23x3d%3B${marker}`,
+    `\\u0026#x61;ccess_token\\u003d${marker}`,
+  ];
+  for (const input of encodedCases) {
+    assert.equal(redactText(input).includes(marker), false, input + ' leaked');
+  }
+
+  const structured = redactValue({
+    clientAssertion: marker,
+    passwordHash: marker,
+    credentialV2: marker,
+    sessionId: marker,
+    token: 'already-covered',
+    tokenFingerprint: 'safe-fingerprint',
+  });
+  for (const key of ['clientAssertion', 'passwordHash', 'credentialV2', 'sessionId']) {
+    assert.equal(structured[key], '[redacted]', key + ' was not redacted');
+  }
+  assert.equal(structured.tokenFingerprint, 'safe-fingerprint');
+  assert.equal(redactText(`token[0]=${marker}`).includes(marker), false);
+  assert.equal(redactText(`credential_v2=${marker}`).includes(marker), false);
+});
+
 test('redaction covers private-key material and common cloud signing credentials', () => {
   const pemSecret = [
     '-----BEGIN PRIVATE KEY-----',
@@ -338,6 +372,11 @@ test('redaction and log serialization are bounded for deep, sparse, and oversize
   assert.equal(eventStringCalls, 0);
   assert.equal(entry.event, 'event');
   assert.ok(Buffer.byteLength(JSON.stringify(entry)) <= logger.maxBytes);
+  assert.ok(fs.statSync(filePath).size <= logger.maxBytes);
+
+  const oversizedEventEntry = logger.info('event-' + 'y'.repeat(5000));
+  assert.equal(oversizedEventEntry.event, '[oversized event omitted]');
+  assert.ok(Buffer.byteLength(JSON.stringify(oversizedEventEntry)) <= logger.maxBytes);
   assert.ok(fs.statSync(filePath).size <= logger.maxBytes);
 });
 
@@ -548,6 +587,70 @@ test('structured logger rotates files, supports tail, and uses restrictive permi
   assert.ok(bounded.maxBytes * (bounded.rotations + 1) <= 512 * 1024 * 1024);
 });
 
+test('logger tail returns a bounded chronological window across rotations', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-tail-rotate-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024, rotations: 2 });
+  fs.appendFileSync(filePath, JSON.stringify({
+    event: 'rotation.previous',
+    padding: 'x'.repeat(1100),
+  }) + '\n');
+  logger.info('rotation.current');
+
+  assert.deepEqual(logger.tail(3).map((entry) => entry.event), [
+    'logger.write_preflight',
+    'rotation.previous',
+    'rotation.current',
+  ]);
+});
+
+test('completed rotation is directory-fsynced even when current-log recreation fails', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-rotate-durable-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false, maxBytes: 1024, rotations: 2 });
+  fs.appendFileSync(filePath, 'x'.repeat(1100));
+  const directoryStat = fs.statSync(directory);
+  const originalRenameSync = fs.renameSync;
+  const originalFsyncSync = fs.fsyncSync;
+  const originalOpenSync = fs.openSync;
+  let currentRenamed = false;
+  let durableRotationSyncs = 0;
+  let recreationRejected = false;
+  fs.renameSync = function trackCurrentRotation(from, to) {
+    const result = originalRenameSync.call(fs, from, to);
+    if (path.basename(String(from)) === path.basename(filePath)) currentRenamed = true;
+    return result;
+  };
+  fs.fsyncSync = function trackPostRotationDirectorySync(descriptor) {
+    const stat = fs.fstatSync(descriptor);
+    if (currentRenamed && stat.isDirectory()
+        && stat.dev === directoryStat.dev && stat.ino === directoryStat.ino) {
+      durableRotationSyncs += 1;
+    }
+    return originalFsyncSync.call(fs, descriptor);
+  };
+  fs.openSync = function rejectCurrentRecreation(target, flags, ...args) {
+    if (currentRenamed && path.basename(String(target)) === path.basename(filePath)
+        && (Number(flags) & fs.constants.O_APPEND) !== 0) {
+      recreationRejected = true;
+      throw Object.assign(new Error('simulated recreation failure'), { code: 'EIO' });
+    }
+    return originalOpenSync.call(fs, target, flags, ...args);
+  };
+  try {
+    logger.info('rotation.recreation-fails');
+  } finally {
+    fs.renameSync = originalRenameSync;
+    fs.fsyncSync = originalFsyncSync;
+    fs.openSync = originalOpenSync;
+  }
+  assert.equal(currentRenamed, true);
+  assert.equal(recreationRejected, true);
+  assert.ok(durableRotationSyncs >= 1);
+  assert.equal(logger.health().healthy, false);
+  assert.equal(fs.existsSync(filePath + '.1'), true);
+});
+
 test('logger treats rotation failure as a failed write until rotation recovers', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
   const filePath = path.join(directory, 'panel.log');
@@ -584,6 +687,39 @@ test('logger treats rotation failure as a failed write until rotation recovers',
   assert.equal(logger.health().healthy, true);
   assert.equal(logger.health().consecutiveWriteFailures, 0);
   assert.equal(logger.tail(1)[0].event, 'test.rotation.recovered');
+});
+
+test('logger console fallback budget resets after file logging recovers', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-fallback-reset-'));
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: true });
+  const originalWriteFileSync = fs.writeFileSync;
+  const originalStdoutWrite = process.stdout.write;
+  const originalStderrWrite = process.stderr.write;
+  const fallbackLines = [];
+  process.stdout.write = () => true;
+  process.stderr.write = (line) => {
+    fallbackLines.push(String(line));
+    return true;
+  };
+  const failOnce = (event) => {
+    fs.writeFileSync = function rejectLogWrite() {
+      throw Object.assign(new Error('simulated log outage'), { code: 'EIO' });
+    };
+    try { logger.info(event); } finally { fs.writeFileSync = originalWriteFileSync; }
+  };
+  try {
+    failOnce('failure.episode-one.a');
+    failOnce('failure.episode-one.b');
+    logger.info('failure.recovered');
+    failOnce('failure.episode-two');
+  } finally {
+    fs.writeFileSync = originalWriteFileSync;
+    process.stdout.write = originalStdoutWrite;
+    process.stderr.write = originalStderrWrite;
+  }
+  assert.equal(fallbackLines.length, 3);
+  for (const line of fallbackLines) assert.doesNotThrow(() => JSON.parse(line));
 });
 
 test('logger write failure fallback never invokes hostile error accessors', () => {
@@ -775,6 +911,37 @@ test('logger tail does not follow a file swapped to a symbolic link before open'
   }
 });
 
+test('logger tail fails closed if the configured directory is replaced after pinning', () => {
+  const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-dir-swap-'));
+  const directory = path.join(parent, 'logs');
+  const movedDirectory = path.join(parent, 'logs-original');
+  fs.mkdirSync(directory, { mode: 0o700 });
+  const filePath = path.join(directory, 'panel.log');
+  const logger = new PanelLogger({ filePath, console: false });
+  logger.info('safe.before-directory-swap');
+
+  const originalOpenSync = fs.openSync;
+  let swapped = false;
+  fs.openSync = function swapDirectoryBeforeLogOpen(target, ...args) {
+    if (!swapped && path.basename(String(target)) === path.basename(filePath)
+        && String(target).startsWith('/proc/self/fd/')) {
+      swapped = true;
+      fs.renameSync(directory, movedDirectory);
+      fs.mkdirSync(directory, { mode: 0o700 });
+      fs.writeFileSync(filePath, JSON.stringify({ event: 'unsafe.replacement' }) + '\n', {
+        mode: 0o600,
+      });
+    }
+    return originalOpenSync.call(fs, target, ...args);
+  };
+  try {
+    assert.deepEqual(logger.tail(10), []);
+  } finally {
+    fs.openSync = originalOpenSync;
+  }
+  assert.equal(swapped, true);
+});
+
 test('logger writes do not follow a file swapped to a symbolic link before open', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-'));
   const filePath = path.join(directory, 'panel.log');
@@ -856,6 +1023,24 @@ test('logger secures the full rotated namespace and refuses unsafe rotation targ
   logger.info('test.unsafe.rotation.target');
   assert.equal(logger.health().healthy, false);
   assert.equal(fs.readFileSync(runtimeOutside, 'utf8'), 'outside-original\n');
+});
+
+test('logger rejects an existing rotation namespace above the hard total-size limit', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-log-total-limit-'));
+  const filePath = path.join(directory, 'panel.log');
+  const oversizedRotation = filePath + '.1';
+  fs.writeFileSync(filePath, 'current\n', { mode: 0o600 });
+  fs.writeFileSync(oversizedRotation, '', { mode: 0o600 });
+  fs.truncateSync(oversizedRotation, 512 * 1024 * 1024 + 1);
+  try {
+    assert.throws(
+      () => new PanelLogger({ filePath, console: false }),
+      { code: 'PANEL_LOG_INITIALIZATION_FAILED' },
+    );
+  } finally {
+    fs.unlinkSync(oversizedRotation);
+  }
+  assert.equal(fs.readFileSync(filePath, 'utf8'), 'current\n');
 });
 
 test('logger scans its directory with a bounded stream instead of an unbounded readdir', () => {
