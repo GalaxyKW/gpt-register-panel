@@ -184,10 +184,21 @@ function credentialsInSync(token, account) {
   if (!sourceAccess || !remoteAccess || sourceAccess !== remoteAccess
       || accountCredentialPresence(account, 'access') === 'absent') return false;
   const sourceRefresh = token?.fingerprints?.refresh || null;
-  if (!sourceRefresh) return true;
-  return accountCredentialPresence(account, 'refresh') === 'present'
-    && Boolean(account?.tokenFingerprints?.refresh)
-    && sourceRefresh === account.tokenFingerprints.refresh;
+  if (sourceRefresh && (accountCredentialPresence(account, 'refresh') !== 'present'
+      || !account?.tokenFingerprints?.refresh
+      || sourceRefresh !== account.tokenFingerprints.refresh)) return false;
+
+  const sourceId = token?.fingerprints?.id || null;
+  if (!sourceId) return true;
+  const remoteIdPresence = accountCredentialPresence(account, 'id');
+  const remoteId = account?.tokenFingerprints?.id || null;
+  // Some Sub2API versions expose only an authoritative id-token presence bit,
+  // so absence of a digest alone cannot prove a difference. When the server
+  // does expose a digest, however, a known mismatch must not be labelled
+  // `in_sync` and silently skip an unavailable account update.
+  if (remoteIdPresence === 'absent') return false;
+  if (!remoteId) return remoteIdPresence === 'present';
+  return sourceId === remoteId;
 }
 
 // Keep the human-facing credential difference and the import planner reason

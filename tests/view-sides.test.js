@@ -190,6 +190,7 @@ test('view rows explicitly reject historical tokens and invalid username phones 
     fileName: 'phase3-source.json',
     email: 'phase3-source@example.test',
     parseStatus: 'ok',
+    historical: false,
     contentHash: 'a'.repeat(64),
     identityKeys: ['account:phase3-source-account'],
     fingerprints: {},

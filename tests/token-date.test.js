@@ -29,9 +29,12 @@ test('token dates reject rolled, ambiguous, incomplete, or non-RFC3339 strings',
     '2026-01-02 03:04:05Z',
     '2026-01-02t03:04:05z',
     ' 2026-01-02T03:04:05Z ',
+    '1'.repeat(129),
   ]) {
     assert.equal(parseDateValue(value), null, value);
   }
+  assert.equal(parseDateValue([1767225600]), null);
+  assert.equal(parseDateValue({ toString() { throw new Error('must not coerce'); } }), null);
 });
 
 test('rolled and ambiguous expiry metadata fail closed instead of affecting token ordering', () => {

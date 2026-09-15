@@ -2,7 +2,10 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 
-const { readGptRegisterSources } = require('./adapters/gptRegisterFs');
+const {
+  isSafeTokenFileName,
+  readGptRegisterTokenSources,
+} = require('./adapters/gptRegisterFs');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
@@ -876,6 +879,11 @@ function moveToQuarantine(sourcePath, targetPath, options = {}) {
 function claimSourcePath(sourcePath, expectedHash) {
   const directory = path.dirname(sourcePath);
   const fileName = path.basename(sourcePath);
+  if (!isSafeTokenFileName(fileName)) {
+    const error = new Error('token 文件名与清理保留命名空间冲突或包含不安全字符');
+    error.code = 'TOKEN_CLEANUP_FILENAME_INVALID';
+    throw error;
+  }
   const owner = currentProcessOwner();
   const encodedName = Buffer.from(fileName, 'utf8').toString('base64url');
   const normalizedHash = String(expectedHash || '').toLowerCase();
@@ -945,9 +953,7 @@ function parseClaimName(fileName) {
         || hashBytes.length !== 32 || hashBytes.toString('base64url') !== match[4]
         || Buffer.from(originalFileName, 'utf8').toString('base64url') !== match[5]
         || nonceBytes.length !== 8 || nonceBytes.toString('base64url') !== match[6]) return null;
-    if (!originalFileName
-        || path.basename(originalFileName) !== originalFileName
-        || !originalFileName.toLowerCase().endsWith('.json')) return null;
+    if (!isSafeTokenFileName(originalFileName)) return null;
     const pid = Number(match[1]);
     if (!Number.isSafeInteger(pid) || pid <= 0) return null;
     const bootHex = bootBytes?.toString('hex') || '';
@@ -969,9 +975,7 @@ function parseClaimName(fileName) {
   if (!match) return null;
   let originalFileName = '';
   try { originalFileName = Buffer.from(match[4], 'base64url').toString('utf8'); } catch { return null; }
-  if (!originalFileName
-      || path.basename(originalFileName) !== originalFileName
-      || !originalFileName.toLowerCase().endsWith('.json')
+  if (!isSafeTokenFileName(originalFileName)
       || Buffer.from(originalFileName, 'utf8').toString('base64url') !== match[4]) return null;
   const pid = Number(match[1]);
   if (!Number.isSafeInteger(pid) || pid <= 0) return null;
@@ -1406,13 +1410,36 @@ function publicExpiredTokenItem(item) {
   return output;
 }
 
+function cleanupNowMs(options) {
+  let nowMs = NaN;
+  try {
+    nowMs = Number(options.nowMs === undefined ? Date.now() : options.nowMs);
+  } catch {}
+  if (!Number.isFinite(nowMs) || !Number.isFinite(new Date(nowMs).getTime())) {
+    const error = new Error('token 清理时间参数无效，未执行扫描或删除');
+    error.code = 'TOKEN_CLEANUP_TIME_INVALID';
+    error.blockedBeforeStart = true;
+    error.executionOutcome = 'not_started';
+    throw error;
+  }
+  return nowMs;
+}
+
 function listExpiredTokens(options = {}) {
+  // Preserve an explicitly supplied Unix epoch (0), and reject non-finite or
+  // out-of-Date-range values before opening source directories. Otherwise a
+  // malformed injected clock can silently become the wall clock or surface as
+  // an unclassified RangeError while formatting generatedAt.
+  const nowMs = cleanupNowMs(options);
   const rootDirectory = ensureDirectory(cleanupRoot(options), 'GPT_REGISTER_ROOT');
   const preparedSources = prepareCleanupSourceDirectories(rootDirectory);
   try {
     const claimsBefore = inspectTokenCleanupClaims(preparedSources);
-    const nowMs = Number(options.nowMs || Date.now());
-    const sources = readGptRegisterSources({ rootDirectory });
+    // Cleanup is explicitly scoped to the two active token directories. It
+    // must not parse or validate username.json: an unrelated oversized,
+    // malformed or symlinked account-history file must not consume cleanup
+    // memory or prevent an operator from quarantining an expired token.
+    const sources = readGptRegisterTokenSources({ rootDirectory });
     const items = [];
     for (const record of sources.tokens || []) {
       if (!SOURCES.has(record.source)

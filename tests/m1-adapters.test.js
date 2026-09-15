@@ -437,6 +437,8 @@ test('token scans reject file names that produce confusable operation keys', () 
   for (const fileName of [
     ' leading-space.json',
     'back\\slash.json',
+    '.panel-token-cleanup-claim-decoy.json',
+    'decomposed-cafe\u0301.json',
     'bidi-\u202eevil.json',
     'zero-width-\u200bevil.json',
     'soft-\u00adevil.json',
@@ -1173,6 +1175,7 @@ test('token rows join one username phone without changing sync identity', () => 
     fileName: 'email-only.json',
     email: ' Source@Example.test ',
     parseStatus: 'ok',
+    historical: false,
     expiryStatus: 'missing',
     contentHash: 'a'.repeat(64),
     identityKeys: ['email:source@example.test'],
@@ -1734,6 +1737,91 @@ test('diff requires a matching remote refresh fingerprint when the source can re
     ...base,
     tokenFingerprints: { ...token.fingerprints },
     credentialPresence: { access: 'present', refresh: 'present', id: 'unknown' },
+  }]);
+  assert.equal(diff.counts.in_sync, 1);
+});
+
+test('diff does not hide a known id-token mismatch behind matching access credentials', () => {
+  const token = {
+    source: 'tokens',
+    relativePath: 'tokens/id-token.json',
+    fileName: 'id-token.json',
+    parseStatus: 'ok',
+    identityKeys: ['account:id-token-account'],
+    fingerprints: {
+      access: 'same-access-fingerprint',
+      refresh: null,
+      id: 'source-id-fingerprint',
+    },
+    raw: { access_token: 'source-access', id_token: 'source-id' },
+    expiryStatus: 'missing',
+  };
+  const account = {
+    id: 196,
+    name: 'free00196',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    identityKeys: token.identityKeys,
+    tokenFingerprints: {
+      access: token.fingerprints.access,
+      refresh: null,
+      id: 'different-id-fingerprint',
+    },
+    credentialPresence: { access: 'present', refresh: 'absent', id: 'present' },
+  };
+
+  let diff = buildDiff([token], [account]);
+  assert.equal(diff.counts.token_changed, 1);
+  let plan = buildImportPlan({ tokens: [token], usernames: [] }, [account]);
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].reason, 'token_changed');
+
+  diff = buildDiff([token], [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: null },
+    credentialPresence: { ...account.credentialPresence, id: 'absent' },
+  }]);
+  assert.equal(diff.counts.token_changed, 1);
+
+  // Presence-only responses cannot prove the digest, but they do prove the
+  // source id-token was retained; avoid an endless update loop on old APIs.
+  diff = buildDiff([token], [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: null },
+  }]);
+  assert.equal(diff.counts.in_sync, 1);
+  plan = buildImportPlan({ tokens: [token], usernames: [] }, [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: null },
+  }]);
+  assert.equal(plan[0].action, 'skip');
+  assert.equal(plan[0].reason, 'already_in_sync');
+
+  // Unknown is not authoritative presence. Without a digest it cannot prove
+  // that Sub2API retained the source id-token, so fail closed and update an
+  // otherwise unavailable account instead of silently skipping it.
+  diff = buildDiff([token], [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: null },
+    credentialPresence: { ...account.credentialPresence, id: 'unknown' },
+  }]);
+  assert.equal(diff.counts.token_changed, 1);
+  plan = buildImportPlan({ tokens: [token], usernames: [] }, [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: null },
+    credentialPresence: { ...account.credentialPresence, id: 'unknown' },
+  }]);
+  assert.equal(plan[0].action, 'update');
+  assert.equal(plan[0].reason, 'token_changed');
+
+  diff = buildDiff([token], [{
+    ...account,
+    tokenFingerprints: { ...account.tokenFingerprints, id: token.fingerprints.id },
   }]);
   assert.equal(diff.counts.in_sync, 1);
 });

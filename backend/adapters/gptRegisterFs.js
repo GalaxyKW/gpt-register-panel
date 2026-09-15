@@ -32,9 +32,11 @@ const HARD_TOKEN_MAX_DIRECTORY_ENTRIES = 200_000;
 const DEFAULT_TOKEN_TOTAL_MAX_BYTES = 256 * 1024 * 1024;
 const HARD_TOKEN_TOTAL_MAX_BYTES = 1024 * 1024 * 1024;
 const REQUIRED_SOURCE_NAMES = Object.freeze(['tokens', 'use_token', 'username.json']);
+const TOKEN_ONLY_SOURCE_READ = Symbol('token-only-source-read');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
 const UNSAFE_TOKEN_FILE_NAME = /[\\\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
+const RESERVED_TOKEN_FILE_PREFIX = '.panel-token-cleanup-claim-';
 
 function decodeUtf8Json(bytes) {
   // Buffer#toString silently replaces malformed byte sequences with U+FFFD.
@@ -559,6 +561,17 @@ function sortFileNames(left, right) {
   return compareNaturalStrings(left, right);
 }
 
+function isSafeTokenFileName(fileName) {
+  const value = typeof fileName === 'string' ? fileName : '';
+  return Boolean(value)
+    && value === value.trim()
+    && value.normalize('NFC') === value
+    && path.basename(value) === value
+    && value.toLowerCase().endsWith('.json')
+    && !value.startsWith(RESERVED_TOKEN_FILE_PREFIX)
+    && !UNSAFE_TOKEN_FILE_NAME.test(value);
+}
+
 function isHistoricalTokenFile(fileName) {
   return /^old_codex[-_]/i.test(String(fileName || ''));
 }
@@ -601,7 +614,7 @@ function readBoundedManifestNames(directoryHandle, limits) {
       // invisible/control characters or a POSIX-valid backslash can make the
       // reviewed path look different from the path that a mutation targets.
       // Reject the source instead of returning a confusable operational key.
-      if (entry.name !== entry.name.trim() || UNSAFE_TOKEN_FILE_NAME.test(entry.name)) {
+      if (!isSafeTokenFileName(entry.name)) {
         throw gptPathError('token 文件名');
       }
       names.push(entry.name);
@@ -1125,6 +1138,7 @@ function safeUsernameRecords(records) {
 }
 
 function readGptRegisterSources(options = {}) {
+  const tokenOnly = options[TOKEN_ONLY_SOURCE_READ] === true;
   const rootDirectory = path.resolve(
     options.rootDirectory
       || process.env.GPT_REGISTER_ROOT
@@ -1148,12 +1162,14 @@ function readGptRegisterSources(options = {}) {
     const rootPresent = assertReadableDirectory(rootDirectory, 'GPT_REGISTER_ROOT');
     const tokensPresent = assertReadableDirectory(tokensDirectory, 'gpt_register/tokens');
     const useTokenPresent = assertReadableDirectory(useTokenDirectory, 'gpt_register/use_token');
-    const usernamePresent = assertReadableFileParent(usernameFile, 'gpt_register/username.json');
+    const usernamePresent = tokenOnly
+      ? true
+      : assertReadableFileParent(usernameFile, 'gpt_register/username.json');
     if (options.strictCompleteSnapshot === true) {
       const missing = [
         tokensPresent ? null : 'tokens',
         useTokenPresent ? null : 'use_token',
-        usernamePresent ? null : 'username.json',
+        tokenOnly || usernamePresent ? null : 'username.json',
       ].filter(Boolean);
       if (missing.length > 0) {
         throw incompleteSourceError(
@@ -1215,12 +1231,14 @@ function readGptRegisterSources(options = {}) {
           manifestBudget,
         ),
       ];
-      initialUsernameState = captureRegularFileManifest(
-        rootHandle,
-        rootDirectory,
-        usernameFile,
-        'gpt_register/username.json',
-      );
+      if (!tokenOnly) {
+        initialUsernameState = captureRegularFileManifest(
+          rootHandle,
+          rootDirectory,
+          usernameFile,
+          'gpt_register/username.json',
+        );
+      }
     }
     tokenRecords = [
       ...readTokenDirectory(tokensDirectory, 'tokens', rootDirectory, options.includeRaw === true, {
@@ -1240,21 +1258,30 @@ function readGptRegisterSources(options = {}) {
         budget: tokenBudget,
       }),
     ];
-    usernameSnapshot = readJsonArraySnapshot(usernameFile, {
-      rootHandle,
-      rootDirectory,
-      strict: true,
-      requireCompleteSnapshot: options.strictCompleteSnapshot === true,
-      // Raw token reads are used to build or execute a write plan. Losing a
-      // terminal username status because the JSON is corrupt must stop that
-      // plan instead of treating the file as an empty account list.
-      requireValidJson: options.requireValidUsername === true
-        || options.strictCompleteSnapshot === true,
-      requireValidRecords: options.requireValidUsername === true
-        || options.strictCompleteSnapshot === true,
-      maxBytes: options.usernameMaxBytes,
-      maxRecords: options.usernameMaxRecords,
-    });
+    usernameSnapshot = tokenOnly
+      ? {
+          records: [],
+          contentHash: null,
+          mtimeMs: 0,
+          size: 0,
+          present: false,
+          fileState: null,
+        }
+      : readJsonArraySnapshot(usernameFile, {
+          rootHandle,
+          rootDirectory,
+          strict: true,
+          requireCompleteSnapshot: options.strictCompleteSnapshot === true,
+          // Raw token reads are used to build or execute a write plan. Losing a
+          // terminal username status because the JSON is corrupt must stop that
+          // plan instead of treating the file as an empty account list.
+          requireValidJson: options.requireValidUsername === true
+            || options.strictCompleteSnapshot === true,
+          requireValidRecords: options.requireValidUsername === true
+            || options.strictCompleteSnapshot === true,
+          maxBytes: options.usernameMaxBytes,
+          maxRecords: options.usernameMaxRecords,
+        });
     if (options.strictCompleteSnapshot === true) {
       const verificationBudget = {
         files: 0,
@@ -1274,16 +1301,18 @@ function readGptRegisterSources(options = {}) {
           verificationBudget,
         );
       }
-      if (!sameStableFileState(initialUsernameState, usernameSnapshot.fileState)) {
-        throw sourceChangedError('gpt_register/username.json');
+      if (!tokenOnly) {
+        if (!sameStableFileState(initialUsernameState, usernameSnapshot.fileState)) {
+          throw sourceChangedError('gpt_register/username.json');
+        }
+        verifyRegularFileManifest(
+          rootHandle,
+          rootDirectory,
+          usernameFile,
+          initialUsernameState,
+          'gpt_register/username.json',
+        );
       }
-      verifyRegularFileManifest(
-        rootHandle,
-        rootDirectory,
-        usernameFile,
-        initialUsernameState,
-        'gpt_register/username.json',
-      );
       assertDirectoryHandleCurrent(rootHandle, 'GPT_REGISTER_ROOT');
       const latestRootStat = fs.fstatSync(rootHandle.descriptor);
       if (!sameStableFileState(snapshotRootStat, latestRootStat)) {
@@ -1319,6 +1348,13 @@ function readGptRegisterSources(options = {}) {
   };
 }
 
+function readGptRegisterTokenSources(options = {}) {
+  return readGptRegisterSources({
+    ...options,
+    [TOKEN_ONLY_SOURCE_READ]: true,
+  });
+}
+
 function toSafeSources(sources) {
   return {
     generatedAt: sources.generatedAt,
@@ -1334,11 +1370,13 @@ function toSafeSources(sources) {
 
 module.exports = {
   closeDirectoryHandle,
+  isSafeTokenFileName,
   isHistoricalTokenFile,
   openRootDirectory,
   readJsonArray,
   readTokenDirectory,
   readGptRegisterSources,
+  readGptRegisterTokenSources,
   toSafeSources,
   usernameRecordLimit,
 };

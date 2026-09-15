@@ -20,6 +20,7 @@ const CREDENTIAL_IDENTITY_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{1
 const LONG_OPAQUE_IDENTITY = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
 const RFC3339_DATE_TIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.\d+)?(?:Z|[+-](\d{2}):(\d{2}))$/;
 const BASE64URL_SEGMENT = /^[A-Za-z0-9_-]+$/;
+const MAX_DATE_SCALAR_LENGTH = 128;
 
 function asString(value) {
   return value === undefined || value === null ? '' : String(value).trim();
@@ -55,6 +56,12 @@ function parseDateValue(value) {
     const date = new Date(ms);
     return Number.isFinite(date.getTime()) ? date.toISOString() : null;
   }
+  if (typeof value !== 'string') return null;
+  // Dates in this format need only a few dozen bytes. Bound strings before
+  // trimming, numeric coercion or regular-expression work so a large but
+  // otherwise bounded source JSON field cannot amplify snapshot/cleanup CPU
+  // and temporary allocations.
+  if (value.length > MAX_DATE_SCALAR_LENGTH) return null;
   const text = asString(value);
   if (!text) return null;
   const numeric = Number(text);

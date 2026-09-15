@@ -85,6 +85,22 @@ function waitForClaimChild(child, timeoutMs = 5000) {
   });
 }
 
+test('expired-token listing preserves epoch zero and rejects invalid injected clocks', () => {
+  const root = makeRoot();
+  const listing = listExpiredTokens({ rootDirectory: root, nowMs: 0 });
+  assert.equal(listing.generatedAt, '1970-01-01T00:00:00.000Z');
+  assert.equal(listing.count, 0);
+
+  for (const nowMs of [NaN, Infinity, -Infinity, 'not-a-time', 8.64e15 + 1]) {
+    assert.throws(
+      () => listExpiredTokens({ rootDirectory: root, nowMs }),
+      (error) => error.code === 'TOKEN_CLEANUP_TIME_INVALID'
+        && error.blockedBeforeStart === true
+        && error.executionOutcome === 'not_started',
+    );
+  }
+});
+
 test('fresh valid token wins over a newer expired duplicate', () => {
   const root = makeRoot();
   fs.writeFileSync(path.join(root, 'tokens', 'valid.json'), JSON.stringify({
@@ -376,6 +392,59 @@ test('cleanup scan fail-closes on malformed claims and bounds public claim metad
   );
   assert.equal(fs.readdirSync(directory).length, 1001);
   assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+});
+
+test('claim recovery rejects original names that are unsafe or collide with cleanup staging', () => {
+  for (const originalFileName of [
+    'back\\slash.json',
+    'decomposed-cafe\u0301.json',
+    'bidi-\u202eevil.json',
+    '.panel-token-cleanup-claim-decoy.json',
+  ]) {
+    const root = makeRoot();
+    const directory = path.join(root, 'tokens');
+    const content = JSON.stringify({
+      access_token: jwt('unsafe-claim@example.test'),
+      email: 'unsafe-claim@example.test',
+      expired: '2020-01-01T00:00:00.000Z',
+    });
+    const claimPath = deadClaimPath(directory, originalFileName, content);
+
+    assert.throws(
+      () => recoverTokenCleanupClaims(root),
+      (error) => error.code === 'TOKEN_CLEANUP_RECOVERY_INVALID_CLAIM'
+        && error.recoveryReason === 'claim_name_invalid',
+      JSON.stringify(originalFileName),
+    );
+    assert.equal(fs.existsSync(claimPath), true);
+    assert.equal(fs.existsSync(path.join(directory, originalFileName)), false);
+  }
+});
+
+test('expired-token listing does not read or validate unrelated username.json', () => {
+  const root = makeRoot();
+  const outside = path.join(
+    fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-username-')),
+    'outside.json',
+  );
+  fs.writeFileSync(outside, JSON.stringify([{
+    email: 'outside@example.test',
+    password: 'must-not-be-read',
+  }]));
+  fs.symlinkSync(outside, path.join(root, 'username.json'));
+  fs.writeFileSync(path.join(root, 'tokens', 'expired.json'), JSON.stringify({
+    access_token: jwt('token-only-cleanup@example.test'),
+    email: 'token-only-cleanup@example.test',
+    expired: '2020-01-01T00:00:00.000Z',
+  }));
+
+  const listing = listExpiredTokens({
+    rootDirectory: root,
+    nowMs: Date.parse('2026-01-01T00:00:00.000Z'),
+  });
+  assert.equal(listing.count, 1);
+  assert.equal(listing.items[0].relativePath, 'tokens/expired.json');
+  assert.equal(JSON.stringify(listing).includes('must-not-be-read'), false);
 });
 
 test('cleanup claim inspection and recovery stream directory entries without unbounded reads', () => {
