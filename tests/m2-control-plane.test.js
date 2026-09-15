@@ -3820,9 +3820,6 @@ test('OAuth update payload preserves refresh metadata without exposing it in sum
     refreshToken: 'refresh-value',
   });
   source.raw.client_id = 'untrusted-client-id';
-  source.raw.scope = 'x'.repeat(5000);
-  source.raw.token_type = 'Bearer\nunsafe';
-  source.raw.organization_id = 'y'.repeat(513);
   const payload = buildOAuthUpdatePayload({
     _raw: source.raw,
     _record: source,
@@ -3833,13 +3830,27 @@ test('OAuth update payload preserves refresh metadata without exposing it in sum
   assert.equal(typeof payload.credentials.client_id, 'string');
   assert.equal(payload.credentials.client_id.length > 0, true);
   assert.notEqual(payload.credentials.client_id, 'untrusted-client-id');
-  assert.equal(Object.hasOwn(payload.credentials, 'scope'), false);
-  assert.equal(Object.hasOwn(payload.credentials, 'token_type'), false);
   assert.equal(payload.credentials.plan_type, 'free');
   assert.equal(payload.credentials.organization_id, 'organization-a');
   assert.match(payload.extra.access_token_sha256, /^[a-f0-9]{64}$/);
   assert.match(payload.extra.refresh_token_sha256, /^[a-f0-9]{64}$/);
   assert.notEqual(payload.extra.access_token_sha256, payload.extra.refresh_token_sha256);
+
+  for (const malformed of [
+    { scope: 'x'.repeat(5000) },
+    { token_type: 'Bearer\nunsafe' },
+    { organization_id: 'y'.repeat(513) },
+  ]) {
+    assert.throws(
+      () => buildOAuthUpdatePayload({
+        _raw: { ...source.raw, ...malformed },
+        _record: source,
+        email: source.email,
+        expiresAt: source.expiresAt,
+      }),
+      (error) => error.code === 'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+    );
+  }
 });
 
 test('OAuth payload uses the same canonical token aliases as source validation', () => {
@@ -4017,6 +4028,7 @@ test('update plan uses the ID-scoped OAuth endpoint and rechecks availability', 
     schedulable: false,
     identityKeys,
     tokenFingerprints: { access: 'old-fingerprint' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
   };
   const after = {
     ...before,
@@ -4557,6 +4569,7 @@ test('import plan items pass one cancellation signal through update and create r
     schedulable: false,
     identityKeys: updateIdentity,
     tokenFingerprints: { access: 'signal-update-old-fingerprint' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
   };
   const updateAfter = {
     ...updateBefore,
@@ -4606,6 +4619,7 @@ test('import plan items pass one cancellation signal through update and create r
     schedulable: true,
     identityKeys: createIdentity,
     tokenFingerprints: { ...createSource.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
     groupIds: [1],
   };
   let createLists = 0;
@@ -5239,6 +5253,7 @@ test('create postflight requires the exact preview-bound group set', async () =>
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
   };
   for (const { detailGroups, listGroups, expectedLists } of [
     { detailGroups: [2], listGroups: [2], expectedLists: 1 },
@@ -5348,6 +5363,7 @@ test('create postflight retries only bounded complete reads and never retries th
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
     groupIds: [1],
   };
   const controller = new AbortController();
@@ -5413,6 +5429,7 @@ test('create postflight fails closed on a concurrent duplicate strong identity',
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
     groupIds: [1],
   };
   let listCalls = 0;
@@ -5470,6 +5487,7 @@ test('create postflight fails closed when the allocated free name is no longer u
     schedulable: true,
     identityKeys,
     tokenFingerprints: { ...source.fingerprints },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
     groupIds: [1],
   };
   let listCalls = 0;

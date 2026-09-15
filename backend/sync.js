@@ -1761,13 +1761,28 @@ function targetVerificationError(message, code) {
   return error;
 }
 
+function credentialPresenceMetadataInvalid(account, requireComplete = false) {
+  const presence = account?.credentialPresence;
+  if (presence === undefined) return requireComplete;
+  if (!presence || typeof presence !== 'object' || Array.isArray(presence)) return true;
+  return ['access', 'refresh', 'id'].some((field) => {
+    const provided = Object.prototype.hasOwnProperty.call(presence, field);
+    return (requireComplete && !provided)
+      || (provided && !['present', 'absent', 'unknown'].includes(presence[field]));
+  });
+}
+
 function verifyTargetIdentity(item, account, expectedId = null) {
   const actualId = Number(account?.id);
   if (!Number.isSafeInteger(actualId) || actualId <= 0
       || (expectedId !== null && actualId !== Number(expectedId))) {
     throw targetVerificationError('Sub2API 返回的账号 ID 与计划目标不一致', 'SUB2API_TARGET_ID_MISMATCH');
   }
-  if (account?.schemaValid === false) {
+  if (account?.schemaValid === false
+      || account?.identityConflict === true
+      || account?.fingerprintConflict === true
+      || account?.credentialsStatusConflict === true
+      || credentialPresenceMetadataInvalid(account)) {
     throw targetVerificationError('Sub2API 目标账号结构存在冲突', 'SUB2API_TARGET_SCHEMA_INVALID');
   }
   if (!isExpectedSub2ApiAccount(account)) {
@@ -1840,6 +1855,16 @@ function verifyUpdatedTargetIdentity(item, account) {
 }
 
 function verifyTargetFingerprint(item, account) {
+  // Postflight verification depends on explicit presence bits. Falling back
+  // from a missing adapter field to a fingerprint cannot prove that the
+  // remote stored all credentials, especially id_token for which Sub2API may
+  // intentionally expose presence without a digest.
+  if (credentialPresenceMetadataInvalid(account, true)) {
+    throw targetVerificationError(
+      '写入后无法确认 Sub2API 凭据存在状态',
+      'SUB2API_TARGET_SCHEMA_INVALID',
+    );
+  }
   const expectedFingerprint = item.fingerprints?.access || null;
   const actualFingerprint = account?.tokenFingerprints?.access || null;
   if (!expectedFingerprint || !actualFingerprint) {
@@ -1857,13 +1882,63 @@ function verifyTargetFingerprint(item, account) {
     if (expectedRefreshFingerprint !== actualRefreshFingerprint) {
       throw targetVerificationError('更新后 refresh token 指纹不一致', 'SUB2API_IMPORT_VERIFY_REFRESH_FINGERPRINT_MISMATCH');
     }
+  } else {
+    // Sub2API's OAuth update contract preserves an existing sensitive
+    // refresh_token when an access-only replacement omits it. Confirm that
+    // promise after the write instead of reporting success when a regression
+    // or concurrent mutation silently removes or replaces the refresh token.
+    const previousAccount = item?._verifiedAccount || item?._account;
+    const previousPresence = accountCredentialPresence(previousAccount, 'refresh');
+    const actualPresence = accountCredentialPresence(account, 'refresh');
+    if (previousPresence !== 'unknown' && actualPresence !== previousPresence) {
+      throw targetVerificationError(
+        '更新后既有 refresh token 状态未保持',
+        'SUB2API_IMPORT_VERIFY_REFRESH_PRESERVATION_MISMATCH',
+      );
+    }
+    const previousRefreshFingerprint = previousAccount?.tokenFingerprints?.refresh || null;
+    const actualRefreshFingerprint = account?.tokenFingerprints?.refresh || null;
+    if (previousRefreshFingerprint
+        && previousRefreshFingerprint !== actualRefreshFingerprint) {
+      throw targetVerificationError(
+        '更新后既有 refresh token 指纹未保持',
+        'SUB2API_IMPORT_VERIFY_REFRESH_PRESERVATION_MISMATCH',
+      );
+    }
+  }
+  const expectedIdFingerprint = item.fingerprints?.id || null;
+  const previousAccount = item?._verifiedAccount || item?._account;
+  const expectedIdPresence = expectedIdFingerprint
+    ? 'present'
+    : accountCredentialPresence(previousAccount, 'id');
+  const actualIdPresence = accountCredentialPresence(account, 'id');
+  if (expectedIdPresence !== 'unknown' && actualIdPresence !== expectedIdPresence) {
+    throw targetVerificationError(
+      '更新后 id token 状态与预期不一致',
+      'SUB2API_IMPORT_VERIFY_ID_TOKEN_MISMATCH',
+    );
+  }
+  // Current Sub2API responses expose id_token presence but may not expose a
+  // stable fingerprint. Compare it when available, while still requiring the
+  // authoritative presence bit above.
+  const actualIdFingerprint = account?.tokenFingerprints?.id || null;
+  const preservedIdFingerprint = expectedIdFingerprint
+    || previousAccount?.tokenFingerprints?.id
+    || null;
+  if (preservedIdFingerprint
+      && actualIdFingerprint
+      && preservedIdFingerprint !== actualIdFingerprint) {
+    throw targetVerificationError(
+      '更新后 id token 指纹与预期不一致',
+      'SUB2API_IMPORT_VERIFY_ID_TOKEN_MISMATCH',
+    );
   }
   return actualFingerprint;
 }
 
 function plannedCredentialStateMatches(plannedAccount, account) {
   if (!plannedAccount) return false;
-  for (const field of ['access', 'refresh']) {
+  for (const field of ['access', 'refresh', 'id']) {
     const expectedFingerprint = plannedAccount.tokenFingerprints?.[field] || null;
     const actualFingerprint = account?.tokenFingerprints?.[field] || null;
     if (expectedFingerprint && expectedFingerprint !== actualFingerprint) return false;
@@ -1875,13 +1950,49 @@ function plannedCredentialStateMatches(plannedAccount, account) {
 }
 
 function sourceCredentialValue(raw, snakeKey, camelKey, maximumLength = 1024) {
-  const value = raw?.[snakeKey] ?? raw?.[camelKey];
-  if (value === undefined || value === null || value === '') return '';
-  if (typeof value !== 'string'
-      && !(typeof value === 'number' && Number.isFinite(value))) return '';
-  const text = String(value).trim();
-  if (!text || text.length > maximumLength || /[\u0000-\u001f\u007f]/.test(text)) return '';
-  return text;
+  const keys = snakeKey === camelKey ? [snakeKey] : [snakeKey, camelKey];
+  const values = new Set();
+  for (const key of keys) {
+    if (!raw || !Object.prototype.hasOwnProperty.call(raw, key)) continue;
+    const value = raw[key];
+    if (value === undefined || value === null || value === '') continue;
+    if (typeof value !== 'string'
+        && !(typeof value === 'number' && Number.isFinite(value))) {
+      throw targetVerificationError(
+        '来源 token 元数据字段类型或长度无效',
+        'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+      );
+    }
+    const text = String(value).trim();
+    // Blank aliases are equivalent to omission, matching the canonical token
+    // reader. Nonblank malformed or contradictory aliases fail closed.
+    if (!text) continue;
+    if (text.length > maximumLength || /[\u0000-\u001f\u007f]/.test(text)) {
+      throw targetVerificationError(
+        '来源 token 元数据字段类型或长度无效',
+        'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+      );
+    }
+    values.add(text);
+  }
+  if (values.size > 1) {
+    throw targetVerificationError(
+      '来源 token 元数据别名互相冲突',
+      'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+    );
+  }
+  return values.size === 1 ? [...values][0] : '';
+}
+
+function consistentSourceCredentialValue(values) {
+  const present = values.filter(Boolean);
+  if (new Set(present).size > 1) {
+    throw targetVerificationError(
+      '来源 token 元数据字段互相冲突',
+      'SOURCE_CREDENTIAL_SCHEMA_INVALID',
+    );
+  }
+  return present[0] || '';
 }
 
 function sourceTokenValue(raw, kind) {
@@ -1939,20 +2050,28 @@ function buildOAuthUpdatePayload(item) {
   if (accountId) credentials.chatgpt_account_id = accountId;
   if (userId) credentials.chatgpt_user_id = userId;
   if (item.expiresAt) credentials.expires_at = item.expiresAt;
-  for (const [key, maximumLength] of [['token_type', 64], ['scope', 4096], ['last_refresh', 64]]) {
-    const value = sourceCredentialValue(raw, key, key, maximumLength);
+  for (const [key, camelKey, maximumLength] of [
+    ['token_type', 'tokenType', 64],
+    ['scope', 'scope', 4096],
+    ['last_refresh', 'lastRefresh', 64],
+  ]) {
+    const value = sourceCredentialValue(raw, key, camelKey, maximumLength);
     if (value) credentials[key] = value;
   }
   const accessPayload = parseJwtPayload(accessToken) || {};
   const rawAuth = accessPayload['https://api.openai.com/auth'];
   const auth = rawAuth && typeof rawAuth === 'object' ? rawAuth : {};
-  const planType = sourceCredentialValue(raw, 'plan_type', 'planType', 128)
-    || sourceCredentialValue(raw, 'chatgpt_plan_type', 'chatgptPlanType', 128)
-    || sourceCredentialValue(auth, 'chatgpt_plan_type', 'chatgptPlanType', 128);
+  const planType = consistentSourceCredentialValue([
+    sourceCredentialValue(raw, 'plan_type', 'planType', 128),
+    sourceCredentialValue(raw, 'chatgpt_plan_type', 'chatgptPlanType', 128),
+    sourceCredentialValue(auth, 'chatgpt_plan_type', 'chatgptPlanType', 128),
+  ]);
   if (planType) credentials.plan_type = planType;
-  let organizationId = sourceCredentialValue(raw, 'organization_id', 'organizationId', 512)
-    || sourceCredentialValue(raw, 'poid', 'poid', 512)
-    || sourceCredentialValue(auth, 'poid', 'poid', 512);
+  let organizationId = consistentSourceCredentialValue([
+    sourceCredentialValue(raw, 'organization_id', 'organizationId', 512),
+    sourceCredentialValue(raw, 'poid', 'poid', 512),
+    sourceCredentialValue(auth, 'poid', 'poid', 512),
+  ]);
   if (!organizationId && Array.isArray(auth.organizations)) {
     const preferred = auth.organizations.find((organization) => organization?.is_default === true)
       || auth.organizations[0];
@@ -1975,6 +2094,11 @@ function buildCodexSessionDocument(item) {
     ...(credentials.email ? { email: credentials.email } : {}),
     ...(credentials.chatgpt_account_id ? { account_id: credentials.chatgpt_account_id } : {}),
     ...(credentials.chatgpt_user_id ? { user_id: credentials.chatgpt_user_id } : {}),
+    // The Codex import parser accepts these top-level metadata fields. Keep
+    // explicit source values when an opaque access token cannot supply them
+    // through JWT claims; the update path already preserves the same values.
+    ...(credentials.plan_type ? { plan_type: credentials.plan_type } : {}),
+    ...(credentials.organization_id ? { organization_id: credentials.organization_id } : {}),
     // Current Sub2API Codex imports read expires_at. `expired` is a legacy
     // gpt_register source field and is ignored by the import parser.
     ...(credentials.expires_at ? { expires_at: credentials.expires_at } : {}),
