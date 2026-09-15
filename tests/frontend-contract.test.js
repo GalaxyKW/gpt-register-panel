@@ -20,6 +20,11 @@ function sourceSection(startMarker, endMarker) {
   return source.slice(start, end);
 }
 
+test('frontend does not claim read-only mode before the first snapshot is verified', () => {
+  assert.match(htmlSource, /id="modeBadge"[^>]*>写入状态确认中<\/span>/);
+  assert.doesNotMatch(htmlSource, /id="modeBadge"[^>]*>只读模式<\/span>/);
+});
+
 test('frontend treats every blocking plan item as a conflict and explains terminal sources', () => {
   const actionContracts = sourceSection('function actionReasonLabel', 'function statusClass');
   const lockingContracts = sourceSection('function actionRequestPending', 'function renderMetrics');
@@ -231,6 +236,70 @@ test('frontend fail-closes unknown sync plan actions and reasons', async () => {
   assert.match(importNotices.at(-1)[0], /无法识别或与操作不匹配的原因/);
 });
 
+test('frontend refuses import plans with visually ambiguous operational paths', () => {
+  const planContract = sourceSection(
+    'function validImportPlanIntentVersion',
+    'function planItemCreatesAccount',
+  );
+  const context = {};
+  vm.runInNewContext(planContract + `
+    valid = importPlanContractProblem({
+      items: [{
+        action: 'update',
+        reason: 'token_changed',
+        relativePath: 'tokens/current.json',
+        selectedSourcePaths: ['tokens/current.json'],
+      }],
+    });
+    bidi = importPlanContractProblem({
+      items: [{ action: 'update', reason: 'token_changed', relativePath: 'tokens/\\u202eevil.json' }],
+    });
+    invisibleSuperseded = importPlanContractProblem({
+      items: [{
+        action: 'update',
+        reason: 'token_changed',
+        relativePath: 'tokens/current.json',
+        selectedSupersededPaths: ['tokens/\\u200bolder.json'],
+      }],
+    });
+  `, context);
+  assert.equal(context.valid, '');
+  assert.match(context.bidi, /无法安全显示的文件路径/);
+  assert.match(context.invisibleSuperseded, /无法安全显示的文件路径/);
+});
+
+test('frontend treats prototype property names as unknown contract values', () => {
+  const labelContract = sourceSection('function badgeClass', 'function sourceClass');
+  const planContract = sourceSection(
+    'function validImportPlanIntentVersion',
+    'function planItemCreatesAccount',
+  );
+  const context = {};
+  vm.runInNewContext(labelContract + '\n' + planContract + `
+    result = {
+      badge: badgeClass('constructor'),
+      kind: kindLabel('constructor'),
+      action: actionLabel('constructor'),
+      reason: actionReasonLabel('constructor'),
+      phase3Reason: phase3ReasonLabel('constructor'),
+      status: statusLabel('constructor'),
+      plan: importPlanContractProblem({
+        items: [{ action: 'constructor', reason: 'token_changed' }],
+      }),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    badge: 'badge-neutral',
+    kind: 'constructor',
+    action: 'constructor',
+    reason: '操作原因未识别',
+    phase3Reason: '该账号不符合 Phase 3 条件',
+    status: 'constructor',
+    plan: '导入计划包含无法识别的操作，请重新检查差异',
+  });
+  assert.doesNotMatch(JSON.stringify(context.result), /function Object|native code/);
+});
+
 test('frontend rejects create previews without an exact group binding', () => {
   const actionContracts = sourceSection('function actionReasonLabel', 'function statusClass');
   const lockingContracts = sourceSection('function actionRequestPending', 'function renderMetrics');
@@ -429,6 +498,7 @@ test('frontend rejects non-importable sync selections before requesting either p
   const historicalKey = 'token:tokens:tokens/old_codex-valid.json';
   const invalidKey = 'token:use_token:use_token/invalid.json';
   const malformedKey = 'token:tokens:tokens/../outside.json';
+  const ambiguousKey = 'token:tokens:tokens/\u200bhidden.json';
   const rows = [
     {
       key: validKey,
@@ -465,6 +535,13 @@ test('frontend rejects non-importable sync selections before requesting either p
       diffKind: 'token_only',
       historical: false,
     },
+    {
+      key: ambiguousKey,
+      source: 'tokens',
+      sourceDetails: { relativePath: 'tokens/\u200bhidden.json' },
+      diffKind: 'token_only',
+      historical: false,
+    },
   ];
   const helperContext = {
     state: { snapshot: { rows } },
@@ -476,6 +553,7 @@ test('frontend rejects non-importable sync selections before requesting either p
       historical: syncSelectionProblem([${JSON.stringify(historicalKey)}]),
       invalid: syncSelectionProblem([${JSON.stringify(invalidKey)}]),
       malformed: syncSelectionProblem([${JSON.stringify(malformedKey)}]),
+      ambiguous: syncSelectionProblem([${JSON.stringify(ambiguousKey)}]),
       stale: syncSelectionProblem(['missing-row']),
     };
   `, helperContext);
@@ -484,6 +562,7 @@ test('frontend rejects non-importable sync selections before requesting either p
   assert.match(helperContext.result.historical, /historical\/old_codex 历史备份/);
   assert.match(helperContext.result.invalid, /无法解析的 token 文件/);
   assert.match(helperContext.result.malformed, /活动 token 文件键/);
+  assert.match(helperContext.result.ambiguous, /活动 token 文件键/);
   assert.match(helperContext.result.stale, /当前快照/);
 
   let previewRequests = 0;
@@ -973,6 +1052,25 @@ test('frontend usage formatting never turns missing statistics into zero', () =>
     partialZero: '0 / - 次',
     requestsOnly: '- / 4 次',
     nestedMissing: '-',
+  });
+});
+
+test('frontend never renders arbitrary credential text as a token fingerprint', () => {
+  const primitives = sourceSection('function escapeHtml', 'function finiteNumber');
+  const context = {};
+  vm.runInNewContext(primitives + `
+    result = {
+      valid: formatFingerprint('ABCDEF0123456789'),
+      bearer: formatFingerprint('Bearer raw-secret-value'),
+      jwt: formatFingerprint('abcdefgh.ijklmnop.qrstuvwx'),
+      shortHex: formatFingerprint('deadbee'),
+    };
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    valid: 'abcdef01',
+    bearer: '-',
+    jwt: '-',
+    shortHex: '-',
   });
 });
 
@@ -1609,6 +1707,10 @@ test('frontend rejects malformed, duplicate, historical, or cross-scope cleanup 
     [item('tokens', 'tokens/one.json'), item('tokens', 'tokens/one.json')],
     [item('tokens', 'tokens/\u202eone.json')],
     [item('tokens', 'tokens/\u200fone.json')],
+    [item('tokens', 'tokens/\u200bone.json')],
+    [item('tokens', 'tokens/\u2060one.json')],
+    [item('tokens', 'tokens/\ufeffone.json')],
+    [item('tokens', 'tokens/\u0085one.json')],
     [null],
   ];
   for (const items of scenarios) {
@@ -1889,6 +1991,72 @@ test('frontend keeps writes locked when another tab queues the same workflow as 
   assert.equal(notices.at(-1)[1], 'notice-warning');
 });
 
+test('frontend preserves a newly discovered reconciliation warning over an older terminal notice', async () => {
+  const pollingSupport = sourceSection('function stopJobPolling', 'async function watchJobs');
+  const watchContract = sourceSection('async function watchJobs', 'async function watchJob');
+  const watchedJobId = 'job_' + 'a'.repeat(24);
+  const heldJobId = 'job_' + 'b'.repeat(24);
+  const notices = [];
+  const stateForTest = {
+    jobPollTimer: null,
+    watchGeneration: 0,
+    watchIds: [],
+    jobs: [],
+    job: null,
+    snapshotRequestSequence: 9,
+    snapshotRefreshPending: false,
+    jobInventoryVerified: true,
+  };
+  const jobNeedsReconciliation = (job) => job?.result?.requiresReconciliation === true;
+  const context = {
+    state: stateForTest,
+    elements: { jobMeta: {} },
+    apiFetch: async () => ({
+      ok: true,
+      async json() {
+        return {
+          id: watchedJobId,
+          type: 'token_import',
+          status: 'succeeded',
+          result: { imported: [{ action: 'update' }] },
+        };
+      },
+    }),
+    renderJob() {},
+    jobNeedsReconciliation,
+    reconciliationNoticeForJobs(jobs) {
+      assert.deepEqual(JSON.parse(JSON.stringify(jobs.map((job) => job.id))), [heldJobId]);
+      return 'CURRENT HOLD WARNING';
+    },
+    renderPlan() {},
+    updateActionState() {},
+    async loadSnapshot(options) {
+      assert.equal(options.resumeJobs, true);
+      stateForTest.snapshotRequestSequence += 1;
+      stateForTest.watchGeneration += 1;
+      stateForTest.jobs = [{
+        id: heldJobId,
+        type: 'account_test',
+        status: 'failed',
+        result: { requiresReconciliation: true, reconciliationHold: true },
+      }];
+      stateForTest.job = stateForTest.jobs[0];
+      stateForTest.snapshotRefreshPending = false;
+      return true;
+    },
+    activeJobPending: () => false,
+    showNotice: (...args) => notices.push(args),
+    window: {
+      clearTimeout() {},
+      setTimeout() { throw new Error('terminal refresh must not schedule the old watcher'); },
+    },
+  };
+  vm.runInNewContext(pollingSupport + '\n' + watchContract
+    + `\nresultPromise = watchJobs([${JSON.stringify(watchedJobId)}], 'token_import');`, context);
+  await context.resultPromise;
+  assert.deepEqual(notices.at(-1), ['CURRENT HOLD WARNING', 'notice-warning']);
+});
+
 test('frontend retries a 401 with a fresh bounded signal and a password dialog token', async () => {
   const apiHeadersContract = sourceSection('let memoryPanelToken', 'const API_REQUEST_TIMEOUT_MS');
   const apiFetchContract = sourceSection('const API_REQUEST_TIMEOUT_MS', 'function renderSelectOptions');
@@ -1944,6 +2112,8 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
       headers: { 'Idempotency-Key': 'idem_v1_401_retry_12345678901234567890' },
     });
     blockedPromise = resultPromise.then(() => apiFetch('https://example.invalid/api/health', { timeoutMs: 1000 }));
+    staticPromise = resultPromise.then(() => apiFetch('/styles.css', { timeoutMs: 1000 }));
+    traversedPromise = resultPromise.then(() => apiFetch('/api/../styles.css', { timeoutMs: 1000 }));
   `, context);
   const response = await context.resultPromise;
   assert.equal(response.status, 200);
@@ -1956,7 +2126,9 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
   assert.equal(calls.every((call) => call.options.redirect === 'error'), true);
   assert.equal(input.value, '');
   assert.equal(context.elements.adminTokenOrigin.textContent, 'http://127.0.0.1:4170');
-  await assert.rejects(context.blockedPromise, /拒绝向非同源地址发送面板凭证/);
+  await assert.rejects(context.blockedPromise, /拒绝向非同源或非 API 地址发送面板凭证/);
+  await assert.rejects(context.staticPromise, /非 API 地址/);
+  await assert.rejects(context.traversedPromise, /非 API 地址/);
   assert.equal(calls.length, 2);
 });
 
@@ -2075,6 +2247,46 @@ test('frontend treats a malformed accepted receipt as unknown and retains its id
 
   vm.runInNewContext('secondPromise = ' + invocation, context);
   await assert.rejects(context.secondPromise, /任务回执格式无效/);
+  assert.equal(calls[1].options.headers['Idempotency-Key'], firstKey);
+  assert.equal(JSON.parse(values.get('panelMutationPending:v2:store')).entries.length, 1);
+});
+
+test('frontend rejects non-202 success responses and retains the same idempotency key', async () => {
+  const contract = sourceSection('const MUTATION_PENDING_PREFIX', 'function renderSelectOptions');
+  const values = new Map();
+  const calls = [];
+  const crypto = require('node:crypto').webcrypto;
+  const context = {
+    TextEncoder,
+    apiFetch: async (url, options) => {
+      calls.push({ url, options });
+      return {
+        ok: true,
+        status: 200,
+        async json() {
+          return { status: 'queued', jobId: 'job_' + 'a'.repeat(24) };
+        },
+      };
+    },
+    sessionStorage: {
+      getItem: (key) => values.get(key) || null,
+      setItem: (key, value) => values.set(key, value),
+      removeItem: (key) => values.delete(key),
+    },
+    window: { crypto },
+  };
+  const invocation = `idempotentMutationFetch('account_test', '/api/account-tests', {
+    targets: [{ accountId: 7, targetRevision: 'account-test-v1.${'a'.repeat(43)}' }],
+    modelId: 'gpt-5.6-luna',
+  })`;
+  vm.runInNewContext(contract, context);
+  vm.runInNewContext('firstPromise = ' + invocation, context);
+  await assert.rejects(context.firstPromise, /非预期的成功状态.*结果未知.*同一幂等键/);
+  const firstKey = calls[0].options.headers['Idempotency-Key'];
+  assert.equal(JSON.parse(values.get('panelMutationPending:v2:store')).entries.length, 1);
+
+  vm.runInNewContext('secondPromise = ' + invocation, context);
+  await assert.rejects(context.secondPromise, /非预期的成功状态/);
   assert.equal(calls[1].options.headers['Idempotency-Key'], firstKey);
   assert.equal(JSON.parse(values.get('panelMutationPending:v2:store')).entries.length, 1);
 });
@@ -2569,7 +2781,7 @@ test('frontend keeps luna selectable without claiming that the account supports 
   assert.match(modelContract, /if \(!requiredModelReported\) values\.unshift\(requiredModel\)/);
   assert.match(modelContract, /（手动候选）/);
   assert.match(modelContract, /最终支持性由账号测试请求结果确认/);
-  assert.match(source, /candidates\.length === 1/);
+  assert.match(source, /selectedRows\.length === 1[\s\S]*candidates\.length === 1/);
   assert.match(source, /state\.accountTestModelsPending/);
   assert.match(remoteStateContract, /availability-note-success/);
   assert.match(remoteStateContract, /availability-note-warning/);
@@ -2597,6 +2809,74 @@ test('frontend keeps luna selectable without claiming that the account supports 
   assert.match(options[0].title, /最终支持性/);
 });
 
+test('frontend only loads advisory models for an original single-row selection', async () => {
+  const contract = sourceSection('function accountTestRows', 'function actionRequestPending');
+  const calls = [];
+  const rendered = [];
+  const snapshot = {};
+  const context = {
+    state: {
+      snapshot,
+      selectionRevision: 4,
+      accountTestModelRequestSequence: 0,
+      accountTestModelsPending: false,
+    },
+    elements: { accountTestModelSelect: { title: '' } },
+    fallbackAccountTestModels: ['fallback'],
+    renderAccountTestModels: (models) => rendered.push([...models]),
+    sub2ApiReadStatus: () => 'ok',
+    updateActionState() {},
+    apiFetch: async (url) => {
+      calls.push(url);
+      return { ok: true, json: async () => ({ models: ['reported'] }) };
+    },
+  };
+  vm.runInNewContext(contract + `
+    multiPromise = loadAccountTestModels(state.snapshot, [
+      { accountId: 7 },
+      { accountId: 'invalid-but-selected' },
+    ]);
+  `, context);
+  await context.multiPromise;
+  assert.deepEqual(calls, []);
+  assert.equal(context.state.accountTestModelsPending, false);
+  assert.match(context.elements.accountTestModelSelect.title, /各账号/);
+
+  vm.runInNewContext(`
+    singlePromise = loadAccountTestModels(state.snapshot, [{ accountId: 7 }]);
+  `, context);
+  await context.singlePromise;
+  assert.deepEqual(calls, ['/api/account-tests/models?accountId=7']);
+  assert.deepEqual(rendered.at(-1), ['reported']);
+});
+
+test('frontend rejects malformed or credential-shaped account test model identifiers', () => {
+  const modelContract = sourceSection('const fallbackAccountTestModels', 'function accountTestModelLabel');
+  const context = {};
+  vm.runInNewContext(modelContract + `
+    results = {
+      canonical: normalizeAccountTestModel('gpt-5.6-luna'),
+      alias: normalizeAccountTestModel('5.6-luna'),
+      whitespace: normalizeAccountTestModel(' gpt-5.6-luna'),
+      delimiter: normalizeAccountTestModel('gpt 5.6 luna'),
+      credentialLabel: normalizeAccountTestModel('access-token.secret-value'),
+      credentialPrefix: normalizeAccountTestModel('sk_1234567890abcdef'),
+      jwt: normalizeAccountTestModel('abcdefgh.ijklmnop.qrstuvwx'),
+      oversized: normalizeAccountTestModel('gpt-' + 'x'.repeat(253)),
+    };
+  `, context);
+  assert.deepEqual({ ...context.results }, {
+    canonical: 'gpt-5.6-luna',
+    alias: 'gpt-5.6-luna',
+    whitespace: '',
+    delimiter: '',
+    credentialLabel: '',
+    credentialPrefix: '',
+    jwt: '',
+    oversized: '',
+  });
+});
+
 test('frontend submits one snapshot-bound revision per unambiguous account test target', () => {
   const targetContract = sourceSection('function accountTestRows', 'async function loadAccountTestModels');
   const handlerContract = sourceSection(
@@ -2622,6 +2902,13 @@ test('frontend submits one snapshot-bound revision per unambiguous account test 
     ]);
     stale = accountTestTargetsFromRows([{ accountId: 7 }]);
     malformed = accountTestTargetsFromRows([{ accountId: 7, targetRevision: 'revision-seven' }]);
+    coercible = ['7', '01', '1e0', ' 7 '].map((accountId) => (
+      accountTestTargetsFromRows([{ accountId, targetRevision: revisionSeven }])
+    ));
+    modelCandidates = accountTestRows([
+      { accountId: '7' },
+      { accountId: 7 },
+    ]);
     tooMany = accountTestTargetsFromRows(Array.from({ length: 101 }, (_, index) => ({
       accountId: index + 1,
       targetRevision: revisionSeven,
@@ -2636,6 +2923,8 @@ test('frontend submits one snapshot-bound revision per unambiguous account test 
   assert.match(context.conflicting.problem, /多个不同 revision/);
   assert.match(context.stale.problem, /刷新后重新选择/);
   assert.match(context.malformed.problem, /有效的当前快照 revision/);
+  assert.equal(context.coercible.every((item) => /不是有效的 Sub2API/.test(item.problem)), true);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.modelCandidates)), [{ accountId: 7 }]);
   assert.match(context.tooMany.problem, /单次最多选择 100 个账号/);
   assert.match(handlerContract, /idempotentMutationFetch\(\s*'account_test',\s*'\/api\/account-tests',\s*\{\s*targets,\s*modelId,/);
   assert.doesNotMatch(handlerContract, /accountIds\s*:/);
@@ -2900,7 +3189,8 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   vm.runInNewContext(reasonContract + '\n' + targetContract + `
     const revision = 'phase3-target-v1.' + 'A'.repeat(43);
     const eligible = {
-      key: 'eligible',
+      key: 'token:tokens:tokens/eligible.json',
+      source: 'tokens',
       email: 'stale-remote@example.test',
       phase3Email: 'source-token@example.test',
       phone: '+86 138-0013-8000',
@@ -2935,9 +3225,38 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
         phase3Eligible: null,
       }]),
       missingRevisionProblem: phase3SelectionProblem([{
-        key: 'missing-revision',
+        key: 'token:tokens:tokens/missing-revision.json',
+        source: 'tokens',
         phase3Eligible: true,
         phase3Email: 'missing-revision@example.test',
+      }], 1),
+      missingSourceEmail: phase3TargetsFromRows([{
+        key: 'token:tokens:tokens/missing-source-email.json',
+        source: 'tokens',
+        email: 'remote-value-must-not-be-used@example.test',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      }]),
+      malformedSourceEmail: phase3TargetsFromRows([{
+        key: 'token:tokens:tokens/malformed-source-email.json',
+        source: 'tokens',
+        phase3Email: 'not-an-email',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      }]),
+      malformedPhoneProblem: phase3SelectionProblem([{
+        key: 'token:tokens:tokens/malformed-phone.json',
+        source: 'tokens',
+        phone: '13800\u202e138000',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
+      }], 1),
+      malformedKeyProblem: phase3SelectionProblem([{
+        key: 'token:tokens:tokens/../wrong.json',
+        source: 'tokens',
+        phase3Email: 'wrong@example.test',
+        phase3Eligible: true,
+        phase3TargetRevision: revision,
       }], 1),
       historicalReason: phase3ReasonLabel('phase3_source_historical'),
       invalidPhoneReason: phase3ReasonLabel('username_phone_invalid'),
@@ -2947,7 +3266,7 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   assert.deepEqual(JSON.parse(JSON.stringify(context.result.eligible)), [{
     email: 'source-token@example.test',
     phone: '8613800138000',
-    selectedKey: 'eligible',
+    selectedKey: 'token:tokens:tokens/eligible.json',
     phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
   }]);
   assert.deepEqual([...context.result.rejected], []);
@@ -2955,7 +3274,11 @@ test('frontend Phase3 uses the token email plus uniquely joined phone and reject
   assert.deepEqual([...context.result.legacy], []);
   assert.deepEqual([...context.result.legacyRemote], []);
   assert.deepEqual([...context.result.malformedEligibility], []);
+  assert.deepEqual([...context.result.missingSourceEmail], []);
+  assert.deepEqual([...context.result.malformedSourceEmail], []);
   assert.match(context.result.missingRevisionProblem, /快照凭证/);
+  assert.match(context.result.malformedPhoneProblem, /缺少可用于 Phase 3/);
+  assert.match(context.result.malformedKeyProblem, /活动 token 选择键/);
   assert.match(context.result.historicalReason, /historical\/old_codex 历史 token/);
   assert.match(context.result.invalidPhoneReason, /手机号格式无效/);
   assert.match(context.result.invalidTargetReason, /快照字段不完整或格式无效/);
@@ -2968,14 +3291,16 @@ test('frontend Phase3 preserves every selected row when strong identities overla
     const revision = 'phase3-target-v1.' + 'B'.repeat(43);
     result = phase3TargetsFromRows([
       {
-        key: 'first-token',
+        key: 'token:tokens:tokens/first-token.json',
+        source: 'tokens',
         phase3Email: 'shared@example.test',
         phone: '+86 138-0013-8000',
         phase3Eligible: true,
         phase3TargetRevision: revision,
       },
       {
-        key: 'second-token',
+        key: 'token:tokens:tokens/second-token.json',
+        source: 'tokens',
         phase3Email: 'shared@example.test',
         phone: '+86 138-0013-8000',
         phase3Eligible: true,
@@ -2987,13 +3312,13 @@ test('frontend Phase3 preserves every selected row when strong identities overla
     {
       email: 'shared@example.test',
       phone: '8613800138000',
-      selectedKey: 'first-token',
+      selectedKey: 'token:tokens:tokens/first-token.json',
       phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
     },
     {
       email: 'shared@example.test',
       phone: '8613800138000',
-      selectedKey: 'second-token',
+      selectedKey: 'token:tokens:tokens/second-token.json',
       phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
     },
   ]);
@@ -3006,6 +3331,7 @@ test('frontend Phase3 submits selected keys in the same order as account targets
   );
   let clickHandler;
   let submittedBody = null;
+  let confirmation = '';
   const targets = [
     { selectedKey: 'snapshot-first', email: 'first@example.test' },
     { selectedKey: 'snapshot-second', email: 'second@example.test' },
@@ -3041,7 +3367,12 @@ test('frontend Phase3 submits selected keys in the same order as account targets
     showNotice() {},
     mutationRejectionSummary: () => '',
     watchJobs: async () => {},
-    window: { confirm: () => true },
+    window: {
+      confirm(message) {
+        confirmation = message;
+        return true;
+      },
+    },
   };
   vm.runInNewContext(phase3Handler, context);
   await clickHandler();
@@ -3049,6 +3380,8 @@ test('frontend Phase3 submits selected keys in the same order as account targets
     accounts: targets,
     selectedKeys: ['snapshot-first', 'snapshot-second'],
   });
+  assert.match(confirmation, /first@example\.test · snapshot-first/);
+  assert.match(confirmation, /second@example\.test · snapshot-second/);
 });
 
 test('frontend disables Phase3 unless the snapshot explicitly declares it enabled', async () => {
@@ -3065,15 +3398,16 @@ test('frontend disables Phase3 unless the snapshot explicitly declares it enable
   );
   const revision = 'phase3-target-v1.' + 'A'.repeat(43);
   const stateForTest = {
-    selected: new Set(['row-one']),
-    rows: [{ key: 'row-one' }],
+    selected: new Set(['token:tokens:tokens/row-one.json']),
+    rows: [{ key: 'token:tokens:tokens/row-one.json' }],
     phase3RequestPending: false,
     jobInventoryVerified: true,
     snapshot: {
       readOnly: false,
       capabilities: { phase3Enabled: false },
       rows: [{
-        key: 'row-one',
+        key: 'token:tokens:tokens/row-one.json',
+        source: 'tokens',
         phase3Email: 'source@example.test',
         phase3Eligible: true,
         phase3TargetRevision: revision,
@@ -3176,6 +3510,8 @@ test('frontend disables Phase3 and explains a backend-rejected selected row', ()
 test('frontend administrator credential uses an origin-labelled password dialog', () => {
   assert.match(htmlSource, /<dialog id="adminTokenDialog"[^>]*aria-labelledby="adminTokenTitle"/);
   assert.match(htmlSource, /<input id="adminTokenInput"[^>]*type="password"[^>]*required>/);
+  assert.match(htmlSource, /<input id="adminTokenInput"[^>]*autocomplete="off"/);
+  assert.doesNotMatch(htmlSource, /<input id="adminTokenInput"[^>]*autocomplete="current-password"/);
   assert.match(htmlSource, /<code id="adminTokenOrigin"><\/code>/);
   assert.doesNotMatch(source, /window\.prompt\s*\(/);
   assert.match(stylesSource, /\.auth-dialog::backdrop/);

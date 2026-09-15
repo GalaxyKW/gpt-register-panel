@@ -116,9 +116,15 @@ function formatDate(value) {
     : String(value);
 }
 
+function canonicalFingerprint(value) {
+  return typeof value === 'string' && /^[a-f0-9]{8,128}$/i.test(value)
+    ? value.toLowerCase()
+    : '';
+}
+
 function formatFingerprint(value) {
-  if (!value) return '-';
-  return String(value).slice(0, 8);
+  const fingerprint = canonicalFingerprint(value);
+  return fingerprint ? fingerprint.slice(0, 8) : '-';
 }
 
 function finiteNumber(value) {
@@ -156,7 +162,7 @@ function formatPeriodUsage(usage) {
 }
 
 function badgeClass(kind) {
-  return {
+  const classes = {
     in_sync: 'badge-success',
     token_only: 'badge-warning',
     remote_unknown: 'badge-neutral',
@@ -169,11 +175,12 @@ function badgeClass(kind) {
     mapping_conflict: 'badge-danger',
     historical_backup: 'badge-neutral',
     missing_refresh_token: 'badge-warning',
-  }[kind] || 'badge-neutral';
+  };
+  return Object.prototype.hasOwnProperty.call(classes, kind) ? classes[kind] : 'badge-neutral';
 }
 
 function kindLabel(kind) {
-  return {
+  const labels = {
     in_sync: '一致',
     token_only: '仅文件',
     remote_unknown: '远端未知',
@@ -186,15 +193,17 @@ function kindLabel(kind) {
     mapping_conflict: '身份冲突',
     historical_backup: '历史备份',
     missing_refresh_token: '缺少续期',
-  }[kind] || kind || '-';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, kind) ? labels[kind] : kind || '-';
 }
 
 function actionLabel(action) {
-  return { create: '新增', update: '更新', skip: '跳过', conflict: '冲突' }[action] || action || '-';
+  const labels = { create: '新增', update: '更新', skip: '跳过', conflict: '冲突' };
+  return Object.prototype.hasOwnProperty.call(labels, action) ? labels[action] : action || '-';
 }
 
 function actionReasonLabel(reason) {
-  return {
+  const labels = {
     token_only: 'Sub2API 没有对应账号',
     already_in_sync: '已经一致',
     sub2api_available: 'Sub2API 当前可用，跳过',
@@ -228,11 +237,14 @@ function actionReasonLabel(reason) {
     sub2api_overload_invalid: 'Sub2API 过载恢复时间无效，跳过',
     sub2api_read_failed: 'Sub2API 读取失败',
     sub2api_not_read: '本次未读取 Sub2API',
-  }[reason] || (reason ? '操作原因未识别' : '-');
+  };
+  return Object.prototype.hasOwnProperty.call(labels, reason)
+    ? labels[reason]
+    : (reason ? '操作原因未识别' : '-');
 }
 
 function phase3ReasonLabel(reason) {
-  return {
+  const labels = {
     token_missing: '该行仅来自 Sub2API，缺少对应 token 文件',
     phase3_source_historical: '该行是 historical/old_codex 历史 token，不能用于 Phase 3',
     username_missing: 'token 邮箱在 username.json 中没有对应账号',
@@ -241,7 +253,10 @@ function phase3ReasonLabel(reason) {
     username_password_missing: 'username.json 对应账号缺少密码',
     username_terminal: 'username.json 对应账号已删除、停用或禁用',
     phase3_target_invalid: 'token 或 username.json 的快照字段不完整或格式无效，无法生成 Phase 3 凭证',
-  }[reason] || '该账号不符合 Phase 3 条件';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, reason)
+    ? labels[reason]
+    : '该账号不符合 Phase 3 条件';
 }
 
 function mutationRejectionSummary(rejected, workflow) {
@@ -301,11 +316,15 @@ function statusClass(value) {
 }
 
 function statusLabel(value) {
-  return {
+  const normalized = String(value || '').trim().toLowerCase();
+  const labels = {
     inactive: '已停用',
     disabled: '已禁用',
     account_deleted: '已处置',
-  }[String(value || '').trim().toLowerCase()] || value || '-';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, normalized)
+    ? labels[normalized]
+    : value || '-';
 }
 
 function sourceClass(value) {
@@ -453,8 +472,9 @@ async function readBoundedApiResponseBody(response, maximumBytes) {
 
 function sameOriginApiUrl(value) {
   const resolved = new URL(String(value), window.location.origin);
-  if (resolved.origin !== window.location.origin || resolved.username || resolved.password) {
-    throw new Error('拒绝向非同源地址发送面板凭证。');
+  if (resolved.origin !== window.location.origin || resolved.username || resolved.password
+      || !resolved.pathname.startsWith('/api/')) {
+    throw new Error('拒绝向非同源或非 API 地址发送面板凭证。');
   }
   return resolved.href;
 }
@@ -780,7 +800,15 @@ async function idempotentMutationFetch(workflow, url, body) {
   } catch {
     throw new Error('服务器返回了无法确认的响应；再次提交将安全复用同一幂等键。');
   }
-  if (response.status === 202 && response.ok) {
+  if (response.ok) {
+    // Every mutation endpoint has one success contract: HTTP 202 plus a
+    // bounded queued-job receipt. Treating a different 2xx as success can
+    // make the caller announce a queue entry that was never identified (and
+    // leave its pending flag locked forever). The persisted key must survive
+    // this ambiguous response so an operator retry can recover one receipt.
+    if (response.status !== 202) {
+      throw new Error('服务器返回了非预期的成功状态；结果未知，再次提交将安全复用同一幂等键。');
+    }
     if (!acceptedMutationResponse(workflow, responseBody)) {
       throw new Error('服务器已接受写操作，但任务回执格式无效；结果未知，再次提交将安全复用同一幂等键。');
     }
@@ -795,7 +823,9 @@ function renderSelectOptions(select, values, labelMap, emptyLabel) {
   for (const value of values || []) {
     const option = document.createElement('option');
     option.value = value;
-    option.textContent = labelMap?.[value] || value;
+    option.textContent = labelMap && Object.prototype.hasOwnProperty.call(labelMap, value)
+      ? labelMap[value]
+      : value;
     select.appendChild(option);
   }
   if ([...select.options].some((option) => option.value === current)) select.value = current;
@@ -809,8 +839,20 @@ const fallbackAccountTestModels = [
   'gpt-5.4-mini',
 ];
 
+const ACCOUNT_TEST_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:+@~*\/-]{0,255}$/;
+const ACCOUNT_TEST_MODEL_CREDENTIAL_LABEL = /(?:^|[._:@/+~-])(?:authorization|bearer|credential|password|passwd|access[-_]?token|refresh[-_]?token|id[-_]?token|api[-_]?key|apikey|token)(?:$|[._:@/+~=-])/i;
+const ACCOUNT_TEST_MODEL_CREDENTIAL_PREFIX = /^(?:sk|rk|pk|sess|secret)[-_][A-Za-z0-9_-]{12,}$/i;
+const ACCOUNT_TEST_MODEL_JWT = /^[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}$/;
+const ACCOUNT_TEST_MODEL_OPAQUE_SECRET = /^(?=.{96,}$)(?=.*[A-Za-z])(?=.*\d)[A-Za-z0-9_+./=-]+$/;
+
 function normalizeAccountTestModel(value) {
-  const model = String(value || '').trim();
+  if (typeof value !== 'string' || value !== value.trim()
+      || !ACCOUNT_TEST_MODEL_ID.test(value)
+      || ACCOUNT_TEST_MODEL_CREDENTIAL_LABEL.test(value)
+      || ACCOUNT_TEST_MODEL_CREDENTIAL_PREFIX.test(value)
+      || ACCOUNT_TEST_MODEL_JWT.test(value)
+      || ACCOUNT_TEST_MODEL_OPAQUE_SECRET.test(value)) return '';
+  const model = value;
   return model.toLowerCase() === '5.6-luna' ? 'gpt-5.6-luna' : model;
 }
 
@@ -851,8 +893,8 @@ function renderAccountTestModels(models) {
 function accountTestRows(rows) {
   const seen = new Set();
   return (rows || []).filter((row) => {
-    const id = Number(row?.accountId);
-    if (!Number.isSafeInteger(id) || id <= 0) return false;
+    const id = row?.accountId;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) return false;
     if (seen.has(id)) return false;
     seen.add(id);
     return true;
@@ -874,8 +916,8 @@ function accountTestTargetsFromRows(rows) {
   const targets = [];
   const revisionsById = new Map();
   for (const row of rows || []) {
-    const accountId = Number(row?.accountId);
-    if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+    const accountId = row?.accountId;
+    if (typeof accountId !== 'number' || !Number.isSafeInteger(accountId) || accountId <= 0) {
       return { targets: [], problem: '所选行不是有效的 Sub2API 上游账号' };
     }
     if (!revisionPattern.test(String(row?.targetRevision || ''))) {
@@ -900,7 +942,13 @@ async function loadAccountTestModels(snapshot, selectedRows = []) {
   const selectionRevision = state.selectionRevision;
   renderAccountTestModels(fallbackAccountTestModels);
   const candidates = accountTestRows(selectedRows);
-  const candidate = candidates.length === 1 ? candidates[0] : null;
+  // A per-account list is meaningful only when the original selection is
+  // exactly one valid row. Do not let filtering/de-duplication turn a wider
+  // or malformed selection into an apparently single-account lookup.
+  const candidate = Array.isArray(selectedRows) && selectedRows.length === 1
+    && candidates.length === 1
+    ? candidates[0]
+    : null;
   state.accountTestModelsPending = Boolean(candidate && sub2ApiReadStatus(snapshot) === 'ok');
   if (elements.accountTestModelSelect) {
     elements.accountTestModelSelect.title = candidate
@@ -1030,12 +1078,21 @@ function importPlanContractProblem(plan) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) {
       return '服务器返回的导入计划项目无效，请重新检查差异';
     }
-    const reasons = reasonsByAction[item.action];
-    if (!reasons) {
+    if (!Object.prototype.hasOwnProperty.call(reasonsByAction, item.action)) {
       return '导入计划包含无法识别的操作，请重新检查差异';
     }
+    const reasons = reasonsByAction[item.action];
     if (!reasons.has(item.reason)) {
       return '导入计划包含无法识别或与操作不匹配的原因，请重新检查差异';
+    }
+    const displayPaths = [item.relativePath, item.fileName]
+      .concat(Array.isArray(item.selectedSupersededPaths) ? item.selectedSupersededPaths : [])
+      .concat(Array.isArray(item.selectedSourcePaths) ? item.selectedSourcePaths : [])
+      .filter((value) => value !== undefined && value !== null);
+    if (displayPaths.some((value) => typeof value !== 'string'
+        || value.length === 0 || value.length > 512
+        || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(value))) {
+      return '导入计划包含无法安全显示的文件路径，请重新检查差异';
     }
   }
   return '';
@@ -1115,6 +1172,7 @@ function syncSelectionProblem(selectedKeys = state.selected) {
     const relativePath = key.slice(prefix.length);
     const segments = relativePath.split('/');
     return relativePath.includes('\\')
+      || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(relativePath)
       || segments.length < 2
       || segments[0] !== source
       || segments.some((segment) => !segment || segment === '.' || segment === '..')
@@ -1205,15 +1263,43 @@ function selectedRowsFromSelection() {
 }
 
 function phase3EmailFromRow(row) {
-  const value = Object.prototype.hasOwnProperty.call(row || {}, 'phase3Email')
-    ? row.phase3Email
-    : row?.email;
-  return String(value || '').trim().toLowerCase();
+  if (!Object.prototype.hasOwnProperty.call(row || {}, 'phase3Email')
+      || typeof row.phase3Email !== 'string') return '';
+  const value = row.phase3Email;
+  const normalized = value.trim().toLowerCase();
+  return value === normalized && value.length <= 320
+    && !/[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u.test(value)
+    && /^[^\s@]+@[^\s@]+$/.test(value)
+    ? value
+    : '';
+}
+
+function phase3PhoneFromRow(row) {
+  if (row?.phone === undefined || row.phone === null || row.phone === '') return '';
+  if (typeof row.phone !== 'string' || row.phone.length > 80
+      || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(row.phone)
+      || !/^[0-9 +().-]+$/.test(row.phone)) return '';
+  return row.phone.replace(/[^0-9]/g, '');
+}
+
+function phase3SelectedKeyFromRow(row) {
+  const key = row?.key;
+  if (typeof key !== 'string' || !key || key !== key.trim() || key.length > 512
+      || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(key)) return '';
+  const match = /^token:(tokens|use_token):(.+)$/u.exec(key);
+  if (!match || row?.source !== match[1]) return '';
+  const relativePath = match[2];
+  const segments = relativePath.split('/');
+  if (relativePath.includes('\\') || segments.length < 2 || segments[0] !== match[1]
+      || segments.some((segment) => !segment || segment === '.' || segment === '..')
+      || !segments.at(-1).toLowerCase().endsWith('.json')) return '';
+  return key;
 }
 
 function phase3RowRejected(row) {
   return row?.phase3Eligible !== true
-    || !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || ''));
+    || !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || ''))
+    || !phase3SelectedKeyFromRow(row);
 }
 
 function phase3TargetsFromRows(rows) {
@@ -1221,13 +1307,12 @@ function phase3TargetsFromRows(rows) {
   for (const row of rows || []) {
     if (phase3RowRejected(row)) continue;
     const email = phase3EmailFromRow(row);
-    const phone = String(row.phone || '').trim();
+    const phone = phase3PhoneFromRow(row);
     if (!email && !phone) continue;
-    const phoneKey = phone.replace(/[^0-9]/g, '');
     targets.push({
       email: email || '',
-      phone: phoneKey || phone || '',
-      selectedKey: row.key,
+      phone,
+      selectedKey: phase3SelectedKeyFromRow(row),
       phase3TargetRevision: row.phase3TargetRevision,
     });
   }
@@ -1244,10 +1329,13 @@ function phase3SelectionProblem(rows, selectedCount) {
   const missingRevision = rows.find((row) => row?.phase3Eligible === true
     && !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(String(row?.phase3TargetRevision || '')));
   if (missingRevision) return '所选账号缺少当前 Phase 3 快照凭证，请刷新后重新选择';
+  const invalidSelectedKey = rows.find((row) => row?.phase3Eligible === true
+    && !phase3SelectedKeyFromRow(row));
+  if (invalidSelectedKey) return '所选账号缺少可核验的活动 token 选择键，请刷新后重新选择';
   const rejected = rows.find(phase3RowRejected);
   if (rejected) return phase3ReasonLabel(rejected.phase3Reason || 'token_missing');
   const missingTarget = rows.some((row) => (
-    !phase3EmailFromRow(row) && !String(row?.phone || '').trim()
+    !phase3EmailFromRow(row) && !phase3PhoneFromRow(row)
   ));
   return missingTarget ? '所选账号缺少可用于 Phase 3 的邮箱或手机号' : '';
 }
@@ -1404,7 +1492,7 @@ function fingerprintText(details) {
 function fingerprintComparisonKey(details) {
   const fingerprints = details?.fingerprints || {};
   return ['access', 'refresh', 'id']
-    .map((key) => comparableText(fingerprints[key]))
+    .map((key) => canonicalFingerprint(fingerprints[key]))
     .join('|');
 }
 
@@ -1435,7 +1523,8 @@ function renderAccountSummary(row, sides, displayName) {
 }
 
 function availabilityReasonLabel(reason) {
-  return {
+  const normalized = String(reason || '').trim().toLowerCase();
+  const labels = {
     sub2api_available: '可用',
     sub2api_status_active: '账号状态正常',
     sub2api_status_inactive: '账号已停用',
@@ -1458,7 +1547,10 @@ function availabilityReasonLabel(reason) {
     sub2api_read_failed: 'Sub2API 读取失败',
     sub2api_not_read: '本次未读取 Sub2API',
     not_in_sub2api: '未导入 Sub2API',
-  }[String(reason || '').trim().toLowerCase()] || '原因无法安全识别';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, normalized)
+    ? labels[normalized]
+    : '原因无法安全识别';
 }
 
 function renderRemoteState(row, sides) {
@@ -1585,9 +1677,10 @@ function renderPlan(plan) {
   }
   const counts = items.reduce((result, item) => {
     const action = effectivePlanAction(item);
-    result[action] = (result[action] || 0) + 1;
+    const previous = Object.prototype.hasOwnProperty.call(result, action) ? result[action] : 0;
+    result[action] = previous + 1;
     return result;
-  }, {});
+  }, Object.create(null));
   const supersededSelectionCount = items.filter((item) => (
     item?.selectedSourceSuperseded === true
   )).length;
@@ -1668,7 +1761,7 @@ function showNotice(message, kind = 'notice-info') {
 }
 
 function jobStatusLabel(status) {
-  return {
+  const labels = {
     queued: '排队中',
     running: '执行中',
     succeeded: '已完成',
@@ -1676,7 +1769,8 @@ function jobStatusLabel(status) {
     failed: '失败',
     interrupted: '已中断',
     unknown: '状态未知',
-  }[status] || status || '-';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, status) ? labels[status] : status || '-';
 }
 
 function jobStatusClass(status) {
@@ -1729,7 +1823,7 @@ function tokenImportReconciliationReason(result) {
       || entry?.outcome === 'requires_reconciliation')
     : null;
   const reason = String(item?.reconciliationReason || '').trim().toLowerCase();
-  return {
+  const labels = {
     timeout: '请求超时，远端是否写入未知',
     external_abort: '停机中断请求，远端是否写入未知',
     post_write_abort: '停机中断写后核验',
@@ -1745,7 +1839,10 @@ function tokenImportReconciliationReason(result) {
     post_write_verification: '写后核验失败',
     write_outcome_unknown: '写入结果未知',
     unknown: '写入结果未知',
-  }[reason] || (reason ? '写入结果未知' : '');
+  };
+  return Object.prototype.hasOwnProperty.call(labels, reason)
+    ? labels[reason]
+    : (reason ? '写入结果未知' : '');
 }
 
 function tokenImportNeedsReconciliation(result) {
@@ -1833,14 +1930,19 @@ function accountTestNeedsReconciliation(result) {
 }
 
 function accountTestScopeLabel(scope) {
-  return {
+  const normalized = String(scope || '').trim().toLowerCase();
+  const labels = {
     test: '账号测试与状态恢复',
     scheduler: '调度写入与回滚',
-  }[String(scope || '').trim().toLowerCase()] || '账号状态核验';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, normalized)
+    ? labels[normalized]
+    : '账号状态核验';
 }
 
 function accountTestReasonLabel(reason) {
-  return {
+  const normalized = String(reason || '').trim().toLowerCase();
+  const labels = {
     external_abort: '停机中断后结果无法确认',
     timeout: '请求超时，结果无法确认',
     transport: '连接中断，结果无法确认',
@@ -1865,7 +1967,10 @@ function accountTestReasonLabel(reason) {
     response_schema: '调度响应结构无效',
     response_mismatch: '调度响应与请求不一致',
     post_write_verification: '调度写后核验失败',
-  }[String(reason || '').trim().toLowerCase()] || '结果无法安全确认';
+  };
+  return Object.prototype.hasOwnProperty.call(labels, normalized)
+    ? labels[normalized]
+    : '结果无法安全确认';
 }
 
 function accountTestReconciliationFacts(results) {
@@ -2115,7 +2220,7 @@ function boundedReconciliationDisplay(value, maximum = 256) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   return text && text.length <= maximum
-    && !/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(text)
+    && !/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(text)
     ? text
     : null;
 }
@@ -2528,10 +2633,25 @@ async function watchJobs(jobIds, initialType = 'phase3') {
           }
           return;
         }
-        showNotice(activeJobPending()
-          ? terminalNotice + ' 已重新核实任务清单，另一个后台任务仍在执行，写操作保持锁定。'
-          : terminalNotice,
-        activeJobPending() ? 'notice-warning' : terminalNoticeKind);
+        const refreshedJobs = Array.isArray(state.job?.jobs)
+          ? state.job.jobs
+          : (state.job ? [state.job] : []);
+        const refreshedReconciliationJobs = refreshedJobs.filter(jobNeedsReconciliation);
+        if (refreshedReconciliationJobs.length > 0) {
+          // The inventory refresh may have discovered a different terminal
+          // hold while this watcher was finishing. Its current safety warning
+          // must take precedence over the stale success/failure notice from
+          // the job that originally triggered this refresh.
+          showNotice(
+            reconciliationNoticeForJobs(refreshedReconciliationJobs),
+            'notice-warning',
+          );
+        } else {
+          showNotice(activeJobPending()
+            ? terminalNotice + ' 已重新核实任务清单，另一个后台任务仍在执行，写操作保持锁定。'
+            : terminalNotice,
+          activeJobPending() ? 'notice-warning' : terminalNoticeKind);
+        }
         // resumeActiveJob reconciles per-workflow pending flags against the
         // newly listed active jobs. Do not clear an old workflow flag here:
         // a task of the same type may have been started in another tab.
@@ -2995,8 +3115,14 @@ elements.phase3Button.addEventListener('click', async () => {
     showNotice('无法提交 Phase 3：' + (selectionProblem || '没有符合条件的账号'), 'notice-warning');
     return;
   }
+  const targetPreview = targets.slice(0, 5).map((target) => {
+    const sourcePath = target.selectedKey.replace(/^token:(?:tokens|use_token):/, '');
+    return target.email + ' · ' + sourcePath;
+  }).join('\n');
+  const targetPreviewSuffix = targets.length > 5 ? '\n…共 ' + targets.length + ' 个目标' : '';
   if (!window.confirm('确认对已选的 ' + targets.length
-      + ' 个本地 gpt_register 账号运行 Phase 3 并更新 token？任务会按顺序执行。')) return;
+      + ' 个本地 gpt_register 账号运行 Phase 3 并更新 token？任务会按顺序执行。\n\n'
+      + targetPreview + targetPreviewSuffix)) return;
   state.phase3RequestPending = true;
   updateActionState();
   try {
@@ -3107,7 +3233,7 @@ if (elements.cleanupButton) {
           || relativePath.length === 0
           || relativePath.length > 1024
           || relativePath.includes('\\')
-          || /[\u0000-\u001f\u007f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/.test(relativePath)) return invalid;
+          || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(relativePath)) return invalid;
       const segments = relativePath.split('/');
       if (segments.length !== 2
           || segments[0] !== source
