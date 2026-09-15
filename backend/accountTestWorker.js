@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const { performance } = require('node:perf_hooks');
 
 const { Sub2ApiAdminClient, safeModelId } = require('./adapters/sub2apiAdmin');
 const { getAccountAvailability } = require('./accountAvailability');
@@ -120,7 +121,7 @@ function accountTestStopError(reason) {
   return error;
 }
 
-function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = Date.now()) {
+function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = performance.now()) {
   const controller = new AbortController();
   const deadline = startedAt + timeoutMs;
   let stopReason = null;
@@ -137,7 +138,7 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = Date.
     if (externalSignal.aborted) onExternalAbort();
   }
   if (!stopReason) {
-    timer = setTimeout(() => stop('timeout'), Math.max(1, deadline - Date.now()));
+    timer = setTimeout(() => stop('timeout'), Math.max(1, deadline - performance.now()));
     timer.unref?.();
   }
 
@@ -146,7 +147,7 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = Date.
     reason() {
       // Do not depend solely on timer scheduling: a synchronous boundary may
       // observe the deadline before the timer callback gets a turn.
-      if (!stopReason && Date.now() >= deadline) stop('timeout');
+      if (!stopReason && performance.now() >= deadline) stop('timeout');
       return stopReason;
     },
     dispose() {
@@ -695,12 +696,13 @@ async function runAccountTestJobNow({
 }) {
   throwIfJobInterrupted(externalSignal);
   const startedAt = Date.now();
+  const timeoutStartedAt = performance.now();
   const jobTimeoutMs = Number.isFinite(Number(requestedJobTimeoutMs))
     && Number(requestedJobTimeoutMs) > 0
     ? Math.floor(Number(requestedJobTimeoutMs))
     : boundedJobDuration(process.env.PANEL_ACCOUNT_TEST_JOB_TIMEOUT_MS);
-  const deadline = startedAt + jobTimeoutMs;
-  const jobSignal = createAccountTestJobSignal(externalSignal, jobTimeoutMs, startedAt);
+  const deadline = timeoutStartedAt + jobTimeoutMs;
+  const jobSignal = createAccountTestJobSignal(externalSignal, jobTimeoutMs, timeoutStartedAt);
   const signal = jobSignal.signal;
   try {
     const normalizedModelId = normalizeAccountTestModelId(modelId);
@@ -870,7 +872,7 @@ async function runAccountTestJobNow({
       const test = await client.testAccount(id, {
         modelId: normalizedModelId,
         prompt,
-        timeoutMs: Math.max(1, deadline - Date.now()),
+        timeoutMs: Math.max(1, deadline - performance.now()),
         signal,
       });
       let returnedTestSuccess;

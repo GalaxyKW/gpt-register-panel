@@ -1,3 +1,5 @@
+const { performance } = require('node:perf_hooks');
+
 const TERMINAL_JOB_STATUSES = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
 const MAX_ADMISSION_DISPATCH_JOBS = 100;
 const FOREGROUND_ADMISSION_RECOVERY_ATTEMPTS = 4;
@@ -518,12 +520,12 @@ function createBackgroundJobManager({ db } = {}) {
   }
 
   async function waitForIdle(timeoutMs) {
-    const deadline = Date.now() + Math.max(0, Number(timeoutMs) || 0);
-    while ((active.size > 0 || admissions > 0) && Date.now() < deadline) {
+    const deadline = performance.now() + Math.max(0, Number(timeoutMs) || 0);
+    while ((active.size > 0 || admissions > 0) && performance.now() < deadline) {
       const pending = [...active.values()]
         .filter(recordHasTrackedPromise)
         .map((record) => record.promise);
-      const remaining = Math.max(0, deadline - Date.now());
+      const remaining = Math.max(0, deadline - performance.now());
       let timer;
       const waits = [new Promise((resolve) => {
           timer = setTimeout(resolve, Math.min(25, remaining));

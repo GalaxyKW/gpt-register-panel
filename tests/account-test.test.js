@@ -2148,6 +2148,46 @@ test('account-test deadline is rechecked after a blocking checkpoint before sche
   assert.equal(outcome.results[0].enabled, false);
 });
 
+test('account-test deadline ignores a wall-clock jump before probe dispatch', async () => {
+  const account = oauthTestAccount(69, 'inactive', false);
+  const originalDateNow = Date.now;
+  let testCalls = 0;
+  try {
+    const outcome = await runAccountTestJobNowWithoutLogger({
+      accountIds: [account.id],
+      targetBaselines: targetBaselines(account),
+      db: fakeWorkerDb(),
+      jobId: 'test-monotonic-account-deadline',
+      jobTimeoutMs: 5_000,
+      logger: {
+        checkpoint(event) {
+          if (event === 'account_test.test_mutation_checkpoint') {
+            Date.now = () => originalDateNow() + 60 * 60 * 1000;
+          }
+          return true;
+        },
+        info() {},
+        warn() {},
+        error() {},
+      },
+      client: {
+        async listAccounts() { return [{ ...account }]; },
+        async getAccount() { return { ...account }; },
+        async testAccount() {
+          testCalls += 1;
+          return { success: true };
+        },
+        async setSchedulable() { throw new Error('inactive account must not be modified'); },
+      },
+    });
+    assert.equal(testCalls, 1);
+    assert.equal(outcome.stopReason, null);
+    assert.equal(outcome.succeeded, 1);
+  } finally {
+    Date.now = originalDateNow;
+  }
+});
+
 test('pre-dispatch scheduler-enable interruption records the known test without a hold', async () => {
   const controller = new AbortController();
   let first = oauthTestAccount(63, 'error', false);

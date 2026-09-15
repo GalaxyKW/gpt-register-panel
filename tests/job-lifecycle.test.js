@@ -371,6 +371,33 @@ test('shutdown timeout retains an active job claim until its real terminal outco
   await db.updateJob(replacement.id, { status: 'failed', error: 'test cleanup' });
 });
 
+test('shutdown drain timeout is not extended when the wall clock stops', async () => {
+  const manager = createBackgroundJobManager({
+    db: {
+      async interruptOwnedActiveJobs() { return []; },
+    },
+  });
+  const record = manager.begin({ id: 'job-monotonic-shutdown' }, 'phase3');
+  manager.track(record, new Promise(() => {}));
+  const originalDateNow = Date.now;
+  const frozenNow = originalDateNow();
+  let safetyTimer;
+  const realStartedAt = process.hrtime.bigint();
+  try {
+    Date.now = () => frozenNow;
+    // Restore the civil clock as a safety valve so the regression test also
+    // terminates against an implementation that still uses Date.now().
+    safetyTimer = setTimeout(() => { Date.now = originalDateNow; }, 300);
+    const result = await manager.shutdown({ timeoutMs: 40 });
+    const elapsedMs = Number(process.hrtime.bigint() - realStartedAt) / 1e6;
+    assert.equal(result.remaining, 1);
+    assert.ok(elapsedMs < 200, 'shutdown should use a monotonic deadline');
+  } finally {
+    if (safetyTimer) clearTimeout(safetyTimer);
+    Date.now = originalDateNow;
+  }
+});
+
 test('shutdown does not exclude a begun job until its observer promise is tracked', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-shutdown-untracked-'));
   const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
