@@ -3804,15 +3804,21 @@ async function startServer(options = {}) {
   }
   await server.panelDb?.ready;
   return new Promise((resolve, reject) => {
-    server.once('error', (error) => {
+    const onStartError = (error) => {
+      server.removeListener('listening', onListening);
       writeLog(server.panelLogger, 'error', 'server.start_failed', {
         host,
         port,
         error: safeErrorMessage(error),
       });
       reject(error);
-    });
-    server.listen(port, host, () => {
+    };
+    const onListening = () => {
+      // This listener exists only to reject the startup promise. Leaving it
+      // installed after a successful bind would consume the first runtime
+      // server error and mislabel it as a startup failure, while the already
+      // resolved promise makes the rejection invisible to the caller.
+      server.removeListener('error', onStartError);
       const address = server.address();
       writeLog(server.panelLogger, 'info', 'server.started', {
         host,
@@ -3821,7 +3827,10 @@ async function startServer(options = {}) {
       });
       process.stdout.write('gpt-register-panel listening on http://' + host + ':' + address.port + '\n');
       resolve(server);
-    });
+    };
+    server.once('error', onStartError);
+    server.once('listening', onListening);
+    server.listen(port, host);
     server.once('close', () => {
       writeLog(server.panelLogger, 'info', 'server.stopped', { host, port });
     });

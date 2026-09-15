@@ -1120,6 +1120,38 @@ test('server startup waits for database initialization before listening', async 
   );
 });
 
+test('successful startup removes the promise-only error listener', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+  };
+  process.env.PANEL_REQUIRE_AUTH = '0';
+  delete process.env.PANEL_ADMIN_TOKEN;
+  let server;
+  try {
+    server = await startServer({
+      host: '127.0.0.1',
+      port: 0,
+      db: {
+        dbPath: '/tmp/unused-panel-start-listener-test.sqlite3',
+        ready: Promise.resolve(),
+      },
+      logger: {
+        info() {},
+        warn() {},
+        error() {},
+      },
+    });
+    assert.equal(server.listenerCount('error'), 0);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+  }
+});
+
 test('authentication defaults to enabled and startup validates before database access', async () => {
   const previous = {
     token: process.env.PANEL_ADMIN_TOKEN,
