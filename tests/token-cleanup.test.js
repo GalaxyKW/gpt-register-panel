@@ -26,7 +26,11 @@ const { currentProcessOwner } = require('../backend/taskCoordinator');
 function jwt(email, { user = 'cleanup-user', suffix = '' } = {}) {
   return [
     'header',
-    Buffer.from(JSON.stringify({ sub: user, email })).toString('base64url'),
+    Buffer.from(JSON.stringify({
+      sub: user,
+      email,
+      'https://api.openai.com/auth': { chatgpt_user_id: user },
+    })).toString('base64url'),
     'signature' + suffix,
   ].join('.');
 }

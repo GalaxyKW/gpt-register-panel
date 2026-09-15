@@ -2522,12 +2522,12 @@ test('aggregated strong identity refuses a partial remote even when the freshest
     Buffer.from(JSON.stringify({
       sub: userId,
       email: 'duplicate@example.test',
-      ...(includeAccount ? {
-        'https://api.openai.com/auth': {
+      'https://api.openai.com/auth': {
+        chatgpt_user_id: userId,
+        ...(includeAccount ? {
           chatgpt_account_id: 'account-fresh',
-          chatgpt_user_id: userId,
-        },
-      } : {}),
+        } : {}),
+      },
     })).toString('base64url'),
     'signature',
   ].join('.');

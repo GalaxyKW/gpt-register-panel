@@ -545,6 +545,7 @@ test('token identity, expiry, refresh, and disabled aliases fail closed', () => 
     mtimeMs: 1,
     data: {
       access_token: jwt({ sub: 'expiry-alias-user' }),
+      account_id: 'expiry-alias-account',
       expired: '2099-01-01T00:00:00.000Z',
       expiresAt: 'invalid-date',
     },

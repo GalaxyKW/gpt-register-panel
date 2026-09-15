@@ -34,6 +34,7 @@ const HARD_TOKEN_TOTAL_MAX_BYTES = 1024 * 1024 * 1024;
 const REQUIRED_SOURCE_NAMES = Object.freeze(['tokens', 'use_token', 'username.json']);
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_LINE_CONTROL = /[\u0000\u000a\u000d]/;
+const UNSAFE_TOKEN_FILE_NAME = /[\\\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
 
 function decodeUtf8Json(bytes) {
   // Buffer#toString silently replaces malformed byte sequences with U+FFFD.
@@ -596,6 +597,13 @@ function readBoundedManifestNames(directoryHandle, limits) {
         throw error;
       }
       if (!entry.name.toLowerCase().endsWith('.json')) continue;
+      // File names become row/selection identifiers in the UI and API. Bidi,
+      // invisible/control characters or a POSIX-valid backslash can make the
+      // reviewed path look different from the path that a mutation targets.
+      // Reject the source instead of returning a confusable operational key.
+      if (entry.name !== entry.name.trim() || UNSAFE_TOKEN_FILE_NAME.test(entry.name)) {
+        throw gptPathError('token 文件名');
+      }
       names.push(entry.name);
       if (names.length > maximumJsonFiles) {
         const error = new Error('token 文件数量超过安全上限');
@@ -604,7 +612,8 @@ function readBoundedManifestNames(directoryHandle, limits) {
       }
     }
   } catch (error) {
-    failure = ['GPT_REGISTER_SOURCE_LIMIT', 'GPT_REGISTER_SOURCE_CHANGED']
+    failure = ['GPT_REGISTER_SOURCE_LIMIT', 'GPT_REGISTER_SOURCE_CHANGED',
+      'GPT_REGISTER_PATH_INVALID']
       .includes(error?.code)
       ? error
       : sourceChangedError('token 目录', error);

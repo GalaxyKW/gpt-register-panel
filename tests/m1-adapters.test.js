@@ -24,7 +24,12 @@ const {
 const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff } = require('../backend/diff');
 const { buildRows, filterRows, rowFromDiffItem } = require('../backend/view');
-const { buildImportPlan, buildSnapshot, safeErrorMessage } = require('../backend/sync');
+const {
+  buildImportPlan,
+  buildOAuthUpdatePayload,
+  buildSnapshot,
+  safeErrorMessage,
+} = require('../backend/sync');
 
 function makeJwt(payload) {
   return [
@@ -288,6 +293,51 @@ test('OIDC issuer subjects allow the bounded Auth0 separator without weakening b
   assert.equal(mismatched.parseStatus, 'invalid');
   assert.equal(mismatched.parseError, 'token 强身份字段互相矛盾');
 
+  const upperUuidSubject = '123E4567-E89B-12D3-A456-426614174000';
+  const lowerUuidSubject = upperUuidSubject.toLowerCase();
+  const caseMismatched = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/case-sensitive-subject.json',
+    fileName: 'case-sensitive-subject.json',
+    mtimeMs: 1,
+    data: {
+      access_token: makeJwt({ sub: upperUuidSubject, email: 'case@example.test' }),
+      id_token: makeJwt({ sub: lowerUuidSubject }),
+    },
+  });
+  assert.equal(caseMismatched.parseStatus, 'invalid');
+  assert.equal(caseMismatched.parseError, 'token 强身份字段互相矛盾');
+
+  const bracedSubject = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/braced-subject.json',
+    fileName: 'braced-subject.json',
+    mtimeMs: 1,
+    data: {
+      access_token: makeJwt({
+        sub: '{' + lowerUuidSubject + '}',
+        email: 'braced@example.test',
+      }),
+    },
+  });
+  assert.equal(bracedSubject.parseStatus, 'invalid');
+  assert.equal(bracedSubject.userId, '');
+
+  const numericSubject = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/numeric-subject.json',
+    fileName: 'numeric-subject.json',
+    mtimeMs: 1,
+    data: {
+      access_token: makeJwt({
+        sub: 12345,
+        email: 'numeric-subject@example.test',
+      }),
+    },
+  });
+  assert.equal(numericSubject.parseStatus, 'invalid');
+  assert.equal(numericSubject.userId, '');
+
   const businessIdWithPipe = normalizeTokenDocument({
     source: 'tokens',
     relativePath: 'tokens/business-id-pipe.json',
@@ -300,6 +350,49 @@ test('OIDC issuer subjects allow the bounded Auth0 separator without weakening b
   });
   assert.equal(businessIdWithPipe.parseStatus, 'invalid');
   assert.equal(businessIdWithPipe.userId, '');
+
+  const subjectOnlyData = {
+    access_token: makeJwt({
+      sub: subject,
+      email: 'subject-only@example.test',
+    }),
+  };
+  const subjectOnly = normalizeTokenDocument({
+    source: 'tokens',
+    relativePath: 'tokens/subject-only.json',
+    fileName: 'subject-only.json',
+    mtimeMs: 1,
+    data: subjectOnlyData,
+    includeRaw: true,
+  });
+  assert.equal(subjectOnly.parseStatus, 'ok');
+  assert.equal(subjectOnly.userId, '');
+  assert.deepEqual(subjectOnly.identityKeys, ['email:subject-only@example.test']);
+  const [subjectOnlyPlan] = buildImportPlan({
+    tokens: [subjectOnly],
+    usernames: [],
+  }, [{
+    id: 901,
+    name: 'free00901',
+    platform: 'openai',
+    type: 'oauth',
+    status: 'error',
+    schedulable: false,
+    email: 'subject-only@example.test',
+    userId: subject,
+    identityKeys: ['user:' + subject, 'email:subject-only@example.test'],
+    tokenFingerprints: { access: 'different-access-fingerprint' },
+  }]);
+  assert.equal(subjectOnlyPlan.action, 'conflict');
+  assert.equal(subjectOnlyPlan.reason, 'source_identity_insufficient');
+  assert.equal(subjectOnlyPlan.accountId, null);
+  assert.equal(subjectOnlyPlan._account, null);
+  const payload = buildOAuthUpdatePayload({
+    ...subjectOnlyPlan,
+    _raw: subjectOnly.raw,
+    _record: subjectOnly,
+  });
+  assert.equal(Object.hasOwn(payload.credentials, 'chatgpt_user_id'), false);
 });
 
 test('an unusable newer credential cannot displace an older valid token', () => {
@@ -338,6 +431,29 @@ test('case-insensitive filename ties have a stable total order', () => {
     sources.tokens.filter((item) => item.source === 'tokens').map((item) => item.fileName),
     ['A.json', 'a.json', 'b.json'],
   );
+});
+
+test('token scans reject file names that produce confusable operation keys', () => {
+  for (const fileName of [
+    ' leading-space.json',
+    'back\\slash.json',
+    'bidi-\u202eevil.json',
+    'zero-width-\u200bevil.json',
+    'soft-\u00adevil.json',
+    'variant-\ufe0fevil.json',
+  ]) {
+    const fixture = fixtureRoot();
+    fs.writeFileSync(path.join(fixture.root, 'tokens', fileName), JSON.stringify({
+      access_token: 'ordinary-access',
+      account_id: 'safe-account-id',
+    }));
+    assert.throws(
+      () => readGptRegisterSources({ rootDirectory: fixture.root }),
+      (error) => error.code === 'GPT_REGISTER_PATH_INVALID'
+        && !String(error.message).includes('evil'),
+      JSON.stringify(fileName),
+    );
+  }
 });
 
 test('safe username summaries never pass nested source values through', () => {
@@ -579,6 +695,8 @@ test('complete source snapshots reject malformed username identity and terminal 
     { email: 'zero\u200bwidth@example.test', password: 'present', status: 'oauth_done' },
     { email: 'bidi\u202e@example.test', password: 'present', status: 'oauth_done' },
     { email: 'c1\u0085@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'soft\u00adhyphen@example.test', password: 'present', status: 'oauth_done' },
+    { email: 'variant\ufe0f@example.test', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', phone: '138\n0000', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', phone: '138\u00a00000', password: 'present', status: 'oauth_done' },
     { email: 'valid@example.test', phone: '138letters0000', password: 'present', status: 'oauth_done' },
@@ -1309,6 +1427,8 @@ test('local and remote email identities reject whitespace, zero-width and bidi a
     'two words@example.test',
     'zero\u200bwidth@example.test',
     'bidi\u202e@example.test',
+    'soft\u00adhyphen@example.test',
+    'variant\ufe0f@example.test',
     'missing-at.example.test',
     'double@@example.test',
   ];
@@ -1338,6 +1458,8 @@ test('generic email identity normalization cannot reintroduce rejected email for
     'zero\u200bwidth@example.test',
     'bidi\u202e@example.test',
     'c1\u0085@example.test',
+    'soft\u00adhyphen@example.test',
+    'variant\ufe0f@example.test',
     'double@@example.test',
   ]) {
     assert.equal(normalizeIdentityValue('email:', email), '', email);

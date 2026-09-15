@@ -3,7 +3,11 @@ const { TextDecoder } = require('node:util');
 const C0_OR_DEL = /[\u0000-\u001f\u007f]/;
 const CREDENTIAL_WHITESPACE_CONTROL_OR_BIDI = /[\s\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/u;
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
-const EMAIL_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+// Email is both displayed and used as a fallback correlation hint. Reject the
+// complete Unicode default-ignorable class (not only the common bidi/zero-
+// width subset), otherwise visually identical addresses can become distinct
+// operational identities through soft hyphens, variation selectors, etc.
+const EMAIL_CONTROL_OR_BIDI = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 // OpenAI's OIDC subject currently uses an Auth0-style `provider|subject`
 // value. It is an issuer subject, not a ChatGPT business user ID, so validate
@@ -206,9 +210,12 @@ function issuerSubjectField(field) {
   if (!field || field.invalid) return { value: '', invalid: true };
   if (!field.value) return { value: '', invalid: false };
   const raw = String(field.value);
-  const normalized = normalizeIdentityValue('user:', raw);
-  if (!normalized || field.outerWhitespace === true
-      || raw !== raw.trim()
+  // OIDC `sub` is an issuer-scoped, case-sensitive string. In particular, do
+  // not apply the business-ID UUID folding/removal of braces performed by
+  // normalizeIdentityValue('user:', ...), because that could make two
+  // distinct access/id-token subjects compare equal.
+  const normalized = raw.trim();
+  if (!normalized || field.outerWhitespace === true || raw !== normalized
       || IDENTITY_CONTROL_OR_BIDI.test(raw)
       || !CANONICAL_ISSUER_SUBJECT.test(normalized)
       || looksLikeCredentialIdentity(normalized.replace(/\|/g, ':'))) {
@@ -251,6 +258,12 @@ function identityDimensionConflict(prefix, fields = []) {
     .map((field) => normalizeIdentityValue(prefix, field?.value))
     .filter(Boolean));
   return values.size > 1;
+}
+
+function issuerSubjectConflict(fields = []) {
+  // issuerSubjectField already performed lossless validation. Compare the
+  // resulting OIDC subjects byte-for-byte because `sub` is case-sensitive.
+  return new Set(fields.map((field) => field?.value).filter(Boolean)).size > 1;
 }
 
 function normalizeTokenDocument({
@@ -313,11 +326,11 @@ function normalizeTokenDocument({
   const claimAccount = strongIdentityField(claimScalar(auth, 'chatgpt_account_id', 512), 'account:');
   const claimChatGptUser = strongIdentityField(claimScalar(auth, 'chatgpt_user_id', 512), 'user:');
   const claimUser = strongIdentityField(claimScalar(auth, 'user_id', 512), 'user:');
-  const claimSubject = issuerSubjectField(claimScalar(accessPayload, 'sub', 512));
+  const claimSubject = issuerSubjectField(claimScalar(accessPayload, 'sub', 512, false));
   const idClaimAccount = strongIdentityField(claimScalar(idAuth, 'chatgpt_account_id', 512), 'account:');
   const idClaimChatGptUser = strongIdentityField(claimScalar(idAuth, 'chatgpt_user_id', 512), 'user:');
   const idClaimUser = strongIdentityField(claimScalar(idAuth, 'user_id', 512), 'user:');
-  const idClaimSubject = issuerSubjectField(claimScalar(idPayload, 'sub', 512));
+  const idClaimSubject = issuerSubjectField(claimScalar(idPayload, 'sub', 512, false));
   const claimAuthEmail = emailIdentityField(claimScalar(auth, 'email', 320, false));
   const claimEmail = emailIdentityField(claimScalar(accessPayload, 'email', 320, false));
   const idClaimAuthEmail = emailIdentityField(claimScalar(idAuth, 'email', 320, false));
@@ -337,9 +350,11 @@ function normalizeTokenDocument({
     idClaimUser,
   ];
   const subjectFields = [claimSubject, idClaimSubject];
-  const userId = primaryUserFields.find((field) => field.value)?.value
-    || subjectFields.find((field) => field.value)?.value
-    || '';
+  // OAuth `sub` identifies the subject within its issuer. It is not the
+  // ChatGPT business-user identifier consumed by Sub2API, so never promote it
+  // into `userId` or a `user:` matching key. The subject fields still
+  // participate in the consistency check below to reject mixed credentials.
+  const userId = primaryUserFields.find((field) => field.value)?.value || '';
   const emailFields = [
     explicitEmail,
     claimAuthEmail,
@@ -357,7 +372,7 @@ function normalizeTokenDocument({
     // OAuth `sub` is an issuer subject, not necessarily the same identifier as
     // OpenAI's chatgpt_user_id.  Compare access/id subjects with each other,
     // but never collapse them into the business-user identity dimension.
-    || identityDimensionConflict('user:', subjectFields);
+    || issuerSubjectConflict(subjectFields);
   const emailIdentityConflict = identityDimensionConflict('email:', emailFields);
   const expiryValues = [document.expired, document.expires_at, document.expiresAt, accessPayload?.exp]
     .filter((value) => value !== undefined && value !== null && value !== '');
