@@ -2180,7 +2180,7 @@ test('executable entrypoints redact fatal stderr instead of printing raw stacks'
     assert.doesNotMatch(entrypoint, /process\.stderr\.write\(error\.stack/);
     assert.match(entrypoint, /process\.stderr\.write\(safeErrorText\(error\)/);
   }
-  assert.match(snapshotSource, /async function main\(\) \{\s*loadEnv\(\);/);
+  assert.match(snapshotSource, /async function main\(\) \{\s*const flags = parseFlags\(\);\s*loadEnv\(\);/);
 });
 
 test('snapshot CLI refuses to publish an incomplete local source tree', () => {
@@ -2207,6 +2207,72 @@ test('snapshot CLI refuses to publish an incomplete local source tree', () => {
   assert.equal(child.stdout, '');
   assert.match(child.stderr, /GPT_REGISTER_SOURCE_MISSING/);
   assert.match(child.stderr, /无法形成完整可信快照/);
+});
+
+test('snapshot CLI rejects unknown and duplicate flags instead of changing scope silently', () => {
+  const snapshotCli = path.resolve(__dirname, '..', 'backend', 'cli', 'snapshot.js');
+  for (const args of [
+    ['--with-sub2api=1'],
+    ['--with-sub2ap'],
+    ['--summary', '--summary'],
+    ['summary'],
+  ]) {
+    const child = spawnSync(process.execPath, [snapshotCli, ...args], {
+      cwd: path.resolve(__dirname, '..'),
+      encoding: 'utf8',
+      env: { ...process.env },
+    });
+    assert.equal(child.status, 1, JSON.stringify(args));
+    assert.equal(child.stdout, '');
+    assert.match(child.stderr, /CLI_ARGUMENT_INVALID/);
+    assert.match(child.stderr, /只接受不重复的/);
+  }
+});
+
+test('snapshot CLI accepts the exact summary flag without enabling Sub2API', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cli-summary-'));
+  const envFile = path.join(root, 'panel.env');
+  fs.writeFileSync(envFile, '# test environment\n', { mode: 0o600 });
+  const child = spawnSync(process.execPath, [
+    path.resolve(__dirname, '..', 'backend', 'cli', 'snapshot.js'),
+    '--summary',
+  ], {
+    cwd: path.resolve(__dirname, '..'),
+    encoding: 'utf8',
+    env: { ...process.env, PANEL_ENV_FILE: envFile },
+  });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stderr, '');
+  const summary = JSON.parse(child.stdout);
+  assert.equal(summary.sub2api.readStatus, 'omitted');
+  assert.equal(summary.sub2api.accountCount, null);
+  assert.equal(summary.comparisonStatus, 'unavailable');
+});
+
+test('snapshot CLI returns failure when an explicitly requested Sub2API read fails', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cli-remote-'));
+  const envFile = path.join(root, 'panel.env');
+  fs.writeFileSync(envFile, '# test environment\n', { mode: 0o600 });
+  const child = spawnSync(process.execPath, [
+    path.resolve(__dirname, '..', 'backend', 'cli', 'snapshot.js'),
+    '--with-sub2api',
+    '--summary',
+  ], {
+    cwd: path.resolve(__dirname, '..'),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PANEL_ENV_FILE: envFile,
+      SUB2API_BASE_URL: 'http://127.0.0.1:1',
+      SUB2API_ADMIN_API_KEY: 'isolated-test-api-key',
+      SUB2API_ALLOW_INSECURE_HTTP: '1',
+      SUB2API_TIMEOUT_MS: '250',
+    },
+  });
+  assert.equal(child.status, 1, child.stderr);
+  assert.equal(child.stdout, '');
+  assert.match(child.stderr, /SUB2API_SNAPSHOT_UNAVAILABLE/);
+  assert.match(child.stderr, /不能输出远端对比快照/);
 });
 
 test('verified static opener rejects final and intermediate symlinks', () => {
