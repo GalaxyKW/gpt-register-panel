@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 
 const PROTOCOL = 'lamport-bakery';
 const PROTOCOL_VERSION = 2;
@@ -345,7 +346,7 @@ async function retryChanged(context, startedAt, callback) {
       return result;
     } catch (error) {
       if (error?.code !== context.changedCode) throw error;
-      if (Date.now() - startedAt >= context.timeoutMs) throw error;
+      if (performance.now() - startedAt >= context.timeoutMs) throw error;
       await sleep(context.pollMs, context);
     }
   }
@@ -444,7 +445,10 @@ async function acquireBakeryLease(options) {
   throwIfLockInterrupted(context);
   assertNamespaceHealthy(context);
   const token = crypto.randomBytes(16).toString('hex');
-  const startedAt = Date.now();
+  // A wall-clock correction must not extend a lock wait indefinitely. Keep
+  // persisted audit timestamps on the civil clock, but measure deadlines with
+  // Node's monotonic clock.
+  const startedAt = performance.now();
   let choosing = null;
   let ticketEntry = null;
   try {
@@ -506,7 +510,7 @@ async function acquireBakeryLease(options) {
           context,
         };
       }
-      if (Date.now() - startedAt >= context.timeoutMs) {
+      if (performance.now() - startedAt >= context.timeoutMs) {
         throw lockError(context.timeoutCode, context.timeoutMessage);
       }
       await sleep(context.pollMs, context);

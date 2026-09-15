@@ -351,6 +351,49 @@ test('bakery lock cancellation interrupts polling and removes only its own lease
   }
 });
 
+test('bakery lock timeout is not extended by a wall-clock rollback', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-clock-'));
+  const lockName = 'monotonic.lock';
+  const descriptor = fs.openSync(
+    root,
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0),
+  );
+  const accessDirectory = process.platform === 'linux'
+    ? '/proc/self/fd/' + descriptor
+    : root;
+  const baseOptions = {
+    directoryDescriptor: descriptor,
+    accessDirectory,
+    lockName,
+    kind: 'test-monotonic-bakery-lock',
+    owner: currentProcessOwner(),
+    isOwnerAlive: () => true,
+    timeoutMs: 40,
+    pollMs: 5,
+    timeoutCode: 'TEST_MONOTONIC_TIMEOUT',
+  };
+  const originalDateNow = Date.now;
+  const controller = new AbortController();
+  let firstLease;
+  let safetyTimer;
+  try {
+    firstLease = await acquireBakeryLease(baseOptions);
+    const frozenNow = originalDateNow();
+    Date.now = () => frozenNow - 60_000;
+    safetyTimer = setTimeout(() => controller.abort(), 500);
+    await assert.rejects(
+      acquireBakeryLease({ ...baseOptions, signal: controller.signal }),
+      (error) => error.code === 'TEST_MONOTONIC_TIMEOUT',
+    );
+  } finally {
+    if (safetyTimer) clearTimeout(safetyTimer);
+    Date.now = originalDateNow;
+    controller.abort();
+    if (firstLease) releaseBakeryLease(firstLease);
+    fs.closeSync(descriptor);
+  }
+});
+
 test('bakery lock bounds the complete directory scan before allocating an unbounded name list', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-bakery-bounded-'));
   const lockName = 'bounded.lock';
