@@ -184,3 +184,70 @@ test('Phase3 signals a cgroup-moved target only by reverified positive PID', () 
   );
   assert.deepEqual(signals, [[4242, 'SIGKILL']]);
 });
+
+test('Phase3 revalidates process-group membership immediately before a group signal', () => {
+  const expected = {
+    pid: 4242,
+    startId: 'start-a',
+    cgroup: '0::/phase3-a',
+    state: 'S',
+    processGroupId: 4242,
+  };
+  const stableSignals = [];
+  _testPhase3ProcessScan.signalVerifiedProcessGroups(
+    [expected],
+    'SIGTERM',
+    100,
+    () => ({ status: 'ok', identity: { ...expected } }),
+    (pid, signal) => stableSignals.push([pid, signal]),
+  );
+  assert.deepEqual(stableSignals, [[-4242, 'SIGTERM']]);
+
+  const recycledSignals = [];
+  _testPhase3ProcessScan.signalVerifiedProcessGroups(
+    [expected],
+    'SIGKILL',
+    100,
+    () => ({
+      status: 'ok',
+      identity: { ...expected, startId: 'recycled-start' },
+    }),
+    (pid, signal) => recycledSignals.push([pid, signal]),
+  );
+  assert.deepEqual(recycledSignals, []);
+
+  const movedSignals = [];
+  _testPhase3ProcessScan.signalVerifiedProcessGroups(
+    [expected],
+    'SIGKILL',
+    100,
+    () => ({
+      status: 'ok',
+      identity: { ...expected, processGroupId: 9000 },
+    }),
+    (pid, signal) => movedSignals.push([pid, signal]),
+  );
+  assert.deepEqual(movedSignals, [[4242, 'SIGKILL']]);
+});
+
+test('Phase3 reports output truncation even when termination was already requested', async () => {
+  const { runCommand } = require('../backend/phase3Worker');
+  const source = [
+    "process.on('SIGTERM', () => process.stdout.write('x'.repeat(8192)));",
+    'setInterval(() => {}, 1000);',
+  ].join('\n');
+  await assert.rejects(
+    runCommand(process.execPath, ['-e', source], {
+      cwd: projectRoot,
+      env: { PATH: process.env.PATH || '' },
+      timeoutMs: 1000,
+      terminationGraceMs: 200,
+      terminationHardDeadlineMs: 200,
+      maxOutputBytes: 4096,
+    }),
+    (error) => error.code === 'PHASE3_TIMEOUT'
+      && error.details?.terminationConfirmed === true
+      && error.details?.outputTruncated === true
+      && error.details?.stdoutBytes >= 8192,
+  );
+});

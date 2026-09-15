@@ -12,7 +12,7 @@ const {
 } = require('./adapters/gptRegisterFs');
 const {
   hasStrongIdentity,
-  identitiesStronglyCompatible,
+  strongIdentitiesFullyMatch,
   isExpired,
   isExpiryInvalid,
 } = require('./diff');
@@ -51,6 +51,11 @@ const PHASE3_CHILD_MUTABLE_FIELDS = new Set([
   'phase3Screenshot',
   'phase3RequestId',
   'phase3Disposition',
+  // gpt_register clears these continuation markers when Phase3 records a
+  // terminal account outcome. They are part of the expected child transition,
+  // not evidence that an unrelated username row was replaced concurrently.
+  'continuationRequired',
+  'continuationStage',
 ]);
 const PHASE3_ENV_NAMES = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV',
@@ -85,6 +90,7 @@ const PHASE3_PROC_TASK_ENTRY_LIMIT = 4096;
 const PHASE3_PROC_CHILDREN_MAX_BYTES = 64 * 1024;
 const PHASE3_PROC_CHILDREN_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 const PHASE3_SUPERVISION_ENV_NAME = 'GPT_REGISTER_PANEL_SUPERVISION_ID';
+const PHASE3_PASSWORD_LINE_CONTROL = /[\u0000\u000a\u000d]/;
 const PHASE3_SCRIPT_CHILD_FD = 3;
 const PHASE3_NODE_CHILD_FD = 4;
 const PHASE3_ROOT_CHILD_FD = 5;
@@ -517,6 +523,50 @@ function signalVerifiedPidTargets(
   }
 }
 
+function signalVerifiedProcessGroups(
+  processes,
+  signal,
+  ownGroup,
+  inspectProcess = readLinuxProcessIdentity,
+  killProcess = process.kill.bind(process),
+) {
+  const grouped = new Map();
+  for (const processInfo of processes) {
+    const groupId = processInfo?.processGroupId;
+    if (!grouped.has(groupId)) grouped.set(groupId, []);
+    grouped.get(groupId).push(processInfo);
+  }
+  for (const [groupId, members] of grouped) {
+    let groupSignalled = false;
+    if (Number.isSafeInteger(groupId) && groupId > 1 && groupId !== ownGroup) {
+      // activeProcessState() can spend time walking a large /proc tree. Recheck
+      // that this exact pid/start-id/cgroup is still a member immediately before
+      // using a negative PID; otherwise an exited Phase3 group could have been
+      // recycled and the group signal could hit an unrelated process tree.
+      const verifiedMember = members.some((expected) => {
+        const latest = inspectProcess(expected.pid);
+        return latest.status === 'ok'
+          && sameLinuxProcess(expected, latest.identity)
+          && latest.identity.processGroupId === groupId
+          && !['Z', 'X'].includes(latest.identity.state);
+      });
+      if (verifiedMember) {
+        try {
+          killProcess(-groupId, signal);
+          groupSignalled = true;
+        } catch {}
+      }
+    }
+    if (groupSignalled) continue;
+    for (const expected of members) {
+      const latest = inspectProcess(expected.pid);
+      if (latest.status !== 'ok' || !sameLinuxProcess(expected, latest.identity)
+          || ['Z', 'X'].includes(latest.identity.state)) continue;
+      try { killProcess(expected.pid, signal); } catch {}
+    }
+  }
+}
+
 function sameFileIdentity(left, right) {
   return Boolean(left && right && left.dev === right.dev && left.ino === right.ino);
 }
@@ -658,6 +708,12 @@ function normalizeUsernamePhone(value) {
     allowNumber: true,
     allowNull: true,
   });
+}
+
+function hasUsablePhase3Password(record) {
+  return typeof record?.password === 'string'
+    && !PHASE3_PASSWORD_LINE_CONTROL.test(record.password)
+    && record.password.trim().length > 0;
 }
 
 function recordFingerprint(record) {
@@ -877,7 +933,7 @@ function findUsernameEntry({
   const normalizedEmail = identity.email;
   const normalizedPhone = identity.phone;
   const eligible = records.map((record, index) => ({ record, index })).filter(({ record }) => {
-    if (!record || !record.password) return false;
+    if (!record || !hasUsablePhase3Password(record)) return false;
     const recordPhone = normalizeUsernamePhone(record.phone);
     if (recordPhone === null) return false;
     const emailMatches = normalizedEmail && record.email
@@ -1168,6 +1224,18 @@ function phase3TokenIdentityMismatchError() {
   return error;
 }
 
+function phase3TokenOutputUnconfirmedError() {
+  const error = new Error('Phase 3 已改变本地 token 文件，但没有形成唯一且可验证的目标账号输出；必须人工对账，禁止直接重试');
+  error.code = 'PHASE3_TOKEN_OUTPUT_UNCONFIRMED';
+  error.writeOutcomeUnknown = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'phase3_token_output';
+  error.reconciliationReason = 'phase3_token_artifact_changed_without_verified_output';
+  return error;
+}
+
 function phase3TokenMatchesBoundIdentity(token, selectedToken) {
   if (!selectedToken) return true;
   const selectedKeys = Array.isArray(selectedToken.identityKeys)
@@ -1178,7 +1246,53 @@ function phase3TokenMatchesBoundIdentity(token, selectedToken) {
   // same-email output. Require the newly fetched artifact to contribute its
   // own strong identity instead of declaring success from email alone.
   if (!hasStrongIdentity(selectedKeys)) return hasStrongIdentity(tokenKeys);
-  return identitiesStronglyCompatible(selectedKeys, tokenKeys);
+  // Once the selected source carries a strong identity, every account/user
+  // dimension is part of the reviewed target. A partial match (for example a
+  // shared workspace with a missing or different user) is insufficient proof
+  // that the new credential belongs to that exact account.
+  return strongIdentitiesFullyMatch(selectedKeys, tokenKeys);
+}
+
+function phase3ChangedTokensShareStrongIdentity(tokens) {
+  if (!Array.isArray(tokens) || tokens.length < 2) return true;
+  const firstKeys = Array.isArray(tokens[0]?.identityKeys) ? tokens[0].identityKeys : [];
+  if (!hasStrongIdentity(firstKeys)) return false;
+  return tokens.slice(1).every((token) => strongIdentitiesFullyMatch(
+    firstKeys,
+    Array.isArray(token?.identityKeys) ? token.identityKeys : [],
+  ));
+}
+
+function phase3TokenArtifactKey(token) {
+  return tokenSelectionKey(token);
+}
+
+function phase3TokenArtifactHash(token) {
+  const value = String(token?.contentHash || '').toLowerCase();
+  return /^[a-f0-9]{64}$/.test(value) ? value : null;
+}
+
+function changedPhase3TokenArtifacts(beforeTokens, afterTokens) {
+  const before = new Map();
+  const after = new Map();
+  for (const token of beforeTokens || []) {
+    const key = phase3TokenArtifactKey(token);
+    const hash = phase3TokenArtifactHash(token);
+    if (key && hash) before.set(key, hash);
+  }
+  const changed = [];
+  for (const token of afterTokens || []) {
+    const key = phase3TokenArtifactKey(token);
+    const hash = phase3TokenArtifactHash(token);
+    if (!key || !hash) continue;
+    after.set(key, hash);
+    if (before.get(key) !== hash) changed.push(token);
+  }
+  let removedCount = 0;
+  for (const key of before.keys()) {
+    if (!after.has(key)) removedCount += 1;
+  }
+  return { changed, removedCount };
 }
 
 function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
@@ -1312,6 +1426,11 @@ function writeLog(logger, level, event, fields = {}) {
   } catch {
     // Logging must never change the outcome of a Phase 3 task.
   }
+}
+
+function monotonicElapsedMilliseconds(startedAt) {
+  const elapsed = performance.now() - Number(startedAt);
+  return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
 }
 
 function phase3TerminationBudget(options = {}) {
@@ -1459,27 +1578,7 @@ function runCommand(command, args, options = {}) {
       const state = activeProcessState();
       const processes = [state.root, ...state.descendants].filter(Boolean);
       const ownGroup = linuxProcessIdentity(process.pid)?.processGroupId;
-      const grouped = new Map();
-      for (const processInfo of processes) {
-        const groupId = processInfo.processGroupId;
-        if (!grouped.has(groupId)) grouped.set(groupId, []);
-        grouped.get(groupId).push(processInfo);
-      }
-      for (const [groupId, members] of grouped) {
-        let groupSignalled = false;
-        if (Number.isSafeInteger(groupId) && groupId > 1 && groupId !== ownGroup) {
-          try {
-            process.kill(-groupId, signal);
-            groupSignalled = true;
-          } catch {}
-        }
-        if (groupSignalled) continue;
-        for (const expected of members) {
-          const latest = linuxProcessIdentity(expected.pid);
-          if (!sameLinuxProcess(expected, latest) || ['Z', 'X'].includes(latest.state)) continue;
-          try { process.kill(expected.pid, signal); } catch {}
-        }
-      }
+      signalVerifiedProcessGroups(processes, signal, ownGroup);
       // A verified pid/start-id may move to another cgroup. It is no longer
       // eligible for process-group signalling, but positive-PID signalling is
       // still safe after one final start-id check. The observed drift keeps
@@ -1671,11 +1770,13 @@ function runCommand(command, args, options = {}) {
         output[streamName].push(Buffer.from(retained));
         retainedBytes += retained.length;
       }
-      if (bytes.length > remaining && !terminationError) {
+      if (bytes.length > remaining) {
         outputTruncated = true;
-        const error = new Error('phase3 输出超过安全上限');
-        error.code = 'PHASE3_OUTPUT_LIMIT';
-        requestTermination(error);
+        if (!terminationError) {
+          const error = new Error('phase3 输出超过安全上限');
+          error.code = 'PHASE3_OUTPUT_LIMIT';
+          requestTermination(error);
+        }
       }
     };
     child.stdout.on('data', (chunk) => collectOutput('stdout', chunk));
@@ -1758,7 +1859,11 @@ async function runPhase3JobNow({
 }) {
   throwIfJobInterrupted(signal);
   if (phase3ProcessTreeUnsafe) throw phase3SupervisionError();
+  // Keep a wall-clock boundary only for comparing filesystem mtimes. Durations
+  // must use the monotonic clock so an NTP/manual clock correction cannot
+  // produce negative or misleading execution timings.
   const startedAt = Date.now();
+  const startedMonotonicAt = performance.now();
   let entry = null;
   let rootHandle = null;
   let scriptHandle = null;
@@ -1802,8 +1907,11 @@ async function runPhase3JobNow({
     const selectedToken = executionBinding
       ? assertTokenExecutionBinding(executionBinding.token, beforeSources, entry, { email, phone })
       : null;
-    const beforeTokens = beforeSources.tokens
-      .filter((item) => item.historical !== true && item.parseStatus === 'ok' && item.email === entry.email)
+    const beforeTokens = beforeSources.tokens;
+    const beforeTargetTokens = beforeTokens
+      .filter((item) => item.historical !== true
+        && item.parseStatus === 'ok'
+        && item.email === entry.email)
       .map((item) => ({
         relativePath: item.relativePath,
         mtimeMs: item.mtimeMs,
@@ -1816,7 +1924,7 @@ async function runPhase3JobNow({
       email: entry.email,
       createdAt: entry.createdAt,
     });
-    const processStartedAt = Date.now();
+    const processStartedAt = performance.now();
     let result;
     let processError = null;
     try {
@@ -1869,7 +1977,7 @@ async function runPhase3JobNow({
         jobId,
         actor,
         email: entry.email,
-        durationMs: Date.now() - processStartedAt,
+        durationMs: monotonicElapsedMilliseconds(processStartedAt),
         ...processSummary,
         error: redactText(String(error?.message || error)),
       });
@@ -1888,7 +1996,7 @@ async function runPhase3JobNow({
         jobId,
         actor,
         email: entry.email,
-        durationMs: Date.now() - processStartedAt,
+        durationMs: monotonicElapsedMilliseconds(processStartedAt),
         ...processSummary,
       });
       const processMarker = new Error('phase3 进程报告了账号状态异常');
@@ -1907,25 +2015,26 @@ async function runPhase3JobNow({
       throw phase3TokenPostflightError(error);
     }
     const tokenObservedAt = Date.now();
-    const beforeByPath = new Map(beforeTokens.map((item) => [item.relativePath, item]));
+    const artifactChanges = changedPhase3TokenArtifacts(beforeTokens, sources.tokens);
+    const beforeByPath = new Map(beforeTargetTokens.map((item) => [item.relativePath, item]));
     const beforeAccessFingerprints = new Set(beforeTokens
-      .filter((item) => item.access)
-      .map((item) => item.access));
-    const observedChangedTokens = sources.tokens
-      .filter((item) => isUsablePhase3Token(item, tokenObservedAt) && item.email === entry.email)
-      .filter((item) => {
-        const before = beforeByPath.get(item.relativePath);
-        if (!before) return true;
-        const fingerprintChanged = before.access !== item.fingerprints?.access
-          || before.refresh !== item.fingerprints?.refresh;
-        const mtimeChangedWithoutFingerprint = !before.access
-          && Number(item.mtimeMs) > Number(before.mtimeMs || 0)
-          && Number(item.mtimeMs) >= startedAt;
-        return fingerprintChanged || mtimeChangedWithoutFingerprint;
-      });
+      .filter((item) => item.fingerprints?.access)
+      .map((item) => item.fingerprints.access));
+    const observedChangedTokens = artifactChanges.changed.filter(
+      (item) => isUsablePhase3Token(item, tokenObservedAt) && item.email === entry.email,
+    ).filter((item) => {
+      const before = beforeByPath.get(item.relativePath);
+      if (!before) return true;
+      const fingerprintChanged = before.access !== item.fingerprints?.access
+        || before.refresh !== item.fingerprints?.refresh;
+      const mtimeChangedWithoutFingerprint = !before.access
+        && Number(item.mtimeMs) > Number(before.mtimeMs || 0)
+        && Number(item.mtimeMs) >= startedAt;
+      return fingerprintChanged || mtimeChangedWithoutFingerprint;
+    });
     if (observedChangedTokens.some(
       (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken),
-    )) {
+    ) || (selectedToken && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
       throw phase3TokenIdentityMismatchError();
     }
     // A second path reusing an access token that was already present before
@@ -1938,6 +2047,15 @@ async function runPhase3JobNow({
     changedTokens.sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
     const token = changedTokens[0];
     if (!token) {
+      const observedArtifacts = new Set(observedChangedTokens);
+      if (artifactChanges.removedCount > 0
+          || artifactChanges.changed.some((item) => !observedArtifacts.has(item))) {
+        // A malformed/expired/disabled/wrong-account artifact or a deletion is
+        // an irreversible filesystem outcome. Valid copies of a previously
+        // known access credential remain TOKEN_UNCHANGED, but an unclassifiable
+        // artifact must not make an automatic OAuth retry look safe.
+        throw phase3TokenOutputUnconfirmedError();
+      }
       if (processError) throw processError;
       const error = new Error('phase3 已退出，但没有检测到对应的 token 变化');
       error.code = 'PHASE3_TOKEN_UNCHANGED';
@@ -2014,7 +2132,7 @@ async function runPhase3JobNow({
       fingerprint: token.fingerprints?.access || null,
       processEndedWithError: output.processEndedWithError === true,
       processErrorCode: output.processErrorCode || null,
-      durationMs: Date.now() - startedAt,
+      durationMs: monotonicElapsedMilliseconds(startedMonotonicAt),
     });
     return output;
   } catch (error) {
@@ -2076,7 +2194,7 @@ async function runPhase3JobNow({
       jobId,
       actor,
       email: email || null,
-      durationMs: Date.now() - startedAt,
+      durationMs: monotonicElapsedMilliseconds(startedMonotonicAt),
       error: redactText(String(error?.message || error)),
       code: error?.code || null,
       dispositionOutcome: error?.dispositionOutcome || null,
@@ -2321,6 +2439,7 @@ function runPhase3Job(args = {}) {
     return Promise.reject(error);
   }
   const queuedAt = Date.now();
+  const queuedMonotonicAt = performance.now();
   const activeRecord = {
     jobId: args.jobId || null,
     email: identity.email,
@@ -2337,7 +2456,7 @@ function runPhase3Job(args = {}) {
   });
   const queued = queueCancelableRun(phase3Queue, async () => {
     throwIfJobInterrupted(args.signal);
-    const queueWaitMs = Date.now() - queuedAt;
+    const queueWaitMs = monotonicElapsedMilliseconds(queuedMonotonicAt);
     writeLog(args.logger, 'info', 'phase3.started_after_queue', {
       jobId: args.jobId || null,
       actor: args.actor || 'local',
@@ -2395,6 +2514,7 @@ module.exports = {
     boundedNumericDirectoryEntries,
     linuxChildPids,
     parseLinuxChildPids,
+    signalVerifiedProcessGroups,
     signalVerifiedPidTargets,
   }),
   classifyPhase3ProcessError,
