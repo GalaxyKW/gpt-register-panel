@@ -14,6 +14,10 @@ async function main() {
   loadEnv();
   const output = await buildSnapshot(new URLSearchParams(hasFlag('--with-sub2api') ? 'withSub2api=1' : ''), {
     readSub2Api: hasFlag('--with-sub2api'),
+    // A command-line snapshot is commonly used as an operational truth
+    // source. Missing directories or a malformed username.json must fail the
+    // command instead of looking like an empty local account set.
+    requireCompleteSources: true,
   });
 
   if (hasFlag('--summary')) {

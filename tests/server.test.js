@@ -2183,6 +2183,32 @@ test('executable entrypoints redact fatal stderr instead of printing raw stacks'
   assert.match(snapshotSource, /async function main\(\) \{\s*loadEnv\(\);/);
 });
 
+test('snapshot CLI refuses to publish an incomplete local source tree', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cli-source-'));
+  const incompleteSource = path.join(root, 'gpt-register');
+  const envFile = path.join(root, 'panel.env');
+  fs.mkdirSync(incompleteSource, { mode: 0o700 });
+  fs.mkdirSync(path.join(incompleteSource, 'tokens'), { mode: 0o700 });
+  fs.writeFileSync(envFile, '# test environment\n', { mode: 0o600 });
+
+  const child = spawnSync(process.execPath, [
+    path.resolve(__dirname, '..', 'backend', 'cli', 'snapshot.js'),
+    '--summary',
+  ], {
+    cwd: path.resolve(__dirname, '..'),
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      PANEL_ENV_FILE: envFile,
+      GPT_REGISTER_ROOT: incompleteSource,
+    },
+  });
+  assert.equal(child.status, 1, child.stderr);
+  assert.equal(child.stdout, '');
+  assert.match(child.stderr, /GPT_REGISTER_SOURCE_MISSING/);
+  assert.match(child.stderr, /无法形成完整可信快照/);
+});
+
 test('verified static opener rejects final and intermediate symlinks', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-static-'));
   const root = path.join(directory, 'frontend');
