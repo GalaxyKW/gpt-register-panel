@@ -120,6 +120,10 @@ test('systemd unit executes only pinned sources and refuses a missing or read-on
     'PANEL_LOG_PATH=/run/gpt-register-panel/runtime/panel.log',
     'PANEL_CONTROL_LOCK_PATH=/run/gpt-register-panel/runtime/panel.sqlite3.control.lock',
     'PANEL_TOKEN_QUARANTINE_DIR=/run/gpt-register-panel/gpt_register/.panel-quarantine/expired-tokens',
+    'HOME=/run/gpt-register-panel/runtime',
+    'XDG_CONFIG_HOME=/run/gpt-register-panel/runtime/.config',
+    'XDG_CACHE_HOME=/run/gpt-register-panel/runtime/.cache',
+    'XDG_RUNTIME_DIR=/run/gpt-register-panel/runtime',
   ]) {
     const name = expected.slice(0, expected.indexOf('=') + 1);
     assert.deepEqual(
@@ -249,6 +253,7 @@ test('systemd unit limits privilege and writable scope without blocking Phase3 n
   assert.equal(one(unit, 'Service', 'NoNewPrivileges'), 'true');
   assert.equal(one(unit, 'Service', 'PrivateTmp'), 'true');
   assert.equal(one(unit, 'Service', 'PrivateDevices'), 'true');
+  assert.equal(one(unit, 'Service', 'ProtectHome'), 'true');
   assert.equal(one(unit, 'Service', 'ProtectSystem'), 'strict');
   assert.equal(one(unit, 'Service', 'RestrictNamespaces'), 'true');
   assert.equal(one(unit, 'Service', 'CapabilityBoundingSet'), '');

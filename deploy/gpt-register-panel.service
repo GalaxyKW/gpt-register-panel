@@ -57,6 +57,13 @@ Environment=PANEL_BACKUP_DIR=/run/gpt-register-panel/runtime/backups
 Environment=PANEL_LOG_PATH=/run/gpt-register-panel/runtime/panel.log
 Environment=PANEL_CONTROL_LOCK_PATH=/run/gpt-register-panel/runtime/panel.sqlite3.control.lock
 Environment=PANEL_TOKEN_QUARANTINE_DIR=/run/gpt-register-panel/gpt_register/.panel-quarantine/expired-tokens
+# Chromium and its launch helpers may consult HOME/XDG even with an explicit
+# browser profile. Keep that state inside the already pinned writable runtime
+# instead of exposing root's real home directory to this network-facing unit.
+Environment=HOME=/run/gpt-register-panel/runtime
+Environment=XDG_CONFIG_HOME=/run/gpt-register-panel/runtime/.config
+Environment=XDG_CACHE_HOME=/run/gpt-register-panel/runtime/.cache
+Environment=XDG_RUNTIME_DIR=/run/gpt-register-panel/runtime
 ExecStartPre=/usr/bin/test -r /etc/gpt-register-panel/panel.env
 ExecStartPre=/usr/bin/test -x /usr/bin/node
 # BindPaths follows its source path before ExecStartPre runs. Check every
@@ -98,6 +105,7 @@ TasksMax=512
 NoNewPrivileges=true
 PrivateTmp=true
 PrivateDevices=true
+ProtectHome=true
 ProtectSystem=strict
 # Keep the host filesystem read-only except for the two pinned writable data
 # roots. The project code has its own read-only bind and is never executed via

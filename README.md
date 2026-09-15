@@ -125,6 +125,11 @@ unit 使用只读文件系统视图，只开放以下已经绑定并固定的服
 - `/run/gpt-register-panel/runtime`（来源为项目的 `runtime`）
 - `/run/gpt-register-panel/gpt_register`（来源为 `/mnt/nvme/gpt_register`）
 
+服务看不到宿主机的 `/root`、`/home` 和 `/run/user`。Chromium 启动器可能读取的
+`HOME`、`XDG_CONFIG_HOME`、`XDG_CACHE_HOME` 和 `XDG_RUNTIME_DIR` 均固定到上述
+私有 runtime 绑定内；这些值也会通过 Phase3 的环境白名单传给子进程，不能从
+`panel.env` 改回宿主机家目录。
+
 `gpt_register` 根目录必须可写，因为 Phase3 会在其中原子替换 `username.json` 等状态文件；unit 会把可信别名下的 `index.js`、`src`、`node_modules`、包清单和配置文件重新覆盖为只读，并隐藏原路径及可信别名中的两个项目 `.git`。数据库、备份、日志、控制面锁、token 隔离目录、Phase3 根和 Phase3 Node 路径均由 unit 显式固定，`panel.env` 中遗留的原始绝对路径不会覆盖它们。`/mnt/nvme/tmp` 不再作为额外可写路径，普通临时文件使用 systemd 提供的私有 `/tmp`。但当前相关项目仍有部分诊断截图硬编码到 `/mnt/nvme/tmp`；在这个加固 unit 中这些截图不会保存，而某些上游错误文字仍可能提到预期路径，因此不得把路径文字当作截图确实存在的证据。应在 `gpt_register` 将截图根改为可配置且固定到私有目录后再依赖该诊断功能，不能为保留截图而把整个宿主 `/mnt/nvme/tmp` 开放给服务写入。同时启用私有设备视图、禁止子进程新建 namespace、禁用 core dump、限制进程数和 socket address family；保留 Chromium/Xvfb 所需的 Unix、IPv4、IPv6 与 netlink socket。上线新版 unit 前仍应在真实环境跑一次非破坏性的 Phase3 验证，因为 Chromium 或显示环境升级可能引入新的设备需求。
 
 模板按上述固定默认路径收口。若要移动数据库、日志、备份、隔离目录、控制面锁、token 输出目录、浏览器 profile 或截图目录，只改 `panel.env` 或 `gpt_register/config.json` 不够；必须为新源目录增加独立的可信 `/run/gpt-register-panel/...` 绑定，令应用只使用绑定后的目标路径，并保留代码及配置的只读覆盖。若 `GPT_REGISTER_ROOT` 或挂载点变化，还必须同步修改全部绑定、环境变量、启动检查、`RequiresMountsFor`、`BindsTo` 和读写路径；不能直接把 `/`、`/mnt` 或整个 `/mnt/nvme` 设为可写。所有绑定源必须在服务启动前存在，关键源目录和文件必须由 root 安全持有且不可由组或其他用户写入。
