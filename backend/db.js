@@ -202,15 +202,21 @@ function storedJobOwnerIsDefinitelyGone(job) {
 }
 
 function storedJobOwnedBy(job, owner) {
-  if (Number(job?.owner_pid) !== Number(owner?.pid)) return false;
+  // Do not coerce a persisted PID. SQLite affinity can retain strings such as
+  // `0x...`, which JavaScript Number() accepts even though the owner column no
+  // longer has the canonical integer storage type used at admission. Treating
+  // that row as locally owned could release a queued claim as "not started".
+  if (!Number.isSafeInteger(job?.owner_pid) || job.owner_pid <= 0
+      || !Number.isSafeInteger(owner?.pid) || owner.pid <= 0
+      || job.owner_pid !== owner.pid) return false;
   const startMatches = owner?.processStartId
-    ? String(job?.owner_start_id || '') === String(owner.processStartId)
-    : job?.owner_start_id === null || job?.owner_start_id === undefined
-      || String(job.owner_start_id) === '';
+    ? typeof job?.owner_start_id === 'string'
+      && job.owner_start_id === owner.processStartId
+    : job?.owner_start_id === null || job?.owner_start_id === undefined;
   const bootMatches = owner?.processBootId
-    ? String(job?.owner_boot_id || '') === String(owner.processBootId)
-    : job?.owner_boot_id === null || job?.owner_boot_id === undefined
-      || String(job.owner_boot_id) === '';
+    ? typeof job?.owner_boot_id === 'string'
+      && job.owner_boot_id === owner.processBootId
+    : job?.owner_boot_id === null || job?.owner_boot_id === undefined;
   return startMatches && bootMatches;
 }
 
@@ -949,6 +955,15 @@ function validateJobClaims(database, { cleanupOrdinaryTerminalClaims = false } =
         // Progress metadata on an active row is not allowed to smuggle a
         // truthy/falsy reconciliation control value past terminal validation.
         parseJobResult();
+      }
+      if (active && job.status === 'queued' && jobExecutionOutcomeUnknown(job)) {
+        // The supported dispatch transition persists `running` and
+        // `started_at` atomically before any protected operation begins. A
+        // queued row carrying execution evidence therefore cannot safely be
+        // launched (or later reclaimed as definitely not started), even when
+        // its recorded owner process is still alive. Convert it through the
+        // normal unknown-outcome recovery path and retain its claims.
+        job.force_recovery = true;
       }
       const acknowledgementMetadataPresent = [
         job.reconciliation_scope,
@@ -2383,6 +2398,16 @@ class PanelDb {
             || (before.mode & 0o077) !== 0) {
           throw new Error('PANEL_DB_PATH 必须是当前用户持有的 0600 非硬链接普通文件');
         }
+        // sql.js treats an empty Uint8Array as a request to create a brand-new
+        // database. An existing zero-byte file is instead evidence that the
+        // durable database was truncated (or that deployment pre-created the
+        // wrong target). Silently accepting it would discard every active
+        // claim and reconciliation barrier, allowing remote work to repeat.
+        if (before.size === 0) {
+          const error = new Error('SQLite 数据库文件为空，拒绝将其当作新数据库');
+          error.code = 'PANEL_DB_EMPTY';
+          throw error;
+        }
         if (before.size > databaseMaximumBytes()) {
           const error = new Error('SQLite 数据库文件超过安全上限');
           error.code = 'PANEL_DB_TOO_LARGE';
@@ -2530,8 +2555,17 @@ class PanelDb {
 
   pruneRows({ pruneMutationReceipts = true } = {}) {
     const maxJobs = maximumRetainedJobs();
-    const maxAudit = Math.max(100, Math.min(200000, Number(process.env.PANEL_MAX_AUDIT_EVENTS) || 20000));
-    const maxSnapshots = Math.max(20, Math.min(10000, Number(process.env.PANEL_MAX_SNAPSHOTS) || 500));
+    // OFFSET accepts only an integer. Environment values such as `100.5`
+    // previously reached SQLite verbatim and made initialization plus every
+    // subsequent write fail with `datatype mismatch`.
+    const maxAudit = Math.trunc(Math.max(
+      100,
+      Math.min(200000, Number(process.env.PANEL_MAX_AUDIT_EVENTS) || 20000),
+    ));
+    const maxSnapshots = Math.trunc(Math.max(
+      20,
+      Math.min(10000, Number(process.env.PANEL_MAX_SNAPSHOTS) || 500),
+    ));
     // Never prune a queued/running job: its claim is the guard that prevents
     // duplicate remote work. Terminal history is expendable; active work is
     // not, even when a burst temporarily exceeds the retention limit.
@@ -3526,7 +3560,7 @@ class PanelDb {
         validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
       }
       const row = resultRows(database.exec(`SELECT id, type, status, claim_keys_json, result_json,
-          owner_pid, owner_start_id, owner_boot_id,
+          error, started_at, finished_at, owner_pid, owner_start_id, owner_boot_id,
           reconciliation_hold, reconciliation_scope, reconciliation_claim_digest
         FROM sync_jobs WHERE id = ${sqlString(id)} LIMIT 1`))[0];
       if (!row) {
@@ -3564,6 +3598,36 @@ class PanelDb {
       // result, error and timestamp patches as well as explicit transitions;
       // dedicated recovery paths remain responsible for foreign dead owners.
       assertStoredJobOwnedByCurrentProcess(row);
+      if (currentStatus === 'queued' && jobExecutionOutcomeUnknown(row)) {
+        const error = new Error('排队任务已包含执行痕迹，必须先进行未知结果恢复');
+        error.code = 'JOB_QUEUED_STATE_INCONSISTENT';
+        error.currentStatus = currentStatus;
+        throw error;
+      }
+      const queuedExecutionEvidence = [
+        safeResultJson,
+        safeError,
+        safeStartedAt,
+        safeFinishedAt,
+      ].some((value) => value !== undefined && value !== null);
+      if (currentStatus === 'queued' && !hasRequestedStatus && queuedExecutionEvidence) {
+        const error = new Error('排队任务不得在开始前写入执行痕迹');
+        error.code = 'JOB_STATUS_CONFLICT';
+        error.currentStatus = currentStatus;
+        error.requestedStatus = null;
+        throw error;
+      }
+      if (currentStatus === 'queued' && requestedStatus === 'running'
+          && (!isCanonicalIsoTimestamp(safeStartedAt)
+            || safeResultJson !== undefined
+            || (safeError !== undefined && safeError !== null)
+            || (safeFinishedAt !== undefined && safeFinishedAt !== null))) {
+        const error = new Error('任务开始转换必须只写入规范的开始时间');
+        error.code = 'JOB_STATUS_CONFLICT';
+        error.currentStatus = currentStatus;
+        error.requestedStatus = requestedStatus;
+        throw error;
+      }
       const transitionAllowed = !hasRequestedStatus
         || (currentStatus === 'queued'
           && (requestedStatus === 'running' || terminalStatus !== null))

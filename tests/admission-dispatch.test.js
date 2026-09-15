@@ -642,6 +642,33 @@ test('owner mismatch rejects an admission batch without releasing any claim', as
   assert.equal(claims, 2);
 });
 
+test('a coercible text PID cannot impersonate the current job owner', async () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-admission-owner-type-'));
+  const db = new PanelDb(path.join(directory, 'panel.sqlite3'));
+  const claimKey = 'phase3:email:owner-type@example.test';
+  const job = await db.createJob('phase3', {}, 'local', { claimKeys: [claimKey] });
+  const hexadecimalPid = '0x' + process.pid.toString(16);
+  assert.equal(Number(hexadecimalPid), process.pid);
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET owner_pid = ? WHERE id = ?');
+    try {
+      statement.run([hexadecimalPid, job.id]);
+    } finally {
+      statement.free();
+    }
+  });
+  assert.equal(await db.read((database) => database.exec(`SELECT typeof(owner_pid)
+    FROM sync_jobs WHERE id = '${job.id}'`)[0]?.values?.[0]?.[0]), 'text');
+
+  await assert.rejects(
+    db.interruptOwnedQueuedJobsBeforeDispatch([job.id]),
+    (error) => error.code === 'JOB_OWNER_CONFLICT',
+  );
+  assert.equal((await db.getJob(job.id)).status, 'queued');
+  assert.equal(await db.read((database) => Number(database.exec(`SELECT COUNT(*)
+    FROM job_claims WHERE job_id = '${job.id}'`)[0]?.values?.[0]?.[0])), 1);
+});
+
 test('dispatch guard never relabels a previously running interruption as not started', async () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-admission-unsafe-skip-'));
   const db = new PanelDb(path.join(directory, 'panel.sqlite3'));

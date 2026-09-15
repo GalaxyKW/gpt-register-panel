@@ -149,6 +149,26 @@ test('job updates reject invalid results and timestamps without poisoning later 
   await db.updateJob(later.id, { status: 'failed', error: 'test cleanup' });
 });
 
+test('fractional retention settings cannot inject a decimal SQLite OFFSET', async () => {
+  const previousAudit = process.env.PANEL_MAX_AUDIT_EVENTS;
+  const previousSnapshots = process.env.PANEL_MAX_SNAPSHOTS;
+  process.env.PANEL_MAX_AUDIT_EVENTS = '100.5';
+  process.env.PANEL_MAX_SNAPSHOTS = '20.75';
+  try {
+    const db = new PanelDb(databasePath('fractional-retention'));
+    await db.ready;
+    await db.audit({ actor: 'tester', action: 'fractional_retention', result: 'ok' });
+    const job = await db.createJob('diagnostic', {}, 'tester');
+    await db.updateJob(job.id, { status: 'failed', error: 'test cleanup' });
+    assert.equal(await scalar(db, 'SELECT COUNT(*) FROM sync_jobs'), 1);
+  } finally {
+    if (previousAudit === undefined) delete process.env.PANEL_MAX_AUDIT_EVENTS;
+    else process.env.PANEL_MAX_AUDIT_EVENTS = previousAudit;
+    if (previousSnapshots === undefined) delete process.env.PANEL_MAX_SNAPSHOTS;
+    else process.env.PANEL_MAX_SNAPSHOTS = previousSnapshots;
+  }
+});
+
 test('shutdown interruption rejects an oversized reason before changing job state', async () => {
   const db = new PanelDb(databasePath('interrupt-reason-bound'));
   const job = await db.createJob('diagnostic', {}, 'tester');

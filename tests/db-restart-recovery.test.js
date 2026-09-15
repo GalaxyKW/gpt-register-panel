@@ -281,6 +281,59 @@ test('a queued mutation rechecks holds at execution time and exits without creat
     `SELECT COUNT(*) FROM job_claims WHERE job_id = '${second.id}'`), 0);
 });
 
+test('queued execution evidence is never launched or reclaimed as not started', async () => {
+  const db = new PanelDb(databasePath('queued-execution-evidence'));
+  const claimKey = 'phase3:queued-execution-evidence';
+  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+
+  await assert.rejects(
+    db.updateJob(job.id, { result: { progress: 1 } }),
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
+      && error.currentStatus === 'queued',
+  );
+  await assert.rejects(
+    db.updateJob(job.id, { status: 'running' }),
+    (error) => error.code === 'JOB_STATUS_CONFLICT'
+      && error.currentStatus === 'queued'
+      && error.requestedStatus === 'running',
+  );
+
+  // Simulate a legacy/crash-corrupt row that persisted execution evidence
+  // without atomically changing the state to running.
+  await db.write((database) => {
+    const statement = database.prepare('UPDATE sync_jobs SET started_at = ? WHERE id = ?');
+    try {
+      statement.run(['2026-09-15T00:00:01.000Z', job.id]);
+    } finally {
+      statement.free();
+    }
+  });
+
+  await assert.rejects(
+    db.updateJob(job.id, {
+      status: 'failed',
+      result: { executionOutcome: 'not_started' },
+      finishedAt: '2026-09-15T00:00:02.000Z',
+    }),
+    (error) => error.code === 'JOB_QUEUED_STATE_INCONSISTENT'
+      && error.currentStatus === 'queued',
+  );
+
+  await assert.rejects(
+    db.startMutationJob(job.id),
+    (error) => error.code === 'JOB_BLOCKED_BY_RECONCILIATION'
+      && error.existingJobId === job.id
+      && error.blockedBeforeStart === true,
+  );
+  const held = await db.getJob(job.id);
+  assert.equal(held.status, 'interrupted');
+  assert.equal(held.result.executionOutcome, 'unknown');
+  assert.equal(held.result.reconciliationReason, 'queued_state_inconsistent');
+  assert.equal(held.result.reconciliationHold, true);
+  assert.equal(await scalar(db,
+    `SELECT COUNT(*) FROM job_claims WHERE job_id = '${job.id}'`), 1);
+});
+
 test('acknowledgement is CAS-protected, audited, idempotent, and never makes the old operation retryable', async () => {
   const file = databasePath('ack');
   const db = new PanelDb(file);

@@ -9,6 +9,8 @@ const { redactText, redactValue } = require('./logger');
 const CONTROL_LOCK_KIND = 'gpt-register-panel-control-lock';
 const CONTROL_LOCK_RELEASE_CODE = 'CONTROL_PLANE_LOCK_RELEASE_FAILED';
 const CRITICAL_SECTION_RESULT_MAX_BYTES = 512 * 1024;
+const PROCESS_START_ID_PATTERN = /^(?:0|[1-9][0-9]{0,19})$/;
+const PROCESS_BOOT_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // Keep FIFO ordering inside one process, then take a filesystem lease for the
 // whole callback so independently started panel processes cannot overlap work
@@ -32,12 +34,15 @@ function processInformation(pid) {
   }
 }
 
-const PROCESS_START_ID = processInformation(process.pid)?.startId || '';
+const RAW_PROCESS_START_ID = processInformation(process.pid)?.startId || '';
+const PROCESS_START_ID = PROCESS_START_ID_PATTERN.test(RAW_PROCESS_START_ID)
+  ? RAW_PROCESS_START_ID
+  : '';
 const PROCESS_BOOT_ID = (() => {
   if (process.platform !== 'linux') return '';
   try {
     const value = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-    return /^[a-f0-9-]{36}$/i.test(value) ? value.toLowerCase() : '';
+    return PROCESS_BOOT_ID_PATTERN.test(value) ? value.toLowerCase() : '';
   } catch {
     return '';
   }
@@ -54,8 +59,6 @@ function currentProcessOwner() {
 function isProcessOwnerAlive(pid, expectedStartId = '', expectedBootId = '') {
   const normalizedPid = Number(pid);
   if (!Number.isSafeInteger(normalizedPid) || normalizedPid <= 0) return false;
-  if (expectedBootId && PROCESS_BOOT_ID
-      && String(expectedBootId).toLowerCase() !== PROCESS_BOOT_ID) return false;
   try {
     process.kill(normalizedPid, 0);
   } catch (error) {
@@ -64,6 +67,15 @@ function isProcessOwnerAlive(pid, expectedStartId = '', expectedBootId = '') {
   }
   const information = processInformation(normalizedPid);
   if (information && ['Z', 'X'].includes(information.state)) return false;
+  // A malformed persisted identity is not evidence that a live PID belongs to
+  // a different process. Treat it as unverifiable and keep its lease. Only a
+  // canonical boot/start mismatch can safely authorize stale-entry cleanup.
+  if (expectedBootId && (typeof expectedBootId !== 'string'
+      || !PROCESS_BOOT_ID_PATTERN.test(expectedBootId))) return true;
+  if (expectedStartId && (typeof expectedStartId !== 'string'
+      || !PROCESS_START_ID_PATTERN.test(expectedStartId))) return true;
+  if (expectedBootId && PROCESS_BOOT_ID
+      && expectedBootId.toLowerCase() !== PROCESS_BOOT_ID) return false;
   if (expectedStartId && information?.startId && information.startId !== String(expectedStartId)) return false;
   return true;
 }

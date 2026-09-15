@@ -8,7 +8,11 @@ const initSqlJs = require('sql.js');
 require('./test-isolation');
 
 const { PanelDb } = require('../backend/db');
-const { currentProcessOwner, withControlPlaneLock } = require('../backend/taskCoordinator');
+const {
+  currentProcessOwner,
+  isProcessOwnerAlive,
+  withControlPlaneLock,
+} = require('../backend/taskCoordinator');
 const { acquireBakeryLease, releaseBakeryLease } = require('../backend/lib/bakeryLock');
 
 function queryRows(database, sql) {
@@ -67,6 +71,83 @@ async function writeLegacyDatabase(file) {
   fs.writeFileSync(file, Buffer.from(database.export()), { mode: 0o600 });
   database.close();
 }
+
+test('an existing empty database fails closed instead of erasing durable task barriers', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-empty-db-'));
+  const file = path.join(root, 'panel.sqlite3');
+  fs.writeFileSync(file, Buffer.alloc(0), { mode: 0o600 });
+
+  const db = new PanelDb(file);
+  await assert.rejects(db.ready, (error) => error.code === 'PANEL_DB_EMPTY');
+  assert.equal(fs.statSync(file).size, 0);
+});
+
+test('malformed live owner identities are unverifiable rather than reclaimable', async () => {
+  const owner = currentProcessOwner();
+  assert.equal(isProcessOwnerAlive(process.pid, 'not-a-start-id', owner.processBootId), true);
+  assert.equal(isProcessOwnerAlive(
+    process.pid,
+    owner.processStartId,
+    '000000000000000000000000000000000000',
+  ), true);
+  assert.equal(isProcessOwnerAlive(
+    2147483647,
+    'not-a-start-id',
+    '000000000000000000000000000000000000',
+  ), false);
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-owner-shape-'));
+  const lockName = 'owner-shape.lock';
+  const kind = 'test-malformed-owner-lock';
+  const descriptor = fs.openSync(
+    root,
+    fs.constants.O_RDONLY | (fs.constants.O_DIRECTORY || 0),
+  );
+  const accessDirectory = process.platform === 'linux'
+    ? '/proc/self/fd/' + descriptor
+    : root;
+  const options = {
+    directoryDescriptor: descriptor,
+    accessDirectory,
+    lockName,
+    kind,
+    owner,
+    isOwnerAlive: isProcessOwnerAlive,
+    timeoutMs: 50,
+    pollMs: 5,
+    timeoutCode: 'TEST_OWNER_TIMEOUT',
+  };
+  const malformedToken = 'a'.repeat(32);
+  const malformedPath = path.join(
+    root,
+    lockName + '.lease-v2-' + malformedToken + '.ticket',
+  );
+  try {
+    const initial = await acquireBakeryLease(options);
+    releaseBakeryLease(initial);
+    fs.writeFileSync(malformedPath, JSON.stringify({
+      kind,
+      protocol: 'lamport-bakery',
+      version: 2,
+      role: 'lease',
+      phase: 'ticket',
+      pid: process.pid,
+      processStartId: owner.processStartId,
+      processBootId: '000000000000000000000000000000000000',
+      token: malformedToken,
+      ticket: 1,
+      createdAt: new Date().toISOString(),
+    }), { mode: 0o600 });
+    await assert.rejects(
+      acquireBakeryLease(options),
+      (error) => error.code === 'TEST_OWNER_TIMEOUT',
+    );
+    assert.equal(fs.existsSync(malformedPath), true);
+  } finally {
+    try { fs.unlinkSync(malformedPath); } catch {}
+    fs.closeSync(descriptor);
+  }
+});
 
 test('PanelDb distinguishes a proven boot mismatch from an unverifiable incomplete owner', async (context) => {
   const owner = currentProcessOwner();
