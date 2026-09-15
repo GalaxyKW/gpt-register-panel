@@ -7,6 +7,7 @@ const {
 } = require('../lib/token');
 const crypto = require('node:crypto');
 const net = require('node:net');
+const { performance } = require('node:perf_hooks');
 const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 
@@ -291,7 +292,10 @@ function firstScalar(values, maximumLength, allowNumber = false) {
 
 function positiveAccountId(value) {
   if (typeof value !== 'string' && typeof value !== 'number') return null;
-  const text = String(value).trim();
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  const text = value;
   if (!/^[1-9]\d*$/.test(text)) return null;
   const id = Number(text);
   return Number.isSafeInteger(id) && id > 0 ? id : null;
@@ -407,9 +411,14 @@ function identityKeysFromFields(accountField, userField, emailField) {
 }
 
 function boundedTimeout(value, fallback, maximum) {
-  const number = Number(value);
-  if (!Number.isFinite(number) || number <= 0) return fallback;
-  return Math.min(Math.floor(number), maximum);
+  let number = null;
+  if (typeof value === 'number') {
+    if (Number.isSafeInteger(value) && value > 0) number = value;
+  } else if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) {
+    const parsed = Number(value);
+    if (Number.isSafeInteger(parsed)) number = parsed;
+  }
+  return number === null ? fallback : Math.min(number, maximum);
 }
 
 function isLoopbackHostname(hostname) {
@@ -934,6 +943,11 @@ function writeLog(logger, level, event, fields = {}) {
   }
 }
 
+function monotonicElapsedMilliseconds(startedAt) {
+  const elapsed = performance.now() - Number(startedAt);
+  return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
+}
+
 function safeRemoteText(value, limit = 1000) {
   let text = value;
   if (value && typeof value === 'object') {
@@ -1183,8 +1197,12 @@ function parseAccountTestSse(text) {
       );
       return;
     }
-    events.push(parsed);
     if (parsed.type === 'error') {
+      if (hasOwn(parsed, 'success') && parsed.success !== false) {
+        invalidate('conflicting_terminal');
+        return;
+      }
+      events.push(parsed);
       terminal = { kind: 'failure', event: parsed };
       return;
     }
@@ -1199,11 +1217,14 @@ function parseAccountTestSse(text) {
         invalidate('conflicting_terminal');
         return;
       }
+      events.push(parsed);
       terminal = {
         kind: parsed.success ? 'success' : 'failure',
         event: parsed,
       };
+      return;
     }
+    events.push(parsed);
   };
 
   let source = String(text || '');
@@ -1466,7 +1487,7 @@ class Sub2ApiAdminClient {
     method = target.method;
     pathname = target.pathname;
     const logPath = target.logPath;
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     writeLog(this.logger, 'info', 'sub2api.request_started', { ...this.logContext, method, path: logPath });
     const headers = { Accept: 'application/json' };
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
@@ -1568,7 +1589,7 @@ class Sub2ApiAdminClient {
         ...this.logContext,
         method,
         path: logPath,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: safeRemoteText(failure.message),
         writeOutcomeUnknown: failure.writeOutcomeUnknown === true,
       });
@@ -1644,7 +1665,7 @@ class Sub2ApiAdminClient {
         method,
         path: logPath,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: error.message,
         upstreamDetailPresent,
         writeOutcomeUnknown: error.writeOutcomeUnknown === true,
@@ -1665,7 +1686,7 @@ class Sub2ApiAdminClient {
       method,
       path: logPath,
       statusCode: response.status,
-      durationMs: Date.now() - startedAt,
+      durationMs: monotonicElapsedMilliseconds(startedAt),
     });
     return unwrapData(payload);
   }
@@ -1887,7 +1908,7 @@ class Sub2ApiAdminClient {
       'SUB2API_TEST_ID_INVALID',
       'Sub2API 账号测试缺少有效账号 ID',
     );
-    const startedAt = Date.now();
+    const startedAt = performance.now();
     const pathname = '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/test';
     const modelId = requestedTestModelId(options);
     const prompt = requestedTestPrompt(options);
@@ -1975,7 +1996,7 @@ class Sub2ApiAdminClient {
           ...this.logContext,
           accountId,
           model: modelId || null,
-          durationMs: Date.now() - startedAt,
+          durationMs: monotonicElapsedMilliseconds(startedAt),
         });
       } else if (abortSource === 'timeout') {
         failure = requestFailure('SUB2API_TEST_TIMEOUT', 'Sub2API 账号测试超时');
@@ -2008,7 +2029,7 @@ class Sub2ApiAdminClient {
         accountId,
         model: modelId || null,
         statusCode: Number.isSafeInteger(response?.status) ? response.status : null,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: safeRemoteText(failure.message),
         testOutcomeUnknown: failure.testOutcomeUnknown === true,
       });
@@ -2028,7 +2049,7 @@ class Sub2ApiAdminClient {
         accountId,
         model: modelId || null,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: failure.message,
         testOutcomeUnknown: true,
       });
@@ -2045,7 +2066,7 @@ class Sub2ApiAdminClient {
         accountId,
         model: modelId || null,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: failure.message,
         testOutcomeUnknown: true,
       });
@@ -2064,7 +2085,7 @@ class Sub2ApiAdminClient {
         accountId,
         model: modelId || null,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: detail,
       });
       const error = new Error(detail);
@@ -2078,7 +2099,7 @@ class Sub2ApiAdminClient {
         accountId,
         model: modelId,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: detail,
       });
       const error = new Error(detail);
@@ -2092,14 +2113,14 @@ class Sub2ApiAdminClient {
         accountId,
         model: completedModel,
         statusCode: response.status,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
         error: detail,
       });
       return {
         success: false,
         model: completedModel,
         message: detail,
-        durationMs: Date.now() - startedAt,
+        durationMs: monotonicElapsedMilliseconds(startedAt),
       };
     }
     writeLog(this.logger, 'info', 'sub2api.account_test_succeeded', {
@@ -2107,13 +2128,13 @@ class Sub2ApiAdminClient {
       accountId,
       model: completedModel,
       statusCode: response.status,
-      durationMs: Date.now() - startedAt,
+      durationMs: monotonicElapsedMilliseconds(startedAt),
     });
     return {
       success: true,
       model: completedModel,
       message: '测试请求成功',
-      durationMs: Date.now() - startedAt,
+      durationMs: monotonicElapsedMilliseconds(startedAt),
     };
   }
 

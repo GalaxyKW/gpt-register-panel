@@ -1397,6 +1397,17 @@ test('uses Sub2API stored token fingerprints and credential-presence metadata wi
   assert.equal(Object.prototype.hasOwnProperty.call(safe, 'credentials'), false);
 });
 
+test('Sub2API accounts require canonical positive safe-integer IDs', () => {
+  assert.equal(safeAccount({ id: '19' })?.id, 19);
+  assert.equal(safeAccount({ id: 19 })?.id, 19);
+  for (const id of [
+    ' 19', '19 ', '019', '+19', '19.0', '', 0, -1, 1.5,
+    Number.MAX_SAFE_INTEGER + 1, true, null,
+  ]) {
+    assert.equal(safeAccount({ id }), null, 'unexpected accepted id: ' + String(id));
+  }
+});
+
 test('safe accounts reject secret-like and confusing strong identities without exposing them', () => {
   const dangerousValues = [
     'Bearer identity-leak-marker',
@@ -3450,6 +3461,99 @@ test('Sub2API timeouts are hard-bounded and request serialization clears its tim
     global.setTimeout = originalSetTimeout;
     global.clearTimeout = originalClearTimeout;
     if (requestTimer) originalClearTimeout(requestTimer);
+  }
+});
+
+test('Sub2API timeouts reject coercive and fractional values instead of collapsing to 1ms', async () => {
+  for (const timeoutMs of [0.5, '0.5', true, '001', ' 10', 0, -1]) {
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      timeoutMs,
+      testTimeoutMs: timeoutMs,
+    });
+    assert.equal(client.timeoutMs, 15000);
+    assert.equal(client.testTimeoutMs, 120000);
+  }
+  const canonical = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    timeoutMs: '25',
+    testTimeoutMs: '50',
+  });
+  assert.equal(canonical.timeoutMs, 25);
+  assert.equal(canonical.testTimeoutMs, 50);
+
+  const originalFetch = global.fetch;
+  const originalSetTimeout = global.setTimeout;
+  const originalClearTimeout = global.clearTimeout;
+  const delays = [];
+  try {
+    global.setTimeout = (callback, delay) => {
+      delays.push(delay);
+      return { callback, delay };
+    };
+    global.clearTimeout = () => {};
+    global.fetch = async () => new Response(
+      'data: {"type":"test_complete","success":true}\n\n',
+      { status: 200, headers: { 'content-type': 'text/event-stream' } },
+    );
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+      testTimeoutMs: 10000,
+    });
+    assert.equal((await client.testAccount(1, { timeoutMs: true })).success, true);
+    assert.equal(delays[0], 10000);
+  } finally {
+    global.fetch = originalFetch;
+    global.setTimeout = originalSetTimeout;
+    global.clearTimeout = originalClearTimeout;
+  }
+});
+
+test('Sub2API request and account-test durations use a monotonic clock', async () => {
+  const originalFetch = global.fetch;
+  const originalDateNow = Date.now;
+  const logs = [];
+  let wallClock = 10_000;
+  const logger = Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+    level,
+    (event, fields) => {
+      logs.push({ level, event, fields });
+      if (event === 'sub2api.request_started' || event === 'sub2api.account_test_started') {
+        wallClock = 1;
+      }
+    },
+  ]));
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger,
+  });
+  try {
+    Date.now = () => wallClock;
+    global.fetch = async (url) => String(url).endsWith('/test')
+      ? new Response('data: {"type":"test_complete","success":true}\n\n', {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      })
+      : new Response(JSON.stringify({ code: 0, data: { accepted: true } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    await client.request('GET', '/api/v1/admin/accounts');
+    wallClock = 10_000;
+    const tested = await client.testAccount(1);
+    assert.equal(tested.success, true);
+    assert.equal(Number.isFinite(tested.durationMs), true);
+    assert.equal(tested.durationMs >= 0, true);
+    const timedLogs = logs.filter((entry) => Number.isFinite(entry.fields?.durationMs));
+    assert.equal(timedLogs.length >= 2, true);
+    assert.equal(timedLogs.every((entry) => entry.fields.durationMs >= 0), true);
+  } finally {
+    global.fetch = originalFetch;
+    Date.now = originalDateNow;
   }
 });
 

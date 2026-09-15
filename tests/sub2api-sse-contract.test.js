@@ -190,6 +190,14 @@ test('Sub2API contradictory, malformed, and incomplete SSE outcomes remain unkno
       body: 'data: {"type":"test_complete","success":true,"message":"contradiction"}\n\n',
     },
     {
+      reason: 'conflicting_terminal',
+      body: 'data: {"type":"error","success":true}\n\n',
+    },
+    {
+      reason: 'conflicting_terminal',
+      body: 'data: {"type":"error","success":null}\n\n',
+    },
+    {
       reason: 'missing_terminal',
       body: 'data: {"type":"status","text":"running"}\n\n',
     },
