@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
+const { performance } = require('node:perf_hooks');
 
 const { readGptRegisterSources, toSafeSources } = require('./adapters/gptRegisterFs');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
@@ -56,7 +57,54 @@ const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
 const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
 
 function safeErrorMessage(error) {
-  return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
+  let detail = 'unknown error';
+  try {
+    let message;
+    try { message = error?.message; } catch {}
+    if (typeof message === 'string' && message) detail = message;
+    else if (error !== undefined && error !== null) detail = String(error);
+  } catch {
+    detail = 'unknown error';
+  }
+  try {
+    return redactText(detail).slice(0, 1000);
+  } catch {
+    return 'unknown error';
+  }
+}
+
+function currentTimeError() {
+  return targetVerificationError('无法安全确认当前时间', 'CURRENT_TIME_INVALID');
+}
+
+function assertCurrentTimeMilliseconds(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+    throw currentTimeError();
+  }
+  return value;
+}
+
+function readCurrentTimeMilliseconds(now = Date.now) {
+  if (typeof now !== 'function') throw currentTimeError();
+  try {
+    return assertCurrentTimeMilliseconds(now());
+  } catch {
+    throw currentTimeError();
+  }
+}
+
+function elapsedMilliseconds(startedAt) {
+  const elapsed = performance.now() - startedAt;
+  return Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : 0;
+}
+
+function canonicalPositiveAccountId(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) && value > 0 ? value : null;
+  }
+  if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return null;
+  const id = Number(value);
+  return Number.isSafeInteger(id) && id > 0 && String(id) === value ? id : null;
 }
 
 function safeRemoteError(value, message = 'Sub2API 已报告远程错误（详情已隐藏）') {
@@ -386,7 +434,7 @@ async function readSub2ApiAccounts(client, options = {}) {
 }
 
 async function buildSnapshot(query = new URLSearchParams(), options = {}) {
-  const startedAt = Date.now();
+  const startedAt = performance.now();
   const logger = options.logger;
   const signal = options.signal;
   const logContext = {
@@ -485,7 +533,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
     writeLog(logger, 'info', 'snapshot.completed', {
       ...logContext,
       version,
-      durationMs: Date.now() - startedAt,
+      durationMs: elapsedMilliseconds(startedAt),
       tokenCount: sources.summary.tokenCount,
       validTokenCount: sources.summary.validTokenCount,
       sub2apiReadStatus: readStatus,
@@ -499,7 +547,7 @@ async function buildSnapshot(query = new URLSearchParams(), options = {}) {
   } catch (error) {
     writeLog(logger, 'error', 'snapshot.failed', {
       ...logContext,
-      durationMs: Date.now() - startedAt,
+      durationMs: elapsedMilliseconds(startedAt),
       error: safeErrorMessage(error),
     });
     throw error;
@@ -519,6 +567,7 @@ function compareNaturalPath(leftValue, rightValue) {
 }
 
 function compareTokenRecordFreshness(leftRecord, rightRecord, nowMs = Date.now()) {
+  nowMs = assertCurrentTimeMilliseconds(nowMs);
   const left = leftRecord || {};
   const right = rightRecord || {};
   const leftExpiryInvalid = isExpiryInvalid(left);
@@ -612,7 +661,9 @@ function markIdentityConflict(candidate, reason) {
 }
 
 function collectCandidates(sources, options = {}) {
-  const nowMs = Number(options.nowMs || Date.now());
+  const nowMs = assertCurrentTimeMilliseconds(
+    Object.prototype.hasOwnProperty.call(options, 'nowMs') ? options.nowMs : Date.now(),
+  );
   const records = (sources.tokens || [])
     .filter((record) => record.parseStatus === 'ok' && record.raw && record.historical !== true)
     .sort((left, right) => compareNaturalPath(left.relativePath, right.relativePath));
@@ -860,9 +911,9 @@ function importPlanCredentialPresence(value) {
 
 function importPlanTargetState(account) {
   if (!account || typeof account !== 'object') return null;
-  const numericId = Number(account.id);
+  const numericId = canonicalPositiveAccountId(account.id);
   return {
-    id: Number.isSafeInteger(numericId) && numericId > 0 ? numericId : null,
+    id: numericId,
     name: typeof account.name === 'string' ? account.name : null,
     platform: typeof account.platform === 'string' ? account.platform : null,
     type: typeof account.type === 'string' ? account.type : null,
@@ -904,15 +955,13 @@ function importPlanTargetState(account) {
 
 function importPlanIntentItem(item) {
   const record = item?._record && typeof item._record === 'object' ? item._record : {};
-  const numericAccountId = Number(item?.accountId);
+  const numericAccountId = canonicalPositiveAccountId(item?.accountId);
   return {
     key: typeof item?.key === 'string' ? item.key : null,
     identityKeys: importPlanIdentityKeys(item?.sourceIdentityKeys),
     action: typeof item?.action === 'string' ? item.action : null,
     reason: typeof item?.reason === 'string' ? item.reason : null,
-    accountId: Number.isSafeInteger(numericAccountId) && numericAccountId > 0
-      ? numericAccountId
-      : null,
+    accountId: numericAccountId,
     accountName: typeof item?.accountName === 'string' ? item.accountName : null,
     source: typeof item?.source === 'string' ? item.source : null,
     relativePath: typeof item?.relativePath === 'string' ? item.relativePath : null,
@@ -1038,7 +1087,10 @@ function resolveImportCreatePolicy(plan, environment = process.env) {
   if (!importPlanHasCreates(plan)) {
     return { schema: IMPORT_CREATE_POLICY_SCHEMA, mode: 'not_applicable' };
   }
-  const configured = environment?.SUB2API_CONFIRM_MIXED_CHANNEL_RISK;
+  const configured = environment
+    && Object.prototype.hasOwnProperty.call(environment, 'SUB2API_CONFIRM_MIXED_CHANNEL_RISK')
+    ? environment.SUB2API_CONFIRM_MIXED_CHANNEL_RISK
+    : undefined;
   if (configured !== undefined && configured !== '0' && configured !== '1') {
     throw importBindingError(
       'IMPORT_CREATE_POLICY_INVALID',
@@ -1217,7 +1269,7 @@ function compareCandidateFreshness(left, right, nowMs) {
 }
 
 function buildImportPlan(sources, accounts, selectedKeys = []) {
-  const nowMs = Date.now();
+  const nowMs = readCurrentTimeMilliseconds();
   const candidates = collectCandidates(sources, { nowMs });
   // A mixed selection used to silently discard unknown, invalid, historical,
   // or Sub2API-only row keys while executing the remaining writes. Require
@@ -1591,11 +1643,11 @@ function importResultItems(result) {
 }
 
 function importResultAccountId(result) {
-  const direct = Number(result?.account_id ?? result?.accountId);
-  if (Number.isSafeInteger(direct) && direct > 0) return direct;
+  const direct = canonicalPositiveAccountId(result?.account_id ?? result?.accountId);
+  if (direct !== null) return direct;
   const ids = [...new Set(importResultItems(result)
-    .map((item) => Number(item.account_id ?? item.accountId))
-    .filter((id) => Number.isSafeInteger(id) && id > 0))];
+    .map((item) => canonicalPositiveAccountId(item.account_id ?? item.accountId))
+    .filter((id) => id !== null))];
   return ids.length === 1 ? ids[0] : null;
 }
 
@@ -1718,7 +1770,10 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   );
   throwIfJobInterrupted(signal);
   const identityMatches = accountMatches({ sourceIdentityKeys: expectedIdentity }, accounts);
-  if (identityMatches.length !== 1 || Number(identityMatches[0]?.id) !== Number(account.id)) {
+  const verifiedAccountId = canonicalPositiveAccountId(account?.id);
+  if (identityMatches.length !== 1
+      || verifiedAccountId === null
+      || canonicalPositiveAccountId(identityMatches[0]?.id) !== verifiedAccountId) {
     throw targetVerificationError(
       '导入后发现来源强身份对应多个 Sub2API 账号',
       'SUB2API_CREATE_RACE_IDENTITY_CONFLICT',
@@ -1733,7 +1788,8 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   if (parseCanonicalFreeName(expectedName) === null
       || String(account?.name || '') !== expectedName
       || nameMatches.length !== 1
-      || Number(nameMatches[0]?.id) !== Number(account.id)) {
+      || verifiedAccountId === null
+      || canonicalPositiveAccountId(nameMatches[0]?.id) !== verifiedAccountId) {
     throw targetVerificationError(
       '导入后发现 Sub2API 账号名称发生竞态或冲突',
       'SUB2API_CREATE_RACE_NAME_CONFLICT',
@@ -1773,9 +1829,13 @@ function credentialPresenceMetadataInvalid(account, requireComplete = false) {
 }
 
 function verifyTargetIdentity(item, account, expectedId = null) {
-  const actualId = Number(account?.id);
-  if (!Number.isSafeInteger(actualId) || actualId <= 0
-      || (expectedId !== null && actualId !== Number(expectedId))) {
+  const actualId = canonicalPositiveAccountId(account?.id);
+  const normalizedExpectedId = expectedId === null
+    ? null
+    : canonicalPositiveAccountId(expectedId);
+  if (actualId === null
+      || (expectedId !== null
+        && (normalizedExpectedId === null || actualId !== normalizedExpectedId))) {
     throw targetVerificationError('Sub2API 返回的账号 ID 与计划目标不一致', 'SUB2API_TARGET_ID_MISMATCH');
   }
   if (account?.schemaValid === false
@@ -2155,6 +2215,7 @@ function sourceTokenChanged(message = '来源 token 在写入前已变化') {
 }
 
 function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
+  nowMs = assertCurrentTimeMilliseconds(nowMs);
   const expected = item?._record;
   if (!expected?.contentHash || !item?.source || !item?.relativePath) {
     throw sourceTokenChanged('来源 token 快照缺少可复核的内容指纹');
@@ -2206,8 +2267,8 @@ async function preflightUpdateAccount(client, item, options = {}) {
   const signal = options.signal;
   const now = typeof options.now === 'function' ? options.now : Date.now;
   throwIfJobInterrupted(signal);
-  const expectedId = Number(item?.accountId);
-  if (!Number.isSafeInteger(expectedId) || expectedId <= 0) {
+  const expectedId = canonicalPositiveAccountId(item?.accountId);
+  if (expectedId === null) {
     throw targetVerificationError('更新计划缺少有效的 Sub2API 账号 ID', 'SUB2API_TARGET_ID_REQUIRED');
   }
   const account = await client.getAccount(expectedId, { signal });
@@ -2218,10 +2279,7 @@ async function preflightUpdateAccount(client, item, options = {}) {
   // A reset/overload window can expire while GET is in flight; using a
   // timestamp captured before the await can overwrite an account that is
   // already available by the time its response arrives.
-  const nowMs = Number(now());
-  if (!Number.isFinite(nowMs)) {
-    throw targetVerificationError('无法安全确认当前时间', 'CURRENT_TIME_INVALID');
-  }
+  const nowMs = readCurrentTimeMilliseconds(now);
   const availability = getAccountAvailability(account, nowMs);
   if (availability.key !== 'unavailable') {
     return { account, skipReason: availability.reason || 'sub2api_availability_unknown' };
@@ -2275,8 +2333,8 @@ async function preflightCreateAccount(client, item, options = {}) {
     );
   }
   return new Set(accounts
-    .map((account) => Number(account?.id))
-    .filter((id) => Number.isSafeInteger(id) && id > 0));
+    .map((account) => canonicalPositiveAccountId(account?.id))
+    .filter((id) => id !== null));
 }
 
 function assertCreatedImportResult(result, knownAccountIds = new Set()) {
@@ -2339,7 +2397,9 @@ async function executeImportPlanItem({
 }) {
   throwIfJobInterrupted(signal);
   if (item.action === 'update') {
-    let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot) : null;
+    let freshRecord = sourceRoot
+      ? revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now))
+      : null;
     throwIfJobInterrupted(signal);
     let preflight = await preflightUpdateAccount(client, item, { signal, now });
     if (preflight.skipReason) {
@@ -2350,7 +2410,7 @@ async function executeImportPlanItem({
       // catches a source replacement during the first GET while ensuring the
       // final operation immediately preceding the write is an exact-ID,
       // strong-identity and availability check of the remote target.
-      freshRecord = revalidateSourceToken(item, sourceRoot);
+      freshRecord = revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now));
       throwIfJobInterrupted(signal);
       preflight = await preflightUpdateAccount(client, item, { signal, now });
       if (preflight.skipReason) {
@@ -2435,7 +2495,8 @@ async function executeImportPlanItem({
       '新建账号缺少已确认的 Sub2API 分组绑定',
     );
   }
-  if (isExpiryInvalid(item?._record) || isExpired(item?._record, Date.now())) {
+  const createNowMs = readCurrentTimeMilliseconds(now);
+  if (isExpiryInvalid(item?._record) || isExpired(item?._record, createNowMs)) {
     return {
       skipped: true,
       reason: isExpiryInvalid(item?._record) ? 'source_expiry_invalid' : 'source_token_expired',
@@ -2443,11 +2504,11 @@ async function executeImportPlanItem({
       result: null,
     };
   }
-  let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot) : null;
+  let freshRecord = sourceRoot ? revalidateSourceToken(item, sourceRoot, createNowMs) : null;
   throwIfJobInterrupted(signal);
   let knownAccountIds = await preflightCreateAccount(client, item, { signal });
   if (sourceRoot) {
-    freshRecord = revalidateSourceToken(item, sourceRoot);
+    freshRecord = revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now));
     throwIfJobInterrupted(signal);
     const finalKnownAccountIds = await preflightCreateAccount(client, item, { signal });
     knownAccountIds = new Set([...knownAccountIds, ...finalKnownAccountIds]);
@@ -2908,8 +2969,8 @@ function assertBackupCoversUpdateTargets(payload, plan = []) {
     accountsByName.set(account.name, bucket);
   }
   for (const item of updates) {
-    const targetId = Number(item?.accountId);
-    if (!Number.isSafeInteger(targetId) || targetId <= 0 || targetIds.has(targetId)) {
+    const targetId = canonicalPositiveAccountId(item?.accountId);
+    if (targetId === null || targetIds.has(targetId)) {
       throw backupCoverageError();
     }
     targetIds.add(targetId);
@@ -2934,7 +2995,7 @@ async function executeImport({
   persistResult = null,
   persistFailure = null,
 }) {
-  const startedAt = Date.now();
+  const startedAt = performance.now();
   writeLog(logger, 'info', 'import.started', {
     jobId,
     actor,
@@ -3114,7 +3175,7 @@ async function executeImport({
       for (let itemIndex = 0; itemIndex < plan.length; itemIndex += 1) {
         const item = plan[itemIndex];
         throwIfJobInterrupted(signal);
-        const itemStartedAt = Date.now();
+        const itemStartedAt = performance.now();
         const baseFields = {
           jobId,
           actor,
@@ -3167,7 +3228,7 @@ async function executeImport({
             writeLog(logger, 'info', 'import.account_skipped_after_recheck', {
               ...baseFields,
               reason: outcome.reason,
-              durationMs: Date.now() - itemStartedAt,
+              durationMs: elapsedMilliseconds(itemStartedAt),
             });
             continue;
           }
@@ -3212,7 +3273,7 @@ async function executeImport({
           }
           writeLog(logger, 'info', 'import.account_succeeded', {
             ...baseFields,
-            durationMs: Date.now() - itemStartedAt,
+            durationMs: elapsedMilliseconds(itemStartedAt),
             sub2apiAccountId: verification.accountId,
           });
         } catch (error) {
@@ -3264,7 +3325,7 @@ async function executeImport({
             }
             writeLog(logger, 'error', 'import.account_reconciliation_required', {
               ...baseFields,
-              durationMs: Date.now() - itemStartedAt,
+              durationMs: elapsedMilliseconds(itemStartedAt),
               error: message,
               code: error?.code || null,
               reconciliationReason,
@@ -3294,7 +3355,7 @@ async function executeImport({
           }
           writeLog(logger, 'error', 'import.account_failed', {
             ...baseFields,
-            durationMs: Date.now() - itemStartedAt,
+            durationMs: elapsedMilliseconds(itemStartedAt),
             error: message,
           });
         }
@@ -3368,7 +3429,7 @@ async function executeImport({
     writeLog(logger, result.failed > 0 ? 'warn' : 'info', 'import.completed', {
       jobId,
       actor,
-      durationMs: Date.now() - startedAt,
+      durationMs: elapsedMilliseconds(startedAt),
       importedCount: result.imported?.length || 0,
       failed: result.failed || 0,
       skipped: Boolean(result.skipped || result.runtimeSkipped),
@@ -3381,7 +3442,7 @@ async function executeImport({
     writeLog(logger, 'error', 'import.failed', {
       jobId,
       actor,
-      durationMs: Date.now() - startedAt,
+      durationMs: elapsedMilliseconds(startedAt),
       error: safeErrorMessage(error),
       code: error?.code || null,
     });

@@ -17,11 +17,13 @@ const {
   collectCandidates,
   executeImport: executeImportWithAuditCheckpoint,
   executeImportPlanItem: executeImportPlanItemWithAuditCheckpoint,
+  importResultAccountId,
   importPlanSummary,
   buildSnapshot,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   snapshotVersion,
+  safeErrorMessage,
   importPlanIntentVersionsEqual,
   resolveGroupIds,
   resolveImportGroupBinding,
@@ -2933,6 +2935,9 @@ test('import intent binds a canonical target and the exact create policy without
     confirmMixedChannelRisk: false,
   });
   assert.equal(confirmedPolicy.confirmMixedChannelRisk, true);
+  assert.equal(resolveImportCreatePolicy(plan, Object.create({
+    SUB2API_CONFIRM_MIXED_CHANNEL_RISK: '1',
+  })).confirmMixedChannelRisk, false);
   assert.throws(
     () => resolveImportCreatePolicy(plan, { SUB2API_CONFIRM_MIXED_CHANNEL_RISK: 'true' }),
     (error) => error.code === 'IMPORT_CREATE_POLICY_INVALID',
@@ -2957,6 +2962,142 @@ test('import intent binds a canonical target and the exact create policy without
     ),
     (error) => error.code === 'IMPORT_EXECUTION_BINDING_REQUIRED',
   );
+});
+
+test('sync operation boundaries reject ambiguous account IDs without remote writes', async () => {
+  const identityKeys = ['account:strict-target-account', 'user:strict-target-user'];
+  const source = syntheticToken('tokens/strict-target.json', identityKeys);
+  const account = {
+    id: 73,
+    name: 'free00073',
+    platform: 'openai',
+    type: 'oauth',
+    schemaValid: true,
+    status: 'error',
+    statusKnown: true,
+    schedulable: false,
+    schedulableKnown: true,
+    identityKeys,
+    tokenFingerprints: { access: 'different-access' },
+    credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+    groupIds: [],
+  };
+  const item = buildImportPlan({ tokens: [source], usernames: [] }, [account])[0];
+  assert.equal(item.action, 'update');
+
+  for (const ambiguousId of ['073', ' 73', '73 ', '+73', '7.3', '7.3e1']) {
+    let reads = 0;
+    let writes = 0;
+    await assert.rejects(
+      executeImportPlanItem({
+        item: { ...item, accountId: ambiguousId },
+        client: {
+          async getAccount() { reads += 1; return account; },
+          async applyOAuthCredentials() { writes += 1; },
+        },
+      }),
+      (error) => error.code === 'SUB2API_TARGET_ID_REQUIRED',
+    );
+    assert.equal(reads, 0);
+    assert.equal(writes, 0);
+    assert.equal(importResultAccountId({ account_id: ambiguousId }), null);
+    assert.throws(
+      () => assertBackupCoversUpdateTargets(
+        { accounts: [] },
+        [{ ...item, accountId: ambiguousId }],
+      ),
+      (error) => error.code === 'SUB2API_BACKUP_COVERAGE_INVALID',
+    );
+  }
+
+  let writes = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async getAccount() { return { ...account, id: '073' }; },
+        async applyOAuthCredentials() { writes += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_TARGET_ID_MISMATCH',
+  );
+  assert.equal(writes, 0);
+  assert.equal(importResultAccountId({ account_id: '73' }), 73);
+});
+
+test('sync token decisions fail closed when the current clock is invalid', async () => {
+  const source = syntheticToken(
+    'tokens/invalid-clock.json',
+    ['account:invalid-clock-account', 'user:invalid-clock-user'],
+  );
+  assert.throws(
+    () => collectCandidates({ tokens: [source] }, { nowMs: '0' }),
+    (error) => error.code === 'CURRENT_TIME_INVALID',
+  );
+
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => Number.NaN;
+    assert.throws(
+      () => buildImportPlan({ tokens: [source], usernames: [] }, []),
+      (error) => error.code === 'CURRENT_TIME_INVALID',
+    );
+  } finally {
+    Date.now = originalDateNow;
+  }
+
+  let reads = 0;
+  let writes = 0;
+  const createItem = buildImportPlan({ tokens: [source], usernames: [] }, [])[0];
+  await assert.rejects(
+    executeImportPlanItem({
+      item: createItem,
+      now: () => -1,
+      client: {
+        async listAccounts() { reads += 1; return []; },
+        async importCodexSession() { writes += 1; },
+      },
+    }),
+    (error) => error.code === 'CURRENT_TIME_INVALID',
+  );
+  assert.equal(reads, 0);
+  assert.equal(writes, 0);
+});
+
+test('sync logging uses monotonic durations and hostile errors fail closed', async () => {
+  const hostile = Object.create(null);
+  Object.defineProperty(hostile, 'message', {
+    get() { throw new Error('credential-hostile-sync-message'); },
+  });
+  hostile.toString = () => { throw new Error('credential-hostile-sync-coercion'); };
+  assert.equal(safeErrorMessage(hostile), 'unknown error');
+
+  const { root } = fixture();
+  const records = [];
+  const originalDateNow = Date.now;
+  try {
+    Date.now = () => 60_000;
+    await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      client: {
+        async listAccounts() {
+          Date.now = () => 0;
+          return [];
+        },
+      },
+      logger: {
+        info(event, fields) { records.push({ event, ...fields }); },
+        warn() {},
+        error() {},
+      },
+    });
+  } finally {
+    Date.now = originalDateNow;
+  }
+  const completed = records.find((record) => record.event === 'snapshot.completed');
+  assert.ok(completed);
+  assert.equal(Number.isSafeInteger(completed.durationMs), true);
+  assert.ok(completed.durationMs >= 0);
 });
 
 test('treats expired active Sub2API accounts as unavailable for replacement', () => {
