@@ -138,8 +138,13 @@ test('Sub2API error terminals are definite failures without returning remote tex
 });
 
 test('Sub2API contradictory, malformed, and incomplete SSE outcomes remain unknown', async () => {
-  const client = clientWithLogs();
+  const logs = [];
+  const client = clientWithLogs(logs);
   const cases = [
+    {
+      reason: 'empty_response',
+      body: '',
+    },
     {
       reason: 'malformed_json',
       body: 'data: {bad-json}\n\ndata: {"type":"test_complete","success":true}\n\n',
@@ -199,6 +204,35 @@ test('Sub2API contradictory, malformed, and incomplete SSE outcomes remain unkno
       ),
     );
   }
+  const failures = logs.filter((entry) => entry.event === 'sub2api.account_test_failed');
+  assert.equal(failures.length, cases.length);
+  assert.equal(failures.every((entry) => entry.fields.testOutcomeUnknown === true), true);
+});
+
+test('Sub2API account tests reject a tampered request origin before logging or fetch', async () => {
+  const logs = [];
+  const client = clientWithLogs(logs);
+  let fetchCalls = 0;
+  await withFetch(
+    async () => {
+      fetchCalls += 1;
+      throw new Error('fetch must not run');
+    },
+    async () => {
+      for (const baseUrl of [
+        'http://evil.example',
+        'http://user@127.0.0.1:8080',
+      ]) {
+        client.baseUrl = baseUrl;
+        await assert.rejects(
+          client.testAccount(9),
+          (error) => error.code === 'SUB2API_REQUEST_TARGET_INVALID',
+        );
+      }
+    },
+  );
+  assert.equal(fetchCalls, 0);
+  assert.deepEqual(logs, []);
 });
 
 test('Sub2API account test rejects non-SSE, failed HTTP, and invalid UTF-8 as unknown', async () => {

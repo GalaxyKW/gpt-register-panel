@@ -1503,6 +1503,31 @@ test('safe accounts accept only lossless safe-integer numeric strong identities'
   assert.equal(canonical.schemaValid, true);
   assert.equal(canonical.accountId, '123e4567-e89b-12d3-a456-426614174000');
   assert.equal(canonical.userId, 'user-real_123');
+
+  const camelCredentials = safeAccount({
+    id: 209,
+    credentials: {
+      chatgptAccountId: '{123E4567-E89B-12D3-A456-426614174000}',
+      chatgptUserId: 'user-real_123',
+    },
+  });
+  assert.equal(camelCredentials.schemaValid, true);
+  assert.equal(camelCredentials.accountId, canonical.accountId);
+  assert.equal(camelCredentials.userId, canonical.userId);
+
+  const camelConflict = safeAccount({
+    id: 210,
+    credentials: {
+      account_id: 'workspace-one',
+      accountId: 'workspace-two',
+      user_id: 'user-one',
+      userId: 'user-two',
+    },
+  });
+  assert.equal(camelConflict.schemaValid, false);
+  assert.equal(camelConflict.identityConflict, true);
+  assert.equal(camelConflict.accountId, 'workspace-one');
+  assert.equal(camelConflict.userId, 'user-one');
 });
 
 test('safe accounts fail closed for malformed or contradictory group metadata', () => {
@@ -2019,6 +2044,15 @@ test('Sub2API account exports require a complete supported backup envelope', asy
         && !error.message.includes(secretMarker),
     );
   }
+
+  let requestedPath = null;
+  client.request = async (method, pathname) => {
+    assert.equal(method, 'GET');
+    requestedPath = pathname;
+    return validPayloads[0];
+  };
+  await client.exportAccounts([1, '2']);
+  assert.equal(requestedPath, '/api/v1/admin/accounts/data?ids=1%2C2');
 });
 
 test('safe accounts preserve unknown status and malformed expiry metadata', () => {
@@ -2470,6 +2504,60 @@ test('Sub2API permits plaintext HTTP only for loopback unless explicitly overrid
   }
 });
 
+test('Sub2API explicit connection options cannot be silently replaced by environment values', async () => {
+  const keys = [
+    'SUB2API_BASE_URL',
+    'SUB2API_ADMIN_API_KEY',
+    'SUB2API_JWT',
+    'SUB2API_ALLOW_INSECURE_HTTP',
+  ];
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  const originalFetch = global.fetch;
+  try {
+    process.env.SUB2API_BASE_URL = 'http://127.0.0.1:9090';
+    process.env.SUB2API_ADMIN_API_KEY = 'environment-api-key-marker';
+    process.env.SUB2API_JWT = 'environment-jwt-marker';
+    process.env.SUB2API_ALLOW_INSECURE_HTTP = '1';
+
+    assert.throws(
+      () => new Sub2ApiAdminClient({ baseUrl: '', apiKey: 'explicit-key' }),
+      /SUB2API_BASE_URL is required/,
+    );
+    assert.throws(
+      () => new Sub2ApiAdminClient({
+        baseUrl: 'http://192.0.2.10:8080',
+        apiKey: 'explicit-key',
+        allowInsecureHttp: false,
+      }),
+      (error) => error.code === 'SUB2API_INSECURE_HTTP',
+    );
+
+    let capturedHeaders = null;
+    global.fetch = async (url, options) => {
+      assert.equal(url, 'http://127.0.0.1:8080/api/v1/admin/accounts/1');
+      capturedHeaders = options.headers;
+      return new Response(JSON.stringify({ code: 0, data: { id: 1 } }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    const client = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: '',
+      jwt: 'explicit-jwt-value',
+    });
+    assert.deepEqual(await client.request('GET', '/api/v1/admin/accounts/1'), { id: 1 });
+    assert.equal(Object.prototype.hasOwnProperty.call(capturedHeaders, 'x-api-key'), false);
+    assert.equal(capturedHeaders.Authorization, 'Bearer explicit-jwt-value');
+  } finally {
+    global.fetch = originalFetch;
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+});
+
 test('Sub2API generic requests reject ambiguous targets before logging or fetch', async () => {
   const originalFetch = global.fetch;
   const records = [];
@@ -2504,6 +2592,9 @@ test('Sub2API generic requests reject ambiguous targets before logging or fetch'
       '/\\evil.example/api',
       '/%2f%2fuser%40evil.example/api',
       '/%5cevil.example/api',
+      '/api/v1/admin/accounts/../groups',
+      '/api/v1/admin/accounts/%2e%2e/groups',
+      '/api/v1/admin/accounts/.%2E/groups',
       '/api/v1/admin/accounts?invalid=%encoding',
       '/api/v1/admin/accounts#fragment',
       '/api/v1/admin/accounts\u0000' + marker,
@@ -2565,6 +2656,37 @@ test('Sub2API generic requests preserve bounded dynamic queries and disable redi
     );
     assert.equal(captured.options.method, 'GET');
     assert.equal(captured.options.redirect, 'error');
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API request logs and errors do not expose query values', async () => {
+  const originalFetch = global.fetch;
+  const records = [];
+  const marker = 'opaque-query-secret-marker';
+  const client = new Sub2ApiAdminClient({
+    baseUrl: 'http://127.0.0.1:8080',
+    apiKey: 'test-key',
+    logger: Object.fromEntries(['info', 'warn', 'error'].map((level) => [
+      level,
+      (event, fields) => records.push({ level, event, fields }),
+    ])),
+  });
+  let requestedUrl = '';
+  try {
+    global.fetch = async (url) => {
+      requestedUrl = url;
+      throw new Error('transport failure');
+    };
+    await assert.rejects(
+      client.request('GET', '/api/v1/admin/accounts?search=' + marker),
+      (error) => error.code === 'SUB2API_TRANSPORT_ERROR'
+        && error.message === 'Sub2API 管理请求传输失败：GET /api/v1/admin/accounts',
+    );
+    assert.equal(requestedUrl.endsWith('?search=' + marker), true);
+    assert.equal(JSON.stringify(records).includes(marker), false);
+    assert.equal(records.every((record) => record.fields.path === '/api/v1/admin/accounts'), true);
   } finally {
     global.fetch = originalFetch;
   }
@@ -3096,6 +3218,27 @@ test('Sub2API outbound account IDs reject coercion and duplicates before side ef
         (error) => error.code === expectedCode,
       );
     }
+
+    for (const ids of [
+      null,
+      '1',
+      [true],
+      ['01'],
+      [' 1 '],
+      [1.5],
+      [{ toString() { throw new Error('export-id-marker'); } }],
+      Array.from({ length: 1001 }, (_, index) => index + 1),
+    ]) {
+      await assert.rejects(
+        client.exportAccounts(ids),
+        (error) => error.code === 'SUB2API_EXPORT_IDS_INVALID'
+          && !error.message.includes('export-id-marker'),
+      );
+    }
+    await assert.rejects(
+      client.exportAccounts([1, '1']),
+      (error) => error.code === 'SUB2API_EXPORT_IDS_DUPLICATE',
+    );
     assert.equal(requestCalls, 0);
     assert.equal(fetchCalls, 0);
     assert.deepEqual(logs, []);

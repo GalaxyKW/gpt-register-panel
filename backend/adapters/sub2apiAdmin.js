@@ -452,6 +452,10 @@ function validatedAdminRequestTarget(baseUrl, baseOrigin, method, pathname) {
       || pathname.includes('#')
       || /[\u0000-\u001f\u007f-\u009f]/.test(pathname)
       || /%(?:2f|5c)/i.test(pathOnly)
+      || pathOnly.split('/').some((segment) => {
+        const decodedDots = segment.replace(/%2e/ig, '.');
+        return decodedDots === '.' || decodedDots === '..';
+      })
       || /%(?![0-9a-f]{2})/i.test(pathname)) {
     throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
   }
@@ -464,7 +468,7 @@ function validatedAdminRequestTarget(baseUrl, baseOrigin, method, pathname) {
   if (target.origin !== baseOrigin || target.username || target.password || target.hash) {
     throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
   }
-  return { method, pathname, url: target.toString() };
+  return { method, pathname, logPath: pathOnly, url: target.toString() };
 }
 
 function normalizedAccountIds(ids) {
@@ -481,6 +485,25 @@ function normalizedAccountIds(ids) {
   if (new Set(normalized).size !== normalized.length) {
     const error = new Error('Sub2API 批量统计账号 ID 不能重复');
     error.code = 'SUB2API_ACCOUNT_IDS_DUPLICATE';
+    throw error;
+  }
+  return normalized;
+}
+
+function normalizedExportAccountIds(ids) {
+  if (!Array.isArray(ids) || ids.length > MAX_BATCH_ACCOUNT_IDS) {
+    const error = new Error('Sub2API 导出账号 ID 必须是最多 1000 项的数组');
+    error.code = 'SUB2API_EXPORT_IDS_INVALID';
+    throw error;
+  }
+  const normalized = ids.map((value) => requestedAccountId(
+    value,
+    'SUB2API_EXPORT_IDS_INVALID',
+    'Sub2API 导出账号 ID 必须是规范正整数',
+  ));
+  if (new Set(normalized).size !== normalized.length) {
+    const error = new Error('Sub2API 导出账号 ID 不能重复');
+    error.code = 'SUB2API_EXPORT_IDS_DUPLICATE';
     throw error;
   }
   return normalized;
@@ -610,15 +633,21 @@ function safeAccount(account) {
   });
   const accountField = identityAliases([
     credentials.chatgpt_account_id,
+    credentials.chatgptAccountId,
     credentials.account_id,
+    credentials.accountId,
     account.chatgpt_account_id,
+    account.chatgptAccountId,
     account.account_id,
     account.accountId,
   ], 'account:');
   const userField = identityAliases([
     credentials.chatgpt_user_id,
+    credentials.chatgptUserId,
     credentials.user_id,
+    credentials.userId,
     account.chatgpt_user_id,
+    account.chatgptUserId,
     account.user_id,
     account.userId,
   ], 'user:');
@@ -1367,13 +1396,13 @@ function canonicalBatchAccountId(rawId, allowed) {
 class Sub2ApiAdminClient {
   constructor(options = {}) {
     this.baseUrl = configuredBaseUrl(
-      options.baseUrl || process.env.SUB2API_BASE_URL || '',
+      options.baseUrl !== undefined ? options.baseUrl : process.env.SUB2API_BASE_URL || '',
     );
     this.apiKey = configuredCredential(
-      options.apiKey || process.env.SUB2API_ADMIN_API_KEY || '',
+      options.apiKey !== undefined ? options.apiKey : process.env.SUB2API_ADMIN_API_KEY || '',
     );
     this.jwt = configuredCredential(
-      options.jwt || process.env.SUB2API_JWT || '',
+      options.jwt !== undefined ? options.jwt : process.env.SUB2API_JWT || '',
     );
     this.timeoutMs = boundedTimeout(
       options.timeoutMs ?? process.env.SUB2API_TIMEOUT_MS,
@@ -1386,7 +1415,9 @@ class Sub2ApiAdminClient {
       MAX_TEST_TIMEOUT_MS,
     );
     const maxResponseBytes = Number(
-      options.maxResponseBytes || process.env.SUB2API_MAX_RESPONSE_BYTES || DEFAULT_RESPONSE_BODY_BYTES,
+      options.maxResponseBytes !== undefined
+        ? options.maxResponseBytes
+        : process.env.SUB2API_MAX_RESPONSE_BYTES || DEFAULT_RESPONSE_BODY_BYTES,
     );
     this.maxResponseBytes = Number.isSafeInteger(maxResponseBytes) && maxResponseBytes >= 1024
       ? Math.min(maxResponseBytes, MAX_RESPONSE_BODY_BYTES)
@@ -1404,8 +1435,9 @@ class Sub2ApiAdminClient {
       if (!parsedBaseUrl.hostname) throw new Error('hostname is required');
       if (parsedBaseUrl.username || parsedBaseUrl.password) throw new Error('embedded credentials are not allowed');
       if (parsedBaseUrl.search || parsedBaseUrl.hash) throw new Error('query and fragment are not allowed');
-      const allowInsecureHttp = options.allowInsecureHttp === true
-        || process.env.SUB2API_ALLOW_INSECURE_HTTP === '1';
+      const allowInsecureHttp = options.allowInsecureHttp === undefined
+        ? process.env.SUB2API_ALLOW_INSECURE_HTTP === '1'
+        : options.allowInsecureHttp === true;
       if (parsedBaseUrl.protocol === 'http:'
           && !isLoopbackHostname(parsedBaseUrl.hostname)
           && !allowInsecureHttp) {
@@ -1433,8 +1465,9 @@ class Sub2ApiAdminClient {
     );
     method = target.method;
     pathname = target.pathname;
+    const logPath = target.logPath;
     const startedAt = Date.now();
-    writeLog(this.logger, 'info', 'sub2api.request_started', { ...this.logContext, method, path: pathname });
+    writeLog(this.logger, 'info', 'sub2api.request_started', { ...this.logContext, method, path: logPath });
     const headers = { Accept: 'application/json' };
     if (this.apiKey) headers['x-api-key'] = this.apiKey;
     else headers.Authorization = 'Bearer ' + this.jwt;
@@ -1470,7 +1503,7 @@ class Sub2ApiAdminClient {
         } catch {
           throw requestFailure(
             'SUB2API_REQUEST_SERIALIZATION_FAILED',
-            'Sub2API 请求数据无法序列化：' + method + ' ' + pathname,
+            'Sub2API 请求数据无法序列化：' + method + ' ' + logPath,
           );
         }
       }
@@ -1487,7 +1520,7 @@ class Sub2ApiAdminClient {
         cancelUnreadResponseBody(response);
         throw requestFailure(
           'SUB2API_RESPONSE_CONTENT_TYPE_INVALID',
-          'Sub2API 返回的响应类型不是 JSON：' + method + ' ' + pathname,
+          'Sub2API 返回的响应类型不是 JSON：' + method + ' ' + logPath,
         );
       }
       // Keep the timeout active while consuming the response body too. A
@@ -1506,7 +1539,7 @@ class Sub2ApiAdminClient {
       } else if (abortSource === 'timeout') {
         failure = requestFailure(
           'SUB2API_TIMEOUT',
-          'Sub2API request timed out: ' + method + ' ' + pathname,
+          'Sub2API request timed out: ' + method + ' ' + logPath,
         );
         reason = 'timeout';
       } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
@@ -1527,14 +1560,14 @@ class Sub2ApiAdminClient {
       } else {
         failure = requestFailure(
           'SUB2API_TRANSPORT_ERROR',
-          'Sub2API 管理请求传输失败：' + method + ' ' + pathname,
+          'Sub2API 管理请求传输失败：' + method + ' ' + logPath,
         );
       }
       failure = writeAwareFailure(failure, requestOptions, requestDispatched, reason);
       writeLog(this.logger, 'error', 'sub2api.request_failed', {
         ...this.logContext,
         method,
-        path: pathname,
+        path: logPath,
         durationMs: Date.now() - startedAt,
         error: safeRemoteText(failure.message),
         writeOutcomeUnknown: failure.writeOutcomeUnknown === true,
@@ -1546,7 +1579,7 @@ class Sub2ApiAdminClient {
     }
     if (!text || !text.trim()) {
       const error = writeAwareFailure(
-        requestFailure('SUB2API_EMPTY_RESPONSE', 'Sub2API 返回空响应：' + method + ' ' + pathname),
+        requestFailure('SUB2API_EMPTY_RESPONSE', 'Sub2API 返回空响应：' + method + ' ' + logPath),
         requestOptions,
         requestDispatched,
         'empty_response',
@@ -1554,7 +1587,7 @@ class Sub2ApiAdminClient {
       writeLog(this.logger, 'warn', 'sub2api.response_invalid', {
         ...this.logContext,
         method,
-        path: pathname,
+        path: logPath,
         statusCode: response.status,
         error: error.message,
       });
@@ -1565,7 +1598,7 @@ class Sub2ApiAdminClient {
       payload = text ? JSON.parse(text) : null;
     } catch {
       const error = writeAwareFailure(
-        requestFailure('SUB2API_INVALID_JSON', 'Sub2API 返回非法 JSON：' + method + ' ' + pathname),
+        requestFailure('SUB2API_INVALID_JSON', 'Sub2API 返回非法 JSON：' + method + ' ' + logPath),
         requestOptions,
         requestDispatched,
         'invalid_json',
@@ -1573,7 +1606,7 @@ class Sub2ApiAdminClient {
       writeLog(this.logger, 'warn', 'sub2api.response_invalid', {
         ...this.logContext,
         method,
-        path: pathname,
+        path: logPath,
         statusCode: response.status,
         error: error.message,
       });
@@ -1597,7 +1630,7 @@ class Sub2ApiAdminClient {
       const error = writeAwareFailure(
         requestFailure(
           'SUB2API_REQUEST_REJECTED',
-          'Sub2API ' + method + ' ' + pathname + ' 请求被上游拒绝'
+          'Sub2API ' + method + ' ' + logPath + ' 请求被上游拒绝'
             + (upstreamStatus === null ? '' : '（HTTP ' + upstreamStatus + '）'),
         ),
         requestOptions,
@@ -1609,7 +1642,7 @@ class Sub2ApiAdminClient {
       writeLog(this.logger, 'warn', 'sub2api.request_rejected', {
         ...this.logContext,
         method,
-        path: pathname,
+        path: logPath,
         statusCode: response.status,
         durationMs: Date.now() - startedAt,
         error: error.message,
@@ -1621,7 +1654,7 @@ class Sub2ApiAdminClient {
     if (payload === null || payload === undefined
         || (typeof payload !== 'object' && !Array.isArray(payload))) {
       throw writeAwareFailure(
-        requestFailure('SUB2API_SCHEMA_INVALID', 'Sub2API 返回数据结构无效：' + method + ' ' + pathname),
+        requestFailure('SUB2API_SCHEMA_INVALID', 'Sub2API 返回数据结构无效：' + method + ' ' + logPath),
         requestOptions,
         requestDispatched,
         'response_schema',
@@ -1630,7 +1663,7 @@ class Sub2ApiAdminClient {
     writeLog(this.logger, 'info', 'sub2api.request_completed', {
       ...this.logContext,
       method,
-      path: pathname,
+      path: logPath,
       statusCode: response.status,
       durationMs: Date.now() - startedAt,
     });
@@ -1858,6 +1891,12 @@ class Sub2ApiAdminClient {
     const pathname = '/api/v1/admin/accounts/' + encodeURIComponent(String(accountId)) + '/test';
     const modelId = requestedTestModelId(options);
     const prompt = requestedTestPrompt(options);
+    const target = validatedAdminRequestTarget(
+      this.baseUrl,
+      this.baseOrigin,
+      'POST',
+      pathname,
+    );
     const body = {};
     if (modelId) body.model_id = modelId;
     if (prompt) body.prompt = prompt;
@@ -1895,7 +1934,7 @@ class Sub2ApiAdminClient {
         throw interruptedRequestError('Sub2API 账号测试在发送前因面板停机中断');
       }
       requestDispatched = true;
-      response = await fetch(this.baseUrl + pathname, {
+      response = await fetch(target.url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
@@ -1980,17 +2019,37 @@ class Sub2ApiAdminClient {
     }
 
     if (!text.trim()) {
-      throw markAccountTestOutcomeUnknown(
+      const failure = markAccountTestOutcomeUnknown(
         requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试返回空响应'),
         'empty_response',
       );
+      writeLog(this.logger, 'error', 'sub2api.account_test_failed', {
+        ...this.logContext,
+        accountId,
+        model: modelId || null,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        error: failure.message,
+        testOutcomeUnknown: true,
+      });
+      throw failure;
     }
     const parsedSse = parseAccountTestSse(text);
     if (parsedSse.invalidReason || !parsedSse.terminal) {
-      throw markAccountTestOutcomeUnknown(
+      const failure = markAccountTestOutcomeUnknown(
         requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应契约无效'),
         parsedSse.invalidReason || 'missing_terminal',
       );
+      writeLog(this.logger, 'error', 'sub2api.account_test_failed', {
+        ...this.logContext,
+        accountId,
+        model: modelId || null,
+        statusCode: response.status,
+        durationMs: Date.now() - startedAt,
+        error: failure.message,
+        testOutcomeUnknown: true,
+      });
+      throw failure;
     }
     const completed = parsedSse.terminal.event;
     const eventModel = safeModelId(completed?.model);
@@ -2190,7 +2249,8 @@ class Sub2ApiAdminClient {
   }
 
   async exportAccounts(ids = [], options = {}) {
-    const query = ids.length > 0 ? '?ids=' + encodeURIComponent(ids.join(',')) : '';
+    const accountIds = normalizedExportAccountIds(ids);
+    const query = accountIds.length > 0 ? '?ids=' + encodeURIComponent(accountIds.join(',')) : '';
     const value = await this.request(
       'GET',
       '/api/v1/admin/accounts/data' + query,
