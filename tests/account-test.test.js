@@ -17,6 +17,7 @@ const {
   normalizeAccountTestRequest,
   runAccountTestJob: runAccountTestJobWithoutLogger,
   runAccountTestJobNow: runAccountTestJobNowWithoutLogger,
+  safeErrorMessage,
 } = require('../backend/accountTestWorker');
 const {
   accountTestTargetRevision,
@@ -224,6 +225,15 @@ test('account test request validation requires one opaque revision per unique po
     }),
     /正整数/,
   );
+  for (const ambiguousAccountId of ['01', ' 1', '1 ', '+1', '1.0']) {
+    assert.throws(
+      () => normalizeAccountTestRequest({
+        targets: [{ accountId: ambiguousAccountId, targetRevision: revision4 }],
+      }),
+      (error) => error.code === 'ACCOUNT_TEST_ACCOUNT_ID_INVALID',
+      'must reject non-canonical account ID ' + JSON.stringify(ambiguousAccountId),
+    );
+  }
   assert.throws(
     () => normalizeAccountTestRequest({
       targets: [
@@ -415,6 +425,51 @@ test('account-test worker rejects a sensitive model before any durable or remote
   assert.equal(JSON.stringify(logRecords).includes(secretMarker), false);
 });
 
+test('account-test worker canonicalizes its own IDs and prompt before durable or remote work', async () => {
+  const account = oauthTestAccount(142, 'active', true);
+  for (const invalidAccountIds of [['0142'], [' 142 '], [142, '142'], null]) {
+    let mutationStarts = 0;
+    let remoteCalls = 0;
+    await assert.rejects(
+      runAccountTestJobNow({
+        accountIds: invalidAccountIds,
+        targetBaselines: targetBaselines(account),
+        db: {
+          async startMutationJob() { mutationStarts += 1; },
+        },
+        jobId: 'test-worker-invalid-account-ids',
+        client: {
+          async listAccounts() { remoteCalls += 1; return [{ ...account }]; },
+        },
+      }),
+      (error) => ['ACCOUNT_TEST_ACCOUNT_ID_INVALID', 'ACCOUNT_TEST_TARGET_DUPLICATE',
+        'ACCOUNT_TEST_SELECTION_INVALID'].includes(error.code),
+    );
+    assert.equal(mutationStarts, 0);
+    assert.equal(remoteCalls, 0);
+  }
+
+  let mutationStarts = 0;
+  let remoteCalls = 0;
+  await assert.rejects(
+    runAccountTestJobNow({
+      accountIds: [account.id],
+      targetBaselines: targetBaselines(account),
+      prompt: { toString() { throw new Error('must not coerce prompt'); } },
+      db: {
+        async startMutationJob() { mutationStarts += 1; },
+      },
+      jobId: 'test-worker-invalid-prompt',
+      client: {
+        async listAccounts() { remoteCalls += 1; return [{ ...account }]; },
+      },
+    }),
+    (error) => error.code === 'ACCOUNT_TEST_PROMPT_INVALID',
+  );
+  assert.equal(mutationStarts, 0);
+  assert.equal(remoteCalls, 0);
+});
+
 test('account test target classification accepts non-error accounts and rejects duplicates', () => {
   const activeJob = { id: 'job_existing', status: 'running', type: 'account_test' };
   const result = classifyAccountTestTargets([
@@ -571,6 +626,34 @@ test('account test checkpoints the probe before calling Sub2API', async () => {
   ]);
 });
 
+test('a plain pre-dispatch adapter failure is not counted as an attempted remote test', async () => {
+  const account = oauthTestAccount(109, 'active', true);
+  let reads = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [account.id],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-pre-dispatch-adapter-failure',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { reads += 1; return { ...account }; },
+      async testAccount() {
+        const error = new Error('adapter rejected the request before dispatch');
+        error.code = 'SUB2API_TEST_PROMPT_INVALID';
+        throw error;
+      },
+    },
+  });
+
+  assert.equal(reads, 2);
+  assert.equal(outcome.failed, 1);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.executionStarted, false);
+  assert.equal(outcome.results[0].attempted, false);
+  assert.equal(outcome.results[0].testSuccessKnown, false);
+});
+
 test('non-boolean or missing test success requires reconciliation and stops the batch', async () => {
   const variants = [
     ['numeric success', { success: 1, message: 'invalid-result-secret-marker' }],
@@ -653,6 +736,16 @@ test('known failed test messages are redacted again at the worker boundary', asy
 
   assert.equal(outcome.results[0].code, 'upstream_test_failed');
   assert.equal(JSON.stringify({ outcome, logRecords }).includes('worker-boundary-marker'), false);
+});
+
+test('worker error redaction fails closed for hostile error accessors and coercion', () => {
+  const hostile = Object.create(null);
+  Object.defineProperty(hostile, 'message', {
+    get() { throw new Error('credential-hostile-message-marker'); },
+  });
+  hostile.toString = () => { throw new Error('credential-hostile-coercion-marker'); };
+
+  assert.equal(safeErrorMessage(hostile), 'unknown error');
 });
 
 test('scheduler enable is not dispatched when its log checkpoint fails', async () => {
@@ -2183,7 +2276,7 @@ test('account-test deadline is rechecked after a blocking checkpoint before sche
   assert.equal(outcome.results[0].enabled, false);
 });
 
-test('account-test deadline ignores a wall-clock jump before probe dispatch', async () => {
+test('account-test deadline and reported durations ignore wall-clock jumps', async () => {
   const account = oauthTestAccount(69, 'inactive', false);
   const originalDateNow = Date.now;
   let testCalls = 0;
@@ -2197,7 +2290,7 @@ test('account-test deadline ignores a wall-clock jump before probe dispatch', as
       logger: {
         checkpoint(event) {
           if (event === 'account_test.test_mutation_checkpoint') {
-            Date.now = () => originalDateNow() + 60 * 60 * 1000;
+            Date.now = () => originalDateNow() - 60 * 60 * 1000;
           }
           return true;
         },
@@ -2218,6 +2311,11 @@ test('account-test deadline ignores a wall-clock jump before probe dispatch', as
     assert.equal(testCalls, 1);
     assert.equal(outcome.stopReason, null);
     assert.equal(outcome.succeeded, 1);
+    assert.equal(outcome.durationMs >= 0 && outcome.durationMs < 10_000, true);
+    assert.equal(
+      outcome.results[0].durationMs >= 0 && outcome.results[0].durationMs < 10_000,
+      true,
+    );
   } finally {
     Date.now = originalDateNow;
   }

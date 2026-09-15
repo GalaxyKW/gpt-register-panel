@@ -28,7 +28,20 @@ function writeLog(logger, level, event, fields = {}) {
 }
 
 function safeErrorMessage(error) {
-  return redactText(String(error?.message || error || 'unknown error')).slice(0, 1000);
+  let detail = 'unknown error';
+  try {
+    let message;
+    try { message = error?.message; } catch {}
+    if (typeof message === 'string' && message) detail = message;
+    else if (error !== undefined && error !== null) detail = String(error);
+  } catch {
+    detail = 'unknown error';
+  }
+  try {
+    return redactText(detail).slice(0, 1000);
+  } catch {
+    return 'unknown error';
+  }
 }
 
 function writeRequiresReconciliation(error) {
@@ -84,10 +97,16 @@ function withAccountTestSubmissionLock(callback) {
 }
 
 function normalizePositiveAccountId(value) {
-  const text = String(value ?? '').trim();
-  if (!/^\d+$/.test(text)) return null;
-  const id = Number(text);
+  let id;
+  if (typeof value === 'number') id = value;
+  else if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) id = Number(value);
+  else return null;
   return Number.isSafeInteger(id) && id > 0 ? id : null;
+}
+
+function elapsedMilliseconds(startedAt) {
+  const elapsed = performance.now() - startedAt;
+  return Number.isFinite(elapsed) ? Math.max(0, Math.floor(elapsed)) : 0;
 }
 
 function normalizeAccountTestModelId(value) {
@@ -104,6 +123,42 @@ function normalizeAccountTestModelId(value) {
     throw error;
   }
   return model.toLowerCase() === '5.6-luna' ? 'gpt-5.6-luna' : model;
+}
+
+function normalizeAccountTestPrompt(value) {
+  if (value === undefined || value === null) return '';
+  if (typeof value !== 'string' || value.length > 2000) {
+    const error = new Error('prompt 必须是长度不超过 2000 的字符串');
+    error.code = 'ACCOUNT_TEST_PROMPT_INVALID';
+    throw error;
+  }
+  return value.trim();
+}
+
+function normalizeAccountTestJobAccountIds(values) {
+  if (!Array.isArray(values) || values.length > 100) {
+    const error = new Error('账号测试任务的账号 ID 列表无效');
+    error.code = 'ACCOUNT_TEST_SELECTION_INVALID';
+    throw error;
+  }
+  const result = [];
+  const seen = new Set();
+  for (const value of values) {
+    const id = normalizePositiveAccountId(value);
+    if (!id) {
+      const error = new Error('账号测试任务的 accountId 必须是规范正整数');
+      error.code = 'ACCOUNT_TEST_ACCOUNT_ID_INVALID';
+      throw error;
+    }
+    if (seen.has(id)) {
+      const error = new Error('账号测试任务不能包含重复 accountId');
+      error.code = 'ACCOUNT_TEST_TARGET_DUPLICATE';
+      throw error;
+    }
+    seen.add(id);
+    result.push(id);
+  }
+  return result;
 }
 
 function boundedJobDuration(value) {
@@ -257,17 +312,11 @@ function normalizeAccountTestRequest(body) {
     error.code = 'ACCOUNT_TEST_MODEL_INVALID';
     throw error;
   }
-  const promptValue = body.prompt ?? '';
-  if (typeof promptValue !== 'string' || promptValue.length > 2000) {
-    const error = new Error('prompt 必须是长度不超过 2000 的字符串');
-    error.code = 'ACCOUNT_TEST_PROMPT_INVALID';
-    throw error;
-  }
   return {
     targets,
     accountIds,
     modelId: normalizedModels[0],
-    prompt: promptValue.trim(),
+    prompt: normalizeAccountTestPrompt(body.prompt),
   };
 }
 
@@ -471,9 +520,12 @@ function assertAccountTestSubmittedBaseline(baseline, account) {
 }
 
 function sameAccountTarget(expected, actual) {
+  const expectedId = normalizePositiveAccountId(expected?.id);
+  const actualId = normalizePositiveAccountId(actual?.id);
   return !accountTestTargetError(expected)
     && !accountTestTargetError(actual)
-    && Number(expected.id) === Number(actual.id)
+    && expectedId !== null
+    && expectedId === actualId
     && identitiesStronglyCompatible(accountIdentityKeys(expected), accountIdentityKeys(actual))
     && JSON.stringify(canonicalStrongIdentityKeys(expected))
       === JSON.stringify(canonicalStrongIdentityKeys(actual));
@@ -695,8 +747,9 @@ async function runAccountTestJobNow({
   persistResult = null,
 }) {
   throwIfJobInterrupted(externalSignal);
-  const startedAt = Date.now();
-  const timeoutStartedAt = performance.now();
+  accountIds = normalizeAccountTestJobAccountIds(accountIds);
+  const startedAt = performance.now();
+  const timeoutStartedAt = startedAt;
   const jobTimeoutMs = Number.isFinite(Number(requestedJobTimeoutMs))
     && Number(requestedJobTimeoutMs) > 0
     ? Math.floor(Number(requestedJobTimeoutMs))
@@ -706,6 +759,7 @@ async function runAccountTestJobNow({
   const signal = jobSignal.signal;
   try {
     const normalizedModelId = normalizeAccountTestModelId(modelId);
+    const normalizedPrompt = normalizeAccountTestPrompt(prompt);
     const baselineByAccountId = accountTestBaselineMap(targetBaselines, accountIds);
   if (db && jobId) {
     if (typeof db.startMutationJob !== 'function') {
@@ -769,7 +823,7 @@ async function runAccountTestJobNow({
         statusBefore,
         statusAfter: null,
         statusAfterKnown: false,
-        durationMs: Date.now() - itemStartedAt,
+        durationMs: elapsedMilliseconds(itemStartedAt),
       };
       results.push(result);
       await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -814,7 +868,7 @@ async function runAccountTestJobNow({
       executionStopIndex = itemIndex;
       break;
     }
-    const itemStartedAt = Date.now();
+    const itemStartedAt = performance.now();
     const listedAccount = initialAccounts.find((candidate) => candidate.id === id) || null;
     const submittedBaseline = baselineByAccountId.get(id);
     let account = listedAccount;
@@ -843,7 +897,7 @@ async function runAccountTestJobNow({
           attempted: false,
           testSuccess: null,
           testSuccessKnown: false,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -868,13 +922,17 @@ async function runAccountTestJobNow({
         model: normalizedModelId || null,
       });
       throwIfAccountTestStopped(signal, () => jobSignal.reason());
-      testAttempted = true;
       const test = await client.testAccount(id, {
         modelId: normalizedModelId,
-        prompt,
+        prompt: normalizedPrompt,
         timeoutMs: Math.max(1, deadline - performance.now()),
         signal,
       });
+      // A returned terminal response proves that the adapter dispatched the
+      // probe. Thrown adapter errors carry their own reconciliation marker
+      // when dispatch occurred; a plain exception is a pre-dispatch failure
+      // and must not inflate attempted/execution counters.
+      testAttempted = true;
       let returnedTestSuccess;
       try {
         returnedTestSuccess = test?.success;
@@ -961,7 +1019,7 @@ async function runAccountTestJobNow({
           enabledKnown: true,
           statusAfter: afterFailure.status || null,
           statusAfterKnown: true,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1006,7 +1064,7 @@ async function runAccountTestJobNow({
             statusBefore,
             statusAfter: targetUnchanged ? after?.status || null : null,
             statusAfterKnown: targetUnchanged,
-            durationMs: Date.now() - itemStartedAt,
+            durationMs: elapsedMilliseconds(itemStartedAt),
           };
           results.push(result);
           await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1033,7 +1091,7 @@ async function runAccountTestJobNow({
           enabled: after.schedulable === true,
           statusBefore,
           statusAfter: after?.status || statusBefore,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1067,7 +1125,7 @@ async function runAccountTestJobNow({
           enabled: true,
           statusBefore,
           statusAfter: afterTest.status || 'active',
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1094,7 +1152,7 @@ async function runAccountTestJobNow({
           enabled: true,
           statusBefore,
           statusAfter: afterTest.status || statusBefore,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1141,7 +1199,7 @@ async function runAccountTestJobNow({
           statusBefore,
           statusAfter: afterTest.status || null,
           statusAfterKnown: true,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1253,7 +1311,7 @@ async function runAccountTestJobNow({
           enabled: sameAccountOwnership(account, rollbackState) && rollbackState.schedulable === true,
           statusBefore,
           statusAfter: rollbackState?.status || after?.status || null,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1282,7 +1340,7 @@ async function runAccountTestJobNow({
         enabled: true,
         statusBefore,
         statusAfter: after?.status || 'active',
-        durationMs: Date.now() - itemStartedAt,
+        durationMs: elapsedMilliseconds(itemStartedAt),
       };
       results.push(result);
       await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1332,7 +1390,7 @@ async function runAccountTestJobNow({
           statusBefore,
           statusAfter: confirmedPostTestState.status || null,
           statusAfterKnown: true,
-          durationMs: Date.now() - itemStartedAt,
+          durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
         await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1451,7 +1509,7 @@ async function runAccountTestJobNow({
         statusBefore,
         statusAfter: afterFailureOwned ? afterFailure.status || null : null,
         statusAfterKnown: afterFailureOwned,
-        durationMs: Date.now() - itemStartedAt,
+        durationMs: elapsedMilliseconds(itemStartedAt),
       };
       results.push(result);
       await auditResult(db, logger, result, actor, jobId, normalizedModelId);
@@ -1548,7 +1606,7 @@ async function runAccountTestJobNow({
     stopReason,
     executionStarted: attemptedCount > 0,
     executionComplete: notAttemptedCount === 0,
-    durationMs: Date.now() - startedAt,
+    durationMs: elapsedMilliseconds(startedAt),
     results,
   };
   result.jobStatus = accountTestJobStatus(result);
