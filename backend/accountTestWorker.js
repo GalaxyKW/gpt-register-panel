@@ -1,6 +1,6 @@
 const crypto = require('node:crypto');
 
-const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
+const { Sub2ApiAdminClient, safeModelId } = require('./adapters/sub2apiAdmin');
 const { getAccountAvailability } = require('./accountAvailability');
 const {
   REVISION_PATTERN,
@@ -15,6 +15,8 @@ const { withControlPlaneLock } = require('./taskCoordinator');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
 
 let submissionQueue = Promise.resolve();
+
+const ACCOUNT_TEST_STATUSES = new Set(['active', 'inactive', 'disabled', 'error']);
 
 function writeLog(logger, level, event, fields = {}) {
   try {
@@ -88,9 +90,19 @@ function normalizePositiveAccountId(value) {
 }
 
 function normalizeAccountTestModelId(value) {
-  const model = String(value ?? '').trim();
-  if (model.toLowerCase() === '5.6-luna') return 'gpt-5.6-luna';
-  return model;
+  if (value === undefined || value === null || value === '') return '';
+  if (typeof value !== 'string') {
+    const error = new Error('modelId 必须是字符串');
+    error.code = 'ACCOUNT_TEST_MODEL_INVALID';
+    throw error;
+  }
+  const model = safeModelId(value);
+  if (!model) {
+    const error = new Error('modelId 包含无效或敏感内容');
+    error.code = 'ACCOUNT_TEST_MODEL_INVALID';
+    throw error;
+  }
+  return model.toLowerCase() === '5.6-luna' ? 'gpt-5.6-luna' : model;
 }
 
 function boundedJobDuration(value) {
@@ -233,9 +245,14 @@ function normalizeAccountTestRequest(body) {
     accountIds.push(id);
     targets.push({ accountId: id, targetRevision: target.targetRevision });
   }
-  const modelValue = body.modelId ?? body.model_id ?? '';
-  if (typeof modelValue !== 'string' || modelValue.length > 256) {
-    const error = new Error('modelId 必须是长度不超过 256 的字符串');
+  const modelAliases = ['modelId', 'model_id']
+    .filter((key) => Object.prototype.hasOwnProperty.call(body, key)
+      && body[key] !== undefined && body[key] !== null);
+  const normalizedModels = modelAliases.length > 0
+    ? modelAliases.map((key) => normalizeAccountTestModelId(body[key]))
+    : [''];
+  if (new Set(normalizedModels).size !== 1) {
+    const error = new Error('modelId 与 model_id 不一致');
     error.code = 'ACCOUNT_TEST_MODEL_INVALID';
     throw error;
   }
@@ -248,7 +265,7 @@ function normalizeAccountTestRequest(body) {
   return {
     targets,
     accountIds,
-    modelId: normalizeAccountTestModelId(modelValue),
+    modelId: normalizedModels[0],
     prompt: promptValue.trim(),
   };
 }
@@ -279,11 +296,12 @@ function accountStatus(account) {
 
 function accountTestState(account) {
   const status = accountStatus(account);
+  const recognizedStatus = ACCOUNT_TEST_STATUSES.has(status);
   return {
     status,
     statusKnown: account?.statusKnown === undefined
-      ? ['active', 'inactive', 'disabled', 'error'].includes(status)
-      : account.statusKnown === true,
+      ? recognizedStatus
+      : account.statusKnown === true && recognizedStatus,
     schedulable: typeof account?.schedulable === 'boolean'
       ? account.schedulable
       : null,
@@ -378,7 +396,7 @@ function accountTestBaselineMap(targetBaselines, accountIds) {
         || !/^[a-f0-9]{64}$/.test(identityDigest)
         || !/^[a-f0-9]{64}$/.test(targetDigest)
         || baseline?.statusKnown !== true
-        || !['active', 'inactive', 'disabled', 'error'].includes(status)
+        || !ACCOUNT_TEST_STATUSES.has(status)
         || baseline?.schedulableKnown !== true
         || typeof baseline?.schedulable !== 'boolean') {
       const error = new Error('账号测试任务的目标身份基线无效');
@@ -804,6 +822,7 @@ async function runAccountTestJobNow({
       : (typeof account?.schedulable === 'boolean' ? account.schedulable : null);
     let recoveryAttempted = false;
     let recoveryMutation = null;
+    let testAttempted = false;
     let testSucceeded = false;
     let testSuccessKnown = false;
     let confirmedPostTestState = null;
@@ -819,6 +838,9 @@ async function runAccountTestJobNow({
           status: 'skipped',
           code: 'account_not_found',
           message: 'Sub2API 中不存在该账号',
+          attempted: false,
+          testSuccess: null,
+          testSuccessKnown: false,
           durationMs: Date.now() - itemStartedAt,
         };
         results.push(result);
@@ -844,6 +866,7 @@ async function runAccountTestJobNow({
         model: normalizedModelId || null,
       });
       throwIfAccountTestStopped(signal, () => jobSignal.reason());
+      testAttempted = true;
       const test = await client.testAccount(id, {
         modelId: normalizedModelId,
         prompt,
@@ -1418,7 +1441,9 @@ async function runAccountTestJobNow({
           ? error.code
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),
         message: safeErrorMessage(error),
-        testSuccess: testSucceeded,
+        attempted: testAttempted,
+        testSuccess: testSuccessKnown ? testSucceeded : null,
+        testSuccessKnown,
         enabled: afterFailureOwned ? afterFailure.schedulable === true : null,
         enabledKnown: afterFailureOwned,
         statusBefore,

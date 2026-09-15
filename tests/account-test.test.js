@@ -22,7 +22,8 @@ const {
   accountTestTargetRevision,
   createAccountTargetRevisionIssuer,
 } = require('../backend/accountTargetRevision');
-const { parseSseEvents } = require('../backend/adapters/sub2apiAdmin');
+const { parseSseEvents, safeModelId } = require('../backend/adapters/sub2apiAdmin');
+const { getAccountAvailability } = require('../backend/accountAvailability');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const { PanelDb } = require('../backend/db');
 
@@ -206,6 +207,13 @@ test('account test request validation requires one opaque revision per unique po
   });
   assert.equal(normalizeAccountTestModelId('5.6-luna'), 'gpt-5.6-luna');
   assert.equal(normalizeAccountTestModelId('gpt-5.6-luna'), 'gpt-5.6-luna');
+  assert.equal(safeModelId('gpt-5.6-luna'), 'gpt-5.6-luna');
+  assert.equal(safeModelId('gpt 5.6 luna'), '');
+  assert.equal(normalizeAccountTestRequest({
+    targets: [{ accountId: 4, targetRevision: revision4 }],
+    modelId: '5.6-luna',
+    model_id: 'gpt-5.6-luna',
+  }).modelId, 'gpt-5.6-luna');
   assert.throws(
     () => normalizeAccountTestRequest({ accountIds: [4] }),
     (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
@@ -241,6 +249,29 @@ test('account test request validation requires one opaque revision per unique po
     targets: [{ accountId: 4, targetRevision: revision4 }],
     modelId: 5,
   }), /modelId/);
+  assert.throws(() => normalizeAccountTestRequest({
+    targets: [{ accountId: 4, targetRevision: revision4 }],
+    modelId: 'gpt-5.6-luna',
+    model_id: 'gpt-5.6-sol',
+  }), (error) => error.code === 'ACCOUNT_TEST_MODEL_INVALID');
+  for (const modelId of [
+    'Bearer model-secret-marker-1234567890',
+    'api_key=model-secret-marker-1234567890',
+    ' token.model ',
+    'gpt 5.6 luna',
+    'gpt-5.6-"luna"',
+    'gpt-模型',
+    'model\u202esecret',
+  ]) {
+    assert.throws(
+      () => normalizeAccountTestRequest({
+        targets: [{ accountId: 4, targetRevision: revision4 }],
+        modelId,
+      }),
+      (error) => error.code === 'ACCOUNT_TEST_MODEL_INVALID'
+        && !error.message.includes('model-secret-marker'),
+    );
+  }
 });
 
 test('account test target revisions are process-scoped, opaque, and bind recovery inputs', () => {
@@ -316,6 +347,39 @@ test('account test target revisions are process-scoped, opaque, and bind recover
   assert.equal(issuerA.issue({ ...account, groupIds: ['invalid-group'] }), null);
 });
 
+test('account-test worker rejects a sensitive model before any durable or remote work', async () => {
+  const account = oauthTestAccount(141, 'active', true);
+  const secretMarker = 'worker-model-secret-marker-1234567890';
+  const logRecords = [];
+  let mutationStarts = 0;
+  let remoteCalls = 0;
+  await assert.rejects(
+    runAccountTestJobNowWithoutLogger({
+      accountIds: [account.id],
+      targetBaselines: targetBaselines(account),
+      modelId: 'Bearer ' + secretMarker,
+      db: {
+        async startMutationJob() { mutationStarts += 1; },
+      },
+      jobId: 'test-sensitive-model-rejected-before-work',
+      logger: {
+        checkpoint() { return true; },
+        info(event, fields) { logRecords.push({ event, fields }); },
+        warn(event, fields) { logRecords.push({ event, fields }); },
+        error(event, fields) { logRecords.push({ event, fields }); },
+      },
+      client: {
+        async listAccounts() { remoteCalls += 1; return [{ ...account }]; },
+      },
+    }),
+    (error) => error.code === 'ACCOUNT_TEST_MODEL_INVALID'
+      && !error.message.includes(secretMarker),
+  );
+  assert.equal(mutationStarts, 0);
+  assert.equal(remoteCalls, 0);
+  assert.equal(JSON.stringify(logRecords).includes(secretMarker), false);
+});
+
 test('account test target classification accepts non-error accounts and rejects duplicates', () => {
   const activeJob = { id: 'job_existing', status: 'running', type: 'account_test' };
   const result = classifyAccountTestTargets([
@@ -329,6 +393,19 @@ test('account test target classification accepts non-error accounts and rejects 
     'account_test_already_running',
     'account_not_found',
   ]);
+});
+
+test('unknown status values cannot become known through a contradictory statusKnown flag', () => {
+  const account = oauthTestAccount(6, 'future-status', false, { statusKnown: true });
+  assert.deepEqual(getAccountAvailability(account), {
+    key: 'unknown',
+    reason: 'sub2api_status_unknown',
+  });
+  assert.equal(accountTestTargetRevision(account), null);
+  assert.equal(accountTestTargetBaseline(account), null);
+  const classified = classifyAccountTestTargets([account], [account.id]);
+  assert.deepEqual(classified.eligible, []);
+  assert.equal(classified.rejected[0].code, 'account_state_unknown');
 });
 
 test('account test baseline binds normalized submission state without raw identity values', () => {
@@ -802,7 +879,34 @@ test('account tests do not probe an ID whose strong identity changed after listi
   });
   assert.equal(outcome.failed, 1);
   assert.equal(testCalls, 0);
-  assert.equal(outcome.results[0].testSuccess, false);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].attempted, false);
+  assert.equal(outcome.results[0].testSuccess, null);
+  assert.equal(outcome.results[0].testSuccessKnown, false);
+});
+
+test('an account deleted after listing is skipped without inventing a test attempt', async () => {
+  const account = oauthTestAccount(140, 'active', true);
+  let testCalls = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [account.id],
+    targetBaselines: targetBaselines(account),
+    db: fakeWorkerDb(),
+    jobId: 'test-target-deleted-before-probe',
+    client: {
+      async listAccounts() { return [{ ...account }]; },
+      async getAccount() { return null; },
+      async testAccount() { testCalls += 1; return { success: true }; },
+    },
+  });
+  assert.equal(testCalls, 0);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].code, 'account_not_found');
+  assert.equal(outcome.results[0].attempted, false);
+  assert.equal(outcome.results[0].testSuccess, null);
+  assert.equal(outcome.results[0].testSuccessKnown, false);
 });
 
 test('account tests reject a numeric ID reused before the worker takes its first snapshot', async () => {
@@ -874,7 +978,11 @@ test('account tests reject submission state changes between list and pre-test de
   });
   assert.equal(outcome.failed, 1);
   assert.equal(outcome.results[0].code, 'ACCOUNT_TEST_SUBMITTED_STATE_CHANGED');
-  assert.equal(outcome.results[0].testSuccess, false);
+  assert.equal(outcome.attemptedCount, 0);
+  assert.equal(outcome.notAttemptedCount, 1);
+  assert.equal(outcome.results[0].attempted, false);
+  assert.equal(outcome.results[0].testSuccess, null);
+  assert.equal(outcome.results[0].testSuccessKnown, false);
   assert.equal(testCalls, 0);
   assert.equal(schedulableCalls, 0);
 });

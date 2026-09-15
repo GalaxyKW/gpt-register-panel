@@ -5,6 +5,7 @@ const { normalizeIdentityValue } = require('./lib/token');
 const REVISION_PREFIX = 'account-test-v1.';
 const REVISION_PATTERN = /^account-test-v1\.[A-Za-z0-9_-]{43}$/;
 const CREDENTIAL_FIELDS = ['access', 'refresh', 'id'];
+const ACCOUNT_TEST_STATUSES = new Set(['active', 'inactive', 'disabled', 'error']);
 
 function positiveAccountId(value) {
   const text = String(value ?? '').trim();
@@ -48,9 +49,10 @@ function canonicalStrongIdentities(account) {
 
 function knownAccountState(account) {
   const status = String(account?.status || '').trim().toLowerCase();
+  const recognizedStatus = ACCOUNT_TEST_STATUSES.has(status);
   const statusKnown = account?.statusKnown === undefined
-    ? ['active', 'inactive', 'disabled', 'error'].includes(status)
-    : account.statusKnown === true;
+    ? recognizedStatus
+    : account.statusKnown === true && recognizedStatus;
   const schedulableKnown = account?.schedulableKnown === undefined
     ? typeof account?.schedulable === 'boolean'
     : account.schedulableKnown === true && typeof account?.schedulable === 'boolean';

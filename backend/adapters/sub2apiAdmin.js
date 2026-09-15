@@ -2260,4 +2260,5 @@ module.exports = {
   normalizeTableUsageStats,
   parseSseEvents,
   safeAccount,
+  safeModelId,
 };

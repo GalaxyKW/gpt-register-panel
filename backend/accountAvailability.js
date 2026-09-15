@@ -35,9 +35,10 @@ function getAccountAvailability(account, nowMs = Date.now()) {
   if (account.schemaValid === false) return unknown('sub2api_schema_invalid');
 
   const status = String(account.status || '').trim().toLowerCase();
+  const recognizedStatus = ['active', 'inactive', 'disabled', 'error'].includes(status);
   const statusKnown = account.statusKnown === undefined
-    ? ['active', 'inactive', 'disabled', 'error'].includes(status)
-    : account.statusKnown === true;
+    ? recognizedStatus
+    : account.statusKnown === true && recognizedStatus;
   const schedulableKnown = account.schedulableKnown === undefined
     ? typeof account.schedulable === 'boolean'
     : account.schedulableKnown === true && typeof account.schedulable === 'boolean';
