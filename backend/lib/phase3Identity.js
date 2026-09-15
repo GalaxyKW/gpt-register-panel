@@ -5,7 +5,7 @@ const { normalizeEmail } = require('./token');
 const PHASE3_PHONE_HTTP_MAX_BYTES = 80;
 const PHASE3_PHONE_USERNAME_MAX_BYTES = 64;
 const PHASE3_SELECTION_KEY_MAX_BYTES = 512;
-const UNSAFE_IDENTITY_TEXT = /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+const UNSAFE_IDENTITY_TEXT = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
 const PHASE3_PHONE_CHARACTERS = /^[0-9 +().-]+$/;
 
 function utf8LengthWithin(value, maximumBytes) {
@@ -21,8 +21,8 @@ function normalizePhase3Email(value, options = {}) {
 }
 
 function normalizePhase3Phone(value, options = {}) {
-  const maximumBytes = Number.isSafeInteger(options.maximumBytes)
-    ? options.maximumBytes
+  const maximumBytes = Number.isSafeInteger(options.maximumBytes) && options.maximumBytes > 0
+    ? Math.min(options.maximumBytes, PHASE3_PHONE_HTTP_MAX_BYTES)
     : PHASE3_PHONE_HTTP_MAX_BYTES;
   if (value === undefined || (options.allowNull === true && value === null)) return '';
   let raw;
@@ -42,8 +42,16 @@ function normalizePhase3Phone(value, options = {}) {
 
 function normalizePhase3Identity(value, options = {}) {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  const email = normalizePhase3Email(value.email, { allowNull: options.allowNull === true });
-  const phone = normalizePhase3Phone(value.phone, {
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  const emailValue = Object.prototype.hasOwnProperty.call(value, 'email')
+    ? value.email
+    : undefined;
+  const phoneValue = Object.prototype.hasOwnProperty.call(value, 'phone')
+    ? value.phone
+    : undefined;
+  const email = normalizePhase3Email(emailValue, { allowNull: options.allowNull === true });
+  const phone = normalizePhase3Phone(phoneValue, {
     maximumBytes: options.phoneMaximumBytes,
     allowNumber: options.allowPhoneNumber === true,
     allowNull: options.allowNull === true,
@@ -59,10 +67,10 @@ function normalizePhase3Identity(value, options = {}) {
 
 function normalizePhase3RelativePath(value, source, options = {}) {
   if (typeof value !== 'string' || !['tokens', 'use_token'].includes(source)) return null;
-  const maximumBytes = Number.isSafeInteger(options.maximumBytes)
-    ? options.maximumBytes
+  const maximumBytes = Number.isSafeInteger(options.maximumBytes) && options.maximumBytes > 0
+    ? Math.min(options.maximumBytes, PHASE3_SELECTION_KEY_MAX_BYTES)
     : PHASE3_SELECTION_KEY_MAX_BYTES;
-  if (!value || !utf8LengthWithin(value, maximumBytes)
+  if (!value || value.normalize('NFC') !== value || !utf8LengthWithin(value, maximumBytes)
       || value.includes('\\') || path.posix.isAbsolute(value)
       || UNSAFE_IDENTITY_TEXT.test(value)) return null;
   const segments = value.split('/');
@@ -113,7 +121,12 @@ function normalizePhase3CanonicalKeys(value, options = {}) {
   if (new Set(keys.map((key) => key.slice(0, key.indexOf(':')))).size !== keys.length) {
     return null;
   }
+  if (Object.prototype.hasOwnProperty.call(options, 'requiredKeys')
+      && !Array.isArray(options.requiredKeys)) return null;
   const requiredKeys = Array.isArray(options.requiredKeys) ? options.requiredKeys : [];
+  if (requiredKeys.length > 2
+      || requiredKeys.some((key) => normalizePhase3CanonicalKey(key) !== key)
+      || new Set(requiredKeys).size !== requiredKeys.length) return null;
   if (requiredKeys.some((key) => !keys.includes(key))) return null;
   return keys.sort();
 }

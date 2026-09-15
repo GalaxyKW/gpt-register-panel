@@ -10,6 +10,24 @@ const {
 
 const REVISION_PREFIX = 'phase3-target-v1.';
 const REVISION_PATTERN = /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/;
+const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+const TERMINAL_USERNAME_STATUSES = new Set([
+  'account_deactivated',
+  'account_deleted',
+  'account_disabled',
+]);
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function ownValue(object, key) {
+  return object && Object.prototype.hasOwnProperty.call(object, key)
+    ? object[key]
+    : undefined;
+}
 
 function canonicalIdentityValues(token, kind) {
   const prefix = kind + ':';
@@ -17,46 +35,74 @@ function canonicalIdentityValues(token, kind) {
   let invalid = false;
   const add = (value) => {
     if (value === undefined || value === null || value === '') return;
+    if ((typeof value !== 'string' && typeof value !== 'number')
+        || (typeof value === 'number' && (!Number.isSafeInteger(value) || Object.is(value, -0)))
+        || (typeof value === 'string' && value !== value.trim())) {
+      invalid = true;
+      return;
+    }
     const normalized = normalizeIdentityValue(prefix, value);
-    if (!normalized || normalized.length > 512) invalid = true;
+    if (!normalized || normalized.length > 512 || !CANONICAL_STRONG_IDENTITY.test(normalized)) {
+      invalid = true;
+    }
     else values.add(normalized);
   };
-  add(kind === 'account' ? token?.accountId : token?.userId);
-  for (const key of Array.isArray(token?.identityKeys) ? token.identityKeys : []) {
-    const text = String(key || '').trim();
+  add(ownValue(token, kind === 'account' ? 'accountId' : 'userId'));
+  const identityKeys = ownValue(token, 'identityKeys');
+  if (!Array.isArray(identityKeys)) invalid = true;
+  for (const key of Array.isArray(identityKeys) ? identityKeys : []) {
+    if (typeof key !== 'string' || key !== key.trim()) {
+      invalid = true;
+      continue;
+    }
+    const text = key;
     if (text.toLowerCase().startsWith(prefix)) add(text.slice(prefix.length));
   }
+  if (values.size > 1) invalid = true;
   return { values: [...values].sort(), invalid };
 }
 
-function canonicalPhase3Target({ token, username, usernameContentHash } = {}) {
-  const source = String(token?.source || '');
-  const relativePath = String(token?.relativePath || '');
-  const contentHash = String(token?.contentHash || '').toLowerCase();
-  const usernameHash = String(usernameContentHash || '').toLowerCase();
-  const usernameIndex = Number(username?.index);
-  const email = normalizeEmail(token?.email);
-  const usernameEmail = normalizeEmail(username?.email);
-  const phone = normalizePhase3Phone(username?.phone, {
+function canonicalPhase3Target(evidence = {}) {
+  if (!isPlainObject(evidence)) return null;
+  const token = ownValue(evidence, 'token');
+  const username = ownValue(evidence, 'username');
+  const usernameContentHash = ownValue(evidence, 'usernameContentHash');
+  if (!isPlainObject(token) || !isPlainObject(username)
+      || typeof usernameContentHash !== 'string') return null;
+  const source = ownValue(token, 'source');
+  const relativePath = ownValue(token, 'relativePath');
+  const rawContentHash = ownValue(token, 'contentHash');
+  const contentHash = typeof rawContentHash === 'string' ? rawContentHash.toLowerCase() : '';
+  const usernameHash = usernameContentHash.toLowerCase();
+  const usernameIndex = ownValue(username, 'index');
+  const tokenEmail = ownValue(token, 'email');
+  const rawUsernameEmail = ownValue(username, 'email');
+  const email = typeof tokenEmail === 'string' ? normalizeEmail(tokenEmail) : '';
+  const usernameEmail = typeof rawUsernameEmail === 'string' ? normalizeEmail(rawUsernameEmail) : '';
+  const phone = normalizePhase3Phone(ownValue(username, 'phone'), {
     maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
     allowNumber: true,
     allowNull: true,
   });
   const accountIdentities = canonicalIdentityValues(token, 'account');
   const userIdentities = canonicalIdentityValues(token, 'user');
-  const status = String(username?.status || '').trim().toLowerCase();
+  const rawStatus = ownValue(username, 'status');
+  const status = rawStatus === undefined
+    ? ''
+    : typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : null;
   if (!['tokens', 'use_token'].includes(source)
       || !normalizePhase3RelativePath(relativePath, source)
       || !phase3SelectedKeyForToken(token)
       || !/^[a-f0-9]{64}$/.test(contentHash)
       || !/^[a-f0-9]{64}$/.test(usernameHash)
       || !Number.isSafeInteger(usernameIndex) || usernameIndex < 0
-      || token?.historical === true || token?.parseStatus !== 'ok'
+      || ownValue(token, 'historical') !== false || ownValue(token, 'parseStatus') !== 'ok'
       || !email || email !== usernameEmail
-      || username?.hasPassword !== true
-      || username?.phoneValid === false || phone === null
+      || ownValue(username, 'hasPassword') !== true
+      || ownValue(username, 'phoneValid') === false || phone === null
       || accountIdentities.invalid || userIdentities.invalid
-      || status.length > 64 || (status && !/^[a-z0-9_-]+$/.test(status))) return null;
+      || status === null || status.length > 64 || (status && !/^[a-z0-9_-]+$/.test(status))
+      || TERMINAL_USERNAME_STATUSES.has(status)) return null;
   return {
     version: 1,
     token: {

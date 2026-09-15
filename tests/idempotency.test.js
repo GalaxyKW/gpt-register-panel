@@ -80,6 +80,54 @@ test('Idempotency-Key and semantic request digests use strict canonical boundari
   assert.equal(promptDigest('first').includes('first'), false);
 });
 
+test('Idempotency-Key rejects synthetic or ambiguous header representations', () => {
+  const valid = 'idem_v1_12345678901234567890';
+  for (const request of [
+    { headers: { 'idempotency-key': valid }, rawHeaders: [] },
+    {
+      headers: { 'idempotency-key': valid },
+      rawHeaders: ['Idempotency-Key', valid + '-different'],
+    },
+    {
+      headers: { 'idempotency-key': valid },
+      rawHeaders: ['Idempotency-Key'],
+    },
+    {
+      headers: Object.create({ 'idempotency-key': valid }),
+      rawHeaders: ['Idempotency-Key', valid],
+    },
+  ]) {
+    assert.throws(
+      () => requestIdempotencyKey(request),
+      (error) => ['IDEMPOTENCY_KEY_INVALID', 'IDEMPOTENCY_KEY_REQUIRED'].includes(error.code),
+    );
+  }
+});
+
+test('canonical request encoding rejects array holes, hidden extras and recursive shapes', () => {
+  const sparse = [];
+  sparse.length = 1;
+  const extra = [1];
+  extra.intent = 'different';
+  const symbolic = { safe: true };
+  symbolic[Symbol('intent')] = 'different';
+  const cyclic = {};
+  cyclic.self = cyclic;
+  let tooDeep = true;
+  for (let index = 0; index < 65; index += 1) tooDeep = [tooDeep];
+
+  for (const value of [sparse, extra, symbolic, cyclic, tooDeep]) {
+    assert.throws(
+      () => canonicalJson(value),
+      (error) => error.code === 'IDEMPOTENCY_REQUEST_INVALID',
+    );
+  }
+  assert.throws(
+    () => promptDigest({ toString: () => 'silently-coerced' }),
+    (error) => error.code === 'IDEMPOTENCY_REQUEST_INVALID',
+  );
+});
+
 test('a receipt replays the exact response across terminal state and database restart', async () => {
   const file = databasePath('restart');
   const firstDb = new PanelDb(file);

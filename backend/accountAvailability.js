@@ -1,28 +1,58 @@
+const { parseDateValue } = require('./lib/token');
+
 function parseTime(value) {
   if (value === undefined || value === null || value === '') return null;
-  const timestamp = Date.parse(String(value));
+  const normalized = parseDateValue(value);
+  const timestamp = normalized ? Date.parse(normalized) : NaN;
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
-function firstPresent(account, keys) {
+function presentOwnValues(account, keys) {
+  const values = [];
   for (const key of keys) {
-    const value = account?.[key];
-    if (value !== undefined && value !== null && value !== '') return value;
+    if (!account || !Object.prototype.hasOwnProperty.call(account, key)) continue;
+    const value = account[key];
+    if (value !== undefined && value !== null && value !== '') values.push(value);
   }
-  return undefined;
+  return values;
+}
+
+function ownValue(account, key) {
+  return account && Object.prototype.hasOwnProperty.call(account, key)
+    ? account[key]
+    : undefined;
 }
 
 function timeState(account, valueKeys, statusKeys = []) {
-  const rawStatus = firstPresent(account, statusKeys);
-  const normalizedStatus = String(rawStatus || '').trim().toLowerCase();
-  const rawValue = firstPresent(account, valueKeys);
-  const timestamp = parseTime(rawValue);
-  if (normalizedStatus === 'invalid') return { status: 'invalid', timestamp: null };
-  if (normalizedStatus === 'missing' && rawValue === undefined) return { status: 'missing', timestamp: null };
-  if (normalizedStatus === 'valid' && timestamp === null) return { status: 'invalid', timestamp: null };
-  if (rawValue === undefined) return { status: 'missing', timestamp: null };
+  const rawStatuses = presentOwnValues(account, statusKeys);
+  const normalizedStatuses = rawStatuses.map((value) => (
+    typeof value === 'string' ? value.trim().toLowerCase() : ''
+  ));
+  if (normalizedStatuses.some((value) => !['valid', 'missing', 'invalid'].includes(value))
+      || new Set(normalizedStatuses).size > 1) {
+    return { status: 'invalid', timestamp: null };
+  }
+  const declaredStatus = normalizedStatuses[0] || '';
+  const rawValues = presentOwnValues(account, valueKeys);
+  const timestamps = rawValues.map(parseTime);
+  if (timestamps.some((value) => value === null)
+      || new Set(timestamps).size > 1) {
+    return { status: 'invalid', timestamp: null };
+  }
+  const timestamp = timestamps[0] ?? null;
+  if (declaredStatus === 'invalid') return { status: 'invalid', timestamp: null };
+  if (declaredStatus === 'missing') {
+    return timestamp === null
+      ? { status: 'missing', timestamp: null }
+      : { status: 'invalid', timestamp: null };
+  }
+  if (declaredStatus === 'valid') {
+    return timestamp === null
+      ? { status: 'invalid', timestamp: null }
+      : { status: 'valid', timestamp };
+  }
   return timestamp === null
-    ? { status: 'invalid', timestamp: null }
+    ? { status: 'missing', timestamp: null }
     : { status: 'valid', timestamp };
 }
 
@@ -32,16 +62,22 @@ function unknown(reason) {
 
 function getAccountAvailability(account, nowMs = Date.now()) {
   if (!account) return { key: 'not_present', reason: 'not_in_sub2api' };
-  if (account.schemaValid === false) return unknown('sub2api_schema_invalid');
+  if (ownValue(account, 'schemaValid') === false) return unknown('sub2api_schema_invalid');
+  if (typeof nowMs !== 'number' || !Number.isFinite(nowMs)) {
+    return unknown('panel_clock_invalid');
+  }
 
-  const status = String(account.status || '').trim().toLowerCase();
+  const status = String(ownValue(account, 'status') || '').trim().toLowerCase();
   const recognizedStatus = ['active', 'inactive', 'disabled', 'error'].includes(status);
-  const statusKnown = account.statusKnown === undefined
+  const rawStatusKnown = ownValue(account, 'statusKnown');
+  const rawSchedulable = ownValue(account, 'schedulable');
+  const rawSchedulableKnown = ownValue(account, 'schedulableKnown');
+  const statusKnown = rawStatusKnown === undefined
     ? recognizedStatus
-    : account.statusKnown === true && recognizedStatus;
-  const schedulableKnown = account.schedulableKnown === undefined
-    ? typeof account.schedulable === 'boolean'
-    : account.schedulableKnown === true && typeof account.schedulable === 'boolean';
+    : rawStatusKnown === true && recognizedStatus;
+  const schedulableKnown = rawSchedulableKnown === undefined
+    ? typeof rawSchedulable === 'boolean'
+    : rawSchedulableKnown === true && typeof rawSchedulable === 'boolean';
   if (!statusKnown) return unknown(status ? 'sub2api_status_unknown' : 'sub2api_status_missing');
   // A known non-active status is already sufficient evidence that the account
   // is unavailable. Older Sub2API responses can omit `schedulable` for error,
@@ -52,16 +88,17 @@ function getAccountAvailability(account, nowMs = Date.now()) {
     return { key: 'unavailable', reason: 'sub2api_status_' + status };
   }
   if (!schedulableKnown) return unknown('sub2api_schedulable_missing');
-  if (account.schedulable === false) {
+  if (rawSchedulable === false) {
     return { key: 'unavailable', reason: 'sub2api_unschedulable' };
   }
 
-  if (account.autoPauseOnExpired !== undefined
-      && typeof account.autoPauseOnExpired !== 'boolean') {
+  const autoPauseOnExpired = ownValue(account, 'autoPauseOnExpired');
+  if (autoPauseOnExpired !== undefined
+      && typeof autoPauseOnExpired !== 'boolean') {
     return unknown('sub2api_auto_pause_invalid');
   }
 
-  if (account.autoPauseOnExpired !== false) {
+  if (autoPauseOnExpired !== false) {
     const accountExpiry = timeState(
       account,
       ['expiresAt', 'expires_at', 'expired'],

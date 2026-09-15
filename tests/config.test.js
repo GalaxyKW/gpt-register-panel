@@ -8,6 +8,7 @@ require('./test-isolation');
 
 const {
   BOOLEAN_ENV_NAMES,
+  booleanEnvEnabled,
   configuredEnvFile,
   loadEnv,
   parseEnvContent,
@@ -182,6 +183,30 @@ test('every declared boolean environment setting accepts only 0 or 1', () => {
       );
     }
   }
+});
+
+test('security configuration cannot be inherited through a polluted object prototype', () => {
+  const inheritedWrite = Object.create({ PANEL_WRITE_ENABLED: '1' });
+  assert.throws(
+    () => validateBooleanEnvironment(inheritedWrite),
+    (error) => error.code === 'ENV_INHERITED_VALUE_INVALID'
+      && !error.message.includes('1'),
+  );
+  assert.throws(
+    () => booleanEnvEnabled('PANEL_WRITE_ENABLED', false, inheritedWrite),
+    (error) => error.code === 'ENV_INHERITED_VALUE_INVALID',
+  );
+
+  const inheritedPath = Object.create({ PANEL_ENV_FILE: '/tmp/untrusted.env' });
+  assert.throws(
+    () => configuredEnvFile(inheritedPath),
+    (error) => error.code === 'ENV_INHERITED_VALUE_INVALID'
+      && !error.message.includes('/tmp/untrusted.env'),
+  );
+  assert.throws(
+    () => loadEnv(undefined, inheritedPath),
+    (error) => error.code === 'ENV_INHERITED_VALUE_INVALID',
+  );
 });
 
 test('configured environment file must be an explicit absolute path', () => {

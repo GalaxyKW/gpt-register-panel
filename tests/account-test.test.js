@@ -327,6 +327,7 @@ test('account test target revisions are process-scoped, opaque, and bind recover
     { credentialPresence: { ...account.credentialPresence, refresh: 'absent' } },
     { userId: 'replacement-user', identityKeys: ['account:aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'user:replacement-user'] },
     { expiresAt: '2099-02-01T00:00:00.000Z' },
+    { autoPauseOnExpired: null },
     { tempUnschedulableUntil: '2097-01-01T00:00:00.000Z', tempUnschedulableUntilStatus: 'valid' },
     { groupIds: [3, 10] },
   ];
@@ -345,6 +346,40 @@ test('account test target revisions are process-scoped, opaque, and bind recover
     (error) => error.code === 'ACCOUNT_TEST_TARGET_REVISION_STALE',
   );
   assert.equal(issuerA.issue({ ...account, groupIds: ['invalid-group'] }), null);
+  for (const invalidTarget of [
+    { ...account, id: '041' },
+    { ...account, platform: 'anthropic' },
+    { ...account, platform: ' openai' },
+    { ...account, type: 'api_key' },
+    { ...account, groupIds: [' 3', 9] },
+    { ...account, identityKeys: 'account:not-an-array' },
+    {
+      ...account,
+      accountId: 'different-account',
+      identityKeys: [...account.identityKeys],
+    },
+    { ...account, identityConflict: true },
+    { ...account, fingerprintConflict: true },
+    { ...account, credentialsStatusConflict: true },
+    { ...account, expiresAt: '2099-02-30T00:00:00.000Z', expiryStatus: 'valid' },
+    { ...account, expiryStatus: 'missing' },
+    {
+      ...account,
+      credentialPresence: { ...account.credentialPresence, access: 'absent' },
+    },
+  ]) {
+    assert.equal(issuerA.issue(invalidTarget), null);
+  }
+
+  const inheritedState = Object.create({
+    id: 41,
+    platform: 'openai',
+    type: 'oauth',
+    status: 'active',
+    schedulable: true,
+    accountId: 'inherited-account',
+  });
+  assert.equal(issuerA.issue(inheritedState), null);
 });
 
 test('account-test worker rejects a sensitive model before any durable or remote work', async () => {

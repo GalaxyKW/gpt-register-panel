@@ -48,6 +48,12 @@ const { getAccountAvailability } = require('../backend/accountAvailability');
 const { buildDiff, toSafeDiff, identitiesCompatible } = require('../backend/diff');
 const { Sub2ApiAdminClient } = require('../backend/adapters/sub2apiAdmin');
 const { tokenFingerprint } = require('../backend/lib/token');
+const {
+  normalizePhase3CanonicalKeys,
+  normalizePhase3Phone,
+  normalizePhase3RelativePath,
+} = require('../backend/lib/phase3Identity');
+const { canonicalPhase3Target } = require('../backend/phase3TargetRevision');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 
 const successfulCheckpointLogger = Object.freeze({
@@ -783,6 +789,58 @@ test('phase3 refuses a same-email username record replacement while queued', asy
     if (previous.enabled === undefined) delete process.env.PANEL_PHASE3_ENABLED;
     else process.env.PANEL_PHASE3_ENABLED = previous.enabled;
   }
+});
+
+test('Phase3 identity and revision boundaries reject ambiguous canonical evidence', () => {
+  const base = {
+    token: {
+      source: 'tokens',
+      relativePath: 'tokens/account.json',
+      contentHash: 'a'.repeat(64),
+      parseStatus: 'ok',
+      historical: false,
+      email: 'one@example.test',
+      accountId: 'account-one',
+      identityKeys: ['account:account-one'],
+    },
+    username: {
+      index: 0,
+      email: 'one@example.test',
+      phone: '+86 138-0000',
+      phoneValid: true,
+      status: 'oauth_done',
+      hasPassword: true,
+    },
+    usernameContentHash: 'b'.repeat(64),
+  };
+  assert.ok(canonicalPhase3Target(base));
+  for (const invalid of [
+    { ...base, username: { ...base.username, index: '0' } },
+    { ...base, username: { ...base.username, status: 'account_deleted' } },
+    { ...base, token: { ...base.token, historical: undefined } },
+    { ...base, token: { ...base.token, identityKeys: 'account:account-one' } },
+    {
+      ...base,
+      token: {
+        ...base.token,
+        identityKeys: ['account:account-two'],
+      },
+    },
+  ]) assert.equal(canonicalPhase3Target(invalid), null);
+  assert.equal(canonicalPhase3Target(Object.create(base)), null);
+
+  assert.equal(
+    normalizePhase3RelativePath('tokens/vis\u00adually-hidden.json', 'tokens'),
+    null,
+  );
+  assert.equal(
+    normalizePhase3RelativePath('tokens/cafe\u0301.json', 'tokens'),
+    null,
+  );
+  assert.equal(normalizePhase3Phone('1'.repeat(81), { maximumBytes: 1000 }), null);
+  assert.equal(normalizePhase3CanonicalKeys(['email:one@example.test'], {
+    requiredKeys: 'email:one@example.test',
+  }), null);
 });
 
 test('phase3 admission rejects an old UI revision after same-path token or username replacement', async () => {
@@ -2957,6 +3015,57 @@ test('unknown Sub2API state fails closed and is never planned as an update', () 
     expiresAt: 'not-a-date',
   }).key, 'unknown');
   assert.equal(getAccountAvailability({ ...base, status: 'active' }).key, 'unknown');
+});
+
+test('availability rejects invalid clocks, inherited state and contradictory time aliases', () => {
+  const base = {
+    status: 'active',
+    schedulable: true,
+    expiresAt: '2099-01-01T00:00:00.000Z',
+    expiryStatus: 'valid',
+  };
+  assert.deepEqual(getAccountAvailability(base, Number.NaN), {
+    key: 'unknown',
+    reason: 'panel_clock_invalid',
+  });
+  assert.deepEqual(getAccountAvailability({
+    ...base,
+    expires_at: '2000-01-01T00:00:00.000Z',
+  }), {
+    key: 'unknown',
+    reason: 'sub2api_expiry_invalid',
+  });
+  assert.deepEqual(getAccountAvailability({
+    ...base,
+    expiresAtStatus: 'missing',
+  }), {
+    key: 'unknown',
+    reason: 'sub2api_expiry_invalid',
+  });
+  assert.deepEqual(getAccountAvailability({
+    ...base,
+    expiryStatus: 'future-contract-value',
+  }), {
+    key: 'unknown',
+    reason: 'sub2api_expiry_invalid',
+  });
+  assert.deepEqual(getAccountAvailability({
+    ...base,
+    expiryStatus: 'missing',
+  }), {
+    key: 'unknown',
+    reason: 'sub2api_expiry_invalid',
+  });
+  assert.equal(getAccountAvailability({
+    ...base,
+    expires_at: '2099-01-01T08:00:00.000+08:00',
+  }).key, 'available');
+
+  const inherited = Object.create({ status: 'error', schedulable: false });
+  assert.deepEqual(getAccountAvailability(inherited), {
+    key: 'unknown',
+    reason: 'sub2api_status_missing',
+  });
 });
 
 test('known non-active status remains unavailable when scheduler metadata is omitted', () => {

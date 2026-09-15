@@ -1,23 +1,40 @@
 const crypto = require('node:crypto');
 
-const { normalizeIdentityValue } = require('./lib/token');
+const { normalizeIdentityValue, parseDateValue } = require('./lib/token');
 
 const REVISION_PREFIX = 'account-test-v1.';
 const REVISION_PATTERN = /^account-test-v1\.[A-Za-z0-9_-]{43}$/;
 const CREDENTIAL_FIELDS = ['access', 'refresh', 'id'];
 const ACCOUNT_TEST_STATUSES = new Set(['active', 'inactive', 'disabled', 'error']);
+const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+const UNSAFE_SCALAR_TEXT = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
+
+function isPlainObject(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function ownValue(object, key) {
+  return object && Object.prototype.hasOwnProperty.call(object, key)
+    ? object[key]
+    : undefined;
+}
 
 function positiveAccountId(value) {
-  const text = String(value ?? '').trim();
-  if (!/^[1-9]\d*$/.test(text)) return null;
-  const id = Number(text);
+  let id;
+  if (typeof value === 'number') id = value;
+  else if (typeof value === 'string' && /^[1-9]\d*$/.test(value)) id = Number(value);
+  else return null;
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 }
 
 function normalizedScalar(value, maximumLength = 1024) {
-  if (typeof value !== 'string' && typeof value !== 'number') return null;
-  const text = String(value).trim();
-  if (!text || text.length > maximumLength || /[\u0000-\u001f\u007f]/.test(text)) return null;
+  if (typeof value !== 'string') return null;
+  const text = value.trim();
+  if (!text || value !== text || text.length > maximumLength || UNSAFE_SCALAR_TEXT.test(value)) {
+    return null;
+  }
   return text;
 }
 
@@ -26,20 +43,35 @@ function canonicalStrongIdentities(account) {
   let invalid = false;
   const add = (kind, value) => {
     if (value === undefined || value === null || value === '') return;
+    if ((typeof value !== 'string' && typeof value !== 'number')
+        || (typeof value === 'number' && (!Number.isSafeInteger(value) || Object.is(value, -0)))
+        || (typeof value === 'string' && value !== value.trim())) {
+      invalid = true;
+      return;
+    }
     const prefix = kind + ':';
     const normalized = normalizeIdentityValue(prefix, value);
-    if (!normalized || normalized.length > 512) invalid = true;
+    if (!normalized || normalized.length > 512 || !CANONICAL_STRONG_IDENTITY.test(normalized)) {
+      invalid = true;
+    }
     else values[kind].add(normalized);
   };
-  for (const key of Array.isArray(account?.identityKeys) ? account.identityKeys : []) {
-    const raw = String(key || '').trim();
+  const identityKeys = ownValue(account, 'identityKeys');
+  if (identityKeys !== undefined && !Array.isArray(identityKeys)) invalid = true;
+  for (const key of Array.isArray(identityKeys) ? identityKeys : []) {
+    if (typeof key !== 'string' || key !== key.trim()) {
+      invalid = true;
+      continue;
+    }
+    const raw = key;
     const separator = raw.indexOf(':');
     if (separator <= 0) continue;
     const kind = raw.slice(0, separator).toLowerCase();
     if (kind === 'account' || kind === 'user') add(kind, raw.slice(separator + 1));
   }
-  add('account', account?.accountId);
-  add('user', account?.userId);
+  add('account', ownValue(account, 'accountId'));
+  add('user', ownValue(account, 'userId'));
+  if (values.account.size > 1 || values.user.size > 1) invalid = true;
   return {
     account: [...values.account].sort(),
     user: [...values.user].sort(),
@@ -48,19 +80,22 @@ function canonicalStrongIdentities(account) {
 }
 
 function knownAccountState(account) {
-  const status = String(account?.status || '').trim().toLowerCase();
+  const status = String(ownValue(account, 'status') || '').trim().toLowerCase();
   const recognizedStatus = ACCOUNT_TEST_STATUSES.has(status);
-  const statusKnown = account?.statusKnown === undefined
+  const rawStatusKnown = ownValue(account, 'statusKnown');
+  const rawSchedulable = ownValue(account, 'schedulable');
+  const rawSchedulableKnown = ownValue(account, 'schedulableKnown');
+  const statusKnown = rawStatusKnown === undefined
     ? recognizedStatus
-    : account.statusKnown === true && recognizedStatus;
-  const schedulableKnown = account?.schedulableKnown === undefined
-    ? typeof account?.schedulable === 'boolean'
-    : account.schedulableKnown === true && typeof account?.schedulable === 'boolean';
+    : rawStatusKnown === true && recognizedStatus;
+  const schedulableKnown = rawSchedulableKnown === undefined
+    ? typeof rawSchedulable === 'boolean'
+    : rawSchedulableKnown === true && typeof rawSchedulable === 'boolean';
   if (!statusKnown || !schedulableKnown) return null;
   return {
     status,
     statusKnown: true,
-    schedulable: account.schedulable,
+    schedulable: rawSchedulable,
     schedulableKnown: true,
   };
 }
@@ -71,41 +106,90 @@ function canonicalOptionalScalar(value, maximumLength = 1024) {
 }
 
 function canonicalGroupIds(value) {
-  if (value === undefined || value === null) return [];
+  if (value === undefined) return [];
   if (!Array.isArray(value)) return null;
   const ids = [];
   for (const raw of value) {
-    const text = String(raw ?? '').trim();
-    if (!/^[1-9]\d*$/.test(text)) return null;
-    const id = Number(text);
+    let id;
+    if (typeof raw === 'number') id = raw;
+    else if (typeof raw === 'string' && /^[1-9]\d*$/.test(raw)) id = Number(raw);
+    else return null;
     if (!Number.isSafeInteger(id) || id <= 0) return null;
     ids.push(id);
   }
   return [...new Set(ids)].sort((left, right) => left - right);
 }
 
+function canonicalTimeEvidence(account, valueField, statusField) {
+  const rawValue = ownValue(account, valueField);
+  const rawStatus = ownValue(account, statusField);
+  const value = canonicalOptionalScalar(rawValue, 1024);
+  const status = canonicalOptionalScalar(rawStatus, 32)?.toLowerCase() || null;
+  if ((rawValue !== undefined && rawValue !== null && rawValue !== '' && !value)
+      || (rawStatus !== undefined && rawStatus !== null && rawStatus !== '' && !status)
+      || (status && !['valid', 'missing', 'invalid'].includes(status))) return null;
+  const normalizedValue = value ? parseDateValue(value) : null;
+  if ((value && !normalizedValue) || status === 'invalid'
+      || (status === 'valid' && !normalizedValue)
+      || (status === 'missing' && normalizedValue)) return null;
+  return {
+    value: normalizedValue,
+    status: status || (normalizedValue ? 'valid' : 'missing'),
+  };
+}
+
 function canonicalAccountTestTarget(account) {
-  const id = positiveAccountId(account?.id);
-  const platform = normalizedScalar(account?.platform, 64)?.toLowerCase() || null;
-  const type = normalizedScalar(account?.type, 64)?.toLowerCase() || null;
+  if (!isPlainObject(account)) return null;
+  const id = positiveAccountId(ownValue(account, 'id'));
+  const platform = normalizedScalar(ownValue(account, 'platform'), 64)?.toLowerCase() || null;
+  const type = normalizedScalar(ownValue(account, 'type'), 64)?.toLowerCase() || null;
   const identities = canonicalStrongIdentities(account);
   const state = knownAccountState(account);
-  const groupIds = canonicalGroupIds(account?.groupIds);
-  if (!id || !platform || !type || !state || account?.schemaValid === false || identities.invalid
+  const groupIds = canonicalGroupIds(ownValue(account, 'groupIds'));
+  const booleanEvidenceFields = [
+    'schemaValid',
+    'identityConflict',
+    'fingerprintConflict',
+    'credentialsStatusConflict',
+  ];
+  const invalidBooleanEvidence = booleanEvidenceFields.some((field) => (
+    Object.prototype.hasOwnProperty.call(account, field)
+      && account[field] !== undefined
+      && typeof account[field] !== 'boolean'
+  ));
+  const conflictEvidence = ownValue(account, 'identityConflict') === true
+    || ownValue(account, 'fingerprintConflict') === true
+    || ownValue(account, 'credentialsStatusConflict') === true;
+  const tokenFingerprints = ownValue(account, 'tokenFingerprints');
+  const credentialPresence = ownValue(account, 'credentialPresence');
+  const invalidCredentialShape = (
+    Object.prototype.hasOwnProperty.call(account, 'tokenFingerprints')
+      && !isPlainObject(tokenFingerprints)
+  ) || (
+    Object.prototype.hasOwnProperty.call(account, 'credentialPresence')
+      && !isPlainObject(credentialPresence)
+  );
+  if (!id || platform !== 'openai' || type !== 'oauth' || !state
+      || ownValue(account, 'schemaValid') === false || identities.invalid
+      || invalidBooleanEvidence || conflictEvidence || invalidCredentialShape
       || !groupIds || identities.account.length + identities.user.length === 0) return null;
 
   const fingerprints = {};
   const presence = {};
   let invalidEvidence = false;
   for (const field of CREDENTIAL_FIELDS) {
-    const rawFingerprint = account?.tokenFingerprints?.[field];
+    const rawFingerprint = Object.prototype.hasOwnProperty.call(tokenFingerprints || {}, field)
+      ? tokenFingerprints[field]
+      : undefined;
     const fingerprint = canonicalOptionalScalar(rawFingerprint, 128);
     if (rawFingerprint !== undefined && rawFingerprint !== null && rawFingerprint !== ''
         && !fingerprint) invalidEvidence = true;
     fingerprints[field] = fingerprint && /^[a-f0-9]+$/i.test(fingerprint)
       ? fingerprint.toLowerCase()
       : fingerprint;
-    const rawPresenceValue = account?.credentialPresence?.[field];
+    const rawPresenceValue = Object.prototype.hasOwnProperty.call(credentialPresence || {}, field)
+      ? credentialPresence[field]
+      : undefined;
     if (rawPresenceValue === undefined || rawPresenceValue === null || rawPresenceValue === '') {
       presence[field] = fingerprints[field] ? 'present' : 'unknown';
     } else {
@@ -113,27 +197,31 @@ function canonicalAccountTestTarget(account) {
       if (!['present', 'absent', 'unknown'].includes(rawPresence)) invalidEvidence = true;
       presence[field] = rawPresence;
     }
+    if (fingerprints[field] && presence[field] === 'absent') invalidEvidence = true;
   }
 
   const scalarState = {};
-  for (const [field, maximumLength, lowercase] of [
-    ['expiresAt', 1024, false],
-    ['expiryStatus', 32, true],
-    ['credentialExpiresAt', 1024, false],
-    ['credentialExpiryStatus', 32, true],
-    ['tempUnschedulableUntil', 1024, false],
-    ['tempUnschedulableUntilStatus', 32, true],
-    ['rateLimitResetAt', 1024, false],
-    ['rateLimitResetStatus', 32, true],
-    ['overloadUntil', 1024, false],
-    ['overloadUntilStatus', 32, true],
+  for (const [valueField, statusField] of [
+    ['expiresAt', 'expiryStatus'],
+    ['credentialExpiresAt', 'credentialExpiryStatus'],
+    ['tempUnschedulableUntil', 'tempUnschedulableUntilStatus'],
+    ['rateLimitResetAt', 'rateLimitResetStatus'],
+    ['overloadUntil', 'overloadUntilStatus'],
   ]) {
-    const raw = account?.[field];
-    const value = canonicalOptionalScalar(raw, maximumLength);
-    if (raw !== undefined && raw !== null && raw !== '' && !value) invalidEvidence = true;
-    scalarState[field] = lowercase && value ? value.toLowerCase() : value;
+    const evidence = canonicalTimeEvidence(account, valueField, statusField);
+    if (!evidence) {
+      invalidEvidence = true;
+      continue;
+    }
+    scalarState[valueField] = evidence.value;
+    scalarState[statusField] = evidence.status;
   }
   if (invalidEvidence) return null;
+
+  const rawAutoPauseOnExpired = ownValue(account, 'autoPauseOnExpired');
+  const canonicalAutoPauseOnExpired = typeof rawAutoPauseOnExpired === 'boolean'
+    ? rawAutoPauseOnExpired
+    : rawAutoPauseOnExpired === undefined ? null : 'invalid';
 
   return {
     version: 1,
@@ -145,13 +233,11 @@ function canonicalAccountTestTarget(account) {
     groupIds,
     state: {
       ...state,
-      schemaValid: account?.schemaValid !== false,
-      identityConflict: account?.identityConflict === true,
-      fingerprintConflict: account?.fingerprintConflict === true,
-      credentialsStatusConflict: account?.credentialsStatusConflict === true,
-      autoPauseOnExpired: typeof account?.autoPauseOnExpired === 'boolean'
-        ? account.autoPauseOnExpired
-        : null,
+      schemaValid: ownValue(account, 'schemaValid') !== false,
+      identityConflict: ownValue(account, 'identityConflict') === true,
+      fingerprintConflict: ownValue(account, 'fingerprintConflict') === true,
+      credentialsStatusConflict: ownValue(account, 'credentialsStatusConflict') === true,
+      autoPauseOnExpired: canonicalAutoPauseOnExpired,
       ...scalarState,
     },
   };

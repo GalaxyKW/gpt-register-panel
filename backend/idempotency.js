@@ -3,6 +3,8 @@ const crypto = require('node:crypto');
 const IDEMPOTENCY_KEY_MIN_BYTES = 20;
 const IDEMPOTENCY_KEY_MAX_BYTES = 128;
 const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+const CANONICAL_JSON_MAX_DEPTH = 64;
+const CANONICAL_JSON_MAX_COLLECTION_ITEMS = 10000;
 
 function idempotencyError(code, message) {
   const error = new Error(message);
@@ -26,10 +28,24 @@ function normalizeIdempotencyKey(value) {
 function requestIdempotencyKey(request) {
   const rawHeaders = Array.isArray(request?.rawHeaders) ? request.rawHeaders : [];
   let occurrences = 0;
-  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
-    if (String(rawHeaders[index]).toLowerCase() === 'idempotency-key') occurrences += 1;
+  let rawValue;
+  if (rawHeaders.length % 2 !== 0) {
+    throw idempotencyError(
+      'IDEMPOTENCY_KEY_INVALID',
+      'Idempotency-Key 请求头结构无效',
+    );
   }
-  const value = request?.headers?.['idempotency-key'];
+  for (let index = 0; index + 1 < rawHeaders.length; index += 2) {
+    if (typeof rawHeaders[index] === 'string'
+        && rawHeaders[index].toLowerCase() === 'idempotency-key') {
+      occurrences += 1;
+      rawValue = rawHeaders[index + 1];
+    }
+  }
+  const headers = request?.headers;
+  const value = headers && Object.prototype.hasOwnProperty.call(headers, 'idempotency-key')
+    ? headers['idempotency-key']
+    : undefined;
   if (occurrences > 1 || Array.isArray(value)) {
     throw idempotencyError(
       'IDEMPOTENCY_KEY_INVALID',
@@ -42,10 +58,19 @@ function requestIdempotencyKey(request) {
       '写操作必须提供 Idempotency-Key',
     );
   }
+  if (occurrences !== 1 || typeof rawValue !== 'string' || rawValue !== value) {
+    throw idempotencyError(
+      'IDEMPOTENCY_KEY_INVALID',
+      'Idempotency-Key 必须与唯一的原始请求头完全一致',
+    );
+  }
   return normalizeIdempotencyKey(value);
 }
 
-function canonicalJson(value) {
+function canonicalJsonValue(value, state, depth) {
+  if (depth > CANONICAL_JSON_MAX_DEPTH) {
+    throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求嵌套层级过深');
+  }
   if (value === null) return 'null';
   if (typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
   if (typeof value === 'number') {
@@ -54,7 +79,32 @@ function canonicalJson(value) {
     }
     return JSON.stringify(value);
   }
-  if (Array.isArray(value)) return '[' + value.map(canonicalJson).join(',') + ']';
+  if (Array.isArray(value)) {
+    if (value.length > CANONICAL_JSON_MAX_COLLECTION_ITEMS
+        || Object.keys(value).length !== value.length
+        || Object.getOwnPropertySymbols(value).some((symbol) => (
+          Object.prototype.propertyIsEnumerable.call(value, symbol)
+        ))) {
+      throw idempotencyError(
+        'IDEMPOTENCY_REQUEST_INVALID',
+        '幂等请求数组必须连续且不能包含额外字段',
+      );
+    }
+    for (let index = 0; index < value.length; index += 1) {
+      if (!Object.prototype.hasOwnProperty.call(value, index)) {
+        throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求数组不能包含空位');
+      }
+    }
+    if (state.ancestors.has(value)) {
+      throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求不能循环引用');
+    }
+    state.ancestors.add(value);
+    try {
+      return '[' + value.map((item) => canonicalJsonValue(item, state, depth + 1)).join(',') + ']';
+    } finally {
+      state.ancestors.delete(value);
+    }
+  }
   if (typeof value !== 'object') {
     throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求包含无法规范化的值');
   }
@@ -62,13 +112,32 @@ function canonicalJson(value) {
   if (prototype !== Object.prototype && prototype !== null) {
     throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求必须由普通对象组成');
   }
-  const fields = Object.keys(value).sort().map((key) => {
-    if (value[key] === undefined) {
-      throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求包含未定义字段');
-    }
-    return JSON.stringify(key) + ':' + canonicalJson(value[key]);
-  });
-  return '{' + fields.join(',') + '}';
+  const keys = Object.keys(value);
+  if (keys.length > CANONICAL_JSON_MAX_COLLECTION_ITEMS
+      || Object.getOwnPropertySymbols(value).some((symbol) => (
+        Object.prototype.propertyIsEnumerable.call(value, symbol)
+      ))) {
+    throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求对象字段无效或过多');
+  }
+  if (state.ancestors.has(value)) {
+    throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求不能循环引用');
+  }
+  state.ancestors.add(value);
+  try {
+    const fields = keys.sort().map((key) => {
+      if (value[key] === undefined) {
+        throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '幂等请求包含未定义字段');
+      }
+      return JSON.stringify(key) + ':' + canonicalJsonValue(value[key], state, depth + 1);
+    });
+    return '{' + fields.join(',') + '}';
+  } finally {
+    state.ancestors.delete(value);
+  }
+}
+
+function canonicalJson(value) {
+  return canonicalJsonValue(value, { ancestors: new Set() }, 0);
 }
 
 function sha256(value) {
@@ -99,8 +168,11 @@ function mutationKeyHash(workflow, actor, key) {
   return sha256('mutation-key-v1\0' + workflow + '\0' + normalizedActor + '\0' + normalizedKey);
 }
 
-function promptDigest(prompt) {
-  return sha256('account-test-prompt-v1\0' + String(prompt || ''));
+function promptDigest(prompt = '') {
+  if (typeof prompt !== 'string') {
+    throw idempotencyError('IDEMPOTENCY_REQUEST_INVALID', '账号测试提示词必须是字符串');
+  }
+  return sha256('account-test-prompt-v1\0' + prompt);
 }
 
 module.exports = {

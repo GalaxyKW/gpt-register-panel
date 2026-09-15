@@ -45,9 +45,23 @@ function envConfigurationError(code, message) {
   return error;
 }
 
+function ownEnvironmentValue(environment, name) {
+  if (!environment || (typeof environment !== 'object' && typeof environment !== 'function')) {
+    throw envConfigurationError('ENV_TARGET_INVALID', '环境配置目标必须是对象');
+  }
+  if (Object.prototype.hasOwnProperty.call(environment, name)) return environment[name];
+  if (name in environment) {
+    throw envConfigurationError(
+      'ENV_INHERITED_VALUE_INVALID',
+      name + ' 不能从对象原型继承',
+    );
+  }
+  return undefined;
+}
+
 function validateBooleanEnvironment(environment = process.env) {
   for (const name of BOOLEAN_ENV_NAMES) {
-    const value = environment[name];
+    const value = ownEnvironmentValue(environment, name);
     if (value !== undefined && value !== '0' && value !== '1') {
       throw envConfigurationError('ENV_BOOLEAN_INVALID', name + ' 必须严格设置为 0 或 1');
     }
@@ -55,7 +69,7 @@ function validateBooleanEnvironment(environment = process.env) {
 }
 
 function booleanEnvEnabled(name, fallback = false, environment = process.env) {
-  const value = environment[name];
+  const value = ownEnvironmentValue(environment, name);
   if (value === undefined) return Boolean(fallback);
   if (value !== '0' && value !== '1') {
     throw envConfigurationError('ENV_BOOLEAN_INVALID', name + ' 必须严格设置为 0 或 1');
@@ -275,7 +289,7 @@ function readEnvFile(filePath) {
 }
 
 function configuredEnvFile(environment = process.env) {
-  const configured = environment.PANEL_ENV_FILE;
+  const configured = ownEnvironmentValue(environment, 'PANEL_ENV_FILE');
   if (configured === undefined) return DEFAULT_ENV_FILE;
   if (typeof configured !== 'string' || configured.length === 0
       || configured.length > 4096 || configured.includes('\0')
@@ -289,7 +303,13 @@ function configuredEnvFile(environment = process.env) {
 }
 
 function loadEnv(filePath, environment = process.env) {
-  const explicitlySelected = filePath !== undefined || environment.PANEL_ENV_FILE !== undefined;
+  // Reject prototype-inherited security switches before copying own values to
+  // the null-prototype prospective object below. Otherwise an inherited
+  // PANEL_WRITE_ENABLED/PANEL_ALLOW_* property could survive validation and
+  // still be observed by direct process.env reads elsewhere in the process.
+  validateBooleanEnvironment(environment);
+  const configuredFile = ownEnvironmentValue(environment, 'PANEL_ENV_FILE');
+  const explicitlySelected = filePath !== undefined || configuredFile !== undefined;
   const selectedFile = filePath === undefined ? configuredEnvFile(environment) : filePath;
   const content = readEnvFile(selectedFile);
   if (content === null) {
