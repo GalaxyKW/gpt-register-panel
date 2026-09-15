@@ -89,7 +89,7 @@ const RECONCILIATION_ACK_RESOLUTIONS = new Set([
   'state_manually_reconciled',
 ]);
 const RECONCILIATION_AVAILABILITY_REASONS = new Set([
-  'not_in_sub2api', 'sub2api_schema_invalid', 'sub2api_status_unknown',
+  'not_in_sub2api', 'panel_clock_invalid', 'sub2api_schema_invalid', 'sub2api_status_unknown',
   'sub2api_status_missing', 'sub2api_status_inactive', 'sub2api_status_disabled',
   'sub2api_status_error',
   'sub2api_schedulable_missing', 'sub2api_unschedulable',
@@ -1525,6 +1525,7 @@ function renderAccountSummary(row, sides, displayName) {
 function availabilityReasonLabel(reason) {
   const normalized = String(reason || '').trim().toLowerCase();
   const labels = {
+    panel_clock_invalid: '面板时间基准无效',
     sub2api_available: '可用',
     sub2api_status_active: '账号状态正常',
     sub2api_status_inactive: '账号已停用',

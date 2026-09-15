@@ -1594,6 +1594,7 @@ test('frontend recognizes and safely renders the real Sub2API inactive status', 
         cssClass: statusClass('inactive'),
         status: statusLabel('INACTIVE'),
         availability: availabilityReasonLabel('sub2api_status_inactive'),
+        clockAvailability: availabilityReasonLabel('panel_clock_invalid'),
         actionReason: actionReasonLabel('sub2api_status_inactive'),
         importReview: reconciliationTargetIsValid('token_import', {
           remoteAccountId: 266,
@@ -1605,15 +1606,22 @@ test('frontend recognizes and safely renders the real Sub2API inactive status', 
           baselineStatus: 'inactive',
           baselineSchedulable: false,
         }),
+        clockReview: reconciliationTargetIsValid('token_import', {
+          remoteAccountId: 267,
+          availability: 'unknown',
+          availabilityReason: 'panel_clock_invalid',
+        }),
       };
     `, context);
   assert.deepEqual({ ...context.result }, {
     cssClass: 'status-error',
     status: '已停用',
     availability: '账号已停用',
+    clockAvailability: '面板时间基准无效',
     actionReason: 'Sub2API 账号已停用',
     importReview: true,
     testReview: true,
+    clockReview: true,
   });
 });
 
