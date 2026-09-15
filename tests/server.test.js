@@ -157,7 +157,15 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'AUDIT_LOG_UNAVAILABLE',
       'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
       'ACCOUNT_TEST_BASELINE_INVALID',
+      'GPT_REGISTER_PATH_INVALID',
+      'GPT_REGISTER_PATH_PERMISSIONS_INVALID',
+      'GPT_REGISTER_FILE_TOO_LARGE',
+      'GPT_REGISTER_SOURCE_LIMIT',
       'GPT_REGISTER_SOURCE_MISSING',
+      'GPT_REGISTER_SOURCE_INCOMPLETE',
+      'GPT_REGISTER_SOURCE_CHANGED',
+      'GPT_REGISTER_USERNAME_INVALID',
+      'GPT_REGISTER_USERNAME_RECORD_LIMIT',
       'SUB2API_GROUP_CONFIG_INVALID',
     ]],
   ]);
@@ -2577,6 +2585,12 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
     )?.phase3TargetRevision;
 
     fs.renameSync(path.join(root, 'use_token'), path.join(root, 'use_token-missing'));
+    const incompleteSourceSnapshot = await request(baseUrl, '/api/snapshot');
+    assert.equal(incompleteSourceSnapshot.status, 503);
+    assert.equal(
+      JSON.parse(incompleteSourceSnapshot.body).error,
+      'GPT_REGISTER_SOURCE_MISSING',
+    );
     const incompleteSourcePreview = await postJson(baseUrl, '/api/sync/preview', {
       selectedKeys: [],
     });
@@ -2586,6 +2600,17 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
       'GPT_REGISTER_SOURCE_MISSING',
     );
     fs.renameSync(path.join(root, 'use_token-missing'), path.join(root, 'use_token'));
+
+    const usernamePath = path.join(root, 'username.json');
+    const validUsernameContent = fs.readFileSync(usernamePath);
+    fs.writeFileSync(usernamePath, '{not-valid-json');
+    const invalidUsernameSnapshot = await request(baseUrl, '/api/snapshot');
+    assert.equal(invalidUsernameSnapshot.status, 503);
+    assert.equal(
+      JSON.parse(invalidUsernameSnapshot.body).error,
+      'GPT_REGISTER_USERNAME_INVALID',
+    );
+    fs.writeFileSync(usernamePath, validUsernameContent);
 
     const incompletePreview = await postJson(baseUrl, '/api/sync/preview', {
       selectedKeys: [],

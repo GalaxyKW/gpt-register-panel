@@ -360,7 +360,15 @@ const PUBLIC_SERVICE_ERRORS = new Set([
   'AUDIT_LOG_UNAVAILABLE',
   'TOKEN_CLEANUP_AUDIT_INTENT_FAILED',
   'ACCOUNT_TEST_BASELINE_INVALID',
+  'GPT_REGISTER_PATH_INVALID',
+  'GPT_REGISTER_PATH_PERMISSIONS_INVALID',
+  'GPT_REGISTER_FILE_TOO_LARGE',
+  'GPT_REGISTER_SOURCE_LIMIT',
   'GPT_REGISTER_SOURCE_MISSING',
+  'GPT_REGISTER_SOURCE_INCOMPLETE',
+  'GPT_REGISTER_SOURCE_CHANGED',
+  'GPT_REGISTER_USERNAME_INVALID',
+  'GPT_REGISTER_USERNAME_RECORD_LIMIT',
   'SUB2API_GROUP_CONFIG_INVALID',
 ]);
 const PUBLIC_ERROR_MESSAGES = Object.freeze({
@@ -393,6 +401,15 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   JOB_RECONCILIATION_NOT_FOUND: '待对账任务不存在',
   JOB_RECONCILIATION_ADMIN_REQUIRED: '只允许经过认证的面板管理员执行该操作',
   AUDIT_LOG_UNAVAILABLE: '审计日志不可用，已拒绝写操作',
+  GPT_REGISTER_PATH_INVALID: 'gpt_register 来源路径不可信或不可读取',
+  GPT_REGISTER_PATH_PERMISSIONS_INVALID: 'gpt_register 来源权限不安全',
+  GPT_REGISTER_FILE_TOO_LARGE: 'gpt_register 来源文件超过安全读取上限',
+  GPT_REGISTER_SOURCE_LIMIT: 'gpt_register 来源数量或总大小超过安全上限',
+  GPT_REGISTER_SOURCE_MISSING: 'gpt_register 必需来源缺失，无法形成可信快照',
+  GPT_REGISTER_SOURCE_INCOMPLETE: 'gpt_register 来源读取不完整，无法形成可信快照',
+  GPT_REGISTER_SOURCE_CHANGED: 'gpt_register 来源在读取期间发生变化，请重试',
+  GPT_REGISTER_USERNAME_INVALID: 'username.json 内容无效，无法形成可信快照',
+  GPT_REGISTER_USERNAME_RECORD_LIMIT: 'username.json 记录数超过安全上限',
 });
 
 function storedErrorCode(error) {
@@ -2769,7 +2786,15 @@ function createServer(options = {}) {
         return;
       }
       try {
-        const snapshot = await buildSnapshot(requestUrl.searchParams, { logger, requestId, actor });
+        const snapshot = await buildSnapshot(requestUrl.searchParams, {
+          logger,
+          requestId,
+          actor,
+          // A missing token directory or damaged username file is not an
+          // empty account set. Refuse the comparison instead of presenting a
+          // misleading wave of Sub2API-only rows.
+          requireCompleteSources: true,
+        });
         jsonResponse(response, 200, {
           ...snapshot,
           capabilities: {
