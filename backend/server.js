@@ -962,6 +962,18 @@ function pathParam(pathname, prefix) {
   try { return decodeURIComponent(value); } catch { return null; }
 }
 
+function accountTestModelQueryId(searchParams) {
+  const values = [
+    ...searchParams.getAll('accountId'),
+    ...searchParams.getAll('account_id'),
+  ];
+  // Both spellings remain supported, but accepting duplicates or coercing
+  // values such as `01` and `1e0` lets intermediaries select a different ID.
+  if (values.length !== 1 || !/^[1-9]\d*$/.test(values[0])) return null;
+  const accountId = Number(values[0]);
+  return Number.isSafeInteger(accountId) ? accountId : null;
+}
+
 function reconciliationAcknowledgePath(pathname) {
   const prefix = '/api/jobs/';
   const suffix = '/reconciliation/acknowledge';
@@ -3204,8 +3216,8 @@ function createServer(options = {}) {
     }
 
     if (request.method === 'GET' && requestUrl.pathname === '/api/account-tests/models') {
-      const accountId = Number(requestUrl.searchParams.get('accountId') || requestUrl.searchParams.get('account_id'));
-      if (!Number.isSafeInteger(accountId) || accountId <= 0) {
+      const accountId = accountTestModelQueryId(requestUrl.searchParams);
+      if (accountId === null) {
         jsonResponse(response, 400, {
           error: 'ACCOUNT_TEST_ACCOUNT_ID_INVALID',
           message: '需要有效的 Sub2API 账号 ID',

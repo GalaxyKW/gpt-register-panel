@@ -708,6 +708,61 @@ test('known routes return an exact Allow method while unknown targets remain 404
   }
 });
 
+test('account-test model lookup rejects ambiguous and non-canonical account IDs', async () => {
+  const previous = {
+    baseUrl: process.env.SUB2API_BASE_URL,
+    apiKey: process.env.SUB2API_ADMIN_API_KEY,
+    jwt: process.env.SUB2API_JWT,
+  };
+  let server;
+  try {
+    delete process.env.SUB2API_BASE_URL;
+    delete process.env.SUB2API_ADMIN_API_KEY;
+    delete process.env.SUB2API_JWT;
+    server = createServer({
+      db: { dbPath: '/tmp/unused-panel-model-query-test.sqlite3' },
+      logger: {
+        requestId: () => 'model-query-test',
+        info() {},
+        warn() {},
+        error() {},
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    for (const query of [
+      'accountId=01',
+      'accountId=1e0',
+      'accountId=1.0',
+      'accountId=%201',
+      'accountId=%2B1',
+      'accountId=1&accountId=2',
+      'accountId=1&account_id=1',
+      'accountId=1&account_id=2',
+      'account_id=01',
+      'accountId=9007199254740992',
+    ]) {
+      const result = await request(baseUrl, '/api/account-tests/models?' + query);
+      assert.equal(result.status, 400, query);
+      assert.deepEqual(JSON.parse(result.body), {
+        error: 'ACCOUNT_TEST_ACCOUNT_ID_INVALID',
+        message: '需要有效的 Sub2API 账号 ID',
+      }, query);
+    }
+  } finally {
+    await closeHttpServer(server);
+    if (previous.baseUrl === undefined) delete process.env.SUB2API_BASE_URL;
+    else process.env.SUB2API_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.SUB2API_ADMIN_API_KEY;
+    else process.env.SUB2API_ADMIN_API_KEY = previous.apiKey;
+    if (previous.jwt === undefined) delete process.env.SUB2API_JWT;
+    else process.env.SUB2API_JWT = previous.jwt;
+  }
+});
+
 test('HTTP responses hide unknown exceptions and lifecycle logs template request paths', async () => {
   const previous = {
     writeEnabled: process.env.PANEL_WRITE_ENABLED,
