@@ -29,6 +29,20 @@ test('loadEnv reads a regular file without overwriting existing environment valu
   assert.equal(environment.PANEL_CONFIG_TEST_EXISTING, 'kept');
 });
 
+test('loadEnv treats Object prototype names as ordinary environment keys', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-keys-'));
+  const filePath = path.join(directory, '.env');
+  fs.writeFileSync(filePath, 'toString=loaded\n__proto__=literal\n', { mode: 0o600 });
+  const environment = {};
+
+  assert.equal(loadEnv(filePath, environment), true);
+  assert.equal(Object.hasOwn(environment, 'toString'), true);
+  assert.equal(environment.toString, 'loaded');
+  assert.equal(Object.hasOwn(environment, '__proto__'), true);
+  assert.equal(environment.__proto__, 'literal');
+  assert.equal(Object.getPrototypeOf(environment), Object.prototype);
+});
+
 test('loadEnv rejects duplicate keys without partially applying earlier values', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-config-atomic-'));
   const filePath = path.join(directory, '.env');
@@ -106,6 +120,24 @@ test('environment parser handles bare CR as a line ending and rejects other cont
   assert.throws(
     () => parseEnvContent('BROKEN=value\u000bhidden'),
     (error) => error.code === 'ENV_SYNTAX_INVALID' && !error.message.includes('hidden'),
+  );
+});
+
+test('environment parser keeps values literal instead of applying shell semantics', () => {
+  assert.deepEqual(parseEnvContent([
+    'HASH=value # literal',
+    'REFERENCE=$HOME',
+    'ESCAPE="one\\ntwo"',
+    '  # full-line comment',
+    '',
+  ].join('\n')), [
+    ['HASH', 'value # literal'],
+    ['REFERENCE', '$HOME'],
+    ['ESCAPE', 'one\\ntwo'],
+  ]);
+  assert.throws(
+    () => parseEnvContent('export NAME=value'),
+    (error) => error.code === 'ENV_SYNTAX_INVALID',
   );
 });
 

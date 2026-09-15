@@ -3,7 +3,10 @@ Description=GPT Register Panel
 Documentation=file:///mnt/nvme/item/gpt-register-panel/README.md
 Wants=network-online.target
 After=network-online.target
-RequiresMountsFor=/mnt/nvme
+# Order every bind source, not only the top-level mount. If runtime or
+# gpt_register is later moved to a nested mount, binding its underlying
+# directory before that mount arrives would pin the wrong data for this start.
+RequiresMountsFor=/mnt/nvme/item/gpt-register-panel /mnt/nvme/item/gpt-register-panel/runtime /mnt/nvme/gpt_register
 # RequiresMountsFor covers ordered startup; BindsTo also stops the panel if an
 # externally managed mount disappears while the service is already running.
 BindsTo=mnt-nvme.mount
@@ -11,6 +14,8 @@ BindsTo=mnt-nvme.mount
 # on a read-only NTFS recovery mount.
 AssertPathIsMountPoint=/mnt/nvme
 AssertPathIsReadWrite=/mnt/nvme
+AssertPathIsReadWrite=/mnt/nvme/item/gpt-register-panel/runtime
+AssertPathIsReadWrite=/mnt/nvme/gpt_register
 StartLimitIntervalSec=60
 StartLimitBurst=5
 
@@ -54,6 +59,11 @@ Environment=PANEL_CONTROL_LOCK_PATH=/run/gpt-register-panel/runtime/panel.sqlite
 Environment=PANEL_TOKEN_QUARANTINE_DIR=/run/gpt-register-panel/gpt_register/.panel-quarantine/expired-tokens
 ExecStartPre=/usr/bin/test -r /etc/gpt-register-panel/panel.env
 ExecStartPre=/usr/bin/test -x /usr/bin/node
+# BindPaths follows its source path before ExecStartPre runs. Check every
+# original path component for symlinks and prove that each resulting bind root
+# is the same inode, otherwise a symlinked deployment source would be hidden by
+# the ordinary directory visible at its /run destination.
+ExecStartPre=/usr/bin/node -e "const fs=require('node:fs'),path=require('node:path'),pairs=process.argv.slice(1);if(pairs.length%%2!==0)throw Error('invalid source binding pairs');const noLinks=(value)=>{const absolute=path.resolve(value),parsed=path.parse(absolute),parts=absolute.slice(parsed.root.length).split(path.sep).filter(Boolean);let current=parsed.root;for(const part of parts){current=path.join(current,part);if(fs.lstatSync(current).isSymbolicLink())throw Error('unsafe source binding link: '+current)}return absolute};for(let i=0;i<pairs.length;i+=2){const source=noLinks(pairs[i]),target=path.resolve(pairs[i+1]),ss=fs.lstatSync(source),ts=fs.lstatSync(target);if(!ss.isDirectory()||ts.isSymbolicLink()||!ts.isDirectory()||ss.dev!==ts.dev||ss.ino!==ts.ino)throw Error('source binding identity mismatch: '+source)}" /mnt/nvme/item/gpt-register-panel /run/gpt-register-panel/code /mnt/nvme/item/gpt-register-panel/runtime /run/gpt-register-panel/runtime /mnt/nvme/gpt_register /run/gpt-register-panel/gpt_register
 # ExecStartPre runs inside the completed private mount namespace. Refuse a
 # source that was replaced before binding, is a symlink/wrong type, is not
 # root-owned, or is writable by a group/other user. Keep these checks inline so

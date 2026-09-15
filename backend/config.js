@@ -302,13 +302,30 @@ function loadEnv(filePath, environment = process.env) {
   // prevents an invalid trailing line or duplicate from leaving a partially
   // applied deployment configuration behind.
   const entries = parseEnvContent(content);
-  const prospectiveEnvironment = { ...environment };
+  // Environment names such as `toString` and `__proto__` are legal on Linux.
+  // Keep precedence checks independent of Object.prototype and use data
+  // properties so those names cannot invoke the legacy __proto__ setter when
+  // tests or embedders supply a plain object instead of process.env.
+  const hasOwnEnvironmentValue = (target, key) => (
+    Object.prototype.hasOwnProperty.call(target, key) && target[key] !== undefined
+  );
+  const setEnvironmentValue = (target, key, value) => {
+    Object.defineProperty(target, key, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  };
+  const prospectiveEnvironment = Object.assign(Object.create(null), environment);
   for (const [key, value] of entries) {
-    if (prospectiveEnvironment[key] === undefined) prospectiveEnvironment[key] = value;
+    if (!hasOwnEnvironmentValue(prospectiveEnvironment, key)) {
+      setEnvironmentValue(prospectiveEnvironment, key, value);
+    }
   }
   validateBooleanEnvironment(prospectiveEnvironment);
   for (const [key, value] of entries) {
-    if (environment[key] === undefined) environment[key] = value;
+    if (!hasOwnEnvironmentValue(environment, key)) setEnvironmentValue(environment, key, value);
   }
   return true;
 }
