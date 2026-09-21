@@ -12,6 +12,7 @@ const {
 } = require('./adapters/gptRegisterFs');
 const {
   hasStrongIdentity,
+  strongIdentityContradiction,
   strongIdentitiesFullyMatch,
   isExpired,
   isExpiryInvalid,
@@ -57,6 +58,12 @@ const PHASE3_CHILD_MUTABLE_FIELDS = new Set([
   'continuationRequired',
   'continuationStage',
 ]);
+const PHASE3_SUCCESS_MUTABLE_FIELDS = new Set([
+  'email',
+  'password',
+  'passwordResetCandidate',
+  'passwordResetPreparedAt',
+]);
 const PHASE3_ENV_NAMES = new Set([
   'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV',
   'DISPLAY', 'WAYLAND_DISPLAY', 'XAUTHORITY',
@@ -91,6 +98,7 @@ const PHASE3_PROC_CHILDREN_MAX_BYTES = 64 * 1024;
 const PHASE3_PROC_CHILDREN_SCAN_MAX_BYTES = 8 * 1024 * 1024;
 const PHASE3_SUPERVISION_ENV_NAME = 'GPT_REGISTER_PANEL_SUPERVISION_ID';
 const PHASE3_PASSWORD_LINE_CONTROL = /[\u0000\u000a\u000d]/;
+const PHASE3_MAX_WALL_CLOCK_MS = 8_640_000_000_000_000;
 const PHASE3_SCRIPT_CHILD_FD = 3;
 const PHASE3_NODE_CHILD_FD = 4;
 const PHASE3_ROOT_CHILD_FD = 5;
@@ -722,6 +730,17 @@ function recordFingerprint(record) {
     .digest('hex');
 }
 
+function phase3WallClockMilliseconds() {
+  let value;
+  try { value = Date.now(); } catch {}
+  if (!Number.isSafeInteger(value) || value < 0 || value > PHASE3_MAX_WALL_CLOCK_MS) {
+    const error = new Error('系统时间无效，拒绝执行或确认 Phase3 输出');
+    error.code = 'PHASE3_CLOCK_INVALID';
+    throw error;
+  }
+  return value;
+}
+
 function phase3ExecutionDigest(scope, value) {
   return crypto.createHmac('sha256', PHASE3_EXECUTION_BINDING_SECRET)
     .update(String(scope))
@@ -806,12 +825,44 @@ function assertTokenExecutionBinding(binding, sources, entry, request = {}) {
   return token;
 }
 
-function phase3TransitionBaseFingerprint(record) {
-  const stable = {};
+function isPhase3ChildMutableField(key) {
+  return PHASE3_CHILD_MUTABLE_FIELDS.has(key) || String(key).startsWith('phase3');
+}
+
+function phase3TransitionBaseFingerprint(record, successTransition = false) {
+  // A null-prototype object keeps a JSON `__proto__` field inside the stable
+  // record instead of treating it as an object-prototype mutation.
+  const stable = Object.create(null);
   for (const [key, value] of Object.entries(record || {})) {
-    if (!PHASE3_CHILD_MUTABLE_FIELDS.has(key)) stable[key] = value;
+    if (!isPhase3ChildMutableField(key)
+        && !(successTransition && PHASE3_SUCCESS_MUTABLE_FIELDS.has(key))) {
+      stable[key] = value;
+    }
   }
   return recordFingerprint(stable);
+}
+
+function phase3UsernameLedgerFingerprint(records, targetIndex, successTransition = false) {
+  if (!Array.isArray(records) || !Number.isSafeInteger(targetIndex)
+      || targetIndex < 0 || targetIndex >= records.length) return null;
+  return recordFingerprint(records.map((record, index) => (
+    index === targetIndex
+      ? ['target', phase3TransitionBaseFingerprint(record, successTransition)]
+      : ['other', recordFingerprint(record)]
+  )));
+}
+
+function phase3PasswordDigest(record) {
+  return phase3ExecutionDigest('phase3-password-state-v1', record?.password);
+}
+
+function phase3PasswordResetMetadataDigest(record) {
+  return phase3ExecutionDigest('phase3-password-reset-state-v1', [
+    Object.hasOwn(record || {}, 'passwordResetCandidate'),
+    record?.passwordResetCandidate,
+    Object.hasOwn(record || {}, 'passwordResetPreparedAt'),
+    record?.passwordResetPreparedAt,
+  ]);
 }
 
 function phase3UsernameMaxBytes() {
@@ -967,7 +1018,12 @@ function findUsernameEntry({
     createdAt: record.createdAt || null,
     recordFingerprint: recordFingerprint(record),
     transitionBaseFingerprint: phase3TransitionBaseFingerprint(record),
-    resolvedAtMs: Date.now(),
+    usernameLedgerFingerprint: phase3UsernameLedgerFingerprint(records, index),
+    usernameSuccessLedgerFingerprint: phase3UsernameLedgerFingerprint(records, index, true),
+    passwordDigest: phase3PasswordDigest(record),
+    passwordResetMetadataDigest: phase3PasswordResetMetadataDigest(record),
+    originalEmail: typeof record.email === 'string' ? record.email : null,
+    resolvedAtMs: phase3WallClockMilliseconds(),
   };
   const currentExecutionDigest = usernameExecutionDigest(index, record);
   if (expectedExecutionBinding) {
@@ -1104,8 +1160,38 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
 }
 
 function safePhase3ErrorCode(value, fallback) {
-  const code = String(value || '').trim().toUpperCase();
+  let code = '';
+  try { code = String(value || '').trim().toUpperCase(); } catch {}
   return /^[A-Z0-9_]{1,96}$/.test(code) ? code : fallback;
+}
+
+function safeOwnDataProperty(value, key) {
+  if ((!value || typeof value !== 'object') && typeof value !== 'function') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safePhase3ErrorMessage(error, fallback = 'Phase3 操作失败') {
+  let value;
+  if (['string', 'number', 'boolean', 'bigint'].includes(typeof error)) {
+    value = error;
+  } else {
+    const ownMessage = safeOwnDataProperty(error, 'message');
+    if (['string', 'number', 'boolean', 'bigint'].includes(typeof ownMessage)) {
+      value = ownMessage;
+    }
+  }
+  let text;
+  try { text = String(value === undefined || value === null ? fallback : value); } catch {
+    text = fallback;
+  }
+  try { return redactText(text).slice(0, 1000); } catch {
+    return fallback;
+  }
 }
 
 function phase3DispositionFailure(primaryError, dispositionError) {
@@ -1143,8 +1229,7 @@ function phase3DispositionFailure(primaryError, dispositionError) {
     // Preserve the primary safety code even for a frozen or non-extensible
     // thrown value. Never attach the raw secondary error or its filesystem
     // diagnostics to the replacement error.
-    const message = redactText(String(primaryError?.message || '账号处置状态需要人工对账'))
-      .slice(0, 1000);
+    const message = safePhase3ErrorMessage(primaryError, '账号处置状态需要人工对账');
     const wrapped = new Error(message || '账号处置状态需要人工对账');
     wrapped.code = safePhase3ErrorCode(primaryError?.code, 'PHASE3_FAILED');
     if (primaryError?.accountDisposition === 'discard') wrapped.accountDisposition = 'discard';
@@ -1199,7 +1284,7 @@ function phase3ProcessSummary(details = {}) {
   };
 }
 
-function phase3TokenPostflightError(cause) {
+function phase3TokenPostflightError(cause, reason = 'phase3_postflight_source_unavailable') {
   const error = new Error('Phase 3 已执行，但无法确认 token 输出；必须人工对账，禁止直接重试');
   error.code = 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN';
   error.writeOutcomeUnknown = true;
@@ -1207,9 +1292,83 @@ function phase3TokenPostflightError(cause) {
   error.retryAllowed = false;
   error.doNotRetry = true;
   error.reconciliationScope = 'phase3_token_output';
-  error.reconciliationReason = 'phase3_postflight_source_unavailable';
-  if (cause) error.cause = cause;
+  error.reconciliationReason = reason;
+  if (cause) {
+    error.causeCode = safePhase3ErrorCode(
+      safeOwnDataProperty(cause, 'code'),
+      'PHASE3_POSTFLIGHT_FAILED',
+    );
+  }
   return error;
+}
+
+function phase3UsernameOutputUnconfirmedError(reason = 'phase3_username_ledger_changed') {
+  const error = new Error('Phase 3 已执行，但 username.json 的账号账本无法确认；必须人工对账，禁止直接重试');
+  error.code = 'PHASE3_USERNAME_OUTPUT_UNCONFIRMED';
+  error.writeOutcomeUnknown = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'phase3_username_output';
+  error.reconciliationReason = reason;
+  return error;
+}
+
+function assertPhase3UsernamePostflight(entry, rootHandle, expectedContentHash) {
+  let snapshot;
+  try {
+    snapshot = readRegularJsonArraySnapshot(
+      usernameFilePath(rootHandle),
+      'username.json',
+      { parentPinned: Boolean(rootHandle) },
+    );
+  } catch {
+    throw phase3UsernameOutputUnconfirmedError('phase3_username_postflight_unavailable');
+  }
+  const current = snapshot.records[entry?.index];
+  const expectedLedger = String(entry?.usernameLedgerFingerprint || '');
+  const currentLedger = phase3UsernameLedgerFingerprint(snapshot.records, entry?.index);
+  if (!/^[a-f0-9]{64}$/.test(expectedLedger)
+      || !/^[a-f0-9]{64}$/.test(String(expectedContentHash || ''))
+      || snapshot.contentHash !== expectedContentHash
+      || normalizeEmail(current?.email) !== entry.email
+      || normalizeUsernamePhone(current?.phone) !== entry.phone) {
+    throw phase3UsernameOutputUnconfirmedError();
+  }
+  if (currentLedger === expectedLedger) {
+    return { snapshot, passwordChanged: false, successTransition: false };
+  }
+
+  // A successful gpt_register Phase3 can legitimately canonicalize the email
+  // and, after a verified password-reset flow, replace the target password.
+  // Keep every other target field and every non-target row immutable. The
+  // password transition is accepted only later, after a newly published token
+  // has also been bound to the reviewed target identity.
+  const expectedSuccessLedger = String(entry?.usernameSuccessLedgerFingerprint || '');
+  const currentSuccessLedger = phase3UsernameLedgerFingerprint(
+    snapshot.records,
+    entry?.index,
+    true,
+  );
+  const passwordChanged = !executionDigestsEqual(
+    entry?.passwordDigest,
+    phase3PasswordDigest(current),
+  );
+  const resetMetadataChanged = !executionDigestsEqual(
+    entry?.passwordResetMetadataDigest,
+    phase3PasswordResetMetadataDigest(current),
+  );
+  const emailChanged = current?.email !== entry?.originalEmail;
+  if (!/^[a-f0-9]{64}$/.test(expectedSuccessLedger)
+      || currentSuccessLedger !== expectedSuccessLedger
+      || (emailChanged && current?.email !== entry.email)
+      || (resetMetadataChanged && !passwordChanged)
+      || (passwordChanged && (!hasUsablePhase3Password(current)
+        || Object.hasOwn(current, 'passwordResetCandidate')
+        || Object.hasOwn(current, 'passwordResetPreparedAt')))) {
+    throw phase3UsernameOutputUnconfirmedError();
+  }
+  return { snapshot, passwordChanged, successTransition: true };
 }
 
 function phase3TokenIdentityMismatchError() {
@@ -1236,6 +1395,18 @@ function phase3TokenOutputUnconfirmedError() {
   return error;
 }
 
+function phase3TokenScopeViolationError() {
+  const error = new Error('Phase 3 改变了无法确认属于目标账号的 token 文件；必须人工对账，禁止直接重试');
+  error.code = 'PHASE3_TOKEN_SCOPE_VIOLATION';
+  error.writeOutcomeUnknown = true;
+  error.requiresReconciliation = true;
+  error.retryAllowed = false;
+  error.doNotRetry = true;
+  error.reconciliationScope = 'phase3_token_output';
+  error.reconciliationReason = 'phase3_token_artifact_outside_target';
+  return error;
+}
+
 function phase3TokenMatchesBoundIdentity(token, selectedToken) {
   if (!selectedToken) return true;
   const selectedKeys = Array.isArray(selectedToken.identityKeys)
@@ -1250,6 +1421,24 @@ function phase3TokenMatchesBoundIdentity(token, selectedToken) {
   // dimension is part of the reviewed target. A partial match (for example a
   // shared workspace with a missing or different user) is insufficient proof
   // that the new credential belongs to that exact account.
+  return strongIdentitiesFullyMatch(selectedKeys, tokenKeys);
+}
+
+function phase3TokenArtifactBelongsToTarget(token, entry, selectedToken, options = {}) {
+  if (normalizeEmail(token?.email) !== entry?.email) return false;
+  if (!selectedToken) return true;
+  const selectedKeys = Array.isArray(selectedToken.identityKeys)
+    ? selectedToken.identityKeys
+    : [];
+  if (!hasStrongIdentity(selectedKeys)) return true;
+  const tokenKeys = Array.isArray(token?.identityKeys) ? token.identityKeys : [];
+  if (options.priorArtifact === true) {
+    // A deterministic output path may contain an older same-account version
+    // with only one identity dimension. Permit replacement when it does not
+    // contradict the reviewed account; the newly written artifact still has
+    // to satisfy the full-identity rule below.
+    return !strongIdentityContradiction(selectedKeys, tokenKeys);
+  }
   return strongIdentitiesFullyMatch(selectedKeys, tokenKeys);
 }
 
@@ -1278,31 +1467,37 @@ function changedPhase3TokenArtifacts(beforeTokens, afterTokens) {
   for (const token of beforeTokens || []) {
     const key = phase3TokenArtifactKey(token);
     const hash = phase3TokenArtifactHash(token);
-    if (key && hash) before.set(key, hash);
+    if (key && hash) before.set(key, { hash, token });
   }
   const changed = [];
+  const replacements = [];
   for (const token of afterTokens || []) {
     const key = phase3TokenArtifactKey(token);
     const hash = phase3TokenArtifactHash(token);
     if (!key || !hash) continue;
     after.set(key, hash);
-    if (before.get(key) !== hash) changed.push(token);
+    const previous = before.get(key) || null;
+    if (previous?.hash !== hash) {
+      changed.push(token);
+      replacements.push({ before: previous?.token || null, after: token });
+    }
   }
-  let removedCount = 0;
-  for (const key of before.keys()) {
-    if (!after.has(key)) removedCount += 1;
+  const removed = [];
+  for (const [key, previous] of before) {
+    if (!after.has(key)) removed.push(previous.token);
   }
-  return { changed, removedCount };
+  return { changed, replacements, removed, removedCount: removed.length };
 }
 
 function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
-  const details = error?.details || {};
+  const ownDetails = safeOwnDataProperty(error, 'details');
+  const details = ownDetails && typeof ownDetails === 'object' ? ownDetails : {};
   const hasProcessDetails = details && typeof details === 'object'
     && ['code', 'signal', 'requestedSignal', 'observedSignal', 'terminationConfirmed',
       'processScanComplete', 'remainingDescendantCount', 'rootProcessRemaining',
       'stdout', 'stderr', 'forcedClose',
       'outputTruncated', 'stdoutBytes', 'stderrBytes'].some((key) => Object.hasOwn(details, key));
-  const combined = [details.stdout, details.stderr, error?.message]
+  const combined = [details.stdout, details.stderr, safePhase3ErrorMessage(error, '')]
     .filter(Boolean)
     .join('\n');
   let childRecordedTerminal = false;
@@ -1431,6 +1626,22 @@ function writeLog(logger, level, event, fields = {}) {
 function monotonicElapsedMilliseconds(startedAt) {
   const elapsed = performance.now() - Number(startedAt);
   return Number.isFinite(elapsed) ? Math.max(0, elapsed) : 0;
+}
+
+function phase3PostflightObservedAt(startedWallClock, startedMonotonicAt) {
+  const currentWallClock = phase3WallClockMilliseconds();
+  const elapsed = Math.ceil(monotonicElapsedMilliseconds(startedMonotonicAt));
+  const projected = Number(startedWallClock) + elapsed;
+  if (!Number.isSafeInteger(startedWallClock) || startedWallClock < 0
+      || !Number.isSafeInteger(projected) || projected > PHASE3_MAX_WALL_CLOCK_MS) {
+    const error = new Error('Phase3 token 后置校验时间无效');
+    error.code = 'PHASE3_CLOCK_INVALID';
+    throw error;
+  }
+  // A forward clock adjustment makes expiry checks more conservative. A
+  // rollback must never make a credential that was already expired at launch
+  // appear valid after the browser process finishes.
+  return Math.max(currentWallClock, projected);
 }
 
 function phase3TerminationBudget(options = {}) {
@@ -1859,11 +2070,11 @@ async function runPhase3JobNow({
 }) {
   throwIfJobInterrupted(signal);
   if (phase3ProcessTreeUnsafe) throw phase3SupervisionError();
-  // Keep a wall-clock boundary only for comparing filesystem mtimes. Durations
-  // must use the monotonic clock so an NTP/manual clock correction cannot
-  // produce negative or misleading execution timings.
-  const startedAt = Date.now();
+  // Keep a wall-clock launch boundary for filesystem mtimes and the token
+  // expiry lower bound. Durations must use the monotonic clock so an NTP/manual
+  // clock correction cannot produce negative or misleading execution timings.
   const startedMonotonicAt = performance.now();
+  let startedAt = null;
   let entry = null;
   let rootHandle = null;
   let scriptHandle = null;
@@ -1880,6 +2091,7 @@ async function runPhase3JobNow({
       error.code = 'PHASE3_DISABLED';
       throw error;
     }
+    startedAt = phase3WallClockMilliseconds();
     if ((requireExecutionBinding && !executionBinding)
         || (executionBinding && (executionBinding.version !== 1
           || !executionBinding.token || !executionBinding.username))) {
@@ -1979,7 +2191,7 @@ async function runPhase3JobNow({
         email: entry.email,
         durationMs: monotonicElapsedMilliseconds(processStartedAt),
         ...processSummary,
-        error: redactText(String(error?.message || error)),
+        error: safePhase3ErrorMessage(error),
       });
       if (error?.accountDisposition === 'discard'
           || error?.details?.terminationConfirmed !== true) throw error;
@@ -2014,7 +2226,17 @@ async function runPhase3JobNow({
     } catch (error) {
       throw phase3TokenPostflightError(error);
     }
-    const tokenObservedAt = Date.now();
+    const usernamePostflight = assertPhase3UsernamePostflight(
+      entry,
+      rootHandle,
+      sources.usernameContentHash,
+    );
+    let tokenObservedAt;
+    try {
+      tokenObservedAt = phase3PostflightObservedAt(startedAt, startedMonotonicAt);
+    } catch (error) {
+      throw phase3TokenPostflightError(error, 'phase3_postflight_clock_invalid');
+    }
     const artifactChanges = changedPhase3TokenArtifacts(beforeTokens, sources.tokens);
     const beforeByPath = new Map(beforeTargetTokens.map((item) => [item.relativePath, item]));
     const beforeAccessFingerprints = new Set(beforeTokens
@@ -2037,6 +2259,19 @@ async function runPhase3JobNow({
     ) || (selectedToken && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
       throw phase3TokenIdentityMismatchError();
     }
+    const artifactScopeValid = artifactChanges.replacements.every((replacement) => (
+      (!replacement.before
+        || phase3TokenArtifactBelongsToTarget(
+          replacement.before,
+          entry,
+          selectedToken,
+          { priorArtifact: true },
+        ))
+      && phase3TokenArtifactBelongsToTarget(replacement.after, entry, selectedToken)
+    )) && artifactChanges.removed.every(
+      (item) => phase3TokenArtifactBelongsToTarget(item, entry, selectedToken),
+    );
+    if (!artifactScopeValid) throw phase3TokenScopeViolationError();
     // A second path reusing an access token that was already present before
     // the child started is only a copy or metadata/refresh-token rewrite, not
     // proof that OAuth produced a fresh access credential.
@@ -2047,6 +2282,9 @@ async function runPhase3JobNow({
     changedTokens.sort((left, right) => comparePhase3TokenFreshness(left, right, tokenObservedAt));
     const token = changedTokens[0];
     if (!token) {
+      if (usernamePostflight.successTransition) {
+        throw phase3UsernameOutputUnconfirmedError('phase3_username_transition_without_token');
+      }
       const observedArtifacts = new Set(observedChangedTokens);
       if (artifactChanges.removedCount > 0
           || artifactChanges.changed.some((item) => !observedArtifacts.has(item))) {
@@ -2060,6 +2298,21 @@ async function runPhase3JobNow({
       const error = new Error('phase3 已退出，但没有检测到对应的 token 变化');
       error.code = 'PHASE3_TOKEN_UNCHANGED';
       throw error;
+    }
+    if (usernamePostflight.passwordChanged) {
+      const selectedIdentityKeys = Array.isArray(selectedToken?.identityKeys)
+        ? selectedToken.identityKeys
+        : [];
+      if (requireExecutionBinding !== true || !executionBinding || !selectedToken
+          || !hasStrongIdentity(selectedIdentityKeys)
+          || !hasStrongIdentity(Array.isArray(token.identityKeys) ? token.identityKeys : [])) {
+        throw phase3UsernameOutputUnconfirmedError('phase3_password_reset_unconfirmed');
+      }
+      writeLog(logger, 'info', 'phase3.password_reset_confirmed', {
+        jobId,
+        actor,
+        email: entry.email,
+      });
     }
     writeLog(logger, 'info', 'phase3.token_detected', {
       jobId,
@@ -2096,7 +2349,7 @@ async function runPhase3JobNow({
           jobId,
           actor,
           email: entry.email,
-          error: redactText(String(jobError?.message || jobError)),
+          error: safePhase3ErrorMessage(jobError),
         });
       }
     }
@@ -2121,7 +2374,7 @@ async function runPhase3JobNow({
         jobId,
         actor,
         email: entry.email,
-        error: redactText(String(auditError?.message || auditError)),
+        error: safePhase3ErrorMessage(auditError),
       });
     }
     writeLog(logger, 'info', 'phase3.completed', {
@@ -2180,7 +2433,7 @@ async function runPhase3JobNow({
             jobId,
             actor,
             email: entry.email,
-            error: redactText(String(dispositionError?.message || dispositionError)),
+            error: safePhase3ErrorMessage(dispositionError),
             errorCode: error.dispositionErrorCode,
             dispositionOutcome: error.dispositionOutcome,
             writeOutcomeUnknown: error.dispositionWriteOutcomeUnknown === true,
@@ -2195,7 +2448,7 @@ async function runPhase3JobNow({
       actor,
       email: email || null,
       durationMs: monotonicElapsedMilliseconds(startedMonotonicAt),
-      error: redactText(String(error?.message || error)),
+      error: safePhase3ErrorMessage(error),
       code: error?.code || null,
       dispositionOutcome: error?.dispositionOutcome || null,
       writeOutcomeUnknown: error?.writeOutcomeUnknown === true,
@@ -2438,7 +2691,12 @@ function runPhase3Job(args = {}) {
     error.existingJobId = duplicate.jobId || null;
     return Promise.reject(error);
   }
-  const queuedAt = Date.now();
+  let queuedAt;
+  try {
+    queuedAt = phase3WallClockMilliseconds();
+  } catch (error) {
+    return Promise.reject(error);
+  }
   const queuedMonotonicAt = performance.now();
   const activeRecord = {
     jobId: args.jobId || null,
@@ -2491,7 +2749,7 @@ function runPhase3Job(args = {}) {
               jobId: args.jobId || null,
               actor: args.actor || 'local',
               terminalOutcome: 'failed',
-              error: redactText(String(jobError?.message || jobError)),
+              error: safePhase3ErrorMessage(jobError),
             });
           }
         }
