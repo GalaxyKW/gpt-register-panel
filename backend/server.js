@@ -32,6 +32,8 @@ const {
   RECONCILIATION_ACK_RESOLUTIONS,
 } = require('./db');
 const {
+  PHASE3_RECONCILIATION_REASON,
+  PHASE3_RECONCILIATION_SCOPE,
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   runPhase3Job,
   canonicalPhase3Keys,
@@ -105,19 +107,8 @@ const GET_API_ENDPOINTS = new Set([
   '/api/logs',
 ]);
 const RECONCILIATION_ACK_RESOLUTION_SET = new Set(RECONCILIATION_ACK_RESOLUTIONS);
-const PHASE3_RECONCILIATION_SCOPES = new Set([
-  'phase3_account_disposition',
-  'phase3_process_tree',
-  'phase3_token_output',
-]);
-const PHASE3_RECONCILIATION_REASONS = new Set([
-  'account_disposition_write_unknown',
-  'account_disposition_checkpoint_unavailable',
-  'account_disposition_not_persisted',
-  'phase3_process_tree_unconfirmed',
-  'phase3_postflight_source_unavailable',
-  'phase3_token_identity_mismatch',
-]);
+const PHASE3_RECONCILIATION_SCOPES = new Set(Object.values(PHASE3_RECONCILIATION_SCOPE));
+const PHASE3_RECONCILIATION_REASONS = new Set(Object.values(PHASE3_RECONCILIATION_REASON));
 const PHASE3_DISPOSITION_OUTCOMES = new Set([
   'persisted',
   'not_persisted',

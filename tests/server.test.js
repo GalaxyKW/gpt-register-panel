@@ -36,6 +36,10 @@ const {
   validateListenConfiguration,
   validateRuntimeConfiguration,
 } = require('../backend/server');
+const {
+  PHASE3_RECONCILIATION_REASON,
+  PHASE3_RECONCILIATION_SCOPE,
+} = require('../backend/phase3Worker');
 const { listExpiredTokens } = require('../backend/tokenCleanup');
 const { PanelDb } = require('../backend/db');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
@@ -476,6 +480,25 @@ test('Phase3 failures persist only bounded reconciliation metadata', () => {
     reconciliationScope: 'phase3_token_output',
     reconciliationReason: 'phase3_token_identity_mismatch',
   });
+});
+
+test('Phase3 worker and terminal persistence share every reconciliation value', () => {
+  assert.equal(Object.isFrozen(PHASE3_RECONCILIATION_SCOPE), true);
+  assert.equal(Object.isFrozen(PHASE3_RECONCILIATION_REASON), true);
+  for (const reconciliationScope of Object.values(PHASE3_RECONCILIATION_SCOPE)) {
+    assert.deepEqual(phase3FailureMetadata({ reconciliationScope }), {
+      code: null,
+      accountDisposition: null,
+      reconciliationScope,
+    });
+  }
+  for (const reconciliationReason of Object.values(PHASE3_RECONCILIATION_REASON)) {
+    assert.deepEqual(phase3FailureMetadata({ reconciliationReason }), {
+      code: null,
+      accountDisposition: null,
+      reconciliationReason,
+    });
+  }
 });
 
 test('generic worker failures preserve only bounded reconciliation signals', () => {

@@ -42,6 +42,28 @@ const TERMINAL_ACCOUNT_STATUSES = new Set([
   'account_deleted',
   'account_disabled',
 ]);
+const PHASE3_RECONCILIATION_SCOPE = Object.freeze({
+  ACCOUNT_DISPOSITION: 'phase3_account_disposition',
+  PROCESS_TREE: 'phase3_process_tree',
+  TOKEN_OUTPUT: 'phase3_token_output',
+  USERNAME_OUTPUT: 'phase3_username_output',
+});
+const PHASE3_RECONCILIATION_REASON = Object.freeze({
+  ACCOUNT_DISPOSITION_WRITE_UNKNOWN: 'account_disposition_write_unknown',
+  ACCOUNT_DISPOSITION_CHECKPOINT_UNAVAILABLE: 'account_disposition_checkpoint_unavailable',
+  ACCOUNT_DISPOSITION_NOT_PERSISTED: 'account_disposition_not_persisted',
+  PROCESS_TREE_UNCONFIRMED: 'phase3_process_tree_unconfirmed',
+  POSTFLIGHT_SOURCE_UNAVAILABLE: 'phase3_postflight_source_unavailable',
+  POSTFLIGHT_CLOCK_INVALID: 'phase3_postflight_clock_invalid',
+  TOKEN_IDENTITY_MISMATCH: 'phase3_token_identity_mismatch',
+  TOKEN_ARTIFACT_CHANGED_WITHOUT_VERIFIED_OUTPUT:
+    'phase3_token_artifact_changed_without_verified_output',
+  TOKEN_ARTIFACT_OUTSIDE_TARGET: 'phase3_token_artifact_outside_target',
+  USERNAME_LEDGER_CHANGED: 'phase3_username_ledger_changed',
+  USERNAME_POSTFLIGHT_UNAVAILABLE: 'phase3_username_postflight_unavailable',
+  USERNAME_TRANSITION_WITHOUT_TOKEN: 'phase3_username_transition_without_token',
+  PASSWORD_RESET_UNCONFIRMED: 'phase3_password_reset_unconfirmed',
+});
 const PHASE3_CHILD_MUTABLE_FIELDS = new Set([
   'status',
   'phase3LastAttemptAt',
@@ -1136,8 +1158,8 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
         requiresReconciliation: true,
         retryAllowed: false,
         doNotRetry: true,
-        reconciliationScope: 'phase3_account_disposition',
-        reconciliationReason: 'account_disposition_write_unknown',
+        reconciliationScope: PHASE3_RECONCILIATION_SCOPE.ACCOUNT_DISPOSITION,
+        reconciliationReason: PHASE3_RECONCILIATION_REASON.ACCOUNT_DISPOSITION_WRITE_UNKNOWN,
       });
     } catch {
       const wrapped = new Error('账号处置写入结果无法确认');
@@ -1146,8 +1168,8 @@ function persistAccountDispositionWithHandle(entry, code, rootHandle) {
       wrapped.requiresReconciliation = true;
       wrapped.retryAllowed = false;
       wrapped.doNotRetry = true;
-      wrapped.reconciliationScope = 'phase3_account_disposition';
-      wrapped.reconciliationReason = 'account_disposition_write_unknown';
+      wrapped.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.ACCOUNT_DISPOSITION;
+      wrapped.reconciliationReason = PHASE3_RECONCILIATION_REASON.ACCOUNT_DISPOSITION_WRITE_UNKNOWN;
       throw wrapped;
     }
     throw target;
@@ -1201,12 +1223,12 @@ function phase3DispositionFailure(primaryError, dispositionError) {
     requiresReconciliation: true,
     retryAllowed: false,
     doNotRetry: true,
-    reconciliationScope: 'phase3_account_disposition',
+    reconciliationScope: PHASE3_RECONCILIATION_SCOPE.ACCOUNT_DISPOSITION,
     reconciliationReason: writeOutcomeUnknown
-      ? 'account_disposition_write_unknown'
+      ? PHASE3_RECONCILIATION_REASON.ACCOUNT_DISPOSITION_WRITE_UNKNOWN
       : checkpointUnavailable
-        ? 'account_disposition_checkpoint_unavailable'
-        : 'account_disposition_not_persisted',
+        ? PHASE3_RECONCILIATION_REASON.ACCOUNT_DISPOSITION_CHECKPOINT_UNAVAILABLE
+        : PHASE3_RECONCILIATION_REASON.ACCOUNT_DISPOSITION_NOT_PERSISTED,
     dispositionPersisted: writeOutcomeUnknown ? null : false,
     dispositionOutcome: writeOutcomeUnknown ? 'unknown' : 'not_persisted',
     dispositionWriteOutcomeUnknown: writeOutcomeUnknown,
@@ -1284,14 +1306,17 @@ function phase3ProcessSummary(details = {}) {
   };
 }
 
-function phase3TokenPostflightError(cause, reason = 'phase3_postflight_source_unavailable') {
+function phase3TokenPostflightError(
+  cause,
+  reason = PHASE3_RECONCILIATION_REASON.POSTFLIGHT_SOURCE_UNAVAILABLE,
+) {
   const error = new Error('Phase 3 已执行，但无法确认 token 输出；必须人工对账，禁止直接重试');
   error.code = 'PHASE3_TOKEN_POSTFLIGHT_UNKNOWN';
   error.writeOutcomeUnknown = true;
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
-  error.reconciliationScope = 'phase3_token_output';
+  error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.TOKEN_OUTPUT;
   error.reconciliationReason = reason;
   if (cause) {
     error.causeCode = safePhase3ErrorCode(
@@ -1302,14 +1327,16 @@ function phase3TokenPostflightError(cause, reason = 'phase3_postflight_source_un
   return error;
 }
 
-function phase3UsernameOutputUnconfirmedError(reason = 'phase3_username_ledger_changed') {
+function phase3UsernameOutputUnconfirmedError(
+  reason = PHASE3_RECONCILIATION_REASON.USERNAME_LEDGER_CHANGED,
+) {
   const error = new Error('Phase 3 已执行，但 username.json 的账号账本无法确认；必须人工对账，禁止直接重试');
   error.code = 'PHASE3_USERNAME_OUTPUT_UNCONFIRMED';
   error.writeOutcomeUnknown = true;
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
-  error.reconciliationScope = 'phase3_username_output';
+  error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.USERNAME_OUTPUT;
   error.reconciliationReason = reason;
   return error;
 }
@@ -1323,7 +1350,9 @@ function assertPhase3UsernamePostflight(entry, rootHandle, expectedContentHash) 
       { parentPinned: Boolean(rootHandle) },
     );
   } catch {
-    throw phase3UsernameOutputUnconfirmedError('phase3_username_postflight_unavailable');
+    throw phase3UsernameOutputUnconfirmedError(
+      PHASE3_RECONCILIATION_REASON.USERNAME_POSTFLIGHT_UNAVAILABLE,
+    );
   }
   const current = snapshot.records[entry?.index];
   const expectedLedger = String(entry?.usernameLedgerFingerprint || '');
@@ -1378,8 +1407,8 @@ function phase3TokenIdentityMismatchError() {
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
-  error.reconciliationScope = 'phase3_token_output';
-  error.reconciliationReason = 'phase3_token_identity_mismatch';
+  error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.TOKEN_OUTPUT;
+  error.reconciliationReason = PHASE3_RECONCILIATION_REASON.TOKEN_IDENTITY_MISMATCH;
   return error;
 }
 
@@ -1390,8 +1419,9 @@ function phase3TokenOutputUnconfirmedError() {
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
-  error.reconciliationScope = 'phase3_token_output';
-  error.reconciliationReason = 'phase3_token_artifact_changed_without_verified_output';
+  error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.TOKEN_OUTPUT;
+  error.reconciliationReason =
+    PHASE3_RECONCILIATION_REASON.TOKEN_ARTIFACT_CHANGED_WITHOUT_VERIFIED_OUTPUT;
   return error;
 }
 
@@ -1402,8 +1432,8 @@ function phase3TokenScopeViolationError() {
   error.requiresReconciliation = true;
   error.retryAllowed = false;
   error.doNotRetry = true;
-  error.reconciliationScope = 'phase3_token_output';
-  error.reconciliationReason = 'phase3_token_artifact_outside_target';
+  error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.TOKEN_OUTPUT;
+  error.reconciliationReason = PHASE3_RECONCILIATION_REASON.TOKEN_ARTIFACT_OUTSIDE_TARGET;
   return error;
 }
 
@@ -1560,8 +1590,8 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
     error.requiresReconciliation = true;
     error.retryAllowed = false;
     error.doNotRetry = true;
-    error.reconciliationScope = 'phase3_process_tree';
-    error.reconciliationReason = 'phase3_process_tree_unconfirmed';
+    error.reconciliationScope = PHASE3_RECONCILIATION_SCOPE.PROCESS_TREE;
+    error.reconciliationReason = PHASE3_RECONCILIATION_REASON.PROCESS_TREE_UNCONFIRMED;
     if (error.accountDisposition === 'discard') {
       error.dispositionPersisted = false;
       error.dispositionOutcome = 'not_attempted';
@@ -2235,7 +2265,10 @@ async function runPhase3JobNow({
     try {
       tokenObservedAt = phase3PostflightObservedAt(startedAt, startedMonotonicAt);
     } catch (error) {
-      throw phase3TokenPostflightError(error, 'phase3_postflight_clock_invalid');
+      throw phase3TokenPostflightError(
+        error,
+        PHASE3_RECONCILIATION_REASON.POSTFLIGHT_CLOCK_INVALID,
+      );
     }
     const artifactChanges = changedPhase3TokenArtifacts(beforeTokens, sources.tokens);
     const beforeByPath = new Map(beforeTargetTokens.map((item) => [item.relativePath, item]));
@@ -2283,7 +2316,9 @@ async function runPhase3JobNow({
     const token = changedTokens[0];
     if (!token) {
       if (usernamePostflight.successTransition) {
-        throw phase3UsernameOutputUnconfirmedError('phase3_username_transition_without_token');
+        throw phase3UsernameOutputUnconfirmedError(
+          PHASE3_RECONCILIATION_REASON.USERNAME_TRANSITION_WITHOUT_TOKEN,
+        );
       }
       const observedArtifacts = new Set(observedChangedTokens);
       if (artifactChanges.removedCount > 0
@@ -2306,7 +2341,9 @@ async function runPhase3JobNow({
       if (requireExecutionBinding !== true || !executionBinding || !selectedToken
           || !hasStrongIdentity(selectedIdentityKeys)
           || !hasStrongIdentity(Array.isArray(token.identityKeys) ? token.identityKeys : [])) {
-        throw phase3UsernameOutputUnconfirmedError('phase3_password_reset_unconfirmed');
+        throw phase3UsernameOutputUnconfirmedError(
+          PHASE3_RECONCILIATION_REASON.PASSWORD_RESET_UNCONFIRMED,
+        );
       }
       writeLog(logger, 'info', 'phase3.password_reset_confirmed', {
         jobId,
@@ -2403,7 +2440,7 @@ async function runPhase3JobNow({
           actor,
           email: entry.email,
           code: error.code || null,
-          reason: 'phase3_process_tree_unconfirmed',
+          reason: PHASE3_RECONCILIATION_REASON.PROCESS_TREE_UNCONFIRMED,
         });
       } else {
         try {
@@ -2766,6 +2803,8 @@ function runPhase3Job(args = {}) {
 }
 
 module.exports = {
+  PHASE3_RECONCILIATION_REASON,
+  PHASE3_RECONCILIATION_SCOPE,
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   _testPhase3ProcessScan: Object.freeze({
     activeTrackedDescendants,
