@@ -1,6 +1,7 @@
 const assert = require('node:assert/strict');
 const crypto = require('node:crypto');
 const http = require('node:http');
+const { spawnSync } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
@@ -550,6 +551,56 @@ function rejectWhenAborted(signal, onAbort = null) {
     signal.addEventListener('abort', abort, { once: true });
   });
 }
+
+test('account-test deadline keeps an otherwise idle worker alive until timeout', () => {
+  const source = [
+    "'use strict';",
+    "require('./tests/test-isolation');",
+    "const { accountTestTargetBaseline, runAccountTestJobNow } = require('./backend/accountTestWorker');",
+    "const account = {",
+    "  id: 91001, name: 'free91001', platform: 'openai', type: 'oauth',",
+    "  status: 'active', schedulable: true,",
+    "  identityKeys: ['account:deadline-liveness', 'user:deadline-liveness'],",
+    "  tokenFingerprints: { access: 'deadline-liveness-fingerprint' },",
+    "};",
+    "const logger = { checkpoint() { return true; }, info() {}, warn() {}, error() {} };",
+    "runAccountTestJobNow({",
+    "  accountIds: [account.id],",
+    "  targetBaselines: [accountTestTargetBaseline(account)],",
+    "  db: { async startMutationJob() {}, async audit() {} },",
+    "  jobId: 'deadline-liveness-child',",
+    "  jobTimeoutMs: 25,",
+    "  logger,",
+    "  client: {",
+    "    async listAccounts() { return [{ ...account }]; },",
+    "    async getAccount() { return { ...account }; },",
+    "    async testAccount(id, { signal }) {",
+    "      return new Promise((resolve, reject) => {",
+    "        const abort = () => reject(signal.reason instanceof Error",
+    "          ? signal.reason : new Error('aborted'));",
+    "        if (signal.aborted) abort();",
+    "        else signal.addEventListener('abort', abort, { once: true });",
+    "      });",
+    "    },",
+    "  },",
+    "}).then((result) => {",
+    "  process.stdout.write(JSON.stringify({ stopReason: result.stopReason }));",
+    "}).catch((error) => {",
+    "  process.stderr.write(String(error && error.stack || error));",
+    "  process.exitCode = 1;",
+    "});",
+  ].join('\n');
+  const child = spawnSync(process.execPath, ['-e', source], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { PATH: process.env.PATH || '' },
+    encoding: 'utf8',
+    timeout: 5000,
+  });
+  assert.equal(child.error, undefined, child.error?.message);
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.signal, null, child.stderr);
+  assert.deepEqual(JSON.parse(child.stdout), { stopReason: 'timeout' });
+});
 
 test('account test requires a durable log checkpoint immediately before dispatch', async () => {
   const account = oauthTestAccount(9, 'active', true);

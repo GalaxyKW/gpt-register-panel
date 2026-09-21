@@ -185,6 +185,13 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = perfo
   const stop = (reason) => {
     if (stopReason) return;
     stopReason = reason;
+    // The job deadline is the only handle guaranteed to wake a client that is
+    // waiting exclusively on AbortSignal. Keep it referenced until the first
+    // stop, then release it immediately (especially on external shutdown).
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
     controller.abort(accountTestStopError(reason));
   };
   const onExternalAbort = () => stop('interrupted');
@@ -194,7 +201,6 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = perfo
   }
   if (!stopReason) {
     timer = setTimeout(() => stop('timeout'), Math.max(1, deadline - performance.now()));
-    timer.unref?.();
   }
 
   return {
@@ -206,7 +212,10 @@ function createAccountTestJobSignal(externalSignal, timeoutMs, startedAt = perfo
       return stopReason;
     },
     dispose() {
-      if (timer) clearTimeout(timer);
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
       if (externalSignal && typeof externalSignal.removeEventListener === 'function') {
         try { externalSignal.removeEventListener('abort', onExternalAbort); } catch {}
       }
