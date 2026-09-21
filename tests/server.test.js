@@ -105,6 +105,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'JOB_RECONCILIATION_CONFIRMATION_INVALID',
       'JOB_RECONCILIATION_RESOLUTION_INVALID',
       'JOB_RECONCILIATION_DIGEST_INVALID',
+      'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID',
     ]],
     [403, [
       'JOB_RECONCILIATION_ADMIN_REQUIRED',
@@ -129,7 +130,9 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'JOB_RECONCILIATION_NOT_HELD',
       'JOB_RECONCILIATION_ACK_CONFLICT',
       'JOB_RECONCILIATION_DIGEST_MISMATCH',
+      'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH',
       'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+      'JOB_RECONCILIATION_CONTEXT_INCOMPLETE',
     ]],
     [413, ['REQUEST_BODY_TOO_LARGE']],
     [502, [
@@ -594,6 +597,7 @@ test('a running token cleanup owned by a dead process recovers as an actionable 
     reviewTargets: [{
       sourcePath: 'tokens/expired.json',
       contentHash,
+      accessFingerprint: 'c'.repeat(16),
     }],
     reviewTargetsTruncated: false,
   }, 'panel-admin', { claimKeys: ['token_cleanup:expired_tokens'] });
@@ -622,7 +626,7 @@ test('a running token cleanup owned by a dead process recovers as an actionable 
   assert.deepEqual(detail.targetContext.targets[1], {
     sourcePath: 'tokens/expired.json',
     contentHash,
-    accessFingerprint: undefined,
+    accessFingerprint: 'c'.repeat(16),
   });
   await assert.rejects(
     restarted.createJob('token_cleanup', {}, 'panel-admin', {
@@ -635,39 +639,374 @@ test('a running token cleanup owned by a dead process recovers as an actionable 
 
 test('reconciliation review never coerces ambiguous stored account IDs', () => {
   const digest = 'c'.repeat(64);
-  const detail = reconciliationReviewDetail({
-    id: 'job_' + 'd'.repeat(24),
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + 'd'.repeat(24),
+      type: 'account_test',
+      status: 'failed',
+      payload: {
+        accountIds: ['01', '1e0', '2', 3],
+        targetBaselines: [
+          { accountId: '01', identityDigest: '1'.repeat(64) },
+          { accountId: '1e0', identityDigest: '2'.repeat(64) },
+          { accountId: '2', identityDigest: '3'.repeat(64) },
+          { accountId: 3, identityDigest: '4'.repeat(64) },
+        ],
+      },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: digest,
+        results: [],
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review rejects a partial token-import target set', () => {
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + 'a'.repeat(24),
+      type: 'token_import',
+      status: 'failed',
+      payload: { selectedSourcePaths: ['tokens/first.json', 'tokens/second.json'] },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: 'b'.repeat(64),
+        reconciliationCount: 2,
+        imported: [{
+          source: 'tokens',
+          relativePath: 'first.json',
+          action: 'create',
+          accountName: 'free00001',
+          fingerprints: { access: 'a'.repeat(16) },
+          sourceIdentityKeys: ['account:strong-one'],
+          requiresReconciliation: true,
+        }, {
+          source: 'tokens',
+          relativePath: 'second.json',
+          action: 'update',
+          fingerprints: { access: 'b'.repeat(16) },
+          sourceIdentityKeys: ['account:strong-two'],
+          requiresReconciliation: true,
+        }],
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review enforces the exact token-import producer matrix', () => {
+  const baseItem = {
+    source: 'tokens',
+    relativePath: 'new-account.json',
+    accountId: null,
+    accountName: 'free00001',
+    email: '',
+    action: 'create',
+    fingerprints: { access: 'a'.repeat(16) },
+    sourceIdentityKeys: [
+      'account:11111111-1111-4111-8111-111111111111',
+    ],
+    availability: 'not_present',
+    availabilityReason: 'not_in_sub2api',
+    requiresReconciliation: true,
+  };
+  const review = (item) => reconciliationReviewDetail({
+    id: 'job_' + 'a'.repeat(24),
+    type: 'token_import',
+    status: 'failed',
+    payload: {},
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: 'b'.repeat(64),
+      reconciliationCount: 1,
+      imported: [item],
+    },
+  });
+  const detail = review(baseItem);
+  assert.deepEqual(detail.targetContext.targets[0], {
+    sourcePath: 'tokens/new-account.json',
+    remoteAccountId: undefined,
+    accountName: 'free00001',
+    email: undefined,
+    action: 'create',
+    accessFingerprint: 'a'.repeat(16),
+    strongIdentityKeys: ['account:11111111-1111-4111-8111-111111111111'],
+    availability: 'not_present',
+    availabilityReason: 'not_in_sub2api',
+  });
+
+  const updateItem = {
+    ...baseItem,
+    relativePath: 'existing-account.json',
+    accountId: 266,
+    accountName: '',
+    action: 'update',
+    availability: 'unavailable',
+    availabilityReason: 'sub2api_status_error',
+  };
+  assert.equal(review(updateItem).targetContext.targets[0].remoteAccountId, 266);
+
+  const invalidItems = [
+    { ...baseItem, accountId: 266 },
+    { ...baseItem, availability: 'unknown', availabilityReason: 'panel_clock_invalid' },
+    { ...updateItem, accountId: '266' },
+    { ...updateItem, availability: 'available', availabilityReason: 'sub2api_available' },
+    { ...updateItem, availabilityReason: 'sub2api_expiry_invalid' },
+    { ...baseItem, sourceIdentityKeys: ['account:one', 'account:two'] },
+    { ...baseItem, sourceIdentityKeys: ['account:one', 'credential:ignored-before'] },
+    { ...baseItem, sourceIdentityKeys: ['account:[redacted]'] },
+    {
+      ...baseItem,
+      email: 'first@example.test',
+      sourceIdentityKeys: ['account:one', 'email:second@example.test'],
+    },
+    { ...baseItem, relativePath: '[redacted].json' },
+    { ...baseItem, relativePath: '[unsupported].json' },
+    { ...baseItem, accountName: '[redaction limit reached]' },
+    { ...baseItem, sourceIdentityKeys: ['account:[circular]'] },
+    { ...baseItem, relativePath: 'vis\u00adible.json' },
+    { ...baseItem, sourceIdentityKeys: ['account:visible\u061cvalue'] },
+    { ...baseItem, accountName: 'free00001\ufe0f' },
+  ];
+  for (const item of invalidItems) {
+    assert.throws(
+      () => review(item),
+      (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+    );
+  }
+});
+
+test('reconciliation review requires the complete account-test result identity set', () => {
+  assert.throws(() => reconciliationReviewDetail({
+    id: 'job_' + 'c'.repeat(24),
     type: 'account_test',
     status: 'failed',
     payload: {
-      accountIds: ['01', '1e0', '2', 3],
-      targetBaselines: [
-        { accountId: '01', identityDigest: '1'.repeat(64) },
-        { accountId: '1e0', identityDigest: '2'.repeat(64) },
-        { accountId: '2', identityDigest: '3'.repeat(64) },
-        { accountId: 3, identityDigest: '4'.repeat(64) },
-      ],
+      accountIds: [1, 2],
+      targetBaselines: [1, 2].map((accountId) => ({
+        accountId,
+        identityDigest: String(accountId).repeat(64),
+        targetDigest: String(accountId + 2).repeat(64),
+        status: 'inactive',
+        statusKnown: true,
+        schedulable: false,
+        schedulableKnown: true,
+      })),
     },
     result: {
       requiresReconciliation: true,
       reconciliationHold: true,
       reconciliationResolved: false,
-      reconciliationClaimDigest: digest,
-      results: [],
+      reconciliationClaimDigest: 'd'.repeat(64),
+      reconciliationCount: 1,
+      results: [{ accountId: 1, requiresReconciliation: true }],
     },
-  });
-  assert.deepEqual(
-    detail.targetContext.targets.map((target) => target.remoteAccountId),
-    [2, 3],
-  );
-  assert.deepEqual(
-    detail.targetContext.targets.map((target) => target.identityDigest),
-    ['3'.repeat(64), '4'.repeat(64)],
+  }), (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
+});
+
+test('reconciliation review rejects selected paths without strong import evidence', () => {
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + 'f'.repeat(24),
+      type: 'token_import',
+      status: 'interrupted',
+      payload: { selectedSourcePaths: ['tokens/legacy.json'] },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: '1'.repeat(64),
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
   );
 });
 
-test('reconciliation review preserves the bounded panel clock availability reason', () => {
-  const detail = reconciliationReviewDetail({
+test('reconciliation review requires a complete Phase3 target revision', () => {
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + '2'.repeat(24),
+      type: 'phase3',
+      status: 'failed',
+      payload: {
+        email: 'phase3@example.test',
+        phone: null,
+        canonicalKeys: ['email:phase3@example.test'],
+        sourcePath: 'tokens/phase3.json',
+      },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: '3'.repeat(64),
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review binds a Phase3 source path to its selected key', () => {
+  const selectedKeyDigest = crypto.createHash('sha256')
+    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update('token:tokens:tokens/other.json')
+    .digest('hex');
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + '9'.repeat(24),
+      type: 'phase3',
+      status: 'failed',
+      payload: {
+        email: 'phase3@example.test',
+        phone: null,
+        canonicalKeys: ['email:phase3@example.test'],
+        sourcePath: 'tokens/phase3.json',
+        selectedKeyDigest,
+        phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+      },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: 'a'.repeat(64),
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review requires the persisted Phase3 canonical-key order', () => {
+  const selectedKey = 'token:tokens:tokens/phase3.json';
+  const selectedKeyDigest = crypto.createHash('sha256')
+    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update(selectedKey)
+    .digest('hex');
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + '7'.repeat(24),
+      type: 'phase3',
+      status: 'failed',
+      payload: {
+        email: 'phase3@example.test',
+        phone: '15550000002',
+        canonicalKeys: [
+          'phone:15550000002',
+          'email:phase3@example.test',
+        ],
+        sourcePath: 'tokens/phase3.json',
+        selectedKeyDigest,
+        phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+      },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: '7'.repeat(64),
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review rejects duplicate token-cleanup targets', () => {
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + '4'.repeat(24),
+      type: 'token_cleanup',
+      status: 'failed',
+      payload: {
+        expectedVersion: '5'.repeat(64),
+        targetCount: 2,
+        reviewTargetsTruncated: false,
+        reviewTargets: [{
+          sourcePath: 'tokens/expired.json',
+          contentHash: '6'.repeat(64),
+          accessFingerprint: 'a'.repeat(16),
+        }, {
+          sourcePath: 'tokens/expired.json',
+          contentHash: '7'.repeat(64),
+          accessFingerprint: 'b'.repeat(16),
+        }],
+      },
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: '8'.repeat(64),
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
+});
+
+test('reconciliation review requires an exact cleanup access fingerprint', () => {
+  const review = (accessFingerprint) => reconciliationReviewDetail({
+    id: 'job_' + '5'.repeat(24),
+    type: 'token_cleanup',
+    status: 'failed',
+    payload: {
+      expectedVersion: '6'.repeat(64),
+      targetCount: 1,
+      reviewTargetsTruncated: false,
+      reviewTargets: [{
+        sourcePath: 'tokens/expired.json',
+        contentHash: '7'.repeat(64),
+        ...(accessFingerprint === undefined ? {} : { accessFingerprint }),
+      }],
+    },
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: '8'.repeat(64),
+    },
+  });
+  assert.equal(review('9'.repeat(16)).targetContext.targets[1].accessFingerprint,
+    '9'.repeat(16));
+  for (const value of [undefined, '9'.repeat(15), '9'.repeat(17), 'A'.repeat(16)]) {
+    assert.throws(
+      () => review(value),
+      (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+    );
+  }
+});
+
+test('reconciliation review rejects redacted Phase3 identity placeholders', () => {
+  const selectedKey = 'token:tokens:tokens/phase3.json';
+  const selectedKeyDigest = crypto.createHash('sha256')
+    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update(selectedKey)
+    .digest('hex');
+  assert.throws(() => reconciliationReviewDetail({
+    id: 'job_' + '9'.repeat(24),
+    type: 'phase3',
+    status: 'failed',
+    payload: {
+      email: '[redacted]@example.test',
+      phone: null,
+      canonicalKeys: ['email:[redacted]@example.test'],
+      sourcePath: 'tokens/phase3.json',
+      selectedKeyDigest,
+      phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+    },
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: 'a'.repeat(64),
+    },
+  }), (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
+});
+
+test('reconciliation review rejects impossible create availability metadata', () => {
+  assert.throws(() => reconciliationReviewDetail({
     id: 'job_' + 'e'.repeat(24),
     type: 'token_import',
     status: 'failed',
@@ -677,18 +1016,21 @@ test('reconciliation review preserves the bounded panel clock availability reaso
       reconciliationHold: true,
       reconciliationResolved: false,
       reconciliationClaimDigest: 'f'.repeat(64),
+      reconciliationCount: 1,
       imported: [{
         source: 'tokens',
         relativePath: 'clock-invalid.json',
+        action: 'create',
+        accountId: null,
+        accountName: 'free00001',
+        fingerprints: { access: 'a'.repeat(16) },
+        sourceIdentityKeys: ['account:clock-account'],
         availability: 'unknown',
         availabilityReason: 'panel_clock_invalid',
+        requiresReconciliation: true,
       }],
     },
-  });
-  assert.equal(
-    detail.targetContext.targets[0].availabilityReason,
-    'panel_clock_invalid',
-  );
+  }), (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
 });
 
 test('HTTP server applies bounded slow-request and connection limits', () => {

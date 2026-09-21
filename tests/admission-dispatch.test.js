@@ -199,6 +199,14 @@ test('all mutation routes interrupt committed jobs when the admission lease rele
           assert.equal(persisted.result.blockedBeforeStart, true);
           assert.equal(persisted.result.executionOutcome, 'not_started');
           assert.equal(persisted.startedAt, null);
+          if (item.name === 'Phase3') {
+            assert.equal(
+              persisted.payload.phase3TargetRevision,
+              'phase3-target-v1.' + 'A'.repeat(43),
+            );
+            assert.equal(persisted.payload.sourcePath, 'tokens/admission-phase3.json');
+            assert.match(persisted.payload.selectedKeyDigest, /^[a-f0-9]{64}$/);
+          }
           const claimCount = await db.read((database) => Number(
             database.exec('SELECT COUNT(*) FROM job_claims')[0]?.values?.[0]?.[0],
           ));

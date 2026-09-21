@@ -462,6 +462,39 @@ function parseStoredResult(job) {
   return result;
 }
 
+function parseStoredReviewPayload(job) {
+  let payload;
+  try {
+    payload = JSON.parse(job?.payload_json);
+  } catch {
+    throw claimIntegrityError('待对账任务的目标元数据无法解析，拒绝解除保护键');
+  }
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+    throw claimIntegrityError('待对账任务的目标元数据无效，拒绝解除保护键');
+  }
+  return payload;
+}
+
+function ownErrorCode(error) {
+  if (!error || (typeof error !== 'object' && typeof error !== 'function')) return null;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, 'code');
+    return descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')
+      && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+function reconciliationGuardUnavailable() {
+  return reconciliationError(
+    'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+    '人工对账目标校验不可用，保护键未解除',
+  );
+}
+
 function validateReconciliationSafetyBooleans(result) {
   if (!result || typeof result !== 'object' || Array.isArray(result)) return;
   for (const field of RECONCILIATION_SAFETY_BOOLEAN_FIELDS) {
@@ -3302,6 +3335,9 @@ class PanelDb {
     const expectedDigest = typeof acknowledgement?.claimDigest === 'string'
       ? acknowledgement.claimDigest.trim().toLowerCase()
       : '';
+    const expectedContextDigest = typeof acknowledgement?.contextDigest === 'string'
+      ? acknowledgement.contextDigest.trim().toLowerCase()
+      : '';
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(jobId)) {
       return Promise.reject(reconciliationError(
         'JOB_RECONCILIATION_JOB_ID_INVALID',
@@ -3332,13 +3368,20 @@ class PanelDb {
         '任务保护键摘要无效',
       ));
     }
+    if (!/^[a-f0-9]{64}$/.test(expectedContextDigest)) {
+      return Promise.reject(reconciliationError(
+        'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID',
+        '人工核对目标摘要无效',
+      ));
+    }
 
     return this.write((database) => {
       database.run('BEGIN IMMEDIATE');
       try {
         validateJobClaims(database, { cleanupOrdinaryTerminalClaims: true });
-        const job = resultRows(database.exec(`SELECT id, type, status, claim_keys_json,
-            result_json, reconciliation_hold, reconciliation_scope, reconciliation_claim_digest,
+        const job = resultRows(database.exec(`SELECT id, type, status, payload_json,
+            claim_keys_json, result_json, reconciliation_hold, reconciliation_scope,
+            reconciliation_claim_digest,
             reconciliation_acknowledged_at, reconciliation_resolution,
             reconciliation_acknowledged_by
           FROM sync_jobs WHERE id = ${sqlString(jobId)} LIMIT 1`))[0];
@@ -3349,10 +3392,15 @@ class PanelDb {
           );
         }
         if (Number(job.reconciliation_hold) !== 1) {
+          const acknowledgedResult = job.reconciliation_acknowledged_at
+            ? parseStoredResult(job)
+            : null;
           const idempotent = job.reconciliation_acknowledged_at
             && job.reconciliation_claim_digest === expectedDigest
             && job.reconciliation_resolution === resolution
-            && job.reconciliation_acknowledged_by === actor;
+            && job.reconciliation_acknowledged_by === actor
+            && acknowledgedResult?.reconciliationReviewedContextDigest
+              === expectedContextDigest;
           if (!idempotent) {
             throw reconciliationError(
               job.reconciliation_acknowledged_at
@@ -3369,6 +3417,7 @@ class PanelDb {
             status: 'acknowledged',
             resolution,
             claimDigest: expectedDigest,
+            contextDigest: expectedContextDigest,
             acknowledgedAt: job.reconciliation_acknowledged_at,
             releasedClaimCount: 0,
             idempotent: true,
@@ -3392,6 +3441,45 @@ class PanelDb {
             || previousResult.reconciliationClaimDigest !== currentDigest) {
           throw claimIntegrityError('待对账任务的结果与持久 hold 不一致');
         }
+        if (typeof acknowledgement.validateContext !== 'function') {
+          throw reconciliationGuardUnavailable();
+        }
+        const reviewPayload = redactValue(parseStoredReviewPayload(job));
+        const reviewResult = redactValue(previousResult);
+        let contextValidated;
+        try {
+          contextValidated = acknowledgement.validateContext({
+            id: job.id,
+            type: job.type,
+            status: job.status,
+            payload: reviewPayload,
+            result: reviewResult,
+            claimKeys: [...claimKeys],
+            reconciliationScope: job.reconciliation_scope,
+            reconciliationClaimDigest: currentDigest,
+          });
+        } catch (error) {
+          if (['JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+            'JOB_RECONCILIATION_CONTEXT_INCOMPLETE',
+            'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH'].includes(ownErrorCode(error))) {
+            throw error;
+          }
+          throw reconciliationGuardUnavailable();
+        }
+        // The validator executes while the same BEGIN IMMEDIATE transaction
+        // owns the authoritative row. It must be a bounded synchronous check;
+        // a Promise or any non-explicit result fails closed.
+        if (contextValidated !== true) {
+          // Attach a rejection handler immediately so a mistakenly async
+          // validator cannot turn a fail-closed acknowledgement into an
+          // unhandled-rejection process failure.
+          try {
+            if (contextValidated && typeof contextValidated.then === 'function') {
+              Promise.resolve(contextValidated).catch(() => {});
+            }
+          } catch {}
+          throw reconciliationGuardUnavailable();
+        }
         const acknowledgedAt = new Date().toISOString();
         const nextResult = {
           ...previousResult,
@@ -3404,6 +3492,7 @@ class PanelDb {
           reconciliationResolution: resolution,
           reconciliationAcknowledgedAt: acknowledgedAt,
           reconciliationAcknowledgedBy: actor,
+          reconciliationReviewedContextDigest: expectedContextDigest,
           reconciliationBlockScope: 'none',
           reconciliationBlockScopeWas: 'all_mutating_operations',
           // These fields continue to describe the original ambiguous
@@ -3442,6 +3531,7 @@ class PanelDb {
             reconciliationResolution: resolution,
             reconciliationAcknowledgedAt: acknowledgedAt,
             reconciliationAcknowledgedBy: actor,
+            reconciliationReviewedContextDigest: expectedContextDigest,
             reconciliationBlockScope: 'none',
             reconciliationBlockScopeWas: 'all_mutating_operations',
             retryAllowed: false,
@@ -3458,6 +3548,7 @@ class PanelDb {
           {
             resolution,
             claimDigest: currentDigest,
+            contextDigest: expectedContextDigest,
             holdScope: job.reconciliation_scope,
             releasedClaimCount: claimKeys.length,
           },
@@ -3469,6 +3560,7 @@ class PanelDb {
             jobId,
             resolution,
             claimDigest: currentDigest,
+            contextDigest: expectedContextDigest,
             holdScope: job.reconciliation_scope,
             releasedClaimCount: claimKeys.length,
           });
@@ -3527,6 +3619,7 @@ class PanelDb {
           status: 'acknowledged',
           resolution,
           claimDigest: currentDigest,
+          contextDigest: expectedContextDigest,
           acknowledgedAt,
           releasedClaimCount: claimKeys.length,
           idempotent: false,

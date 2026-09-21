@@ -63,6 +63,7 @@ const {
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree } = require('./lib/safeFs');
 const {
+  normalizePhase3CanonicalKeys,
   normalizePhase3Identity,
   normalizePhase3SelectedKey,
 } = require('./lib/phase3Identity');
@@ -296,6 +297,7 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'JOB_RECONCILIATION_CONFIRMATION_INVALID',
   'JOB_RECONCILIATION_RESOLUTION_INVALID',
   'JOB_RECONCILIATION_DIGEST_INVALID',
+  'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID',
 ]);
 const PUBLIC_CONFLICT_ERRORS = new Set([
   'IDEMPOTENCY_KEY_REUSED',
@@ -314,7 +316,9 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'JOB_RECONCILIATION_NOT_HELD',
   'JOB_RECONCILIATION_ACK_CONFLICT',
   'JOB_RECONCILIATION_DIGEST_MISMATCH',
+  'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH',
   'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  'JOB_RECONCILIATION_CONTEXT_INCOMPLETE',
 ]);
 const PUBLIC_FORBIDDEN_ERRORS = new Set([
   'PHASE3_DISABLED',
@@ -1078,7 +1082,19 @@ function requestLogPath(pathname) {
   return pathname.startsWith('/api/') ? '/api/<unknown>' : '<unknown-path>';
 }
 
-const UNSAFE_REVIEW_TEXT = /[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/;
+const UNSAFE_REVIEW_TEXT = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
+const REVIEW_REDACTION_SENTINEL = /\[(?:redacted(?:-key-\d+| encoded text)?|uninspectable|unsupported|binary redacted|circular|accessor omitted|truncated|redaction(?: [a-z]+)* reached|oversized(?: [a-z]+)* omitted|oversized)\]/i;
+const REVIEW_STRONG_IDENTITY_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
+const REVIEW_UNAVAILABLE_REASONS = new Set([
+  'sub2api_status_inactive',
+  'sub2api_status_disabled',
+  'sub2api_status_error',
+  'sub2api_unschedulable',
+  'sub2api_expired',
+  'sub2api_temp_unschedulable',
+  'sub2api_rate_limited',
+  'sub2api_overloaded',
+]);
 const REVIEW_AVAILABILITY_REASONS = new Set([
   'not_in_sub2api',
   'sub2api_schema_invalid',
@@ -1105,15 +1121,19 @@ const REVIEW_AVAILABILITY_REASONS = new Set([
 function boundedReviewText(value, maximum = 256) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
-  if (!text || text.length > maximum || UNSAFE_REVIEW_TEXT.test(text)) return null;
-  return redactText(text).slice(0, maximum);
+  if (!text || text !== value || text.length > maximum
+      || UNSAFE_REVIEW_TEXT.test(text) || REVIEW_REDACTION_SENTINEL.test(text)) return null;
+  return redactText(text) === text ? text : null;
 }
 
 function safeReviewRelativePath(value) {
+  const raw = typeof value === 'string' ? value : '';
   const text = boundedReviewText(value, 512);
-  if (!text || path.isAbsolute(text) || text.includes('\\')) return null;
+  if (!text || text !== raw || text.normalize('NFC') !== text
+      || path.isAbsolute(text) || text.includes('\\')) return null;
   const segments = text.split('/');
-  if (segments.some((segment) => !segment || segment === '.' || segment === '..')) return null;
+  if (segments.some((segment) => !segment || segment === '.' || segment === '..')
+      || !segments.at(-1).toLowerCase().endsWith('.json')) return null;
   return text;
 }
 
@@ -1137,6 +1157,15 @@ function sourcePathFromSelectionKey(value) {
   return normalizedReviewSourcePath(source, text.slice(separator + 1));
 }
 
+function phase3SelectedKeyDigest(value) {
+  const selectedKey = normalizePhase3SelectedKey(value);
+  if (!selectedKey) return null;
+  return crypto.createHash('sha256')
+    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update(selectedKey)
+    .digest('hex');
+}
+
 function safeReviewSourcePath(value) {
   if (typeof value !== 'string') return null;
   const separator = value.indexOf('/');
@@ -1156,7 +1185,9 @@ function safeReviewAccountId(value) {
 
 function safeReviewFingerprint(value) {
   const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return /^[a-f0-9]{8,128}$/.test(text) ? text : null;
+  return typeof value === 'string' && value === text && /^[a-f0-9]{16}$/.test(text)
+    ? text
+    : null;
 }
 
 function safeReviewCode(value, allowed = null) {
@@ -1166,165 +1197,315 @@ function safeReviewCode(value, allowed = null) {
 }
 
 function safeReviewStrongIdentities(value) {
-  if (!Array.isArray(value)) return { keys: [], truncated: false };
+  if (!Array.isArray(value) || value.length === 0 || value.length > 1000) {
+    return { keys: [], valid: false };
+  }
   const keys = [];
   const seen = new Set();
-  for (const rawKey of value.slice(0, 1000)) {
-    if (typeof rawKey !== 'string' || rawKey.length > 520
-        || UNSAFE_REVIEW_TEXT.test(rawKey)) continue;
+  const seenDimensions = new Set();
+  let email = null;
+  for (const rawKey of value) {
+    if (typeof rawKey !== 'string') return { keys: [], valid: false };
     const separator = rawKey.indexOf(':');
+    if (separator <= 0) return { keys: [], valid: false };
     const prefix = rawKey.slice(0, separator + 1);
-    if (!['account:', 'user:'].includes(prefix)) continue;
-    const identity = boundedReviewText(rawKey.slice(separator + 1), 512);
-    const key = identity ? prefix + identity : null;
-    if (!key || seen.has(key)) continue;
+    if (!['account:', 'user:', 'email:'].includes(prefix)) {
+      return { keys: [], valid: false };
+    }
+    if (rawKey.length > 520 || UNSAFE_REVIEW_TEXT.test(rawKey)) {
+      return { keys: [], valid: false };
+    }
+    const identity = boundedReviewText(
+      rawKey.slice(separator + 1),
+      prefix === 'email:' ? 320 : 512,
+    );
+    const identityValid = prefix === 'email:'
+      ? identity && identity === identity.toLowerCase() && /^[^\s@]+@[^\s@]+$/.test(identity)
+      : identity && REVIEW_STRONG_IDENTITY_VALUE.test(identity);
+    const key = identityValid ? prefix + identity : null;
+    if (!key || key !== rawKey || seen.has(key)) return { keys: [], valid: false };
     seen.add(key);
-    keys.push(key);
+    if (seenDimensions.has(prefix)) return { keys: [], valid: false };
+    seenDimensions.add(prefix);
+    if (prefix === 'email:') email = identity;
+    else keys.push(key);
   }
   keys.sort();
-  return { keys: keys.slice(0, 10), truncated: value.length > 1000 || keys.length > 10 };
+  return { keys, email, valid: keys.length > 0 };
 }
 
 function tokenImportReviewTargets(job) {
-  const targets = [];
-  const resultItems = Array.isArray(job?.result?.imported)
-    ? job.result.imported.slice(0, 1000)
-    : [];
+  const resultItems = job?.result?.imported;
+  const expectedTotal = job?.result?.reconciliationCount;
+  if (!Array.isArray(resultItems) || resultItems.length > 1000
+      || !Number.isSafeInteger(expectedTotal) || expectedTotal <= 0) {
+    return { total: 0, targets: [], complete: false };
+  }
   const uncertain = resultItems.filter((item) => (
     item?.requiresReconciliation === true || item?.writeOutcomeUnknown === true
       || item?.outcome === 'requires_reconciliation'
   ));
-  const selectedItems = uncertain.length > 0 ? uncertain : resultItems;
-  for (const item of selectedItems) {
-    if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
+  if (uncertain.length !== expectedTotal) {
+    return { total: expectedTotal, targets: [], complete: false };
+  }
+  const targets = [];
+  const seenPaths = new Set();
+  const seenStrongIdentities = new Set();
+  const seenRemoteAccountIds = new Set();
+  const seenCreateNames = new Set();
+  for (const item of uncertain) {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) {
+      return { total: expectedTotal, targets: [], complete: false };
+    }
     const source = safeReviewCode(item.source, new Set(['tokens', 'use_token']));
-    const sourcePath = source
-      ? normalizedReviewSourcePath(source, item.relativePath || item.fileName)
+    const sourcePath = source ? normalizedReviewSourcePath(source, item.relativePath) : null;
+    const action = safeReviewCode(item.action, new Set(['create', 'update']));
+    const remoteAccountId = safeReviewAccountId(item.accountId);
+    const accountName = boundedReviewText(item.accountName, 128);
+    const accessFingerprint = typeof item?.fingerprints?.access === 'string'
+      && /^[a-f0-9]{16}$/.test(item.fingerprints.access)
+      ? item.fingerprints.access
       : null;
-    const remoteAccountId = safeReviewAccountId(
-      item.accountId ?? item.sub2apiAccountId ?? item.sub2apiId ?? item?.verification?.accountId,
-    );
     const strongIdentities = safeReviewStrongIdentities(item.sourceIdentityKeys);
-    if (!sourcePath && !remoteAccountId) continue;
-    targets.push({
-      sourcePath: sourcePath || undefined,
-      remoteAccountId: remoteAccountId || undefined,
-      accountName: boundedReviewText(item.accountName ?? item?.verification?.accountName, 128)
-        || undefined,
-      email: boundedReviewText(item.email, 320) || undefined,
-      action: safeReviewCode(item.action, new Set(['create', 'update'])) || undefined,
-      accessFingerprint: safeReviewFingerprint(item?.fingerprints?.access) || undefined,
-      strongIdentityKeys: strongIdentities.keys.length > 0 ? strongIdentities.keys : undefined,
-      strongIdentityTruncated: strongIdentities.truncated || undefined,
-      availability: safeReviewCode(
+    const availability = item.availability === undefined || item.availability === null
+      ? null
+      : safeReviewCode(
         item.availability,
         new Set(['available', 'unavailable', 'unknown', 'not_present']),
-      ) || undefined,
-      availabilityReason: safeReviewCode(item.availabilityReason, REVIEW_AVAILABILITY_REASONS)
-        || undefined,
+      );
+    const availabilityReason = item.availabilityReason === undefined
+      || item.availabilityReason === null
+      ? null
+      : safeReviewCode(item.availabilityReason, REVIEW_AVAILABILITY_REASONS);
+    const email = item.email === undefined || item.email === null
+      ? null
+      : boundedReviewText(item.email, 320);
+    const canonicalEmail = email && email === email.toLowerCase()
+      && /^[^\s@]+@[^\s@]+$/.test(email)
+      ? email
+      : null;
+    const overlappingIdentity = strongIdentities.keys.some((key) => seenStrongIdentities.has(key));
+    const createTargetValid = action === 'create'
+      && item.accountId === null
+      && !remoteAccountId
+      && /^free\d{5}$/.test(accountName || '')
+      && availability === 'not_present'
+      && availabilityReason === 'not_in_sub2api';
+    const updateTargetValid = action === 'update'
+      && typeof item.accountId === 'number'
+      && Boolean(remoteAccountId)
+      && availability === 'unavailable'
+      && REVIEW_UNAVAILABLE_REASONS.has(availabilityReason);
+    if (!sourcePath || source !== item.source || seenPaths.has(sourcePath)
+        || !action || action !== item.action || !accessFingerprint
+        || !strongIdentities.valid || overlappingIdentity
+        || (!createTargetValid && !updateTargetValid)
+        || (action === 'update' && seenRemoteAccountIds.has(remoteAccountId))
+        || (action === 'create' && seenCreateNames.has(accountName))
+        || (item.accountName !== undefined && item.accountName !== null
+          && item.accountName !== '' && !accountName)
+        || (item.email !== undefined && item.email !== null && item.email !== ''
+          && canonicalEmail !== item.email)
+        || strongIdentities.email !== canonicalEmail
+        || (item.availability !== undefined && item.availability !== null
+          && availability !== item.availability)
+        || (item.availabilityReason !== undefined && item.availabilityReason !== null
+          && availabilityReason !== item.availabilityReason)) {
+      return { total: expectedTotal, targets: [], complete: false };
+    }
+    seenPaths.add(sourcePath);
+    for (const key of strongIdentities.keys) seenStrongIdentities.add(key);
+    if (action === 'update') seenRemoteAccountIds.add(remoteAccountId);
+    else seenCreateNames.add(accountName);
+    targets.push({
+      sourcePath,
+      remoteAccountId: remoteAccountId || undefined,
+      accountName: accountName || undefined,
+      email: canonicalEmail || undefined,
+      action,
+      accessFingerprint,
+      strongIdentityKeys: strongIdentities.keys,
+      availability: availability || undefined,
+      availabilityReason: availabilityReason || undefined,
     });
   }
-  if (targets.length === 0) {
-    const selectedSourcePaths = Array.isArray(job?.payload?.selectedSourcePaths)
-      ? job.payload.selectedSourcePaths.slice(0, 1000)
-      : [];
-    for (const selectedPath of selectedSourcePaths) {
-      const sourcePath = safeReviewSourcePath(selectedPath);
-      if (sourcePath) targets.push({ sourcePath });
-    }
-  }
-  return targets;
+  return { total: expectedTotal, targets, complete: targets.length === expectedTotal };
 }
 
 function accountTestReviewTargets(job) {
+  const payloadIds = job?.payload?.accountIds;
+  const rawBaselines = job?.payload?.targetBaselines;
+  if (!Array.isArray(payloadIds) || payloadIds.length === 0 || payloadIds.length > 1000
+      || !Array.isArray(rawBaselines) || rawBaselines.length !== payloadIds.length) {
+    return { total: 0, targets: [], complete: false };
+  }
+  const canonicalIds = payloadIds.map((accountId) => (
+    typeof accountId === 'number' ? safeReviewAccountId(accountId) : null
+  ));
+  if (canonicalIds.some((accountId) => !accountId)
+      || new Set(canonicalIds).size !== canonicalIds.length) {
+    return { total: payloadIds.length, targets: [], complete: false };
+  }
   const baselines = new Map();
-  for (const baseline of Array.isArray(job?.payload?.targetBaselines)
-    ? job.payload.targetBaselines.slice(0, 1000) : []) {
-    const accountId = safeReviewAccountId(baseline?.accountId);
-    if (!accountId || baselines.has(accountId)) continue;
+  for (const baseline of rawBaselines) {
+    const accountId = typeof baseline?.accountId === 'number'
+      ? safeReviewAccountId(baseline.accountId)
+      : null;
+    const identityDigest = typeof baseline?.identityDigest === 'string'
+      ? baseline.identityDigest
+      : '';
+    const targetDigest = typeof baseline?.targetDigest === 'string'
+      ? baseline.targetDigest
+      : '';
+    const status = safeReviewCode(
+      baseline?.status,
+      new Set(['active', 'inactive', 'disabled', 'error']),
+    );
+    if (!accountId || !canonicalIds.includes(accountId) || baselines.has(accountId)
+        || !/^[a-f0-9]{64}$/.test(identityDigest)
+        || !/^[a-f0-9]{64}$/.test(targetDigest)
+        || baseline?.statusKnown !== true || !status || baseline.status !== status
+        || baseline?.schedulableKnown !== true
+        || typeof baseline?.schedulable !== 'boolean') {
+      return { total: payloadIds.length, targets: [], complete: false };
+    }
     baselines.set(accountId, {
-      identityDigest: /^[a-f0-9]{64}$/.test(String(baseline?.identityDigest || ''))
-        ? baseline.identityDigest
-        : undefined,
-      baselineStatus: safeReviewCode(
-        baseline?.status,
-        new Set(['active', 'inactive', 'disabled', 'error']),
-      ) || undefined,
-      baselineSchedulable: typeof baseline?.schedulable === 'boolean'
-        ? baseline.schedulable
-        : undefined,
+      identityDigest,
+      targetDigest,
+      baselineStatus: status,
+      baselineSchedulable: baseline.schedulable,
     });
   }
-  const resultItems = Array.isArray(job?.result?.results)
-    ? job.result.results.slice(0, 1000)
-    : [];
-  const uncertainIds = new Set(resultItems.filter((item) => (
-    item?.requiresReconciliation === true || item?.writeOutcomeUnknown === true
-      || item?.outcome === 'requires_reconciliation'
-  )).map((item) => safeReviewAccountId(item?.accountId)).filter(Boolean));
-  const payloadIds = Array.isArray(job?.payload?.accountIds)
-    ? job.payload.accountIds.slice(0, 1000)
-    : [];
-  const ids = uncertainIds.size > 0 ? [...uncertainIds] : payloadIds;
-  const targets = [];
-  const seen = new Set();
-  for (const value of ids) {
-    const remoteAccountId = safeReviewAccountId(value);
-    if (!remoteAccountId || seen.has(remoteAccountId)) continue;
-    seen.add(remoteAccountId);
-    targets.push({ remoteAccountId, ...(baselines.get(remoteAccountId) || {}) });
+  if (baselines.size !== canonicalIds.length) {
+    return { total: payloadIds.length, targets: [], complete: false };
   }
-  return targets;
+  let targetIds = canonicalIds;
+  if (job?.result?.results !== undefined) {
+    const resultItems = job.result.results;
+    const expectedTotal = job?.result?.reconciliationCount;
+    if (!Array.isArray(resultItems) || resultItems.length !== canonicalIds.length
+        || !Number.isSafeInteger(expectedTotal) || expectedTotal <= 0) {
+      return { total: canonicalIds.length, targets: [], complete: false };
+    }
+    const uncertainIds = [];
+    const seen = new Set();
+    for (const item of resultItems) {
+      const accountId = typeof item?.accountId === 'number'
+        ? safeReviewAccountId(item.accountId)
+        : null;
+      if (!accountId || !baselines.has(accountId) || seen.has(accountId)) {
+        return { total: expectedTotal, targets: [], complete: false };
+      }
+      seen.add(accountId);
+      if (item?.requiresReconciliation === true || item?.writeOutcomeUnknown === true
+          || item?.outcome === 'requires_reconciliation') uncertainIds.push(accountId);
+    }
+    if (seen.size !== canonicalIds.length || uncertainIds.length !== expectedTotal) {
+      return { total: expectedTotal, targets: [], complete: false };
+    }
+    targetIds = uncertainIds;
+  }
+  const targets = targetIds.map((remoteAccountId) => ({
+    remoteAccountId,
+    ...baselines.get(remoteAccountId),
+  }));
+  return { total: targets.length, targets, complete: targets.length > 0 };
 }
 
 function phase3ReviewTargets(job) {
   const payload = job?.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)
     ? job.payload
     : {};
-  const sourcePath = safeReviewSourcePath(payload.sourcePath)
-    || sourcePathFromSelectionKey(payload.selectedKey);
-  const email = boundedReviewText(payload.email, 320);
-  const rawPhone = typeof payload.phone === 'string' ? payload.phone.trim() : '';
-  const phone = /^\d{1,80}$/.test(rawPhone) ? rawPhone : null;
-  if (!sourcePath && !email && !phone) return [];
-  return [{
-    sourcePath: sourcePath || undefined,
-    email: email || undefined,
-    phone: phone || undefined,
-  }];
+  const sourcePath = safeReviewSourcePath(payload.sourcePath);
+  const safeEmail = boundedReviewText(payload.email, 320);
+  const safePhone = payload.phone === null ? null : boundedReviewText(payload.phone, 80);
+  const safeCanonicalKeys = Array.isArray(payload.canonicalKeys)
+    && payload.canonicalKeys.every((key) => boundedReviewText(key, 327) === key)
+    ? payload.canonicalKeys
+    : null;
+  const identity = safeEmail && (payload.phone === null || safePhone)
+    ? normalizePhase3Identity({ email: safeEmail, phone: safePhone }, {
+      allowNull: true,
+    })
+    : null;
+  const canonicalKeys = identity
+    ? normalizePhase3CanonicalKeys(safeCanonicalKeys, { requiredKeys: identity.keys })
+    : null;
+  const canonicalKeysExact = canonicalKeys && safeCanonicalKeys
+    && safeCanonicalKeys.length === canonicalKeys.length
+    && safeCanonicalKeys.every((key, index) => key === canonicalKeys[index]);
+  const phase3TargetRevision = typeof payload.phase3TargetRevision === 'string'
+    && /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(payload.phase3TargetRevision)
+    ? payload.phase3TargetRevision
+    : null;
+  const source = sourcePath?.split('/', 1)[0];
+  const reconstructedSelectedKey = sourcePath && ['tokens', 'use_token'].includes(source)
+    ? 'token:' + source + ':' + sourcePath
+    : null;
+  const selectedKeyDigest = typeof payload.selectedKeyDigest === 'string'
+    && /^[a-f0-9]{64}$/.test(payload.selectedKeyDigest)
+    ? payload.selectedKeyDigest
+    : null;
+  const identityCanonical = identity && identity.email
+    && safeEmail === identity.email
+    && (safePhone === null || safePhone === identity.phone)
+    && canonicalKeysExact
+    && canonicalKeys.length === identity.keys.length;
+  if (!sourcePath || !identityCanonical || !phase3TargetRevision || !selectedKeyDigest
+      || phase3SelectedKeyDigest(reconstructedSelectedKey) !== selectedKeyDigest) {
+    return { total: 1, targets: [], complete: false };
+  }
+  return {
+    total: 1,
+    complete: true,
+    targets: [{
+      sourcePath,
+      email: identity.email,
+      phone: identity.phone || undefined,
+      phase3TargetRevision,
+    }],
+  };
 }
 
 function tokenCleanupReviewContext(job) {
   const payload = job?.payload && typeof job.payload === 'object' && !Array.isArray(job.payload)
     ? job.payload
     : {};
-  const expectedVersion = /^[a-f0-9]{64}$/.test(String(payload.expectedVersion || ''))
+  const expectedVersion = typeof payload.expectedVersion === 'string'
+    && /^[a-f0-9]{64}$/.test(payload.expectedVersion)
     ? payload.expectedVersion
     : null;
-  const targetCount = Number(payload.targetCount);
+  const targetCount = payload.targetCount;
   if (!expectedVersion || !Number.isSafeInteger(targetCount)
       || targetCount < 0 || targetCount > 1_000_000) return null;
-  const rawTargets = Array.isArray(payload.reviewTargets)
-    ? payload.reviewTargets.slice(0, MAX_TOKEN_CLEANUP_REVIEW_TARGETS)
-    : [];
-  const targets = rawTargets.map((target) => {
+  const rawTargets = Array.isArray(payload.reviewTargets) ? payload.reviewTargets : [];
+  const seenPaths = new Set();
+  let complete = rawTargets.length <= MAX_TOKEN_CLEANUP_REVIEW_TARGETS;
+  const targets = rawTargets.slice(0, MAX_TOKEN_CLEANUP_REVIEW_TARGETS).map((target) => {
     const sourcePath = safeReviewSourcePath(target?.sourcePath);
-    const contentHash = /^[a-f0-9]{64}$/.test(String(target?.contentHash || ''))
+    const contentHash = typeof target?.contentHash === 'string'
+      && /^[a-f0-9]{64}$/.test(target.contentHash)
       ? target.contentHash
       : null;
-    if (!sourcePath || !contentHash) return null;
+    const accessFingerprint = safeReviewFingerprint(target?.accessFingerprint);
+    if (!sourcePath || !contentHash || seenPaths.has(sourcePath)
+        || !accessFingerprint) {
+      complete = false;
+      return null;
+    }
+    seenPaths.add(sourcePath);
     return {
       sourcePath,
       contentHash,
-      accessFingerprint: safeReviewFingerprint(target?.accessFingerprint) || undefined,
+      accessFingerprint,
     };
   }).filter(Boolean);
-  const complete = payload.reviewTargetsTruncated === false
+  complete = complete && payload.reviewTargetsTruncated === false
     && rawTargets.length === targetCount
     && targets.length === targetCount;
   return {
     total: targetCount + 1,
-    truncated: !complete,
+    complete,
     targets: [{
       cleanupScope: 'expired_tokens',
       expectedVersion,
@@ -1349,28 +1530,20 @@ function reconciliationReviewDetail(job) {
     error.code = 'JOB_RECONCILIATION_NOT_HELD';
     throw error;
   }
-  let targets = [];
-  let targetTotal = 0;
-  let targetsAlreadyTruncated = false;
-  if (job.type === 'token_import') targets = tokenImportReviewTargets(job);
-  else if (job.type === 'account_test') targets = accountTestReviewTargets(job);
-  else if (job.type === 'phase3') targets = phase3ReviewTargets(job);
-  else if (job.type === TOKEN_CLEANUP_JOB_TYPE) {
-    const context = tokenCleanupReviewContext(job);
-    if (context) {
-      targets = context.targets;
-      targetTotal = context.total;
-      targetsAlreadyTruncated = context.truncated;
-    }
-  }
-  if (targets.length === 0) {
+  let context = null;
+  if (job.type === 'token_import') context = tokenImportReviewTargets(job);
+  else if (job.type === 'account_test') context = accountTestReviewTargets(job);
+  else if (job.type === 'phase3') context = phase3ReviewTargets(job);
+  else if (job.type === TOKEN_CLEANUP_JOB_TYPE) context = tokenCleanupReviewContext(job);
+  if (!context || context.complete !== true || context.targets.length === 0
+      || context.targets.length !== context.total) {
     const error = new Error('该任务未保留足够的安全目标信息，不能从面板确认人工对账');
     error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE';
     throw error;
   }
-  const returnedTargets = targets.slice(0, 100);
-  const totalTargets = Math.max(targetTotal, targets.length);
-  return {
+  const returnedTargets = context.targets.slice(0, 100);
+  const totalTargets = context.total;
+  const detail = {
     version: 1,
     id: job.id,
     type: job.type,
@@ -1384,10 +1557,79 @@ function reconciliationReviewDetail(job) {
       available: true,
       total: totalTargets,
       returned: returnedTargets.length,
-      truncated: targetsAlreadyTruncated || totalTargets > returnedTargets.length,
+      truncated: totalTargets > returnedTargets.length,
       targets: returnedTargets,
     },
   };
+  detail.reconciliationContextDigest = crypto.createHash('sha256')
+    .update('gpt-register-panel/reconciliation-context/v1\0')
+    .update(JSON.stringify({
+      version: detail.version,
+      id: detail.id,
+      type: detail.type,
+      status: detail.status,
+      reconciliationClaimDigest: detail.reconciliationClaimDigest,
+      reconciliationHoldScope: detail.reconciliationHoldScope,
+      reconciliationBlockScope: detail.reconciliationBlockScope,
+      targetContext: detail.targetContext,
+    }))
+    .digest('hex');
+  return detail;
+}
+
+function validateReconciliationAcknowledgeContext(job, expectedContextDigest) {
+  const detail = reconciliationReviewDetail(job);
+  if (typeof expectedContextDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(expectedContextDigest)
+      || !tokensEqual(detail.reconciliationContextDigest, expectedContextDigest)) {
+    const error = new Error('人工核对目标摘要已变化，请刷新后重新核对');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH';
+    throw error;
+  }
+  const context = detail.targetContext;
+  if (!context || context.available !== true || context.truncated !== false
+      || !Array.isArray(context.targets) || context.targets.length === 0
+      || context.total !== context.returned
+      || context.returned !== context.targets.length) {
+    const error = new Error('人工对账目标信息不完整，保护键未解除');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_INCOMPLETE';
+    throw error;
+  }
+  const actualClaims = Array.isArray(job.claimKeys) ? job.claimKeys : [];
+  let expectedClaims = null;
+  if (job.reconciliationScope === 'global') {
+    expectedClaims = ['reconciliation:legacy-global:'
+      + crypto.createHash('sha256').update(String(job.id)).digest('hex').slice(0, 32)];
+  } else if (job.reconciliationScope === 'claims') {
+    if (job.type === 'token_import') expectedClaims = ['token_import'];
+    else if (job.type === 'account_test') {
+      expectedClaims = job.payload.accountIds.map((id) => 'account_test:' + String(id));
+    } else if (job.type === 'phase3') {
+      const identity = normalizePhase3Identity({
+        email: job.payload.email,
+        phone: job.payload.phone,
+      }, { allowNull: true });
+      const canonicalKeys = identity
+        ? normalizePhase3CanonicalKeys(job.payload.canonicalKeys, {
+          requiredKeys: identity.keys,
+        })
+        : null;
+      expectedClaims = canonicalKeys?.map((key) => 'phase3:' + key) || null;
+    } else if (job.type === TOKEN_CLEANUP_JOB_TYPE) {
+      expectedClaims = [TOKEN_CLEANUP_CLAIM_KEY];
+    }
+  }
+  const actualSet = new Set(actualClaims);
+  const expectedSet = new Set(expectedClaims || []);
+  if (!expectedClaims || actualSet.size !== actualClaims.length
+      || expectedSet.size !== expectedClaims.length
+      || actualSet.size !== expectedSet.size
+      || [...expectedSet].some((key) => !actualSet.has(key))) {
+    const error = new Error('人工对账目标与持久保护键不一致，保护键未解除');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_INCOMPLETE';
+    throw error;
+  }
+  return true;
 }
 
 function reconciliationAcknowledgeRequestError(body, jobId) {
@@ -1402,7 +1644,9 @@ function reconciliationAcknowledgeRequestError(body, jobId) {
     error.code = 'INVALID_REQUEST_BODY';
     return error;
   }
-  const allowed = new Set(['jobId', 'confirmation', 'resolution', 'claimDigest']);
+  const allowed = new Set([
+    'jobId', 'confirmation', 'resolution', 'claimDigest', 'contextDigest',
+  ]);
   if (Object.keys(body).some((key) => !allowed.has(key))) {
     const error = new Error('人工对账请求包含未允许的字段');
     error.code = 'JOB_RECONCILIATION_REQUEST_INVALID';
@@ -1429,6 +1673,12 @@ function reconciliationAcknowledgeRequestError(body, jobId) {
       || !/^[a-f0-9]{64}$/.test(body.claimDigest)) {
     const error = new Error('任务保护键摘要无效');
     error.code = 'JOB_RECONCILIATION_DIGEST_INVALID';
+    return error;
+  }
+  if (typeof body.contextDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(body.contextDigest)) {
+    const error = new Error('人工核对目标摘要无效');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID';
     return error;
   }
   return null;
@@ -1672,11 +1922,12 @@ function tokenCleanupReviewTarget(item) {
   const contentHash = /^[a-f0-9]{64}$/i.test(String(item?.contentHash || ''))
     ? String(item.contentHash).toLowerCase()
     : null;
-  if (!sourcePath || !contentHash) return null;
+  const accessFingerprint = safeReviewFingerprint(item?.fingerprint);
+  if (!sourcePath || !contentHash || !accessFingerprint) return null;
   return {
     sourcePath,
     contentHash,
-    accessFingerprint: safeReviewFingerprint(item?.fingerprint) || undefined,
+    accessFingerprint,
   };
 }
 
@@ -3208,6 +3459,10 @@ function createServer(options = {}) {
                     // selectedKey itself is redacted in persisted job payloads;
                     // retain only its validated source-relative path for review.
                     sourcePath: sourcePathFromSelectionKey(requestItem.selectedKey),
+                    selectedKeyDigest: phase3SelectedKeyDigest(requestItem.selectedKey),
+                    // This opaque revision binds the reviewed token and
+                    // username.json evidence without persisting credentials.
+                    phase3TargetRevision: requestItem.phase3TargetRevision,
                     batch: resolvedRequests.length > 1,
                   },
                   claimKeys: phase3ClaimKeys(requestItem),
@@ -3722,6 +3977,11 @@ function createServer(options = {}) {
             confirmation: body.confirmation,
             resolution: body.resolution,
             claimDigest: body.claimDigest,
+            contextDigest: body.contextDigest,
+            validateContext: (job) => validateReconciliationAcknowledgeContext(
+              job,
+              body.contextDigest,
+            ),
             beforeRelease: (fields) => {
               throwIfJobInterrupted(signal);
               assertAuditLogCheckpoint(logger, 'job.reconciliation_acknowledge_checkpoint', {

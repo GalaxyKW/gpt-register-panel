@@ -43,13 +43,22 @@ function validReviewDetail(job) {
     reconciliationHold: true,
     reconciliationResolved: false,
     reconciliationClaimDigest: job.result.reconciliationClaimDigest,
+    reconciliationContextDigest: 'd'.repeat(64),
     reconciliationHoldScope: 'claims',
     targetContext: {
       available: true,
       total: 1,
       returned: 1,
       truncated: false,
-      targets: [{ sourcePath: 'tokens/free-account.json', remoteAccountId: 266 }],
+      targets: [{
+        sourcePath: 'tokens/free-account.json',
+        remoteAccountId: 266,
+        action: 'update',
+        accessFingerprint: 'c'.repeat(16),
+        strongIdentityKeys: ['account:11111111-1111-4111-8111-111111111111'],
+        availability: 'unavailable',
+        availabilityReason: 'sub2api_status_error',
+      }],
     },
   };
 }
@@ -92,6 +101,131 @@ test('token cleanup reconciliation requires a path-bound content hash', () => {
   assert.equal(context.reconciliationTargetIsValid('token_cleanup', {
     sourcePath: 'tokens/expired.json',
     accessFingerprint: 'c'.repeat(16),
+  }), false);
+  for (const accessFingerprint of [undefined, 'c'.repeat(15), 'c'.repeat(17), 'C'.repeat(16)]) {
+    assert.equal(context.reconciliationTargetIsValid('token_cleanup', {
+      sourcePath: 'tokens/expired.json',
+      contentHash: 'b'.repeat(64),
+      accessFingerprint,
+    }), false);
+  }
+  assert.equal(context.reconciliationTargetSetIsValid('token_cleanup', [{
+    cleanupScope: 'expired_tokens',
+    expectedVersion: 'a'.repeat(64),
+    targetCount: 1,
+  }, {
+    sourcePath: 'tokens/expired.json',
+    contentHash: 'b'.repeat(64),
+    accessFingerprint: 'c'.repeat(16),
+  }], 2), true);
+  assert.equal(context.reconciliationTargetSetIsValid('token_cleanup', [{
+    cleanupScope: 'expired_tokens',
+    expectedVersion: 'a'.repeat(64),
+    targetCount: 2,
+  }, {
+    sourcePath: 'tokens/expired.json',
+    contentHash: 'b'.repeat(64),
+    accessFingerprint: 'c'.repeat(16),
+  }], 2), false);
+});
+
+test('frontend rejects weak reconciliation targets for every mutating workflow', () => {
+  const contracts = section(
+    'function boundedReconciliationDisplay',
+    'function reconciliationReviewDetailError',
+  );
+  const context = {};
+  vm.runInNewContext(contracts, context);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    sourcePath: 'tokens/free-account.json',
+    remoteAccountId: 266,
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('account_test', {
+    remoteAccountId: 266,
+    identityDigest: 'a'.repeat(64),
+    baselineStatus: 'inactive',
+    baselineSchedulable: false,
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('phase3', {
+    sourcePath: 'tokens/free-account.json',
+    email: 'review@example.test',
+  }), false);
+  const validCreate = {
+    sourcePath: 'tokens/new-account.json',
+    accountName: 'free00001',
+    action: 'create',
+    accessFingerprint: 'c'.repeat(16),
+    strongIdentityKeys: ['account:11111111-1111-4111-8111-111111111111'],
+    availability: 'not_present',
+    availabilityReason: 'not_in_sub2api',
+  };
+  assert.equal(context.reconciliationTargetIsValid('token_import', validCreate), true);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    remoteAccountId: 266,
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    availability: 'unknown',
+    availabilityReason: 'panel_clock_invalid',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/[redacted].json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/[unsupported].json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    accountName: '[redaction limit reached]',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: ['account:[redacted]'],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: ['account:[circular]'],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/vis\u00adible.json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: ['account:visible\u061cvalue'],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    accountName: 'free00001\ufe0f',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: ['account:one', 'account:two'],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    email: 'UPPER@example.test',
+  }), false);
+  const validUpdate = {
+    ...validCreate,
+    accountName: 'free00002',
+    action: 'update',
+    remoteAccountId: 266,
+    availability: 'unavailable',
+    availabilityReason: 'sub2api_status_error',
+  };
+  assert.equal(context.reconciliationTargetIsValid('token_import', validUpdate), true);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validUpdate,
+    remoteAccountId: '266',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validUpdate,
+    availability: 'available',
+    availabilityReason: 'sub2api_available',
   }), false);
 });
 
@@ -263,6 +397,7 @@ test('frontend fetches and validates target detail before submitting the path-bo
             reconciliationHold: true,
             reconciliationResolved: false,
             reconciliationClaimDigest: job.result.reconciliationClaimDigest,
+            reconciliationContextDigest: 'd'.repeat(64),
             reconciliationHoldScope: 'all_future_jobs',
             targetContext: {
               available: true,
@@ -324,6 +459,7 @@ test('frontend fetches and validates target detail before submitting the path-bo
     confirmation: '我已按强身份完成人工核对',
     resolution: 'operation_not_applied',
     claimDigest: job.result.reconciliationClaimDigest,
+    contextDigest: 'd'.repeat(64),
   });
   assert.equal(closedWith, 'acknowledged');
   assert.match(notice, /原任务仍不可重试/);

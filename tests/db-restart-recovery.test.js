@@ -36,6 +36,8 @@ function acknowledge(db, job, resolution = 'state_manually_reconciled', extra = 
     confirmation: RECONCILIATION_ACK_CONFIRMATION,
     resolution,
     claimDigest: job.result.reconciliationClaimDigest,
+    contextDigest: 'c'.repeat(64),
+    validateContext: () => true,
     ...extra,
   });
 }
@@ -357,6 +359,10 @@ test('acknowledgement is CAS-protected, audited, idempotent, and never makes the
     (error) => error.code === 'JOB_RECONCILIATION_DIGEST_MISMATCH',
   );
   await assert.rejects(
+    acknowledge(db, held, 'operation_applied', { contextDigest: 'short' }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID',
+  );
+  await assert.rejects(
     acknowledge(db, held, 'invalid'),
     (error) => error.code === 'JOB_RECONCILIATION_RESOLUTION_INVALID',
   );
@@ -368,23 +374,52 @@ test('acknowledgement is CAS-protected, audited, idempotent, and never makes the
       return true;
     },
   );
+  await assert.rejects(
+    acknowledge(db, held, 'operation_applied', { validateContext: undefined }),
+    (error) => error.code === 'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+  );
+  await assert.rejects(
+    acknowledge(db, held, 'operation_applied', {
+      validateContext: () => Promise.resolve(true),
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+  );
+  await assert.rejects(
+    acknowledge(db, held, 'operation_applied', {
+      validateContext: () => Promise.reject(new Error('async validator rejected')),
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+  );
+  assert.equal((await db.getJob(job.id)).result.reconciliationHold, true);
 
   let checkpointFields;
+  const releaseOrder = [];
   const released = await acknowledge(db, held, 'operation_applied', {
-    beforeRelease(fields) { checkpointFields = fields; },
+    validateContext() { releaseOrder.push('context'); return true; },
+    beforeRelease(fields) { releaseOrder.push('checkpoint'); checkpointFields = fields; },
   });
   assert.equal(released.idempotent, false);
   assert.equal(released.releasedClaimCount, 1);
+  assert.equal(released.contextDigest, 'c'.repeat(64));
   assert.equal(checkpointFields.jobId, job.id);
+  assert.equal(checkpointFields.contextDigest, 'c'.repeat(64));
+  assert.deepEqual(releaseOrder, ['context', 'checkpoint']);
   const resolved = await db.getJob(job.id);
   assert.equal(resolved.status, 'interrupted');
   assert.equal(resolved.result.reconciliationResolved, true);
   assert.equal(resolved.result.futureOperationsUnblocked, true);
   assert.equal(resolved.result.reconciliationResolution, 'operation_applied');
+  assert.equal(resolved.result.reconciliationReviewedContextDigest, 'c'.repeat(64));
   assert.equal(resolved.result.retryAllowed, false);
   assert.equal(resolved.result.doNotRetry, true);
   assert.equal(resolved.error, originalError);
-  assert.equal((await acknowledge(db, held, 'operation_applied')).idempotent, true);
+  assert.equal((await acknowledge(db, held, 'operation_applied', {
+    validateContext() { throw new Error('must not run for exact replay'); },
+  })).idempotent, true);
+  await assert.rejects(
+    acknowledge(db, held, 'operation_applied', { contextDigest: 'd'.repeat(64) }),
+    (error) => error.code === 'JOB_RECONCILIATION_ACK_CONFLICT',
+  );
   await assert.rejects(
     acknowledge(db, held, 'operation_not_applied'),
     (error) => error.code === 'JOB_RECONCILIATION_ACK_CONFLICT',
@@ -393,6 +428,7 @@ test('acknowledgement is CAS-protected, audited, idempotent, and never makes the
     event.jobId === job.id
       && event.action === 'job_reconciliation_acknowledge'
       && event.details.resolution === 'operation_applied'
+      && event.details.contextDigest === 'c'.repeat(64)
   )));
   const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
   await db.updateJob(replacement.id, { status: 'failed', error: 'cleanup' });

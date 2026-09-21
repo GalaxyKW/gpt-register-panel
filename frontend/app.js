@@ -88,16 +88,6 @@ const RECONCILIATION_ACK_RESOLUTIONS = new Set([
   'operation_not_applied',
   'state_manually_reconciled',
 ]);
-const RECONCILIATION_AVAILABILITY_REASONS = new Set([
-  'not_in_sub2api', 'panel_clock_invalid', 'sub2api_schema_invalid', 'sub2api_status_unknown',
-  'sub2api_status_missing', 'sub2api_status_inactive', 'sub2api_status_disabled',
-  'sub2api_status_error',
-  'sub2api_schedulable_missing', 'sub2api_unschedulable',
-  'sub2api_auto_pause_invalid', 'sub2api_expiry_invalid', 'sub2api_expired',
-  'sub2api_temp_unschedulable_invalid', 'sub2api_temp_unschedulable',
-  'sub2api_rate_limit_invalid', 'sub2api_rate_limited',
-  'sub2api_overload_invalid', 'sub2api_overloaded', 'sub2api_available',
-]);
 
 function escapeHtml(value) {
   return String(value === undefined || value === null ? '' : value)
@@ -2224,75 +2214,138 @@ function setReconciliationDialogPending(pending) {
 function boundedReconciliationDisplay(value, maximum = 256) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
-  return text && text.length <= maximum
-    && !/[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(text)
+  return text && text === value && text.length <= maximum
+    && !/\[(?:redacted(?:-key-\d+| encoded text)?|uninspectable|unsupported|binary redacted|circular|accessor omitted|truncated|redaction(?: [a-z]+)* reached|oversized(?: [a-z]+)* omitted|oversized)\]/i
+      .test(text)
+    && !/[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u.test(text)
+    ? text
+    : null;
+}
+
+function reconciliationSourcePath(value) {
+  const text = boundedReconciliationDisplay(value, 512);
+  if (!text || text.normalize('NFC') !== text || text.includes('\\') || text.startsWith('/')) {
+    return null;
+  }
+  const segments = text.split('/');
+  return segments.length >= 2
+    && ['tokens', 'use_token'].includes(segments[0])
+    && segments.every((segment) => segment && segment !== '.' && segment !== '..')
+    && segments.at(-1).toLowerCase().endsWith('.json')
     ? text
     : null;
 }
 
 function reconciliationTargetIsValid(workflow, target) {
   if (!target || typeof target !== 'object' || Array.isArray(target)) return false;
-  const sourcePath = boundedReconciliationDisplay(target.sourcePath, 512);
-  const remoteAccountId = Number(target.remoteAccountId);
-  const hasRemoteAccountId = Number.isSafeInteger(remoteAccountId) && remoteAccountId > 0;
+  const sourcePath = reconciliationSourcePath(target.sourcePath);
+  const hasRemoteAccountId = typeof target.remoteAccountId === 'number'
+    && Number.isSafeInteger(target.remoteAccountId) && target.remoteAccountId > 0;
   const email = boundedReconciliationDisplay(target.email, 320);
+  const canonicalEmail = email && email === email.toLowerCase()
+    && /^[^\s@]+@[^\s@]+$/.test(email)
+    ? email
+    : null;
   const phone = typeof target.phone === 'string' && /^\d{1,80}$/.test(target.phone)
     ? target.phone
     : null;
   if (workflow === 'token_import') {
-    if (!sourcePath && !hasRemoteAccountId) return false;
+    if (!sourcePath || !['create', 'update'].includes(target.action)
+        || !/^[a-f0-9]{16}$/.test(String(target.accessFingerprint || ''))
+        || !Array.isArray(target.strongIdentityKeys)
+        || target.strongIdentityKeys.length === 0
+        || target.strongIdentityKeys.length > 10
+        || new Set(target.strongIdentityKeys).size !== target.strongIdentityKeys.length
+        || target.strongIdentityKeys.some((key) => {
+          const text = boundedReconciliationDisplay(key, 520);
+          return !text || !/^(?:account|user):[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/
+            .test(text);
+        })) return false;
+    const dimensions = target.strongIdentityKeys.map((key) => key.slice(0, key.indexOf(':')));
+    if (new Set(dimensions).size !== dimensions.length) return false;
+    const createTargetValid = target.action === 'create'
+      && target.remoteAccountId === undefined
+      && /^free\d{5}$/.test(String(target.accountName || ''))
+      && target.availability === 'not_present'
+      && target.availabilityReason === 'not_in_sub2api';
+    const updateTargetValid = target.action === 'update'
+      && hasRemoteAccountId
+      && target.availability === 'unavailable'
+      && [
+        'sub2api_status_inactive', 'sub2api_status_disabled', 'sub2api_status_error',
+        'sub2api_unschedulable', 'sub2api_expired', 'sub2api_temp_unschedulable',
+        'sub2api_rate_limited', 'sub2api_overloaded',
+      ].includes(target.availabilityReason);
+    if (!createTargetValid && !updateTargetValid) return false;
     if (target.accountName !== undefined
         && !boundedReconciliationDisplay(target.accountName, 128)) return false;
-    if (target.email !== undefined && !email) return false;
-    if (target.action !== undefined && !['create', 'update'].includes(target.action)) return false;
-    if (target.accessFingerprint !== undefined
-        && !/^[a-f0-9]{8,128}$/.test(String(target.accessFingerprint))) return false;
-    if (target.strongIdentityKeys !== undefined
-        && (!Array.isArray(target.strongIdentityKeys)
-          || target.strongIdentityKeys.length === 0
-          || target.strongIdentityKeys.length > 10
-          || new Set(target.strongIdentityKeys).size !== target.strongIdentityKeys.length
-          || target.strongIdentityKeys.some((key) => {
-            const text = boundedReconciliationDisplay(key, 520);
-            return !text || !/^(?:account|user):.+$/.test(text);
-          }))) return false;
+    if (target.email !== undefined && !canonicalEmail) return false;
     if (target.strongIdentityTruncated === true) return false;
     if (target.strongIdentityTruncated !== undefined
         && target.strongIdentityTruncated !== false) return false;
-    if (target.availability !== undefined
-        && !['available', 'unavailable', 'unknown', 'not_present']
-          .includes(target.availability)) return false;
-    if (target.availabilityReason !== undefined
-        && !RECONCILIATION_AVAILABILITY_REASONS.has(target.availabilityReason)) return false;
     return true;
   }
   if (workflow === 'account_test') {
-    if (!hasRemoteAccountId) return false;
-    if (target.identityDigest !== undefined
-        && !/^[a-f0-9]{64}$/.test(String(target.identityDigest))) return false;
-    if (target.baselineStatus !== undefined
-        && !['active', 'inactive', 'disabled', 'error'].includes(target.baselineStatus)) return false;
-    if (target.baselineSchedulable !== undefined
-        && typeof target.baselineSchedulable !== 'boolean') return false;
-    return true;
+    return hasRemoteAccountId
+      && /^[a-f0-9]{64}$/.test(String(target.identityDigest || ''))
+      && /^[a-f0-9]{64}$/.test(String(target.targetDigest || ''))
+      && ['active', 'inactive', 'disabled', 'error'].includes(target.baselineStatus)
+      && typeof target.baselineSchedulable === 'boolean';
   }
   if (workflow === 'phase3') {
-    if (!sourcePath && !email && !phone) return false;
-    if (target.email !== undefined && !email) return false;
+    if (!sourcePath || !canonicalEmail
+        || !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(
+          String(target.phase3TargetRevision || ''),
+        )) return false;
     if (target.phone !== undefined && !phone) return false;
     return true;
   }
   if (workflow === 'token_cleanup') {
     if (target.cleanupScope === 'expired_tokens') {
-      const targetCount = Number(target.targetCount);
       return /^[a-f0-9]{64}$/.test(String(target.expectedVersion || ''))
-        && Number.isSafeInteger(targetCount) && targetCount >= 0 && targetCount <= 1_000_000;
+        && typeof target.targetCount === 'number'
+        && Number.isSafeInteger(target.targetCount)
+        && target.targetCount >= 0 && target.targetCount <= 1_000_000;
     }
     if (!sourcePath) return false;
     if (!/^[a-f0-9]{64}$/.test(String(target.contentHash || ''))) return false;
-    if (target.accessFingerprint !== undefined
-        && !/^[a-f0-9]{8,128}$/.test(String(target.accessFingerprint))) return false;
+    return /^[a-f0-9]{16}$/.test(String(target.accessFingerprint || ''));
+  }
+  return false;
+}
+
+function reconciliationTargetSetIsValid(workflow, targets, total) {
+  if (!Array.isArray(targets) || targets.length !== total) return false;
+  if (workflow === 'phase3') return total === 1;
+  if (workflow === 'account_test') {
+    return new Set(targets.map((target) => target.remoteAccountId)).size === targets.length;
+  }
+  if (workflow === 'token_import') {
+    const paths = new Set();
+    const identities = new Set();
+    const remoteIds = new Set();
+    const createNames = new Set();
+    for (const target of targets) {
+      if (paths.has(target.sourcePath)) return false;
+      paths.add(target.sourcePath);
+      if (target.strongIdentityKeys.some((key) => identities.has(key))) return false;
+      for (const key of target.strongIdentityKeys) identities.add(key);
+      if (target.action === 'update') {
+        if (remoteIds.has(target.remoteAccountId)) return false;
+        remoteIds.add(target.remoteAccountId);
+      } else {
+        if (createNames.has(target.accountName)) return false;
+        createNames.add(target.accountName);
+      }
+    }
     return true;
+  }
+  if (workflow === 'token_cleanup') {
+    const summaries = targets.filter((target) => target.cleanupScope === 'expired_tokens');
+    if (summaries.length !== 1 || targets[0] !== summaries[0]
+        || summaries[0].targetCount !== targets.length - 1) return false;
+    const paths = targets.slice(1).map((target) => target.sourcePath);
+    return paths.every(Boolean) && new Set(paths).size === paths.length;
   }
   return false;
 }
@@ -2304,6 +2357,10 @@ function reconciliationReviewDetailError(detail, expected) {
       || detail.reconciliationClaimDigest !== expected.digest) {
     return '任务标识或保护键摘要与列表不一致';
   }
+  if (typeof detail.reconciliationContextDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(detail.reconciliationContextDigest)) {
+    return '人工核对目标摘要无效';
+  }
   if (!terminalJob(detail.status) || detail.reconciliationHold !== true
       || detail.reconciliationResolved !== false) return '任务已不再处于可确认的待核对状态';
   const context = detail.targetContext;
@@ -2311,12 +2368,13 @@ function reconciliationReviewDetailError(detail, expected) {
       || context.targets.length === 0 || context.targets.length > 100) {
     return '任务未提供可安全核对的目标信息';
   }
-  const total = Number(context.total);
-  const returned = Number(context.returned);
+  const total = context.total;
+  const returned = context.returned;
   if (!Number.isSafeInteger(total) || !Number.isSafeInteger(returned)
       || total < returned || returned !== context.targets.length
       || context.truncated !== (total > returned)
-      || !context.targets.every((target) => reconciliationTargetIsValid(detail.type, target))) {
+      || !context.targets.every((target) => reconciliationTargetIsValid(detail.type, target))
+      || !reconciliationTargetSetIsValid(detail.type, context.targets, total)) {
     return '人工核对目标详情不完整或格式无效';
   }
   return null;
@@ -2349,6 +2407,8 @@ function reconciliationTargetContextText(detail) {
       fields.push('提交时调度 ' + (target.baselineSchedulable ? '启用' : '停用'));
     }
     if (target.identityDigest) fields.push('强身份摘要 ' + target.identityDigest);
+    if (target.targetDigest) fields.push('目标状态摘要 ' + target.targetDigest);
+    if (target.phase3TargetRevision) fields.push('Phase 3 目标版本 ' + target.phase3TargetRevision);
     if (target.strongIdentityKeys) {
       fields.push('来源强身份 ' + target.strongIdentityKeys.join(' / '));
     }
@@ -2403,7 +2463,11 @@ async function openReconciliationDialog() {
     if (detail.targetContext.truncated) {
       throw new Error('人工核对目标超过单次安全显示上限，不能从面板确认');
     }
-    state.reconciliationAckTarget = { ...expected, reviewVerified: true };
+    state.reconciliationAckTarget = {
+      ...expected,
+      contextDigest: detail.reconciliationContextDigest,
+      reviewVerified: true,
+    };
     if (elements.reconciliationAckJobId) elements.reconciliationAckJobId.textContent = detail.id;
     if (elements.reconciliationAckScope) {
       elements.reconciliationAckScope.textContent = detail.reconciliationHoldScope === 'all_future_jobs'
@@ -2446,7 +2510,8 @@ async function submitReconciliationAcknowledgement(event) {
   const current = reconciliationHoldJobs(state.job).find((job) => (
     job.id === target?.id && job.result.reconciliationClaimDigest === target?.digest
   ));
-  if (!current || target?.reviewVerified !== true) {
+  if (!current || target?.reviewVerified !== true
+      || !/^[a-f0-9]{64}$/.test(String(target?.contextDigest || ''))) {
     setReconciliationDialogError('任务或保护键摘要已变化，请关闭后刷新。');
     return;
   }
@@ -2476,6 +2541,7 @@ async function submitReconciliationAcknowledgement(event) {
           confirmation,
           resolution,
           claimDigest: target.digest,
+          contextDigest: target.contextDigest,
         }),
       },
     );

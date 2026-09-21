@@ -44,6 +44,8 @@ function acknowledge(db, job, resolution = 'state_manually_reconciled') {
     confirmation: RECONCILIATION_ACK_CONFIRMATION,
     resolution,
     claimDigest: job.result.reconciliationClaimDigest,
+    contextDigest: 'c'.repeat(64),
+    validateContext: () => true,
   });
 }
 

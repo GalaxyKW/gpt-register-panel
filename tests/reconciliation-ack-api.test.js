@@ -12,10 +12,21 @@ const {
   PanelDb,
   RECONCILIATION_ACK_CONFIRMATION,
 } = require('../backend/db');
-const { createServer, sourcePathFromSelectionKey } = require('../backend/server');
+const {
+  createServer,
+  reconciliationReviewDetail,
+  sourcePathFromSelectionKey,
+} = require('../backend/server');
 const { CONFIRMATION: TOKEN_CLEANUP_CONFIRMATION } = require('../backend/tokenCleanup');
 
 const ADMIN_TOKEN = 'panel-test-token-16-chars';
+
+function phase3SelectedKeyDigest(selectedKey) {
+  return crypto.createHash('sha256')
+    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update(selectedKey)
+    .digest('hex');
+}
 
 function requestJson(baseUrl, pathname, options = {}) {
   return new Promise((resolve, reject) => {
@@ -68,7 +79,16 @@ function testDbPath(label) {
 }
 
 async function heldJob(db, claimKey) {
-  const job = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
+  const selectedKey = 'token:tokens:tokens/review.json';
+  const job = await db.createJob('phase3', {
+    email: 'review@example.test',
+    phone: null,
+    canonicalKeys: ['email:review@example.test'],
+    selectedKey,
+    sourcePath: 'tokens/review.json',
+    selectedKeyDigest: phase3SelectedKeyDigest(selectedKey),
+    phase3TargetRevision: 'phase3-target-v1.' + 'A'.repeat(43),
+  }, 'tester', { claimKeys: [claimKey] });
   await db.updateJob(job.id, {
     status: 'failed',
     result: { writeOutcomeUnknown: true },
@@ -93,11 +113,16 @@ test('review source paths accept only exact source-bound selection keys', () => 
 });
 
 function acknowledgementBody(job, resolution = 'state_manually_reconciled') {
+  let contextDigest = '0'.repeat(64);
+  try {
+    contextDigest = reconciliationReviewDetail(job).reconciliationContextDigest;
+  } catch {}
   return {
     jobId: job.id,
     confirmation: RECONCILIATION_ACK_CONFIRMATION,
     resolution,
     claimDigest: job.result.reconciliationClaimDigest,
+    contextDigest,
   };
 }
 
@@ -113,7 +138,7 @@ test('acknowledgement route requires an authenticated administrator and a durabl
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '0';
   const db = new PanelDb(testDbPath('authenticated'));
-  const held = await heldJob(db, 'phase3:api-auth');
+  const held = await heldJob(db, 'phase3:email:review@example.test');
   let checkpointAllowed = false;
   const logRecords = [];
   const logger = {
@@ -151,6 +176,25 @@ test('acknowledgement route requires an authenticated administrator and a durabl
     });
     assert.equal(invalidResolution.status, 400);
     assert.equal(invalidResolution.json.error, 'JOB_RECONCILIATION_RESOLUTION_INVALID');
+
+    const invalidContextDigest = await requestJson(baseUrl, route, {
+      method: 'POST',
+      token: ADMIN_TOKEN,
+      body: { ...acknowledgementBody(held), contextDigest: 'short' },
+    });
+    assert.equal(invalidContextDigest.status, 400);
+    assert.equal(invalidContextDigest.json.error,
+      'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID');
+
+    const changedContext = await requestJson(baseUrl, route, {
+      method: 'POST',
+      token: ADMIN_TOKEN,
+      body: { ...acknowledgementBody(held), contextDigest: 'f'.repeat(64) },
+    });
+    assert.equal(changedContext.status, 409);
+    assert.equal(changedContext.json.error,
+      'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH');
+    assert.equal((await db.getJob(held.id)).result.reconciliationHold, true);
 
     const missingJobId = 'job_' + '0'.repeat(24);
     const notFound = await requestJson(
@@ -193,7 +237,9 @@ test('acknowledgement route requires an authenticated administrator and a durabl
     assert.equal(unavailable.json.error, 'AUDIT_LOG_UNAVAILABLE');
     assert.equal((await db.getJob(held.id)).result.reconciliationHold, true);
     await assert.rejects(
-      db.createJob('phase3', {}, 'tester', { claimKeys: ['phase3:api-auth'] }),
+      db.createJob('phase3', {}, 'tester', {
+        claimKeys: ['phase3:email:review@example.test'],
+      }),
       (error) => error.code === 'JOB_RECONCILIATION_REQUIRED',
     );
 
@@ -221,10 +267,94 @@ test('acknowledgement route requires an authenticated administrator and a durabl
     assert.equal(conflict.status, 409);
     assert.equal(conflict.json.error, 'JOB_RECONCILIATION_ACK_CONFLICT');
 
+    const mismatchedClaims = await heldJob(
+      db,
+      'phase3:email:different@example.test',
+    );
+    const checkpointCount = logRecords.filter((record) => (
+      record.event === 'job.reconciliation_acknowledge_checkpoint'
+    )).length;
+    const mismatched = await requestJson(
+      baseUrl,
+      '/api/jobs/' + encodeURIComponent(mismatchedClaims.id)
+        + '/reconciliation/acknowledge',
+      { method: 'POST', token: ADMIN_TOKEN, body: acknowledgementBody(mismatchedClaims) },
+    );
+    assert.equal(mismatched.status, 409);
+    assert.equal(mismatched.json.error, 'JOB_RECONCILIATION_CONTEXT_INCOMPLETE');
+    assert.equal((await db.getJob(mismatchedClaims.id)).result.reconciliationHold, true);
+    assert.equal(logRecords.filter((record) => (
+      record.event === 'job.reconciliation_acknowledge_checkpoint'
+    )).length, checkpointCount);
+
     const serializedLogs = JSON.stringify(logRecords);
     assert.equal(serializedLogs.includes(RECONCILIATION_ACK_CONFIRMATION), false);
-    assert.equal(serializedLogs.includes('phase3:api-auth'), false);
+    assert.equal(serializedLogs.includes('phase3:email:review@example.test'), false);
     assert.ok(logRecords.some((record) => record.event === 'job.reconciliation_acknowledge_checkpoint'));
+  } finally {
+    await close(server);
+    if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
+    else process.env.PANEL_ADMIN_TOKEN = previous.token;
+    if (previous.requireAuth === undefined) delete process.env.PANEL_REQUIRE_AUTH;
+    else process.env.PANEL_REQUIRE_AUTH = previous.requireAuth;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.insecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.insecureWrite;
+  }
+});
+
+test('acknowledgement cannot release a hold whose target context is incomplete', async () => {
+  const previous = {
+    token: process.env.PANEL_ADMIN_TOKEN,
+    requireAuth: process.env.PANEL_REQUIRE_AUTH,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    insecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.PANEL_ADMIN_TOKEN = ADMIN_TOKEN;
+  process.env.PANEL_REQUIRE_AUTH = '1';
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '0';
+  const db = new PanelDb(testDbPath('incomplete-context'));
+  const created = await db.createJob('phase3', {}, 'tester', {
+    claimKeys: ['phase3:incomplete-context'],
+  });
+  await db.updateJob(created.id, {
+    status: 'failed',
+    result: { writeOutcomeUnknown: true },
+    finishedAt: new Date().toISOString(),
+  });
+  const held = await db.getJob(created.id);
+  let checkpointCalls = 0;
+  const logger = {
+    requestId: () => 'ack-incomplete-request',
+    probe: () => true,
+    checkpoint() { checkpointCalls += 1; return true; },
+    info() {}, warn() {}, error() {},
+  };
+  const server = createServer({ db, logger });
+  try {
+    const baseUrl = await listen(server);
+    const detail = await requestJson(
+      baseUrl,
+      '/api/jobs/' + encodeURIComponent(held.id) + '/reconciliation',
+      { token: ADMIN_TOKEN },
+    );
+    assert.equal(detail.status, 409);
+    assert.equal(detail.json.error, 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
+
+    const response = await requestJson(
+      baseUrl,
+      '/api/jobs/' + encodeURIComponent(held.id) + '/reconciliation/acknowledge',
+      { method: 'POST', token: ADMIN_TOKEN, body: acknowledgementBody(held) },
+    );
+    assert.equal(response.status, 409);
+    assert.equal(response.json.error, 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
+    assert.equal(checkpointCalls, 0);
+    assert.equal((await db.getJob(held.id)).result.reconciliationHold, true);
+    assert.equal((await db.listAudit(50)).some((entry) => (
+      entry.action === 'job_reconciliation_acknowledge'
+    )), false);
   } finally {
     await close(server);
     if (previous.token === undefined) delete process.env.PANEL_ADMIN_TOKEN;
@@ -261,6 +391,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     targetBaselines: [{
       accountId: 381,
       identityDigest: 'd'.repeat(64),
+      targetDigest: 'e'.repeat(64),
       status: 'inactive',
       statusKnown: true,
       schedulable: false,
@@ -273,13 +404,18 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     phone: '13800138000',
     selectedKey: 'token:use_token:use_token/phase3-account.json',
     sourcePath: 'use_token/phase3-account.json',
-    canonicalKeys: ['email:phase3@example.test', 'credential:' + secretCanary],
+    selectedKeyDigest: phase3SelectedKeyDigest(
+      'token:use_token:use_token/phase3-account.json',
+    ),
+    canonicalKeys: ['email:phase3@example.test', 'phone:13800138000'],
+    phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
   }, 'tester', { claimKeys: ['phase3:email:phase3@example.test'] });
   await db.updateJob(job.id, {
     status: 'failed',
     result: {
       writeOutcomeUnknown: true,
       unrelatedResult: secretCanary,
+      reconciliationCount: 1,
       imported: [{
         source: 'tokens',
         relativePath: 'tokens/free-account.json',
@@ -292,7 +428,6 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
           'account:11111111-1111-4111-8111-111111111111',
           'user:22222222-2222-4222-8222-222222222222',
           'email:account@example.test',
-          'credential:' + secretCanary,
         ],
         availability: 'unavailable',
         availabilityReason: 'sub2api_status_inactive',
@@ -309,6 +444,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     status: 'failed',
     result: {
       writeOutcomeUnknown: true,
+      reconciliationCount: 1,
       results: [{ accountId: 381, requiresReconciliation: true }],
     },
     finishedAt: new Date().toISOString(),
@@ -338,6 +474,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     assert.equal(response.json.type, 'token_import');
     assert.equal(response.json.reconciliationClaimDigest,
       held.result.reconciliationClaimDigest);
+    assert.match(response.json.reconciliationContextDigest, /^[a-f0-9]{64}$/);
     assert.deepEqual(response.json.targetContext, {
       available: true,
       total: 1,
@@ -374,6 +511,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     assert.deepEqual(accountDetail.json.targetContext.targets, [{
       remoteAccountId: 381,
       identityDigest: 'd'.repeat(64),
+      targetDigest: 'e'.repeat(64),
       baselineStatus: 'inactive',
       baselineSchedulable: false,
     }]);
@@ -388,6 +526,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
       sourcePath: 'use_token/phase3-account.json',
       email: 'phase3@example.test',
       phone: '13800138000',
+      phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
     }]);
     assert.equal(JSON.stringify(phase3Detail.json).includes(secretCanary), false);
 
@@ -423,7 +562,7 @@ test('loopback insecure-write mode cannot acknowledge a hold as the local actor'
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
   const db = new PanelDb(testDbPath('local-rejected'));
-  const held = await heldJob(db, 'phase3:local-rejected');
+  const held = await heldJob(db, 'phase3:email:review@example.test');
   const logger = {
     requestId: () => 'ack-local-request',
     probe: () => true,
@@ -466,7 +605,7 @@ test('an unresolved hold blocks token cleanup before its audit intent or filesys
   process.env.PANEL_WRITE_ENABLED = '1';
   process.env.PANEL_ALLOW_INSECURE_WRITE = '0';
   const db = new PanelDb(testDbPath('cleanup-blocked'));
-  const held = await heldJob(db, 'phase3:cleanup-blocked');
+  const held = await heldJob(db, 'phase3:email:review@example.test');
   const logger = {
     requestId: () => 'cleanup-blocked-request',
     probe: () => true,
