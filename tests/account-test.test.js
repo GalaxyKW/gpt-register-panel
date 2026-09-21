@@ -791,12 +791,17 @@ test('known failed test messages are redacted again at the worker boundary', asy
 
 test('worker error redaction fails closed for hostile error accessors and coercion', () => {
   const hostile = Object.create(null);
+  let coercionCalls = 0;
   Object.defineProperty(hostile, 'message', {
     get() { throw new Error('credential-hostile-message-marker'); },
   });
-  hostile.toString = () => { throw new Error('credential-hostile-coercion-marker'); };
+  hostile.toString = () => {
+    coercionCalls += 1;
+    return 'credential-hostile-coercion-marker';
+  };
 
   assert.equal(safeErrorMessage(hostile), 'unknown error');
+  assert.equal(coercionCalls, 0);
 });
 
 test('scheduler enable is not dispatched when its log checkpoint fails', async () => {

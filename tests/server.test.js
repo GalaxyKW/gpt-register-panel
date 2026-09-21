@@ -243,10 +243,15 @@ test('cleanup public fields expose only a strict current version and bounded rec
     currentVersion,
   }), {});
   const hostileVersion = {};
+  let hostileVersionReads = 0;
   Object.defineProperty(hostileVersion, 'currentVersion', {
-    get() { throw new Error('private-version-getter-marker'); },
+    get() {
+      hostileVersionReads += 1;
+      return hostileVersionReads < 3 ? currentVersion : 'private-version-getter-marker';
+    },
   });
   assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_STALE', hostileVersion), {});
+  assert.equal(hostileVersionReads, 0);
   assert.deepEqual(publicTokenCleanupErrorFields('TOKEN_CLEANUP_RECOVERY_REQUIRED', {
     recoveryRequired: true,
     claimCount: 7,
@@ -434,6 +439,36 @@ test('Phase3 failures persist only bounded reconciliation metadata', () => {
   });
   assert.equal(JSON.stringify(metadata).includes('must-not-persist'), false);
 
+  let hostileReads = 0;
+  const hostile = {};
+  for (const key of [
+    'code',
+    'accountDisposition',
+    'requiresReconciliation',
+    'writeOutcomeUnknown',
+    'doNotRetry',
+    'retryAllowed',
+    'reconciliationScope',
+    'reconciliationReason',
+    'dispositionPersisted',
+    'dispositionOutcome',
+    'dispositionWriteOutcomeUnknown',
+    'dispositionCode',
+    'dispositionErrorCode',
+  ]) {
+    Object.defineProperty(hostile, key, {
+      get() {
+        hostileReads += 1;
+        return 'credential-hostile-phase3-marker';
+      },
+    });
+  }
+  assert.deepEqual(phase3FailureMetadata(hostile), {
+    code: null,
+    accountDisposition: null,
+  });
+  assert.equal(hostileReads, 0);
+
   assert.deepEqual(phase3FailureMetadata({
     code: 'invalid-code!',
     accountDisposition: 'delete_everything',
@@ -521,6 +556,30 @@ test('generic worker failures preserve only bounded reconciliation signals', () 
     reconciliationReason: 'post_write_verification',
   });
   assert.equal(JSON.stringify(metadata).includes('must-not-persist'), false);
+
+  let hostileReads = 0;
+  const hostile = {};
+  for (const key of [
+    'code',
+    'requiresReconciliation',
+    'writeOutcomeUnknown',
+    'doNotRetry',
+    'retryAllowed',
+    'blockedBeforeStart',
+    'executionOutcome',
+    'reconciliationReason',
+    'criticalSectionCompleted',
+    'controlPlaneLeaseReleaseFailed',
+  ]) {
+    Object.defineProperty(hostile, key, {
+      get() {
+        hostileReads += 1;
+        return 'credential-hostile-mutation-marker';
+      },
+    });
+  }
+  assert.deepEqual(mutationFailureMetadata(hostile), { code: null });
+  assert.equal(hostileReads, 0);
 });
 
 test('a running token cleanup owned by a dead process recovers as an actionable hold', async () => {

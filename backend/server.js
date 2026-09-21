@@ -23,7 +23,6 @@ const {
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,
-  safeErrorMessage,
 } = require('./sync');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const {
@@ -47,7 +46,6 @@ const {
   classifyAccountTestTargets,
   normalizeAccountTestRequest,
   runAccountTestJob,
-  safeErrorMessage: safeAccountTestErrorMessage,
   withAccountTestSubmissionLock,
 } = require('./accountTestWorker');
 const {
@@ -403,12 +401,38 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   GPT_REGISTER_USERNAME_RECORD_LIMIT: 'username.json 记录数超过安全上限',
 });
 
-function storedErrorCode(error) {
+function safeOwnDataProperty(value, key) {
+  if ((!value || typeof value !== 'object') && typeof value !== 'function') return undefined;
   try {
-    return typeof error?.code === 'string' ? error.code : '';
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
   } catch {
-    return '';
+    return undefined;
   }
+}
+
+function safeOwnPrimitive(value, key) {
+  const candidate = safeOwnDataProperty(value, key);
+  return ['string', 'number', 'boolean', 'bigint'].includes(typeof candidate)
+    ? candidate
+    : candidate === null ? null : undefined;
+}
+
+function safeErrorMessage(error, fallback = 'unknown error') {
+  let value;
+  if (['string', 'number', 'boolean', 'bigint'].includes(typeof error)) value = error;
+  else value = safeOwnPrimitive(error, 'message');
+  try {
+    const text = redactText(value === undefined || value === null ? fallback : String(value));
+    return text.slice(0, 1000) || fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storedErrorCode(error) {
+  const code = safeOwnPrimitive(error, 'code');
+  return typeof code === 'string' ? code : '';
 }
 
 function safeHttpErrorMessage(error) {
@@ -1621,25 +1645,18 @@ function boundedCleanupCount(value) {
 
 function publicTokenCleanupErrorFields(publicCode, error) {
   if (publicCode === 'TOKEN_CLEANUP_STALE') {
-    let currentVersion = null;
-    try {
-      if (typeof error?.currentVersion === 'string'
-          && /^[a-f0-9]{64}$/.test(error.currentVersion)) {
-        currentVersion = error.currentVersion;
-      }
-    } catch {}
+    const rawCurrentVersion = safeOwnPrimitive(error, 'currentVersion');
+    const currentVersion = typeof rawCurrentVersion === 'string'
+        && /^[a-f0-9]{64}$/.test(rawCurrentVersion)
+      ? rawCurrentVersion
+      : null;
     return currentVersion ? { currentVersion } : {};
   }
   if (publicCode === 'TOKEN_CLEANUP_RECOVERY_REQUIRED'
       || publicCode === 'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT') {
-    let recoveryRequired = false;
-    let claimCount = 0;
-    let claimCountTruncated = false;
-    try {
-      recoveryRequired = error?.recoveryRequired === true;
-      claimCount = boundedCleanupCount(error?.claimCount);
-      claimCountTruncated = error?.claimCountTruncated === true;
-    } catch {}
+    const recoveryRequired = safeOwnPrimitive(error, 'recoveryRequired') === true;
+    const claimCount = boundedCleanupCount(safeOwnPrimitive(error, 'claimCount'));
+    const claimCountTruncated = safeOwnPrimitive(error, 'claimCountTruncated') === true;
     return recoveryRequired
       ? { recoveryRequired, claimCount, claimCountTruncated }
       : {};
@@ -1707,11 +1724,18 @@ function tokenCleanupResultSummary(result) {
 function tokenCleanupFailureMetadata(error, completedResult = null) {
   const output = mutationFailureMetadata(error);
   const completedCount = completedResult
-    ? boundedCleanupCount(completedResult.count)
-    : boundedCleanupCount(error?.completedCount);
-  const skippedCount = completedResult && Array.isArray(completedResult.skipped)
-    ? boundedCleanupCount(completedResult.skipped.length)
-    : boundedCleanupCount(error?.skippedCount);
+    ? boundedCleanupCount(safeOwnPrimitive(completedResult, 'count'))
+    : boundedCleanupCount(safeOwnPrimitive(error, 'completedCount'));
+  const completedSkipped = safeOwnDataProperty(completedResult, 'skipped');
+  let completedSkippedLength = null;
+  try {
+    if (Array.isArray(completedSkipped)) {
+      completedSkippedLength = safeOwnPrimitive(completedSkipped, 'length');
+    }
+  } catch {}
+  const skippedCount = completedResult && completedSkippedLength !== null
+    ? boundedCleanupCount(completedSkippedLength)
+    : boundedCleanupCount(safeOwnPrimitive(error, 'skippedCount'));
   output.outcome = output.requiresReconciliation === true
     ? 'requires_reconciliation'
     : output.executionOutcome || 'failed';
@@ -1720,22 +1744,26 @@ function tokenCleanupFailureMetadata(error, completedResult = null) {
   output.skipped = skippedCount;
   output.completedCount = completedCount;
   output.skippedCount = skippedCount;
-  if (error?.reconciliationScope === 'expired_token_cleanup') {
+  if (safeOwnPrimitive(error, 'reconciliationScope') === 'expired_token_cleanup') {
     output.reconciliationScope = 'expired_token_cleanup';
   }
-  const currentSource = safeReviewCode(error?.currentItem?.source, new Set(['tokens', 'use_token']));
+  const currentItem = safeOwnDataProperty(error, 'currentItem');
+  const currentSource = safeReviewCode(
+    safeOwnPrimitive(currentItem, 'source'),
+    new Set(['tokens', 'use_token']),
+  );
   const currentSourcePath = currentSource
-    ? normalizedReviewSourcePath(currentSource, error?.currentItem?.relativePath)
+    ? normalizedReviewSourcePath(currentSource, safeOwnPrimitive(currentItem, 'relativePath'))
     : null;
   if (currentSourcePath) output.currentSourcePath = currentSourcePath;
-  const recoveredCount = boundedCleanupCount(error?.recoveredCount);
+  const recoveredCount = boundedCleanupCount(safeOwnPrimitive(error, 'recoveredCount'));
   if (recoveredCount > 0) output.recoveredCount = recoveredCount;
-  if (error?.recoveryRequired === true) {
+  if (safeOwnPrimitive(error, 'recoveryRequired') === true) {
     output.recoveryRequired = true;
-    output.claimCount = boundedCleanupCount(error?.claimCount);
-    output.claimCountTruncated = error?.claimCountTruncated === true;
+    output.claimCount = boundedCleanupCount(safeOwnPrimitive(error, 'claimCount'));
+    output.claimCountTruncated = safeOwnPrimitive(error, 'claimCountTruncated') === true;
   }
-  const causeCode = safePhase3FailureCode(error?.causeCode);
+  const causeCode = safePhase3FailureCode(safeOwnPrimitive(error, 'causeCode'));
   if (causeCode) output.causeCode = causeCode;
   return output;
 }
@@ -1755,16 +1783,25 @@ function tokenCleanupReconciliationError(
   error.reconciliationScope = 'expired_token_cleanup';
   error.reconciliationReason = reason;
   error.completedCount = result
-    ? boundedCleanupCount(result.count)
-    : boundedCleanupCount(cause?.completedCount);
+    ? boundedCleanupCount(safeOwnPrimitive(result, 'count'))
+    : boundedCleanupCount(safeOwnPrimitive(cause, 'completedCount'));
+  const skipped = safeOwnDataProperty(result, 'skipped');
+  let skippedLength = null;
+  try {
+    if (Array.isArray(skipped)) skippedLength = safeOwnPrimitive(skipped, 'length');
+  } catch {}
   error.skippedCount = result
-    ? boundedCleanupCount(result?.skipped?.length)
-    : boundedCleanupCount(cause?.skippedCount);
-  const causeCode = safePhase3FailureCode(cause?.code);
+    ? boundedCleanupCount(skippedLength)
+    : boundedCleanupCount(safeOwnPrimitive(cause, 'skippedCount'));
+  const causeCode = safePhase3FailureCode(safeOwnPrimitive(cause, 'code'));
   if (causeCode) error.causeCode = causeCode;
-  const currentSource = safeReviewCode(cause?.currentItem?.source, new Set(['tokens', 'use_token']));
+  const currentItem = safeOwnDataProperty(cause, 'currentItem');
+  const currentSource = safeReviewCode(
+    safeOwnPrimitive(currentItem, 'source'),
+    new Set(['tokens', 'use_token']),
+  );
   const currentRelativePath = currentSource
-    ? normalizedReviewSourcePath(currentSource, cause?.currentItem?.relativePath)
+    ? normalizedReviewSourcePath(currentSource, safeOwnPrimitive(currentItem, 'relativePath'))
     : null;
   if (currentRelativePath) {
     error.currentItem = {
@@ -1772,7 +1809,7 @@ function tokenCleanupReconciliationError(
       relativePath: currentRelativePath,
     };
   }
-  const recoveredCount = boundedCleanupCount(cause?.recoveredCount);
+  const recoveredCount = boundedCleanupCount(safeOwnPrimitive(cause, 'recoveredCount'));
   if (recoveredCount > 0) error.recoveredCount = recoveredCount;
   return error;
 }
@@ -1824,58 +1861,74 @@ function safePhase3FailureCode(value) {
 }
 
 function phase3FailureMetadata(error) {
+  const code = safeOwnPrimitive(error, 'code');
+  const accountDisposition = safeOwnPrimitive(error, 'accountDisposition');
+  const reconciliationScope = safeOwnPrimitive(error, 'reconciliationScope');
+  const reconciliationReason = safeOwnPrimitive(error, 'reconciliationReason');
+  const dispositionPersisted = safeOwnPrimitive(error, 'dispositionPersisted');
+  const dispositionOutcome = safeOwnPrimitive(error, 'dispositionOutcome');
+  const dispositionWriteOutcomeUnknown = safeOwnPrimitive(
+    error,
+    'dispositionWriteOutcomeUnknown',
+  );
   const output = {
-    code: safePhase3FailureCode(error?.code),
-    accountDisposition: error?.accountDisposition === 'discard' ? 'discard' : null,
+    code: safePhase3FailureCode(code),
+    accountDisposition: accountDisposition === 'discard' ? 'discard' : null,
   };
-  if (error?.requiresReconciliation === true) output.requiresReconciliation = true;
-  if (error?.writeOutcomeUnknown === true) output.writeOutcomeUnknown = true;
-  if (error?.doNotRetry === true) output.doNotRetry = true;
-  if (error?.retryAllowed === false) output.retryAllowed = false;
-  if (PHASE3_RECONCILIATION_SCOPES.has(error?.reconciliationScope)) {
-    output.reconciliationScope = error.reconciliationScope;
+  if (safeOwnPrimitive(error, 'requiresReconciliation') === true) output.requiresReconciliation = true;
+  if (safeOwnPrimitive(error, 'writeOutcomeUnknown') === true) output.writeOutcomeUnknown = true;
+  if (safeOwnPrimitive(error, 'doNotRetry') === true) output.doNotRetry = true;
+  if (safeOwnPrimitive(error, 'retryAllowed') === false) output.retryAllowed = false;
+  if (PHASE3_RECONCILIATION_SCOPES.has(reconciliationScope)) {
+    output.reconciliationScope = reconciliationScope;
   }
-  if (PHASE3_RECONCILIATION_REASONS.has(error?.reconciliationReason)) {
-    output.reconciliationReason = error.reconciliationReason;
+  if (PHASE3_RECONCILIATION_REASONS.has(reconciliationReason)) {
+    output.reconciliationReason = reconciliationReason;
   }
-  if (error?.dispositionPersisted === true
-      || error?.dispositionPersisted === false
-      || error?.dispositionPersisted === null) {
-    output.dispositionPersisted = error.dispositionPersisted;
+  if (dispositionPersisted === true
+      || dispositionPersisted === false
+      || dispositionPersisted === null) {
+    output.dispositionPersisted = dispositionPersisted;
   }
-  if (PHASE3_DISPOSITION_OUTCOMES.has(error?.dispositionOutcome)) {
-    output.dispositionOutcome = error.dispositionOutcome;
+  if (PHASE3_DISPOSITION_OUTCOMES.has(dispositionOutcome)) {
+    output.dispositionOutcome = dispositionOutcome;
   }
-  if (error?.dispositionWriteOutcomeUnknown === true) {
+  if (dispositionWriteOutcomeUnknown === true) {
     output.dispositionWriteOutcomeUnknown = true;
-  } else if (error?.dispositionWriteOutcomeUnknown === false) {
+  } else if (dispositionWriteOutcomeUnknown === false) {
     output.dispositionWriteOutcomeUnknown = false;
   }
-  const dispositionCode = safePhase3FailureCode(error?.dispositionCode);
+  const dispositionCode = safePhase3FailureCode(safeOwnPrimitive(error, 'dispositionCode'));
   if (dispositionCode) output.dispositionCode = dispositionCode;
-  const dispositionErrorCode = safePhase3FailureCode(error?.dispositionErrorCode);
+  const dispositionErrorCode = safePhase3FailureCode(
+    safeOwnPrimitive(error, 'dispositionErrorCode'),
+  );
   if (dispositionErrorCode) output.dispositionErrorCode = dispositionErrorCode;
   return output;
 }
 
 function mutationFailureMetadata(error) {
-  const output = { code: safePhase3FailureCode(error?.code) };
-  if (error?.requiresReconciliation === true) output.requiresReconciliation = true;
-  if (error?.writeOutcomeUnknown === true) output.writeOutcomeUnknown = true;
-  if (error?.doNotRetry === true) output.doNotRetry = true;
-  if (error?.retryAllowed === false) output.retryAllowed = false;
-  if (error?.blockedBeforeStart === true) output.blockedBeforeStart = true;
-  if (['not_started', 'unknown'].includes(error?.executionOutcome)) {
-    output.executionOutcome = error.executionOutcome;
+  const output = { code: safePhase3FailureCode(safeOwnPrimitive(error, 'code')) };
+  if (safeOwnPrimitive(error, 'requiresReconciliation') === true) output.requiresReconciliation = true;
+  if (safeOwnPrimitive(error, 'writeOutcomeUnknown') === true) output.writeOutcomeUnknown = true;
+  if (safeOwnPrimitive(error, 'doNotRetry') === true) output.doNotRetry = true;
+  if (safeOwnPrimitive(error, 'retryAllowed') === false) output.retryAllowed = false;
+  if (safeOwnPrimitive(error, 'blockedBeforeStart') === true) output.blockedBeforeStart = true;
+  const executionOutcome = safeOwnPrimitive(error, 'executionOutcome');
+  if (['not_started', 'unknown'].includes(executionOutcome)) {
+    output.executionOutcome = executionOutcome;
   }
-  const reconciliationReason = typeof error?.reconciliationReason === 'string'
-    ? error.reconciliationReason.trim().toLowerCase()
+  const rawReconciliationReason = safeOwnPrimitive(error, 'reconciliationReason');
+  const reconciliationReason = typeof rawReconciliationReason === 'string'
+    ? rawReconciliationReason.trim().toLowerCase()
     : '';
   if (/^[a-z0-9_]{1,64}$/.test(reconciliationReason)) {
     output.reconciliationReason = reconciliationReason;
   }
-  if (error?.criticalSectionCompleted === true) output.criticalSectionCompleted = true;
-  if (error?.controlPlaneLeaseReleaseFailed === true) {
+  if (safeOwnPrimitive(error, 'criticalSectionCompleted') === true) {
+    output.criticalSectionCompleted = true;
+  }
+  if (safeOwnPrimitive(error, 'controlPlaneLeaseReleaseFailed') === true) {
     output.controlPlaneLeaseReleaseFailed = true;
   }
   return output;
@@ -1904,7 +1957,7 @@ function observeTokenCleanupJob({
   });
   const persistFailure = async (error) => {
     const result = tokenCleanupFailureMetadata(error, completedResult);
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     const status = result.requiresReconciliation === true && result.completedCount > 0
       ? 'partial'
@@ -2036,8 +2089,8 @@ function observeTokenCleanupJob({
         } catch (error) {
           let terminalError = error;
           if ((completedResult || mutationBoundaryEntered)
-              && error?.requiresReconciliation !== true
-              && error?.writeOutcomeUnknown !== true) {
+              && safeOwnPrimitive(error, 'requiresReconciliation') !== true
+              && safeOwnPrimitive(error, 'writeOutcomeUnknown') !== true) {
             terminalError = tokenCleanupReconciliationError(
               completedResult,
               completedResult ? 'post_mutation_failure' : 'mutation_boundary_failure',
@@ -2099,8 +2152,8 @@ function observeTokenCleanupJob({
     } catch (error) {
       let terminalError = error;
       if ((completedResult || mutationBoundaryEntered)
-          && error?.requiresReconciliation !== true
-          && error?.writeOutcomeUnknown !== true) {
+          && safeOwnPrimitive(error, 'requiresReconciliation') !== true
+          && safeOwnPrimitive(error, 'writeOutcomeUnknown') !== true) {
         terminalError = tokenCleanupReconciliationError(
           completedResult,
           completedResult ? 'control_plane_completion_unknown' : 'mutation_boundary_failure',
@@ -2120,14 +2173,18 @@ function observeTokenCleanupJob({
           });
         }
       }
-      writeLog(logger, terminalError?.requiresReconciliation === true ? 'warn' : 'error',
-        terminalError?.requiresReconciliation === true
+      const requiresReconciliation = safeOwnPrimitive(
+        terminalError,
+        'requiresReconciliation',
+      ) === true;
+      writeLog(logger, requiresReconciliation ? 'warn' : 'error',
+        requiresReconciliation
           ? 'token_cleanup.job_reconciliation_required'
           : 'token_cleanup.job_failed', {
           requestId,
           jobId: job.id,
           actor,
-          code: terminalError?.code || null,
+          code: storedErrorCode(terminalError) || null,
           error: safeErrorMessage(terminalError),
         });
     }
@@ -2166,7 +2223,7 @@ function observePhase3Job({
     successPersisted = true;
   };
   const persistFailure = async (error) => {
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     await updateTerminalJob(db, job.id, {
       status: interrupted ? 'interrupted' : 'failed',
@@ -2219,7 +2276,7 @@ function observePhase3Job({
     .catch(async (error) => {
       const message = safeErrorMessage(error);
       const failureMetadata = phase3FailureMetadata(error);
-      const interrupted = error?.code === 'JOB_INTERRUPTED'
+      const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
         || tracked?.controller.signal.aborted === true;
       if (!successPersisted && !failurePersisted) try {
         await persistFailure(error);
@@ -2295,11 +2352,11 @@ function observeAccountTestJob({
     resultPersisted = true;
   };
   const persistFailure = async (error) => {
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     await updateTerminalJob(db, job.id, {
       status: interrupted ? 'interrupted' : 'failed',
-      error: safeAccountTestErrorMessage(error),
+      error: safeErrorMessage(error),
       result: mutationFailureMetadata(error),
       finishedAt: new Date().toISOString(),
     }, terminalUpdateOptions({
@@ -2348,8 +2405,8 @@ function observeAccountTestJob({
       durationMs: result.durationMs,
     });
   }).catch(async (error) => {
-    const message = safeAccountTestErrorMessage(error);
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const message = safeErrorMessage(error);
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     if (!resultPersisted && !failurePersisted) try {
       await persistFailure(error);
@@ -2367,7 +2424,7 @@ function observeAccountTestJob({
         actor,
         action: 'account_test',
         result: interrupted ? 'interrupted' : 'failed',
-        details: { error: message, code: error?.code || null },
+        details: { error: message, code: storedErrorCode(error) || null },
       });
     } catch (auditError) {
       writeLog(logger, 'error', 'account_test.audit_failed', {
@@ -2436,7 +2493,7 @@ function observeImportJob({
     resultPersisted = true;
   };
   const persistImportFailure = async (error) => {
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     await updateTerminalJob(db, job.id, {
       status: interrupted ? 'interrupted' : 'failed',
@@ -2491,7 +2548,7 @@ function observeImportJob({
     });
   }).catch(async (error) => {
     const message = safeErrorMessage(error);
-    const interrupted = error?.code === 'JOB_INTERRUPTED'
+    const interrupted = storedErrorCode(error) === 'JOB_INTERRUPTED'
       || tracked?.controller.signal.aborted === true;
     if (!resultPersisted && !failurePersisted) try {
       await persistImportFailure(error);

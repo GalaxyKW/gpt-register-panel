@@ -3067,11 +3067,16 @@ test('sync token decisions fail closed when the current clock is invalid', async
 
 test('sync logging uses monotonic durations and hostile errors fail closed', async () => {
   const hostile = Object.create(null);
+  let coercionCalls = 0;
   Object.defineProperty(hostile, 'message', {
     get() { throw new Error('credential-hostile-sync-message'); },
   });
-  hostile.toString = () => { throw new Error('credential-hostile-sync-coercion'); };
+  hostile.toString = () => {
+    coercionCalls += 1;
+    return 'credential-hostile-sync-coercion';
+  };
   assert.equal(safeErrorMessage(hostile), 'unknown error');
+  assert.equal(coercionCalls, 0);
 
   const { root } = fixture();
   const records = [];

@@ -119,6 +119,47 @@ test('callback failure remains the primary error when lease release also fails',
   });
 });
 
+test('release recovery never invokes hostile callback error getters or coercion', async () => {
+  await withInjectedReleaseFailure('gpt-register-panel-hostile-release-', async () => {
+    const hostile = {};
+    let getterCalls = 0;
+    let coercionCalls = 0;
+    for (const key of [
+      'code',
+      'message',
+      'criticalSectionCompleted',
+      'requiresReconciliation',
+      'doNotRetry',
+      'retryAllowed',
+    ]) {
+      Object.defineProperty(hostile, key, {
+        get() {
+          getterCalls += 1;
+          return 'credential-hostile-control-plane-marker';
+        },
+      });
+    }
+    hostile.toString = () => {
+      coercionCalls += 1;
+      return 'credential-hostile-control-plane-marker';
+    };
+    Object.preventExtensions(hostile);
+
+    let observed;
+    try {
+      await withControlPlaneLock(async () => { throw hostile; });
+      assert.fail('hostile callback failure must reject');
+    } catch (error) {
+      observed = error;
+    }
+    assert.equal(observed.code, 'CONTROL_PLANE_CALLBACK_FAILED');
+    assert.equal(observed.message, '控制面操作失败');
+    assert.equal(getterCalls, 0);
+    assert.equal(coercionCalls, 0);
+    assert.equal(JSON.stringify(observed).includes('credential-hostile'), false);
+  });
+});
+
 test('ordinary callback failure releases its lease and preserves the original error', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-callback-fail-'));
   const lockName = 'control.lock';

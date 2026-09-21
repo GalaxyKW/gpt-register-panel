@@ -1309,6 +1309,19 @@ function requestFailure(code, message) {
   return error;
 }
 
+function safeOwnString(value, key) {
+  if ((!value || typeof value !== 'object') && typeof value !== 'function') return '';
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value')
+        && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : '';
+  } catch {
+    return '';
+  }
+}
+
 function markWriteOutcomeUnknown(error, reason) {
   const target = error instanceof Error
     ? error
@@ -1554,6 +1567,7 @@ class Sub2ApiAdminClient {
     } catch (error) {
       let failure;
       let reason = 'transport';
+      const errorCode = safeOwnString(error, 'code');
       if (abortSource === 'external') {
         failure = interruptedRequestError('Sub2API 管理请求因面板停机中断');
         reason = 'external_abort';
@@ -1563,20 +1577,20 @@ class Sub2ApiAdminClient {
           'Sub2API request timed out: ' + method + ' ' + logPath,
         );
         reason = 'timeout';
-      } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
-        failure = error;
+      } else if (errorCode === 'SUB2API_RESPONSE_TOO_LARGE') {
+        failure = requestFailure(errorCode, 'Sub2API 返回的响应体过大');
         reason = 'response_too_large';
-      } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
-        failure = error;
+      } else if (errorCode === 'SUB2API_RESPONSE_UTF8_INVALID') {
+        failure = requestFailure(errorCode, 'Sub2API 返回的响应编码无效');
         reason = 'invalid_utf8';
-      } else if (error?.code === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
-        failure = error;
+      } else if (errorCode === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
+        failure = requestFailure(errorCode, 'Sub2API 返回的响应无法安全读取');
         reason = 'response_stream_unavailable';
-      } else if (error?.code === 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID') {
-        failure = error;
+      } else if (errorCode === 'SUB2API_RESPONSE_CONTENT_TYPE_INVALID') {
+        failure = requestFailure(errorCode, 'Sub2API 返回的响应类型无效');
         reason = 'invalid_content_type';
-      } else if (error?.code === 'SUB2API_REQUEST_SERIALIZATION_FAILED') {
-        failure = error;
+      } else if (errorCode === 'SUB2API_REQUEST_SERIALIZATION_FAILED') {
+        failure = requestFailure(errorCode, 'Sub2API 管理请求序列化失败');
         reason = 'request_validation';
       } else {
         failure = requestFailure(
@@ -1989,6 +2003,7 @@ class Sub2ApiAdminClient {
     } catch (error) {
       let failure;
       let reason = 'transport';
+      const errorCode = safeOwnString(error, 'code');
       if (abortSource === 'external') {
         failure = interruptedRequestError('Sub2API 账号测试因面板停机中断');
         reason = 'external_abort';
@@ -2001,22 +2016,27 @@ class Sub2ApiAdminClient {
       } else if (abortSource === 'timeout') {
         failure = requestFailure('SUB2API_TEST_TIMEOUT', 'Sub2API 账号测试超时');
         reason = 'timeout';
-      } else if (error?.code === 'SUB2API_RESPONSE_TOO_LARGE') {
+      } else if (errorCode === 'SUB2API_RESPONSE_TOO_LARGE') {
         failure = requestFailure('SUB2API_TEST_RESPONSE_TOO_LARGE', 'Sub2API 账号测试响应过大');
         reason = 'response_too_large';
-      } else if (error?.code === 'SUB2API_RESPONSE_UTF8_INVALID') {
+      } else if (errorCode === 'SUB2API_RESPONSE_UTF8_INVALID') {
         failure = requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应编码无效');
         reason = 'invalid_utf8';
-      } else if (error?.code === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
+      } else if (errorCode === 'SUB2API_RESPONSE_STREAM_UNAVAILABLE') {
         failure = requestFailure('SUB2API_TEST_RESPONSE_INVALID', 'Sub2API 账号测试响应无法安全读取');
         reason = 'response_stream_unavailable';
-      } else if (error?.code === 'JOB_INTERRUPTED') {
-        failure = error;
+      } else if (errorCode === 'JOB_INTERRUPTED') {
+        failure = interruptedRequestError('Sub2API 账号测试因面板停机中断');
         reason = 'external_abort';
-      } else if (error?.code === 'SUB2API_TEST_REQUEST_REJECTED'
-          || error?.code === 'SUB2API_TEST_RESPONSE_INVALID') {
-        failure = error;
-        reason = error.reconciliationReason || 'invalid_response';
+      } else if (errorCode === 'SUB2API_TEST_REQUEST_REJECTED'
+          || errorCode === 'SUB2API_TEST_RESPONSE_INVALID') {
+        failure = requestFailure(
+          errorCode,
+          errorCode === 'SUB2API_TEST_REQUEST_REJECTED'
+            ? 'Sub2API 账号测试请求被上游拒绝'
+            : 'Sub2API 账号测试响应无效',
+        );
+        reason = safeOwnString(error, 'reconciliationReason') || 'invalid_response';
       } else {
         failure = requestFailure('SUB2API_TEST_TRANSPORT_ERROR', 'Sub2API 账号测试请求失败');
       }

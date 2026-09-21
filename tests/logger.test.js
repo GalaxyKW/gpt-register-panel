@@ -152,6 +152,25 @@ test('free-text redaction covers compound headers, structured values, and opaque
   assert.equal(url.includes('fake-password'), false);
   assert.match(url, /https:\/\/\[redacted\]@host\.example\/path\?q=1/);
 
+  const networkPath = redactText('request failed at //fake-user:fake-password@host.example/path');
+  assert.equal(networkPath.includes('fake-user'), false);
+  assert.equal(networkPath.includes('fake-password'), false);
+  assert.match(networkPath, /\/\/\[redacted\]@host\.example\/path/);
+
+  for (const prefix of ['failed.', 'x-', 'x+']) {
+    const punctuated = redactText(prefix + '//fake-user:fake-password@host.example/path');
+    assert.equal(punctuated.includes('fake-user'), false, prefix);
+    assert.equal(punctuated.includes('fake-password'), false, prefix);
+    assert.match(punctuated, /\/\/\[redacted\]@host\.example\/path/);
+  }
+
+  for (const label of ['access key', 'access key id', 'access key secret', 'access key material']) {
+    const credentialMarker = 'AKIA-CREDENTIAL-MARKER';
+    const output = redactText(label + ' ' + credentialMarker + '; status=failed');
+    assert.equal(output.includes(credentialMarker), false, label);
+    assert.match(output, /status=failed/);
+  }
+
   const longUserinfoSecret = 'x'.repeat(4097) + '-long-userinfo-secret';
   const longUrl = redactText(
     'https://fake-user:' + longUserinfoSecret + '@host.example/path',
@@ -190,6 +209,7 @@ test('redaction covers localized, composite, and URL-encoded credential forms', 
     OAuth凭据响应: marker,
     访问令牌: marker,
     API密钥: marker,
+    accessKey: marker,
     tokenCount: 3,
     tokenFingerprint: 'safe-fingerprint',
   });
@@ -201,6 +221,7 @@ test('redaction covers localized, composite, and URL-encoded credential forms', 
     'OAuth凭据响应',
     '访问令牌',
     'API密钥',
+    'accessKey',
   ]) assert.equal(structured[key], '[redacted]', key + ' was not redacted');
   assert.equal(structured.tokenCount, 3);
   assert.equal(structured.tokenFingerprint, 'safe-fingerprint');

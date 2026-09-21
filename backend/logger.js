@@ -29,7 +29,7 @@ const MAX_LOG_NAMESPACE_FILES = 1000;
 // directory full of unrelated names must not make startup materialize an
 // unbounded readdir result before the namespace limit can be enforced.
 const MAX_LOG_DIRECTORY_ENTRIES = 20_000;
-const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|(?:用户|登录)?密码|口令|(?:管理员|访问|刷新|身份|认证|授权|bearer|jwt)?令牌|(?:api|客户端|签名|加密|私有|服务账号|访问)?密钥|私钥|(?:oauth|身份|登录|认证|授权)?凭据|认证信息|授权信息|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bod(?:y|ies)|texts?|json|lists?|maps?|objects?|arrays?|blobs?|responses?|previews?|plaintexts?|jars?))*(?:值|内容|原文|头|正文|数据|列表|映射|对象|数组|载荷|响应|预览|明文)*$/i;
+const SECRET_KEY = /(^|_)(access_tokens?|refresh_tokens?|id_tokens?|passwords?|passwds?|pwds?|passphrases?|prompts?|secrets?|secret_keys?|private_keys?|signing_keys?|encryption_keys?|secret_access_keys?|access_keys?|access_key_ids?|service_account_keys?|key_materials?|mfa_secrets?|totp_secrets?|recovery_codes?|api_?keys?|auth|authentication|authorizations?|authorization_codes?|oauth_codes?|verification_codes?|code_verifiers?|cookies?|tokens?|credentials?|nonces?|client_secrets?|jwts?|sessions?|(?:用户|登录)?密码|口令|(?:管理员|访问|刷新|身份|认证|授权|bearer|jwt)?令牌|(?:api|客户端|签名|加密|私有|服务账号|访问)?密钥|私钥|(?:oauth|身份|登录|认证|授权)?凭据|认证信息|授权信息|验证码|授权码)(?:_(?:values?|payloads?|data|raw|headers?|bod(?:y|ies)|texts?|json|lists?|maps?|objects?|arrays?|blobs?|responses?|previews?|plaintexts?|jars?))*(?:值|内容|原文|头|正文|数据|列表|映射|对象|数组|载荷|响应|预览|明文)*$/i;
 const NON_SECRET_METADATA_WORDS = new Set([
   'count', 'counts', 'fingerprint', 'fingerprints', 'status', 'statuses',
   'state', 'states', 'expiry', 'expiries', 'expiration', 'expirations',
@@ -288,7 +288,7 @@ function redactSpaceSeparatedSecrets(value) {
   // container word covers phrases such as "credential map {...}" without
   // turning ordinary "token count/status/fingerprint" diagnostics into
   // secrets. Labels and single-key forms are both length bounded.
-  const naturalPattern = /(^|[^A-Za-z0-9_])(["']?)((?:(?:access|refresh|id)[ \t]+tokens?|api[ \t]+keys?|private[ \t]+keys?|signing[ \t]+keys?|encryption[ \t]+keys?|secret[ \t]+access[ \t]+keys?|access[ \t]+key[ \t]+ids?|service[ \t]+account[ \t]+keys?|key[ \t]+materials?|mfa[ \t]+secrets?|totp[ \t]+secrets?|recovery[ \t]+codes?|authorization(?:[ \t]+codes?)?|oauth[ \t]+codes?|verification[ \t]+codes?|code[ \t]+verifiers?|client[ \t]+secrets?|secret[ \t]+keys?|passwords?|passwds?|passphrases?|secrets?|cookies?|tokens?|credentials?|nonces?|jwts?|authentication|auth|sessions?)(?:[ \t]+(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?)(["']?[ \t]+)/gi;
+  const naturalPattern = /(^|[^A-Za-z0-9_])(["']?)((?:(?:access|refresh|id)[ \t]+tokens?|api[ \t]+keys?|private[ \t]+keys?|signing[ \t]+keys?|encryption[ \t]+keys?|secret[ \t]+access[ \t]+keys?|access[ \t]+key[ \t]+ids?|access[ \t]+key[ \t]+secrets?|access[ \t]+key[ \t]+materials?|access[ \t]+keys?|service[ \t]+account[ \t]+keys?|key[ \t]+materials?|mfa[ \t]+secrets?|totp[ \t]+secrets?|recovery[ \t]+codes?|authorization(?:[ \t]+codes?)?|oauth[ \t]+codes?|verification[ \t]+codes?|code[ \t]+verifiers?|client[ \t]+secrets?|secret[ \t]+keys?|passwords?|passwds?|passphrases?|secrets?|cookies?|tokens?|credentials?|nonces?|jwts?|authentication|auth|sessions?)(?:[ \t]+(?:values?|payloads?|data|raw|headers?|bodies|texts?|json|lists?|maps?|objects?|arrays?))?)(["']?[ \t]+)/gi;
   const singleKeyPattern = /(^|[^A-Za-z0-9_])(["']?)([A-Za-z_\u4e00-\u9fff][A-Za-z0-9_.\[\]\-\u4e00-\u9fff]{0,127})(["']?[ \t]+)/gi;
   return redactSpaceSeparatedPattern(
     redactSpaceSeparatedPattern(value, naturalPattern),
@@ -298,7 +298,7 @@ function redactSpaceSeparatedSecrets(value) {
 
 function redactUrlUserinfo(value) {
   return String(value || '').replace(
-    /\b([A-Za-z][A-Za-z0-9+.-]{0,30}:\/\/)([^/?#\s@]+)@/g,
+    /((?:[A-Za-z][A-Za-z0-9+.-]{0,30}:)?\/\/)([^/?#\s@]+)@/g,
     '$1[redacted]@',
   );
 }
@@ -1342,4 +1342,5 @@ module.exports = {
   redactText,
   redactValue,
   safeErrorText,
+  safeFailureMessage,
 };

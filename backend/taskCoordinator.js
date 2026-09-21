@@ -4,7 +4,7 @@ const path = require('node:path');
 const { acquireBakeryLease, releaseBakeryLease } = require('./lib/bakeryLock');
 const { ensureDirectoryTree } = require('./lib/safeFs');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
-const { redactText, redactValue } = require('./logger');
+const { redactValue, safeFailureMessage } = require('./logger');
 
 const CONTROL_LOCK_KIND = 'gpt-register-panel-control-lock';
 const CONTROL_LOCK_RELEASE_CODE = 'CONTROL_PLANE_LOCK_RELEASE_FAILED';
@@ -190,15 +190,17 @@ function safeErrorCode(value, fallback) {
 }
 
 function errorProperty(error, key) {
-  try { return error?.[key]; } catch { return undefined; }
+  if ((!error || typeof error !== 'object') && typeof error !== 'function') return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, key);
+    return descriptor && Object.hasOwn(descriptor, 'value') ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 function safeErrorMessage(error, fallback) {
-  try {
-    return redactText(String(error?.message || error || fallback)).slice(0, 1000) || fallback;
-  } catch {
-    return fallback;
-  }
+  return safeFailureMessage(error, fallback);
 }
 
 function safeReleaseFailure(error) {

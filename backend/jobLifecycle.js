@@ -39,6 +39,19 @@ function safeAdmissionFailureCode(value, fallback = 'JOB_ADMISSION_DISPATCH_FAIL
   return /^[A-Z0-9_]{1,96}$/.test(code) ? code : fallback;
 }
 
+function safeOwnString(value, key) {
+  if ((!value || typeof value !== 'object') && typeof value !== 'function') return '';
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor && Object.hasOwn(descriptor, 'value')
+        && typeof descriptor.value === 'string'
+      ? descriptor.value
+      : '';
+  } catch {
+    return '';
+  }
+}
+
 function admissionDispatchError(code, message, fields = {}) {
   const error = new Error(message);
   error.code = code;
@@ -233,7 +246,7 @@ function createAdmissionDispatchGuard({ db, jobManager, onRetry, onInterrupted }
   function scheduleBackgroundRecovery(cause) {
     if (backgroundRecoveryScheduled || pendingStates().length === 0) return;
     backgroundRecoveryScheduled = true;
-    const code = safeAdmissionFailureCode(cause?.code);
+    const code = safeAdmissionFailureCode(safeOwnString(cause, 'code'));
     let releaseAdmissionHold = null;
     try {
       releaseAdmissionHold = jobManager?.holdAdmissions?.({ code }) || null;
@@ -278,7 +291,7 @@ function createAdmissionDispatchGuard({ db, jobManager, onRetry, onInterrupted }
         { retryAllowed: false, doNotRetry: true },
       );
     }
-    const code = safeAdmissionFailureCode(cause?.code);
+    const code = safeAdmissionFailureCode(safeOwnString(cause, 'code'));
     const ids = pending.map((state) => state.id);
     let lastError;
     for (let attempt = 1; attempt <= FOREGROUND_ADMISSION_RECOVERY_ATTEMPTS; attempt += 1) {
@@ -298,7 +311,10 @@ function createAdmissionDispatchGuard({ db, jobManager, onRetry, onInterrupted }
       '任务已入队但派发失败，且安全中断未能持久化；保护键已保留',
       {
         admissionFailureCode: code,
-        persistenceFailureCode: safeAdmissionFailureCode(lastError?.code, 'JOB_PERSISTENCE_FAILED'),
+        persistenceFailureCode: safeAdmissionFailureCode(
+          safeOwnString(lastError, 'code'),
+          'JOB_PERSISTENCE_FAILED',
+        ),
         retryAllowed: false,
         doNotRetry: true,
       },
@@ -339,7 +355,7 @@ function createAdmissionDispatchGuard({ db, jobManager, onRetry, onInterrupted }
       }
       if (committed.size > 0
           && [...committed.values()].every((state) => state.interrupted)) {
-        const code = safeAdmissionFailureCode(error?.code);
+        const code = safeAdmissionFailureCode(safeOwnString(error, 'code'));
         throw admissionDispatchError(
           code,
           '任务已持久入队，但未交给执行器；已确认未开始并安全中断',
@@ -412,7 +428,7 @@ async function updateTerminalJob(db, jobId, patch = {}, options = {}) {
         'JOB_STATUS_INVALID',
         'JOB_STORED_STATUS_INVALID',
         'JOB_TERMINAL_STATUS_CONFLICT',
-      ].includes(error?.code)) break;
+      ].includes(safeOwnString(error, 'code'))) break;
       if (typeof options.onRetry === 'function') {
         try { options.onRetry(error, attempt); } catch {}
       }

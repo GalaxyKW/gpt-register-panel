@@ -66,6 +66,33 @@ test('terminal job updates retry a bounded number of times with one stable times
     /persistent sqlite failure/,
   );
   assert.equal(failures, 2);
+
+  const hostile = new Error('hostile terminal persistence failure');
+  let codeGetterCalls = 0;
+  Object.defineProperty(hostile, 'code', {
+    get() {
+      codeGetterCalls += 1;
+      throw new Error('credential-hostile-terminal-code');
+    },
+  });
+  let hostileAttempts = 0;
+  let hostileRetries = 0;
+  await assert.rejects(
+    updateTerminalJob({
+      async updateJob() {
+        hostileAttempts += 1;
+        throw hostile;
+      },
+    }, 'job-hostile-error', { status: 'failed' }, {
+      attempts: 3,
+      initialDelayMs: 0,
+      onRetry() { hostileRetries += 1; },
+    }),
+    (error) => error === hostile,
+  );
+  assert.equal(hostileAttempts, 3);
+  assert.equal(hostileRetries, 2);
+  assert.equal(codeGetterCalls, 0);
 });
 
 test('terminal job updates fail closed when durable storage is unavailable', async () => {

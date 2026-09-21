@@ -3135,6 +3135,29 @@ test('Sub2API write requests distinguish pre-dispatch failures from unknown remo
       );
     }
 
+    const hostileWriteError = new Error('credential-hostile-write-error');
+    let hostileWriteCodeReads = 0;
+    Object.defineProperty(hostileWriteError, 'code', {
+      get() {
+        hostileWriteCodeReads += 1;
+        throw new Error('credential-hostile-write-code');
+      },
+    });
+    global.fetch = async () => { throw hostileWriteError; };
+    const hostileWriteClient = new Sub2ApiAdminClient({
+      baseUrl: 'http://127.0.0.1:8080',
+      apiKey: 'test-key',
+    });
+    await assert.rejects(
+      hostileWriteClient.importCodexSession({ content: '{}' }, { idempotencyKey }),
+      (error) => error.code === 'SUB2API_TRANSPORT_ERROR'
+        && error.writeOutcomeUnknown === true
+        && error.requiresReconciliation === true
+        && error.writeOutcomeReason === 'transport'
+        && !error.message.includes('credential-hostile'),
+    );
+    assert.equal(hostileWriteCodeReads, 0);
+
     global.fetch = async () => response(JSON.stringify({
       success: true,
       data: { unexpected: true },
@@ -3767,6 +3790,42 @@ test('Sub2API account tests distinguish pre-dispatch interruption from unknown s
       (error) => assertUnknown(error, 'SUB2API_TEST_TRANSPORT_ERROR', 'transport')
         && !error.message.includes('transport-secret'),
     );
+
+    const hostileTestError = new Error('credential-hostile-test-error');
+    let hostileTestCodeReads = 0;
+    Object.defineProperty(hostileTestError, 'code', {
+      get() {
+        hostileTestCodeReads += 1;
+        throw new Error('credential-hostile-test-code');
+      },
+    });
+    global.fetch = async () => { throw hostileTestError; };
+    await assert.rejects(
+      client.testAccount(1),
+      (error) => assertUnknown(error, 'SUB2API_TEST_TRANSPORT_ERROR', 'transport')
+        && !error.message.includes('credential-hostile'),
+    );
+    assert.equal(hostileTestCodeReads, 0);
+
+    const hostileReasonError = new Error('credential-hostile-test-reason');
+    hostileReasonError.code = 'SUB2API_TEST_RESPONSE_INVALID';
+    let hostileReasonReads = 0;
+    Object.defineProperty(hostileReasonError, 'reconciliationReason', {
+      get() {
+        hostileReasonReads += 1;
+        throw new Error('credential-hostile-reconciliation-reason');
+      },
+    });
+    global.fetch = async () => { throw hostileReasonError; };
+    await assert.rejects(
+      client.testAccount(1),
+      (error) => assertUnknown(
+        error,
+        'SUB2API_TEST_RESPONSE_INVALID',
+        'invalid_response',
+      ) && !error.message.includes('credential-hostile'),
+    );
+    assert.equal(hostileReasonReads, 0);
 
     const runningAbort = new AbortController();
     global.fetch = async (url, options) => new Promise((resolve, reject) => {

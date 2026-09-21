@@ -11,7 +11,7 @@ const {
 } = require('./accountTargetRevision');
 const { accountKeys, hasStrongIdentity, identitiesStronglyCompatible } = require('./diff');
 const { normalizeIdentityValue } = require('./lib/token');
-const { assertAuditLogCheckpoint, redactText } = require('./logger');
+const { assertAuditLogCheckpoint, safeFailureMessage } = require('./logger');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
 
@@ -28,20 +28,7 @@ function writeLog(logger, level, event, fields = {}) {
 }
 
 function safeErrorMessage(error) {
-  let detail = 'unknown error';
-  try {
-    let message;
-    try { message = error?.message; } catch {}
-    if (typeof message === 'string' && message) detail = message;
-    else if (error !== undefined && error !== null) detail = String(error);
-  } catch {
-    detail = 'unknown error';
-  }
-  try {
-    return redactText(detail).slice(0, 1000);
-  } catch {
-    return 'unknown error';
-  }
+  return safeFailureMessage(error);
 }
 
 function writeRequiresReconciliation(error) {

@@ -34,7 +34,7 @@ const {
 } = require('./view');
 const { getAccountAvailability } = require('./accountAvailability');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
-const { assertAuditLogCheckpoint, redactText } = require('./logger');
+const { assertAuditLogCheckpoint, safeFailureMessage } = require('./logger');
 const {
   parseJwtPayload,
   normalizeIdentityValue,
@@ -57,20 +57,7 @@ const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
 const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
 
 function safeErrorMessage(error) {
-  let detail = 'unknown error';
-  try {
-    let message;
-    try { message = error?.message; } catch {}
-    if (typeof message === 'string' && message) detail = message;
-    else if (error !== undefined && error !== null) detail = String(error);
-  } catch {
-    detail = 'unknown error';
-  }
-  try {
-    return redactText(detail).slice(0, 1000);
-  } catch {
-    return 'unknown error';
-  }
+  return safeFailureMessage(error);
 }
 
 function currentTimeError() {
