@@ -313,6 +313,7 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'TOKEN_CLEANUP_STALE',
   'TOKEN_CLEANUP_RECOVERY_REQUIRED',
   'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT',
+  'TOKEN_CLEANUP_REVIEW_TARGET_LIMIT',
   'JOB_RECONCILIATION_NOT_HELD',
   'JOB_RECONCILIATION_ACK_CONFLICT',
   'JOB_RECONCILIATION_DIGEST_MISMATCH',
@@ -391,6 +392,7 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   TOKEN_CLEANUP_STALE: '过期 token 清单已变化，请重新扫描',
   TOKEN_CLEANUP_RECOVERY_REQUIRED: '过期 token 清理存在待恢复状态，已阻止继续删除',
   TOKEN_CLEANUP_CLAIM_SCAN_LIMIT: 'token 清理声明扫描超过安全上限，已阻止继续操作',
+  TOKEN_CLEANUP_REVIEW_TARGET_LIMIT: '过期 token 超过 99 个，当前无法安全一次清理，已拒绝操作',
   JOB_RECONCILIATION_NOT_FOUND: '待对账任务不存在',
   JOB_RECONCILIATION_ADMIN_REQUIRED: '只允许经过认证的面板管理员执行该操作',
   AUDIT_LOG_UNAVAILABLE: '审计日志不可用，已拒绝写操作',
@@ -1915,14 +1917,19 @@ function publicTokenCleanupErrorFields(publicCode, error) {
 }
 
 function tokenCleanupReviewTarget(item) {
-  const source = safeReviewCode(item?.source, new Set(['tokens', 'use_token']));
+  const sourceValue = safeOwnPrimitive(item, 'source');
+  const relativePath = safeOwnPrimitive(item, 'relativePath');
+  const contentHashValue = safeOwnPrimitive(item, 'contentHash');
+  const fingerprintValue = safeOwnPrimitive(item, 'fingerprint');
+  const source = safeReviewCode(sourceValue, new Set(['tokens', 'use_token']));
   const sourcePath = source
-    ? normalizedReviewSourcePath(source, item?.relativePath)
+    ? normalizedReviewSourcePath(source, relativePath)
     : null;
-  const contentHash = /^[a-f0-9]{64}$/i.test(String(item?.contentHash || ''))
-    ? String(item.contentHash).toLowerCase()
+  const contentHash = typeof contentHashValue === 'string'
+    && /^[a-f0-9]{64}$/.test(contentHashValue)
+    ? contentHashValue
     : null;
-  const accessFingerprint = safeReviewFingerprint(item?.fingerprint);
+  const accessFingerprint = safeReviewFingerprint(fingerprintValue);
   if (!sourcePath || !contentHash || !accessFingerprint) return null;
   return {
     sourcePath,
@@ -1932,17 +1939,38 @@ function tokenCleanupReviewTarget(item) {
 }
 
 function tokenCleanupJobPayload(listing) {
-  const items = Array.isArray(listing?._internalItems) ? listing._internalItems : [];
-  const targets = items.map(tokenCleanupReviewTarget).filter(Boolean);
-  const targetCount = boundedCleanupCount(listing?.count);
+  const version = safeOwnPrimitive(listing, 'version');
+  const targetCount = safeOwnPrimitive(listing, 'count');
+  const items = safeOwnDataProperty(listing, '_internalItems');
+  if (typeof version !== 'string' || !/^[a-f0-9]{64}$/.test(version)
+      || typeof targetCount !== 'number' || !Number.isSafeInteger(targetCount)
+      || targetCount < 0 || !Array.isArray(items) || items.length !== targetCount) {
+    const error = new Error('过期 token 清理目标清单不完整，未创建任务');
+    error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+    throw error;
+  }
+  if (targetCount > MAX_TOKEN_CLEANUP_REVIEW_TARGETS) {
+    const error = new Error('过期 token 超过 99 个，当前无法安全一次清理，已拒绝操作');
+    error.code = 'TOKEN_CLEANUP_REVIEW_TARGET_LIMIT';
+    throw error;
+  }
+  const targets = [];
+  const seenPaths = new Set();
+  for (const item of items) {
+    const target = tokenCleanupReviewTarget(item);
+    if (!target || seenPaths.has(target.sourcePath)) {
+      const error = new Error('过期 token 清理目标清单无效，未创建任务');
+      error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+      throw error;
+    }
+    seenPaths.add(target.sourcePath);
+    targets.push(target);
+  }
   return {
-    expectedVersion: /^[a-f0-9]{64}$/i.test(String(listing?.version || ''))
-      ? String(listing.version).toLowerCase()
-      : null,
+    expectedVersion: version,
     targetCount,
-    reviewTargets: targets.slice(0, MAX_TOKEN_CLEANUP_REVIEW_TARGETS),
-    reviewTargetsTruncated: targets.length !== targetCount
-      || targets.length > MAX_TOKEN_CLEANUP_REVIEW_TARGETS,
+    reviewTargets: targets,
+    reviewTargetsTruncated: false,
   };
 }
 

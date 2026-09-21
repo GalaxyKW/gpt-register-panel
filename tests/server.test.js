@@ -33,6 +33,7 @@ const {
   safeStaticPath,
   shutdownServer,
   startServer,
+  tokenCleanupJobPayload,
   validateListenConfiguration,
   validateRuntimeConfiguration,
 } = require('../backend/server');
@@ -127,6 +128,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'TOKEN_CLEANUP_STALE',
       'TOKEN_CLEANUP_RECOVERY_REQUIRED',
       'TOKEN_CLEANUP_CLAIM_SCAN_LIMIT',
+      'TOKEN_CLEANUP_REVIEW_TARGET_LIMIT',
       'JOB_RECONCILIATION_NOT_HELD',
       'JOB_RECONCILIATION_ACK_CONFLICT',
       'JOB_RECONCILIATION_DIGEST_MISMATCH',
@@ -272,6 +274,66 @@ test('cleanup public fields expose only a strict current version and bounded rec
     claimCount: 0,
     claimCountTruncated: false,
   });
+});
+
+test('cleanup job payload preserves the complete 99-target review boundary', () => {
+  const reviewItem = (index) => ({
+    source: index % 2 === 0 ? 'tokens' : 'use_token',
+    relativePath: (index % 2 === 0 ? 'tokens/' : 'use_token/')
+      + 'expired-' + String(index).padStart(3, '0') + '.json',
+    contentHash: crypto.createHash('sha256').update('cleanup-' + index).digest('hex'),
+    fingerprint: (index + 1).toString(16).padStart(16, '0'),
+  });
+  const listing = (count) => ({
+    version: 'a'.repeat(64),
+    count,
+    _internalItems: Array.from({ length: count }, (_, index) => reviewItem(index)),
+  });
+  const payload = tokenCleanupJobPayload(listing(99));
+  assert.equal(payload.targetCount, 99);
+  assert.equal(payload.reviewTargets.length, 99);
+  assert.equal(payload.reviewTargetsTruncated, false);
+  const detail = reconciliationReviewDetail({
+    id: 'job_' + 'f'.repeat(24),
+    type: 'token_cleanup',
+    status: 'failed',
+    payload,
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: 'b'.repeat(64),
+    },
+  });
+  assert.equal(detail.targetContext.total, 100);
+  assert.equal(detail.targetContext.returned, 100);
+  assert.equal(detail.targetContext.truncated, false);
+
+  assert.throws(
+    () => tokenCleanupJobPayload(listing(100)),
+    (error) => error.code === 'TOKEN_CLEANUP_REVIEW_TARGET_LIMIT',
+  );
+  const malformedListings = [
+    { ...listing(1), count: 2 },
+    {
+      ...listing(2),
+      _internalItems: [reviewItem(0), reviewItem(0)],
+    },
+    {
+      ...listing(1),
+      _internalItems: [{ ...reviewItem(0), contentHash: 'A'.repeat(64) }],
+    },
+    {
+      ...listing(1),
+      _internalItems: [{ ...reviewItem(0), fingerprint: 'a'.repeat(15) }],
+    },
+  ];
+  for (const malformed of malformedListings) {
+    assert.throws(
+      () => tokenCleanupJobPayload(malformed),
+      (error) => error.code === 'JOB_RECONCILIATION_GUARD_UNAVAILABLE',
+    );
+  }
 });
 
 test('request log paths use fixed templates without raw dynamic or unknown segments', () => {
@@ -2617,6 +2679,86 @@ test('concurrent requests that both miss initially create and dispatch only once
   }
 });
 
+test('expired-token cleanup rejects 100 targets before durable admission or mutation', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-limit-'));
+  fs.mkdirSync(path.join(root, 'tokens'));
+  fs.mkdirSync(path.join(root, 'use_token'));
+  fs.writeFileSync(path.join(root, 'username.json'), '[]\n');
+  const markerPath = path.join(root, 'tokens', 'keep.json');
+  fs.writeFileSync(markerPath, '{"marker":true}\n');
+  const previous = {
+    root: process.env.GPT_REGISTER_ROOT,
+    writeEnabled: process.env.PANEL_WRITE_ENABLED,
+    allowInsecureWrite: process.env.PANEL_ALLOW_INSECURE_WRITE,
+  };
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  const db = new PanelDb(path.join(root, 'panel.sqlite3'));
+  const originalCreateMutationSubmission = db.createMutationSubmission.bind(db);
+  let createCalls = 0;
+  db.createMutationSubmission = async (...args) => {
+    createCalls += 1;
+    return originalCreateMutationSubmission(...args);
+  };
+  const version = 'd'.repeat(64);
+  const items = Array.from({ length: 100 }, (_, index) => ({
+    source: 'tokens',
+    relativePath: 'tokens/expired-' + String(index).padStart(3, '0') + '.json',
+    contentHash: crypto.createHash('sha256').update('cleanup-limit-' + index).digest('hex'),
+    fingerprint: (index + 1).toString(16).padStart(16, '0'),
+  }));
+  let server;
+  try {
+    server = createServer({
+      db,
+      logger: {
+        requestId: () => 'cleanup-limit-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+        checkpoint() { return true; },
+      },
+      expiredTokenLister: () => ({
+        version,
+        count: items.length,
+        items: [],
+        _internalItems: items,
+        recoveryRequired: false,
+        claimCount: 0,
+        claimCountTruncated: false,
+      }),
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const response = await postJson(
+      'http://127.0.0.1:' + server.address().port,
+      '/api/tokens/expired/delete',
+      { version, confirmation: 'DELETE_EXPIRED_TOKENS' },
+    );
+    assert.equal(response.status, 409);
+    const responseBody = JSON.parse(response.body);
+    assert.equal(responseBody.error, 'TOKEN_CLEANUP_REVIEW_TARGET_LIMIT');
+    assert.equal(responseBody.message, '过期 token 超过 99 个，当前无法安全一次清理，已拒绝操作');
+    assert.equal(createCalls, 0);
+    assert.equal((await db.listJobs()).length, 0);
+    assert.equal((await db.listAudit()).length, 0);
+    assert.equal(fs.readFileSync(markerPath, 'utf8'), '{"marker":true}\n');
+    assert.equal(fs.existsSync(path.join(root, '.panel-quarantine')), false);
+  } finally {
+    await closeHttpServer(server);
+    if (previous.root === undefined) delete process.env.GPT_REGISTER_ROOT;
+    else process.env.GPT_REGISTER_ROOT = previous.root;
+    if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
+    else process.env.PANEL_WRITE_ENABLED = previous.writeEnabled;
+    if (previous.allowInsecureWrite === undefined) delete process.env.PANEL_ALLOW_INSECURE_WRITE;
+    else process.env.PANEL_ALLOW_INSECURE_WRITE = previous.allowInsecureWrite;
+  }
+});
+
 test('a completed cleanup replays its original 202 without rescanning or starting another worker', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-cleanup-replay-'));
   fs.mkdirSync(path.join(root, 'tokens'));
@@ -2639,6 +2781,14 @@ test('a completed cleanup replays its original 202 without rescanning or startin
   let server;
   try {
     const listing = listExpiredTokens();
+    const oversizedItems = Array.from({ length: 100 }, (_, index) => ({
+      source: 'tokens',
+      relativePath: 'tokens/replay-' + String(index).padStart(3, '0') + '.json',
+      contentHash: crypto.createHash('sha256').update('cleanup-replay-' + index).digest('hex'),
+      fingerprint: (index + 1).toString(16).padStart(16, '0'),
+    }));
+    let listingCalls = 0;
+    let exposeOversizedListing = false;
     const requestBody = {
       version: listing.version,
       confirmation: 'DELETE_EXPIRED_TOKENS',
@@ -2653,6 +2803,20 @@ test('a completed cleanup replays its original 202 without rescanning or startin
         error() {},
         probe() { return true; },
         checkpoint() { return true; },
+      },
+      expiredTokenLister() {
+        listingCalls += 1;
+        return exposeOversizedListing
+          ? {
+            version: listing.version,
+            count: oversizedItems.length,
+            items: [],
+            _internalItems: oversizedItems,
+            recoveryRequired: false,
+            claimCount: 0,
+            claimCountTruncated: false,
+          }
+          : listing;
       },
     });
     await new Promise((resolve, reject) => {
@@ -2669,12 +2833,14 @@ test('a completed cleanup replays its original 202 without rescanning or startin
     const terminal = await waitForTerminalJob(baseUrl, firstBody.jobId);
     assert.equal(terminal.status, 'succeeded');
 
+    exposeOversizedListing = true;
     const replay = await postJson(baseUrl, '/api/tokens/expired/delete', requestBody, {
       'idempotency-key': key,
     });
     assert.equal(replay.status, 202);
     assert.equal(replay.headers['idempotency-replayed'], 'true');
     assert.equal(replay.body, first.body);
+    assert.equal(listingCalls, 1);
     assert.equal((await db.listJobs()).filter((job) => job.type === 'token_cleanup').length, 1);
 
     const changed = await postJson(baseUrl, '/api/tokens/expired/delete', {
@@ -2683,6 +2849,7 @@ test('a completed cleanup replays its original 202 without rescanning or startin
     }, { 'idempotency-key': key });
     assert.equal(changed.status, 409);
     assert.equal(JSON.parse(changed.body).error, 'IDEMPOTENCY_KEY_REUSED');
+    assert.equal(listingCalls, 1);
     assert.equal((await db.listJobs()).filter((job) => job.type === 'token_cleanup').length, 1);
   } finally {
     await closeHttpServer(server);

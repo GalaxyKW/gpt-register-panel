@@ -165,7 +165,12 @@ test('all mutation routes interrupt committed jobs when the admission lease rele
             version,
             count: 1,
             items: [],
-            _internalItems: [],
+            _internalItems: [{
+              source: 'tokens',
+              relativePath: 'tokens/expired.json',
+              contentHash: 'a'.repeat(64),
+              fingerprint: 'b'.repeat(16),
+            }],
             recoveryRequired: false,
             claimCount: 0,
           };
