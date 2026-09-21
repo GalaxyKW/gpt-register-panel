@@ -406,6 +406,12 @@ test('acknowledgement compacts an oversized legacy result instead of trapping it
     status: 'failed',
     result: {
       writeOutcomeUnknown: true,
+      attempted: 2,
+      succeeded: 1,
+      failed: 1,
+      plannedSkipped: 3,
+      runtimeSkipped: 2,
+      skippedCount: 5,
       padding: 'x'.repeat(2_096_550),
     },
     finishedAt: new Date().toISOString(),
@@ -421,6 +427,12 @@ test('acknowledgement compacts an oversized legacy result instead of trapping it
   assert.ok(resolved.result.originalResultBytes > 2_000_000);
   assert.equal(resolved.result.reconciliationResolved, true);
   assert.equal(resolved.result.retryAllowed, false);
+  assert.equal(resolved.result.attempted, 2);
+  assert.equal(resolved.result.succeeded, 1);
+  assert.equal(resolved.result.failed, 1);
+  assert.equal(resolved.result.plannedSkipped, 3);
+  assert.equal(resolved.result.runtimeSkipped, 2);
+  assert.equal(resolved.result.skippedCount, 5);
   const replacement = await db.createJob('phase3', {}, 'tester', { claimKeys: [claimKey] });
   await db.updateJob(replacement.id, { status: 'failed', error: 'cleanup' });
 });

@@ -1806,7 +1806,11 @@ function tokenImportResultCounts(result) {
   }
   return {
     succeeded: Math.max(0, finiteNumber(result?.succeeded)),
-    skipped: Math.max(0, finiteNumber(result?.runtimeSkipped)),
+    skipped: Math.max(
+      0,
+      finiteNumber(result?.skippedCount),
+      finiteNumber(result?.plannedSkipped) + finiteNumber(result?.runtimeSkipped),
+    ),
     failed: Math.max(0, finiteNumber(result?.failed)),
     reconciliation: Math.max(
       0,

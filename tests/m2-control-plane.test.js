@@ -30,6 +30,7 @@ const {
   resolveImportTargetBinding,
   resolveImportCreatePolicy,
   resolveImportExecutionBinding,
+  revalidateSourceToken,
   writeBackup,
   assertBackupCoversUpdateTargets,
 } = require('../backend/sync');
@@ -3390,6 +3391,56 @@ test('create preflight requires a canonical name and rejects casefold-equivalent
   assert.equal(writes, 0);
 });
 
+test('create preflight treats superseded strong identity as a blocker, never an update target', async () => {
+  const freshest = syntheticToken(
+    'tokens/create-freshest.json',
+    ['account:create-fresh-account'],
+    {
+      accountId: 'create-fresh-account',
+      accessFingerprint: 'create-fresh-fingerprint',
+      mtimeMs: 20,
+    },
+  );
+  const older = syntheticToken(
+    'use_token/create-older.json',
+    ['account:create-fresh-account', 'user:create-older-user'],
+    {
+      source: 'use_token',
+      accountId: 'create-fresh-account',
+      userId: 'create-older-user',
+      accessFingerprint: 'create-older-fingerprint',
+      mtimeMs: 10,
+    },
+  );
+  const item = buildImportPlan({ tokens: [freshest, older], usernames: [] }, [])[0];
+  assert.equal(item.action, 'create');
+  assert.deepEqual(item.sourceIdentityKeys, ['account:create-fresh-account']);
+
+  let createCalls = 0;
+  let updateCalls = 0;
+  await assert.rejects(
+    executeImportPlanItem({
+      item,
+      client: {
+        async listAccounts() {
+          return [{
+            id: 333,
+            name: 'free00333',
+            platform: 'openai',
+            type: 'oauth',
+            identityKeys: ['user:create-older-user'],
+          }];
+        },
+        async importCodexSession() { createCalls += 1; },
+        async applyOAuthCredentials() { updateCalls += 1; },
+      },
+    }),
+    (error) => error.code === 'SUB2API_CREATE_IDENTITY_AMBIGUOUS',
+  );
+  assert.equal(createCalls, 0);
+  assert.equal(updateCalls, 0);
+});
+
 test('create preflight rejects a truncated strict account page before dispatching a write', async () => {
   const identityKeys = ['account:truncated-page-account', 'user:truncated-page-user'];
   const source = syntheticToken('tokens/truncated-page.json', identityKeys, {
@@ -3879,6 +3930,95 @@ test('import rejects a named-group retarget before starting the job, backup, or 
     assert.equal(started, 0);
     assert.equal(backups, 0);
     assert.equal(writes, 0);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('skip-only imports preserve reviewed rows and report zero attempted mutations', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = TEST_SUB2API_BASE_URL;
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  try {
+    const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+    const source = readGptRegisterSources({ rootDirectory: root, includeRaw: true })
+      .tokens.find((item) => item.parseStatus === 'ok');
+    const remote = {
+      id: 707,
+      name: 'free00707',
+      platform: 'openai',
+      type: 'oauth',
+      schemaValid: true,
+      status: 'active',
+      statusKnown: true,
+      schedulable: true,
+      schedulableKnown: true,
+      identityKeys: source.identityKeys,
+      tokenFingerprints: { access: 'remote-different-fingerprint' },
+      credentialPresence: { access: 'present', refresh: 'unknown', id: 'unknown' },
+    };
+    const client = {
+      baseUrl: TEST_SUB2API_BASE_URL,
+      async listAccounts() { return [remote]; },
+      async listGroups() { throw new Error('skip-only plan must not resolve groups'); },
+      async exportAccounts() { throw new Error('skip-only plan must not create a backup'); },
+      async applyOAuthCredentials() { throw new Error('skip-only plan must not update'); },
+      async importCodexSession() { throw new Error('skip-only plan must not create'); },
+    };
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client,
+    });
+    const unselectedPlan = buildImportPlan(preview._internal.sources, [remote]);
+    assert.equal(unselectedPlan.length, 1);
+    assert.equal(unselectedPlan[0].action, 'skip');
+    assert.equal(unselectedPlan[0].reason, 'sub2api_available');
+    const selectedKeys = [unselectedPlan[0].key];
+    const plan = buildImportPlan(preview._internal.sources, [remote], selectedKeys);
+    const planIntentVersion = buildImportPlanIntentVersion(
+      preview.version,
+      selectedKeys,
+      plan,
+      null,
+      resolveImportExecutionBinding(client, plan),
+    );
+
+    const result = await executeImport({
+      snapshotVersion: preview.version,
+      planIntentVersion,
+      selectedKeys,
+      actor: 'tester',
+      jobId: 'skip-only-import-job',
+      db: { async startMutationJob() {} },
+      client,
+    });
+    assert.equal(result.imported.length, 1);
+    assert.equal(result.imported[0].action, 'skip');
+    assert.equal(result.imported[0].reason, 'sub2api_available');
+    assert.equal(result.imported[0].attempted, false);
+    assert.equal(result.imported[0].skipped, true);
+    assert.equal(result.attempted, 0);
+    assert.equal(result.succeeded, 0);
+    assert.equal(result.failed, 0);
+    assert.equal(result.plannedSkipped, 1);
+    assert.equal(result.runtimeSkipped, 0);
+    assert.equal(result.skippedCount, 1);
+    assert.equal(result.skipped, true);
+    assert.equal(result.backupPath, null);
   } finally {
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];
@@ -4701,6 +4841,61 @@ test('source token changes after remote preflight block every mutation', async (
       type: 'codex',
     }));
   });
+});
+
+test('source revalidation binds superseded strong identities even when the winner is unchanged', () => {
+  const makeRoot = () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-group-revalidate-'));
+    fs.mkdirSync(path.join(root, 'tokens'));
+    fs.mkdirSync(path.join(root, 'use_token'));
+    return root;
+  };
+  const freshDocument = {
+    access_token: 'opaque-fresh-group-revalidation-token',
+    account_id: 'group-revalidation-account',
+    expired: '2099-01-01T00:00:00.000Z',
+    last_refresh: '2098-12-01T00:00:00.000Z',
+  };
+  const olderDocument = {
+    access_token: 'opaque-older-group-revalidation-token',
+    account_id: 'group-revalidation-account',
+    user_id: 'group-revalidation-user',
+    expired: '2098-01-01T00:00:00.000Z',
+    last_refresh: '2097-12-01T00:00:00.000Z',
+  };
+  const readSources = (root) => {
+    const { readGptRegisterSources } = require('../backend/adapters/gptRegisterFs');
+    return readGptRegisterSources({ rootDirectory: root, includeRaw: true });
+  };
+  const writeVersion = (root, source, name, document) => {
+    fs.writeFileSync(path.join(root, source, name), JSON.stringify(document));
+  };
+
+  const addedRoot = makeRoot();
+  writeVersion(addedRoot, 'tokens', 'fresh.json', freshDocument);
+  const beforeAdd = buildImportPlan(readSources(addedRoot), [])[0];
+  assert.equal(beforeAdd.relativePath, 'tokens/fresh.json');
+  assert.deepEqual(beforeAdd._groupIdentityKeys, ['account:group-revalidation-account']);
+  writeVersion(addedRoot, 'use_token', 'older.json', olderDocument);
+  assert.throws(
+    () => revalidateSourceToken(beforeAdd, addedRoot, Date.parse('2026-01-01T00:00:00.000Z')),
+    (error) => error.code === 'SOURCE_TOKEN_CHANGED',
+  );
+
+  const removedRoot = makeRoot();
+  writeVersion(removedRoot, 'tokens', 'fresh.json', freshDocument);
+  writeVersion(removedRoot, 'use_token', 'older.json', olderDocument);
+  const beforeRemove = buildImportPlan(readSources(removedRoot), [])[0];
+  assert.equal(beforeRemove.relativePath, 'tokens/fresh.json');
+  assert.deepEqual(beforeRemove._groupIdentityKeys, [
+    'account:group-revalidation-account',
+    'user:group-revalidation-user',
+  ]);
+  fs.rmSync(path.join(removedRoot, 'use_token', 'older.json'));
+  assert.throws(
+    () => revalidateSourceToken(beforeRemove, removedRoot, Date.parse('2026-01-01T00:00:00.000Z')),
+    (error) => error.code === 'SOURCE_TOKEN_CHANGED',
+  );
 });
 
 test('final remote preflight skips a target that becomes available before mutation', async () => {

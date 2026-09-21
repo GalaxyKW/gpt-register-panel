@@ -620,6 +620,24 @@ function identityValues(keys = [], prefix) {
   return values;
 }
 
+function strongIdentityOverlaps(leftKeys = [], rightKeys = []) {
+  for (const prefix of ['account:', 'user:']) {
+    const left = identityValues(leftKeys, prefix);
+    const right = identityValues(rightKeys, prefix);
+    if ([...left].some((value) => right.has(value))) return true;
+  }
+  return false;
+}
+
+function accountsSharingStrongIdentity(identityKeys, accounts = []) {
+  return accounts.filter((account) => {
+    const remoteKeys = Array.isArray(account?.identityKeys) && account.identityKeys.length > 0
+      ? account.identityKeys
+      : accountKeys(account);
+    return strongIdentityOverlaps(identityKeys, remoteKeys);
+  });
+}
+
 function aggregateIdentityKeys(records = []) {
   const keys = [];
   for (const prefix of ['account:', 'user:', 'email:']) {
@@ -969,6 +987,10 @@ function importPlanIntentItem(item) {
     sourceMtimeMs: Number.isFinite(Number(record.mtimeMs)) ? Number(record.mtimeMs) : null,
     sourceType: typeof record.type === 'string' ? record.type : null,
     sourceIdentityKeys: importPlanIdentityKeys(record.identityKeys),
+    // Older copies may contribute duplicate-create evidence, but never an
+    // update target. Bind that evidence separately so execution cannot lose
+    // a reviewed create blocker without invalidating the plan intent.
+    sourceGroupIdentityKeys: importPlanIdentityKeys(item?._groupIdentityKeys),
     sourceFingerprints: importPlanFingerprintState(record.fingerprints),
     expiryStatus: typeof item?.expiryStatus === 'string' ? item.expiryStatus : null,
     expiresAt: item?.expiresAt || null,
@@ -1294,6 +1316,12 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       candidate,
       matches,
       ambiguousHints: matches.length === 0 ? ambiguousAccountHints(candidate, accounts) : [],
+      // Aggregate identities from superseded copies are diagnostic-only. A
+      // shared account/user value may block a would-be create, but it must
+      // never select a Sub2API row or authorize an update.
+      createIdentityBlockers: matches.length === 0
+        ? accountsSharingStrongIdentity(candidate.groupIdentityKeys || [], accounts)
+        : [],
       // Do not retain an operational target for an aggregate-only match. The
       // matched row remains visible through `matches` solely as diagnostic
       // evidence for the conflict reason.
@@ -1341,7 +1369,13 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   const plan = [];
   let nextNumber = nextFreeNumber(accounts);
   for (const entry of entries) {
-    const { candidate, matches, ambiguousHints, account } = entry;
+    const {
+      candidate,
+      matches,
+      ambiguousHints,
+      createIdentityBlockers,
+      account,
+    } = entry;
     if (!selectedCandidate(candidate, selectedKeys)) continue;
     const terminalEvidence = sourceTerminalEvidence(sources?.usernames, candidate.record);
     const terminalStatus = terminalEvidence?.status || null;
@@ -1363,6 +1397,9 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       action = 'conflict';
       reason = 'multiple_sub2api_accounts';
     } else if (ambiguousHints.length > 0) {
+      action = 'conflict';
+      reason = 'ambiguous_sub2api_identity';
+    } else if (createIdentityBlockers.length > 0) {
       action = 'conflict';
       reason = 'ambiguous_sub2api_identity';
     } else if (entry.remoteIdentityAmbiguous || entry.groupIdentityAmbiguous) {
@@ -1427,6 +1464,7 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
       _raw: candidate.record.raw,
       _record: candidate.record,
       _account: account,
+      _groupIdentityKeys: candidate.groupIdentityKeys || candidate.sourceIdentityKeys || [],
     };
     plan.push(item);
   }
@@ -2210,6 +2248,12 @@ function canonicalIdentitySet(keys = []) {
   return normalized.sort(compareNaturalStrings);
 }
 
+function canonicalStrongIdentitySet(keys = []) {
+  return canonicalIdentitySet(keys).filter((key) => (
+    key.startsWith('account:') || key.startsWith('user:')
+  ));
+}
+
 function sourceTokenChanged(message = '来源 token 在写入前已变化') {
   return targetVerificationError(message, 'SOURCE_TOKEN_CHANGED');
 }
@@ -2253,7 +2297,11 @@ function revalidateSourceToken(item, rootDirectory, nowMs = Date.now()) {
       || record.disabled !== expected.disabled
       || JSON.stringify(record.fingerprints || {}) !== JSON.stringify(expected.fingerprints || {})
       || JSON.stringify(canonicalIdentitySet(candidate.sourceIdentityKeys))
-        !== JSON.stringify(canonicalIdentitySet(item.sourceIdentityKeys || []))) {
+        !== JSON.stringify(canonicalIdentitySet(item.sourceIdentityKeys || []))
+      || JSON.stringify(canonicalStrongIdentitySet(candidate.groupIdentityKeys))
+        !== JSON.stringify(canonicalStrongIdentitySet(
+          item._groupIdentityKeys || item.sourceIdentityKeys || [],
+        ))) {
     throw sourceTokenChanged();
   }
   if (isExpiryInvalid(record) || isExpired(record, nowMs) || record.disabled
@@ -2325,6 +2373,15 @@ async function preflightCreateAccount(client, item, options = {}) {
   }
   if (ambiguousAccountHints({ sourceIdentityKeys: item.sourceIdentityKeys || [] }, accounts).length > 0) {
     throw targetVerificationError('写入前发现仅能通过邮箱关联的 Sub2API 账号', 'SUB2API_CREATE_IDENTITY_AMBIGUOUS');
+  }
+  if (accountsSharingStrongIdentity(
+    item?._groupIdentityKeys || item.sourceIdentityKeys || [],
+    accounts,
+  ).length > 0) {
+    throw targetVerificationError(
+      '写入前发现历史 token 强身份可能已存在于 Sub2API',
+      'SUB2API_CREATE_IDENTITY_AMBIGUOUS',
+    );
   }
   if (accountsMatchingFreeName(accounts, item.accountName).length > 0) {
     throw targetVerificationError(
@@ -3107,6 +3164,16 @@ async function executeImport({
           afterFingerprint: item.fingerprints?.access || null,
         });
       }
+      const plannedSkippedItems = fullPlan
+        .filter((item) => item.action === 'skip')
+        .map((item) => ({
+          ...safeImportItem(item),
+          result: null,
+          verification: null,
+          skipped: true,
+          attempted: false,
+          outcome: 'skipped',
+        }));
       const plan = fullPlan.filter((item) => item.action !== 'skip');
       const conflicts = plan.filter((item) => item.action === 'conflict' || item.conflictingVersions);
       if (conflicts.length > 0) {
@@ -3126,7 +3193,25 @@ async function executeImport({
         throw new Error('存在身份或版本冲突，已停止导入');
       }
       throwIfJobInterrupted(signal);
-      if (plan.length === 0) return { ...importPlanSummary([]), imported: [], skipped: true };
+      if (plan.length === 0) {
+        return {
+          ...importPlanSummary(fullPlan),
+          imported: plannedSkippedItems,
+          notAttempted: [],
+          backupPath: null,
+          attempted: 0,
+          succeeded: 0,
+          failed: 0,
+          plannedSkipped: plannedSkippedItems.length,
+          runtimeSkipped: 0,
+          skippedCount: plannedSkippedItems.length,
+          notAttemptedCount: 0,
+          halted: false,
+          requiresReconciliation: false,
+          reconciliationCount: 0,
+          skipped: true,
+        };
+      }
 
       let backupPath = null;
       writeLog(logger, 'info', 'import.backup_started', { jobId, actor });
@@ -3169,7 +3254,7 @@ async function executeImport({
         count: plan.length,
         groupCount: groups.length,
       });
-      const imported = [];
+      const imported = [...plannedSkippedItems];
       let notAttempted = [];
       let haltedForReconciliation = false;
       for (let itemIndex = 0; itemIndex < plan.length; itemIndex += 1) {
@@ -3207,6 +3292,7 @@ async function executeImport({
               result: null,
               verification: null,
               skipped: true,
+              attempted: true,
             });
             try {
               await db?.audit({
@@ -3361,37 +3447,42 @@ async function executeImport({
         }
       }
       if (!haltedForReconciliation) throwIfJobInterrupted(signal);
-      const failed = imported.filter((item) => item.error).length;
-      const runtimeSkipped = imported.filter((item) => item.skipped).length;
+      const attemptedItems = imported.filter((item) => item.attempted !== false);
+      const failed = attemptedItems.filter((item) => item.error).length;
+      const runtimeSkipped = attemptedItems.filter((item) => item.skipped).length;
       const reconciliationCount = imported.filter(
         (item) => item.requiresReconciliation === true,
       ).length;
-      const succeeded = imported.length - failed - runtimeSkipped;
+      const succeeded = attemptedItems.length - failed - runtimeSkipped;
+      const skippedCount = plannedSkippedItems.length + runtimeSkipped;
       writeLog(logger, failed > 0 ? 'warn' : 'info', 'import.accounts_completed', {
         jobId,
         actor,
-        count: plan.length,
-        attempted: imported.length,
+        count: fullPlan.length,
+        attempted: attemptedItems.length,
         succeeded,
         failed,
-        skipped: runtimeSkipped,
+        skipped: skippedCount,
         requiresReconciliation: haltedForReconciliation,
         reconciliationCount,
         notAttempted: notAttempted.length,
       });
           return {
-        ...importPlanSummary(plan),
+        ...importPlanSummary(fullPlan),
         imported,
         notAttempted,
         backupPath,
-        attempted: imported.length,
+        attempted: attemptedItems.length,
         succeeded,
         failed,
+        plannedSkipped: plannedSkippedItems.length,
         runtimeSkipped,
+        skippedCount,
         notAttemptedCount: notAttempted.length,
         halted: haltedForReconciliation,
         requiresReconciliation: haltedForReconciliation,
         reconciliationCount,
+        skipped: skippedCount > 0,
           };
         }, { signal });
       } catch (error) {

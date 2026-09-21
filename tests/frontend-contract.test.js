@@ -1097,6 +1097,29 @@ test('frontend token import totals separate errors, runtime skips, and successes
   });
 });
 
+test('frontend token import totals preserve compacted planned skip counts', () => {
+  const countsContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
+  const context = { finiteNumber: (value) => Number.isFinite(Number(value)) ? Number(value) : 0 };
+  vm.runInNewContext(countsContract + `
+    result = tokenImportResultCounts({
+      succeeded: 2,
+      failed: 1,
+      plannedSkipped: 3,
+      runtimeSkipped: 2,
+      skippedCount: 5,
+      reconciliationCount: 0,
+      notAttemptedCount: 0,
+    });
+  `, context);
+  assert.deepEqual({ ...context.result }, {
+    succeeded: 2,
+    skipped: 5,
+    failed: 1,
+    reconciliation: 0,
+    notAttempted: 0,
+  });
+});
+
 test('frontend separates unknown write outcomes from failures and shows halted items', () => {
   const countsContract = sourceSection('function tokenImportResultCounts', 'function renderJob');
   const renderContract = sourceSection('function renderJob', 'function stopJobPolling');
