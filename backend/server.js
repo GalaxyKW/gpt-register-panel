@@ -97,7 +97,10 @@ const CONTENT_TYPES = {
 };
 const MIN_PHASE3_SHUTDOWN_TIMEOUT_MS = PHASE3_TERMINATION_MAX_TOTAL_MS + 1000;
 const CONTENT_SECURITY_POLICY = "default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
-const STATIC_ALLOWLIST = new Set(['/index.html', '/app.js', '/styles.css', '/local-phase3.js']);
+const STATIC_ALLOWLIST = new Set([
+  '/index.html', '/app.js', '/styles.css', '/local-phase3.js',
+  '/account-test-batch.js', '/account-test-batch-ui.js',
+]);
 const JSON_BODY_ENDPOINTS = new Set([
   '/api/sync/preview',
   '/api/sync/import',

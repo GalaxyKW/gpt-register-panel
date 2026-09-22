@@ -135,6 +135,20 @@ test('local Phase3 bounds rendered rows and page selection does not silently sel
   assert.equal(run('localPhase3State.selected.size'), 100);
 });
 
+test('local Phase3 renders known OAuth and terminal statuses without implying unknown state', () => {
+  const { run, context, elements } = harness();
+  context.sample = listing([account(0, { status: 'oauth_done' }), account(1, {
+    status: 'account_deactivated', eligible: false, reason: 'phase3_account_terminal', phase3TargetRevision: null,
+  }), account(2, {
+    status: 'account_disabled', eligible: false, reason: 'phase3_account_terminal', phase3TargetRevision: null,
+  })]);
+  run('localPhase3State.listing = sample; renderLocalPhase3Rows();');
+  assert.match(elements['#localPhase3Rows'].innerHTML, /OAuth 已完成/);
+  assert.match(elements['#localPhase3Rows'].innerHTML, /账号已停用/);
+  assert.match(elements['#localPhase3Rows'].innerHTML, /账号已禁用/);
+  assert.doesNotMatch(elements['#localPhase3Rows'].innerHTML, /未标注或未知/);
+});
+
 test('local Phase3 submits only confirmed local identities with revisions through existing idempotency', async () => {
   let submitted;
   let watched;

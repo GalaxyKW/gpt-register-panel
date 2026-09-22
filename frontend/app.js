@@ -8,6 +8,7 @@ const state = {
   previewRequestPending: false,
   importRequestPending: false,
   accountTestRequestPending: false,
+  accountTestBatchPending: false,
   snapshotRefreshPending: false,
   job: null,
   jobs: [],
@@ -983,6 +984,7 @@ function actionRequestPending() {
     || state.phase3RequestPending
     || state.localPhase3ListingPending
     || state.accountTestRequestPending
+    || state.accountTestBatchPending
     || state.cleanupRequestPending
     || state.reconciliationAckPending;
 }
@@ -3417,6 +3419,10 @@ elements.phase3Button.addEventListener('click', async () => {
 
 if (elements.accountTestButton) {
   elements.accountTestButton.addEventListener('click', async () => {
+    if (typeof openAccountTestBatchDialog === 'function') {
+      await openAccountTestBatchDialog();
+      return;
+    }
     if (state.accountTestRequestPending) return;
     const selectionVisibilityProblem = hiddenSelectionProblem();
     if (selectionVisibilityProblem) {
@@ -3596,7 +3602,9 @@ function updateActionState() {
   const importSelectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   const phase3Targets = phase3TargetsFromRows(selectedRows);
   const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
-  const testSelection = accountTestTargetsFromRows(selectedRows);
+  const testSelection = typeof accountTestBatchSelection === 'function'
+    ? accountTestBatchSelection(selectedRows)
+    : accountTestTargetsFromRows(selectedRows);
   const testTargets = testSelection.targets;
   const writeModeProblem = state.snapshot?.readOnly === true
     ? '当前面板为只读模式'
@@ -3643,7 +3651,9 @@ function updateActionState() {
     } else if (!canRunAccountTest) {
       elements.accountTestButton.title = testSelection.problem || '请选择已导入 Sub2API 的上游账号';
     } else {
-      elements.accountTestButton.title = '使用所选模型测试 Sub2API 上游账号；error 账号成功后恢复并启用';
+      elements.accountTestButton.title = testSelection.skipped?.length
+        ? '可测试 ' + testTargets.length + ' 个，需先明确确认跳过 ' + testSelection.skipped.length + ' 个不可测项'
+        : '使用所选模型测试 Sub2API 上游账号；error 账号成功后恢复并启用';
     }
   }
   if (elements.accountTestModelSelect) {
@@ -3732,6 +3742,7 @@ function updateActionState() {
       : '';
   }
   if (typeof updateLocalPhase3ActionState === 'function') updateLocalPhase3ActionState();
+  if (typeof updateAccountTestBatchUi === 'function') updateAccountTestBatchUi();
 }
 
 function applyColumnVisibility() {

@@ -9,7 +9,7 @@ const test = require('node:test');
 require('./test-isolation');
 
 const { createServer, shutdownServer, reconciliationReviewDetail, requestLogPath } = require('../backend/server');
-const { PanelDb } = require('../backend/db');
+const { PanelDb, RECONCILIATION_ACK_CONFIRMATION } = require('../backend/db');
 const ADMIN = 'local-api-fixture-administrator';
 const EMAIL = 'local-api@example.test';
 const logger = {
@@ -199,5 +199,59 @@ test('local Phase3 durable review requires exact source mode, index, revision do
   ]) {
     assert.throws(() => reconciliationReviewDetail({ ...base, payload: { ...payload, ...patch } }),
       (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE');
+  }
+});
+
+test('local Phase3 hold survives database reopen and can only be acknowledged with its reviewed context', async (t) => {
+  const { root, db, server, selection } = await fixture(t);
+  const selected = (await selection()).accounts[0];
+  const held = await db.createJob('phase3', {
+    sourceMode: 'username', usernameIndex: 0, email: EMAIL, phone: null,
+    canonicalKeys: ['email:' + EMAIL], sourcePath: null,
+    selectedKeyDigest: crypto.createHash('sha256')
+      .update('gpt-register-panel/phase3-local-selected-key/v1\0')
+      .update(selected.selectedKey).digest('hex'),
+    phase3TargetRevision: selected.phase3TargetRevision,
+  }, 'panel-admin', { claimKeys: ['phase3:email:' + EMAIL] });
+  await db.updateJob(held.id, { status: 'failed', result: {
+    requiresReconciliation: true, writeOutcomeUnknown: true,
+  }, finishedAt: new Date().toISOString() });
+  await shutdownServer(server);
+  const reopenedDb = new PanelDb(path.join(root, 'panel.sqlite3'));
+  const reopenedServer = createServer({ db: reopenedDb, logger });
+  try {
+    await new Promise((resolve, reject) => {
+      reopenedServer.once('error', reject);
+      reopenedServer.listen(0, '127.0.0.1', resolve);
+    });
+    const base = 'http://127.0.0.1:' + reopenedServer.address().port;
+    const read = async (route) => {
+      const response = await fetch(base + route, { headers: { 'x-panel-token': ADMIN } });
+      assert.equal(response.status, 200);
+      return response.json();
+    };
+    assert.equal((await read('/api/jobs?limit=200')).reconciliationHolds.total, 1);
+    const review = await read('/api/jobs/' + held.id + '/reconciliation');
+    assert.equal(review.targetContext.targets[0].sourceMode, 'username');
+    assert.equal(review.targetContext.targets[0].usernameIndex, 0);
+    assert.doesNotMatch(JSON.stringify(review), /local-api-fixture-password|executionBinding|passwordDigest/);
+    const body = { jobId: held.id, confirmation: RECONCILIATION_ACK_CONFIRMATION,
+      resolution: 'state_manually_reconciled', claimDigest: review.reconciliationClaimDigest,
+      contextDigest: review.reconciliationContextDigest };
+    const acknowledge = async (value) => fetch(base + '/api/jobs/' + held.id + '/reconciliation/acknowledge', {
+      method: 'POST', headers: { 'x-panel-token': ADMIN, 'content-type': 'application/json' },
+      body: JSON.stringify(value),
+    });
+    const stale = await acknowledge({ ...body, contextDigest: 'b'.repeat(64) });
+    assert.equal(stale.status, 409);
+    await stale.arrayBuffer();
+    assert.equal((await read('/api/jobs?limit=200')).reconciliationHolds.total, 1);
+    const acknowledged = await acknowledge(body);
+    assert.equal(acknowledged.status, 200);
+    await acknowledged.arrayBuffer();
+    assert.equal((await read('/api/jobs?limit=200')).reconciliationHolds.total, 0);
+    assert.equal((await reopenedDb.getJob(held.id)).result.reconciliationResolved, true);
+  } finally {
+    await shutdownServer(reopenedServer);
   }
 });

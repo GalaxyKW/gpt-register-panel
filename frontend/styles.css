@@ -104,6 +104,11 @@ h2 { margin-bottom: 5px; font-size: 18px; letter-spacing: .01em; }
 .local-phase3-table-wrap { max-height: 42vh; overflow: auto; }
 .local-phase3-table-wrap table { min-width: 560px; }
 .local-phase3-table-wrap td { white-space: normal; overflow-wrap: anywhere; }
+.account-test-batch-panel { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; padding: 14px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+.account-test-batch-panel p { margin: 5px 0 0; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.auth-dialog.account-test-batch-dialog { width: min(740px, calc(100vw - 24px)); max-width: 740px; }
+.batch-target-list, .batch-skip-list { max-height: 24vh; overflow: auto; overflow-wrap: anywhere; white-space: pre-wrap; font-size: 12px; line-height: 1.6; }
+.batch-target-list { padding: 10px; background: var(--canvas); }
 .maintenance-actions { margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line); }
 .maintenance-label { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .02em; }
 .toolbar-check { display: inline-flex !important; align-items: center; gap: 7px; min-width: auto !important; min-height: 38px; color: var(--ink-soft) !important; font-size: 12px !important; font-weight: 700 !important; white-space: nowrap; }

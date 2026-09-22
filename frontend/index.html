@@ -98,6 +98,7 @@
         <p id="importActionHint" hidden></p>
         <p id="phase3ActionHint" hidden></p>
         <p id="accountTestActionHint" hidden></p>
+        <p id="accountTestBatchSelectionHint" hidden></p>
       </div>
       <div class="toolbar-actions maintenance-actions" aria-label="全局维护">
         <span class="maintenance-label">全局维护 · 不受筛选和选择影响</span>
@@ -108,6 +109,11 @@
         <button id="localPhase3Button" class="button button-secondary" type="button" aria-describedby="localPhase3ActionHint" disabled>从本地账号获取 token</button>
         <p id="localPhase3ActionHint" class="local-recovery-hint">正在确认本地 Phase 3 是否可用</p>
       </div>
+    </section>
+
+    <section id="accountTestBatchPanel" class="account-test-batch-panel" aria-label="账号分批测试进度" hidden>
+      <div><strong>账号分批测试</strong><p id="accountTestBatchProgress" aria-live="polite"></p></div>
+      <button id="accountTestBatchStop" class="button button-danger" type="button">停止后续批次</button>
     </section>
 
     <section id="planPanel" class="plan-panel" hidden>
@@ -233,7 +239,30 @@
       </div>
     </form>
   </dialog>
+  <dialog id="accountTestBatchDialog" class="auth-dialog account-test-batch-dialog" aria-labelledby="accountTestBatchTitle" aria-describedby="accountTestBatchHelp">
+    <form id="accountTestBatchForm" method="dialog" class="auth-dialog-form">
+      <div>
+        <h2 id="accountTestBatchTitle">确认账号测试范围</h2>
+        <p id="accountTestBatchHelp">每批最多 100 个，上一批全部明确成功后才提交下一批。失败、部分成功、身份变化、待对账或状态未知均停止后续批次。刷新或关闭页面也会停止未提交批次；已提交任务继续，可从任务清单恢复状态，不会自动续批。</p>
+      </div>
+      <p id="accountTestBatchSummary"></p>
+      <div><strong>将测试的 Sub2API 账号 ID</strong><pre id="accountTestBatchTargets" class="batch-target-list"></pre></div>
+      <div id="accountTestBatchSkippedSection" hidden>
+        <strong>不可测试、需要明确确认跳过的项目（不会删除账号）</strong>
+        <ul id="accountTestBatchSkipped" class="batch-skip-list"></ul>
+        <label><input id="accountTestBatchSkipAcknowledged" type="checkbox"> 我已核对上列原因，确认本次不测试这些项目</label>
+      </div>
+      <p>测试可能更新 Sub2API 账号状态、限流或调度；error 账号测试成功后会尝试恢复并启用。</p>
+      <p id="accountTestBatchError" class="dialog-error" aria-live="polite" hidden></p>
+      <div class="auth-dialog-actions">
+        <button class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
+        <button id="accountTestBatchConfirm" class="button button-primary" type="submit" value="confirm">确认开始串行测试</button>
+      </div>
+    </form>
+  </dialog>
+  <script src="/account-test-batch.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/local-phase3.js" defer></script>
+  <script src="/account-test-batch-ui.js" defer></script>
 </body>
 </html>

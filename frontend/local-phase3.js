@@ -154,8 +154,13 @@ function renderLocalPhase3Rows() {
     const index = account.selectedKey.slice(9);
     const email = localPhase3Email(account.email) || '邮箱未通过核验';
     const phone = /^\d{1,80}$/.test(account.phone) ? account.phone : '';
-    const status = ['active', 'inactive', 'disabled', 'error', 'account_deleted', 'discard', 'pending']
-      .includes(account.status) ? account.status : '未标注或未知';
+    const statuses = {
+      active: '活动', inactive: '停用', disabled: '禁用', error: '异常',
+      account_deleted: '账号已删除', account_deactivated: '账号已停用',
+      account_disabled: '账号已禁用', discard: '已处置', pending: '待处理',
+      oauth_done: 'OAuth 已完成',
+    };
+    const status = Object.hasOwn(statuses, account.status) ? statuses[account.status] : '未标注或未知';
     return '<tr><td><input type="checkbox" data-local-phase3-key="' + escapeHtml(account.selectedKey)
       + '" data-eligible="' + account.eligible + '" aria-label="选择本地记录 ' + index + '"'
       + checked + (account.eligible ? '' : ' disabled') + '></td><td>username.json #'

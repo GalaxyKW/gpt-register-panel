@@ -53,6 +53,8 @@ test('static routing exposes only the declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/app.js')), 'app.js');
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
   assert.equal(path.basename(safeStaticPath('/local-phase3.js')), 'local-phase3.js');
+  assert.equal(path.basename(safeStaticPath('/account-test-batch.js')), 'account-test-batch.js');
+  assert.equal(path.basename(safeStaticPath('/account-test-batch-ui.js')), 'account-test-batch-ui.js');
   assert.equal(safeStaticPath('/debug.json'), null);
   assert.equal(safeStaticPath('/nested/asset.js'), null);
 });
