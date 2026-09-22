@@ -56,6 +56,10 @@ const elements = {
   phase3ButtonLabel: document.querySelector('#phase3ButtonLabel'),
   accountTestButton: document.querySelector('#accountTestButton'),
   accountTestModelSelect: document.querySelector('#accountTestModelSelect'),
+  previewActionHint: document.querySelector('#previewActionHint'),
+  importActionHint: document.querySelector('#importActionHint'),
+  phase3ActionHint: document.querySelector('#phase3ActionHint'),
+  accountTestActionHint: document.querySelector('#accountTestActionHint'),
   cleanupButton: document.querySelector('#cleanupButton'),
   planPanel: document.querySelector('#planPanel'),
   planSummary: document.querySelector('#planSummary'),
@@ -1202,6 +1206,13 @@ function updateImportButtonState() {
     || state.plan.selectedKeys.length === 0
     || hasBlockingConflict
     || !items.some((item) => ['create', 'update'].includes(effectivePlanAction(item)));
+  elements.importButton.title = planContractProblem || groupBindingProblem
+    || (!comparisonAvailable() ? 'Sub2API 账号尚未成功读取，无法比较或同步' : '')
+    || (state.plan && !validImportPlanIntentVersion(state.plan.planIntentVersion)
+      ? '导入预览凭证无效，请重新生成本地导入预览' : '')
+    || (hasBlockingConflict ? '导入预览存在冲突，请先处理冲突后重新预览' : '')
+    || (state.plan && !items.some((item) => ['create', 'update'].includes(effectivePlanAction(item)))
+      ? '当前预览没有可执行的新增或更新项；跳过项不会写入 Sub2API' : '');
 }
 
 function renderMetrics(snapshot) {
@@ -1339,7 +1350,10 @@ function phase3SelectionProblem(rows, selectedCount) {
 function invalidatePlan() {
   if (!state.plan) return;
   renderPlan(null);
-  showNotice('选择已变化，请重新执行“检查差异”。', 'notice-warning');
+  const problem = syncSelectionProblem();
+  showNotice(problem
+    ? '选择已变化，原导入预览已作废。' + problem + '。Sub2API 账号测试不依赖导入预览。'
+    : '选择已变化，原导入预览已作废；如需导入，请重新执行“本地导入预览”。', 'notice-warning');
 }
 
 function selectionsEqual(left, right) {
@@ -3635,7 +3649,8 @@ function updateActionState() {
         : writeModeProblem
           || hiddenSelectionProblem(state.plan?.selectedKeys)
           || importSelectionProblem
-          || (!state.plan ? '请先选择本地 token 并执行“检查差异”' : '');
+          || (!state.plan ? '请先选择本地 token 并执行“本地导入预览”' : '')
+          || elements.importButton.title;
   if (elements.cleanupButton) {
     elements.cleanupButton.disabled = state.snapshot?.readOnly !== false || mutationLocked;
     elements.cleanupButton.title = writeBlocked
@@ -3671,13 +3686,29 @@ function updateActionState() {
     elements.phase3Button.title = '按顺序为已选本地 gpt_register 账号运行 Phase 3';
   }
   const previewScopeTitle = state.selected.size > 0
-    ? '检查所选账号与 Sub2API 的同步差异'
+    ? '预览所选本地 token 的导入动作；仅 Sub2API 账号不参与导入'
     : '检查全部活动 token 与 Sub2API 的同步差异；不受当前筛选条件影响';
   elements.previewButton.title = state.jobInventoryVerified !== true
     ? '正在确认后台任务和待对账项，暂不可操作'
-    : selectionVisibilityProblem || syncProblem || (comparisonAvailable()
-      ? previewScopeTitle
-      : 'Sub2API 账号尚未成功读取，无法比较或同步');
+    : locked
+      ? '另一个任务或请求执行中'
+      : selectionVisibilityProblem || syncProblem || (comparisonAvailable()
+        ? previewScopeTitle
+        : 'Sub2API 账号尚未成功读取，无法比较或同步');
+  // Disabled controls cannot reliably expose hover titles on touch screens.
+  // Keep each workflow's reason visible and distinct from the global notice.
+  for (const [hint, button, label] of [
+    [elements.previewActionHint, elements.previewButton, '本地导入预览'],
+    [elements.importActionHint, elements.importButton, '确认导入'],
+    [elements.phase3ActionHint, elements.phase3Button, '所选 token 的 Phase 3'],
+    [elements.accountTestActionHint, elements.accountTestButton, 'Sub2API 账号测试'],
+  ]) {
+    if (!hint || !button) continue;
+    hint.hidden = !button.disabled;
+    hint.textContent = button.disabled
+      ? label + '：' + (button.title || '当前不可执行，请刷新快照后检查选择')
+      : '';
+  }
 }
 
 function applyColumnVisibility() {

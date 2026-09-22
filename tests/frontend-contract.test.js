@@ -3088,7 +3088,7 @@ test('zero-selection difference preview explicitly covers all active tokens rega
   assert.equal(renderedPlans[0], null);
   assert.match(notices.at(-1)[0], /全部活动 token/);
   assert.match(notices.at(-1)[0], /不受当前筛选条件影响/);
-  assert.match(updateContract, /previewScopeTitle = state\.selected\.size > 0[\s\S]*检查所选账号[\s\S]*检查全部活动 token/);
+  assert.match(updateContract, /previewScopeTitle = state\.selected\.size > 0[\s\S]*预览所选本地 token[\s\S]*检查全部活动 token/);
   assert.match(htmlSource, /未选择时检查全部活动 token，不受当前筛选条件影响/);
 });
 
@@ -3580,4 +3580,89 @@ test('frontend administrator credential uses an origin-labelled password dialog'
   const mobile = stylesSource.slice(stylesSource.indexOf('@media (max-width: 700px)'));
   assert.match(mobile, /\.auth-dialog-form \{ padding: 18px; \}/);
   assert.match(mobile, /\.auth-dialog-actions \.button \{ flex: 1 1 0; \}/);
+});
+
+test('frontend hidden attributes override author panel and button display rules', () => {
+  const hiddenRule = stylesSource.lastIndexOf('[hidden] { display: none !important; }');
+  assert.ok(hiddenRule > stylesSource.lastIndexOf('.job-panel'));
+  assert.ok(hiddenRule > stylesSource.lastIndexOf('.button'));
+  assert.ok(hiddenRule > stylesSource.lastIndexOf('.toolbar-check'));
+  assert.match(htmlSource, /id="jobPanel"[^>]*hidden/);
+  assert.match(htmlSource, /id="reconciliationAckButton"[^>]*hidden/);
+});
+
+test('frontend invalidated previews do not tell remote-only selections to rerun import preview', () => {
+  const contract = sourceSection('function invalidatePlan', 'function selectionsEqual');
+  const notices = [];
+  let problem = '所选项目包含仅 Sub2API 账号；同步导入只能选择本地 token 文件';
+  const context = {
+    state: { plan: { items: [] } },
+    renderPlan(plan) { context.state.plan = plan; },
+    syncSelectionProblem: () => problem,
+    showNotice: (message) => notices.push(message),
+  };
+  vm.runInNewContext(contract + '\ninvalidatePlan();', context);
+  assert.equal(context.state.plan, null);
+  assert.match(notices[0], /仅 Sub2API 账号/);
+  assert.match(notices[0], /测试不依赖导入预览/);
+  assert.doesNotMatch(notices[0], /请重新执行/);
+  context.state.plan = { items: [] };
+  problem = '';
+  vm.runInNewContext('invalidatePlan();', context);
+  assert.match(notices[1], /如需导入.*本地导入预览/);
+  vm.runInNewContext('invalidatePlan();', context);
+  assert.equal(notices.length, 2);
+});
+
+test('frontend exposes distinct visible disabled reasons and clears them when actions become available', () => {
+  const contract = sourceSection('function updateActionState', 'function applyColumnVisibility');
+  let remoteOnly = true;
+  let locked = false;
+  const row = { key: 'sub2api:143', accountId: 143 };
+  const context = {
+    state: {
+      selected: new Set([row.key]), snapshot: { readOnly: false },
+      jobInventoryVerified: true,
+    },
+    elements: Object.fromEntries([
+      'previewButton', 'importButton', 'phase3Button', 'accountTestButton',
+      'previewActionHint', 'importActionHint', 'phase3ActionHint', 'accountTestActionHint',
+      'clearSelectionButton', 'selectAll',
+    ].map((name) => [name, {}])),
+    document: { querySelectorAll: () => [] },
+    selectedRowsFromSelection: () => [row],
+    hiddenSelectionProblem: () => '',
+    syncSelectionProblem: () => remoteOnly ? '仅 Sub2API 账号不能参与导入' : '',
+    phase3TargetsFromRows: () => remoteOnly ? [] : [row],
+    phase3SelectionProblem: () => remoteOnly ? '缺少活动 token，不能从所选行运行 Phase 3' : '',
+    accountTestTargetsFromRows: () => remoteOnly
+      ? { targets: [], problem: '所选账号缺少有效的当前快照 revision，请刷新后重新选择' }
+      : { targets: [row], problem: '' },
+    phase3CapabilityAvailable: () => true,
+    comparisonAvailable: () => true,
+    actionsLocked: () => locked,
+    reconciliationWriteBlocked: () => false,
+    updateImportButtonState() { context.elements.importButton.disabled = true; },
+  };
+  vm.runInNewContext(contract + '\nupdateActionState();', context);
+  for (const [name, pattern] of [
+    ['previewActionHint', /本地导入预览：.*仅 Sub2API/],
+    ['importActionHint', /确认导入：.*仅 Sub2API/],
+    ['phase3ActionHint', /所选 token 的 Phase 3：.*缺少活动 token/],
+    ['accountTestActionHint', /Sub2API 账号测试：.*revision/],
+  ]) {
+    assert.equal(context.elements[name].hidden, false);
+    assert.match(context.elements[name].textContent, pattern);
+    assert.match(htmlSource, new RegExp('aria-describedby="' + name + '"'));
+  }
+  remoteOnly = false;
+  vm.runInNewContext('updateActionState();', context);
+  for (const name of ['previewActionHint', 'phase3ActionHint', 'accountTestActionHint']) {
+    assert.equal(context.elements[name].hidden, true);
+    assert.equal(context.elements[name].textContent, '');
+  }
+  locked = true;
+  vm.runInNewContext('updateActionState();', context);
+  assert.equal(context.elements.previewActionHint.hidden, false);
+  assert.match(context.elements.previewActionHint.textContent, /请求执行中/);
 });

@@ -88,10 +88,16 @@
           <label><input type="checkbox" data-column-toggle="current" checked> 本周期</label>
         </details>
         <button id="clearSelectionButton" class="button button-secondary" type="button"><span class="button-icon" aria-hidden="true">×</span><span>清除选择</span></button>
-        <button id="previewButton" class="button button-secondary" type="button" title="选择账号时检查所选项；未选择时检查全部活动 token，不受当前筛选条件影响"><span class="button-icon" aria-hidden="true">⌁</span><span>检查差异</span></button>
-        <button id="importButton" class="button button-primary" type="button" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
-        <button id="phase3Button" class="button button-secondary phase3-button" type="button" disabled title="正在确认 Phase 3 是否启用"><span class="button-icon" aria-hidden="true">↗</span><span id="phase3ButtonLabel">本地 Phase 3</span></button>
-        <button id="accountTestButton" class="button button-secondary account-test-button" type="button" disabled title="测试所选行关联的 Sub2API 上游账号"><span class="button-icon" aria-hidden="true">✓</span><span>测试 Sub2API 账号</span></button>
+        <button id="previewButton" class="button button-secondary" type="button" aria-describedby="previewActionHint" title="仅预览本地 token 导入动作；未选择时检查全部活动 token，不受当前筛选条件影响"><span class="button-icon" aria-hidden="true">⌁</span><span>本地导入预览</span></button>
+        <button id="importButton" class="button button-primary" type="button" aria-describedby="importActionHint" disabled><span class="button-icon" aria-hidden="true">↑</span><span>确认导入</span></button>
+        <button id="phase3Button" class="button button-secondary phase3-button" type="button" aria-describedby="phase3ActionHint" disabled title="正在确认 Phase 3 是否启用"><span class="button-icon" aria-hidden="true">↗</span><span id="phase3ButtonLabel">本地 Phase 3</span></button>
+        <button id="accountTestButton" class="button button-secondary account-test-button" type="button" aria-describedby="accountTestActionHint" disabled title="测试所选行关联的 Sub2API 上游账号"><span class="button-icon" aria-hidden="true">✓</span><span>测试 Sub2API 账号</span></button>
+      </div>
+      <div class="action-hints" aria-live="polite" aria-label="操作不可用原因">
+        <p id="previewActionHint" hidden></p>
+        <p id="importActionHint" hidden></p>
+        <p id="phase3ActionHint" hidden></p>
+        <p id="accountTestActionHint" hidden></p>
       </div>
       <div class="toolbar-actions maintenance-actions" aria-label="全局维护">
         <span class="maintenance-label">全局维护 · 不受筛选和选择影响</span>
