@@ -100,6 +100,15 @@ function phase3SelectedKeyForToken(token) {
   return normalizePhase3SelectedKey('token:' + source + ':' + relativePath);
 }
 
+// Local credential recovery is an explicit, separate selection namespace.
+// Do not teach the token selection parser to accept these keys: an ordinary
+// token request must never fall back to username.json merely by matching email.
+function normalizeLocalPhase3SelectedKey(value) {
+  if (typeof value !== 'string' || !/^username:(0|[1-9]\d{0,15})$/.test(value)) return null;
+  const index = Number(value.slice('username:'.length));
+  return Number.isSafeInteger(index) ? value : null;
+}
+
 function normalizePhase3CanonicalKey(value) {
   if (typeof value !== 'string' || !value || value !== value.trim()
       || UNSAFE_IDENTITY_TEXT.test(value)) return null;
@@ -142,5 +151,6 @@ module.exports = {
   normalizePhase3Phone,
   normalizePhase3RelativePath,
   normalizePhase3SelectedKey,
+  normalizeLocalPhase3SelectedKey,
   phase3SelectedKeyForToken,
 };

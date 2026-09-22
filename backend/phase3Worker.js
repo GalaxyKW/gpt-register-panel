@@ -24,9 +24,14 @@ const {
   normalizePhase3Identity,
   normalizePhase3Phone,
   normalizePhase3SelectedKey,
+  normalizeLocalPhase3SelectedKey,
   phase3SelectedKeyForToken,
 } = require('./lib/phase3Identity');
-const { phase3TargetRevisionMatches } = require('./phase3TargetRevision');
+const {
+  localPhase3TargetRevision,
+  localPhase3TargetRevisionMatches,
+  phase3TargetRevisionMatches,
+} = require('./phase3TargetRevision');
 const { assertAuditLogCheckpoint, redactText } = require('./logger');
 const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator');
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
@@ -812,6 +817,113 @@ function createTokenExecutionBinding(token, selectedKey) {
     relativePath: token.relativePath,
     digest: tokenExecutionDigest(token),
   });
+}
+
+function createLocalExecutionBinding(selectedKey, username) {
+  const value = { version: 2, sourceMode: 'username', selectedKey, username };
+  return Object.freeze({
+    ...value,
+    proof: phase3ExecutionDigest('phase3-local-execution-v1', value),
+  });
+}
+
+function validLocalExecutionBinding(binding) {
+  if (!binding || binding.version !== 2 || binding.sourceMode !== 'username'
+      || !normalizeLocalPhase3SelectedKey(binding.selectedKey)
+      || !binding.username || binding.username.version !== 1
+      || binding.selectedKey !== 'username:' + binding.username.index
+      || Object.hasOwn(binding, 'token')) return false;
+  return executionDigestsEqual(binding.proof, phase3ExecutionDigest('phase3-local-execution-v1', {
+    version: 2,
+    sourceMode: 'username',
+    selectedKey: binding.selectedKey,
+    username: binding.username,
+  }));
+}
+
+function localPhase3TargetsFromSnapshot(snapshot, tokens = []) {
+  const emailCounts = new Map();
+  const phoneCounts = new Map();
+  const activeTokenEmails = new Set(tokens.filter((token) => token.historical !== true)
+    .map((token) => normalizeEmail(token.email)).filter(Boolean));
+  for (const record of snapshot.records) {
+    const email = typeof record?.email === 'string' ? normalizeEmail(record.email) : '';
+    const phone = normalizeUsernamePhone(record?.phone);
+    if (email) emailCounts.set(email, (emailCounts.get(email) || 0) + 1);
+    if (phone) phoneCounts.set(phone, (phoneCounts.get(phone) || 0) + 1);
+  }
+  return snapshot.records.map((record, index) => {
+    const email = typeof record?.email === 'string' ? normalizeEmail(record.email) : '';
+    const phone = normalizeUsernamePhone(record?.phone);
+    const rawStatus = record?.status;
+    const status = rawStatus === undefined ? ''
+      : typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : null;
+    let reason = null;
+    if (!record || typeof record !== 'object' || Array.isArray(record)
+        || !email || phone === null || status === null
+        || (status && !/^[a-z0-9_-]{1,64}$/.test(status))) {
+      reason = 'phase3_account_invalid';
+    } else if (TERMINAL_ACCOUNT_STATUSES.has(status)
+        || ['deleted', 'disabled', 'deactivated'].includes(status)
+        || record.disabled === true || record.enabled === false
+        || (typeof record.phase3Disposition === 'string'
+          && record.phase3Disposition.trim().toLowerCase() === 'discard')) {
+      reason = 'phase3_account_terminal';
+    } else if (emailCounts.get(email) !== 1 || (phone && phoneCounts.get(phone) !== 1)) {
+      // The actual child selects by email/phone, not array index. Even an
+      // incomplete duplicate record can change which credentials it consumes.
+      reason = 'phase3_account_ambiguous';
+    } else if (!hasUsablePhase3Password(record)) {
+      reason = 'phase3_password_missing';
+    } else if (activeTokenEmails.has(email)) {
+      reason = 'phase3_source_present';
+    }
+    const username = { index, email, phone: phone || '', phoneValid: phone !== null,
+      status: status || '', hasPassword: hasUsablePhase3Password(record) };
+    const revision = reason ? null : localPhase3TargetRevision({
+      username,
+      usernameContentHash: snapshot.contentHash,
+    });
+    if (!reason && !revision) reason = 'phase3_account_invalid';
+    return {
+      selectedKey: 'username:' + index,
+      email: email || null,
+      phone: phone || null,
+      status: status && /^[a-z0-9_-]{1,64}$/.test(status) ? status : '',
+      eligible: !reason,
+      reason,
+      phase3TargetRevision: revision,
+    };
+  });
+}
+
+function readLocalPhase3Snapshot(rootHandle = null, expectedContentHash = null) {
+  const snapshot = readRegularJsonArraySnapshot(usernameFilePath(rootHandle), 'username.json', {
+    parentPinned: Boolean(rootHandle),
+  });
+  if (expectedContentHash !== null && snapshot.contentHash !== expectedContentHash) {
+    throw phase3BindingError('PHASE3_USERNAME_CHANGED_DURING_ADMISSION',
+      'username.json 在 Phase3 入队检查期间发生变化');
+  }
+  return snapshot;
+}
+
+function listLocalPhase3Targets() {
+  const rootHandle = openPinnedPhase3Root(registerRoot());
+  try {
+    const sources = readGptRegisterSources({
+      rootDirectory: registerRoot(), rootHandle, requireValidUsername: true,
+      strictCompleteSnapshot: true, usernameMaxBytes: phase3UsernameMaxBytes(),
+      usernameMaxRecords: usernameRecordLimit(),
+    });
+    const accounts = localPhase3TargetsFromSnapshot(
+      readLocalPhase3Snapshot(rootHandle, sources.usernameContentHash), sources.tokens,
+    );
+    const eligible = accounts.filter((account) => account.eligible).length;
+    return { accounts, summary: { total: accounts.length, eligible, ineligible: accounts.length - eligible } };
+  } finally {
+    closeDirectoryHandle(rootHandle);
+  }
 }
 
 function assertTokenExecutionBinding(binding, sources, entry, request = {}) {
@@ -2089,6 +2201,7 @@ function runCommand(command, args, options = {}) {
 async function runPhase3JobNow({
   email,
   phone,
+  sourceMode = 'token',
   executionBinding = null,
   requireExecutionBinding = false,
   actor = 'local',
@@ -2112,6 +2225,7 @@ async function runPhase3JobNow({
   writeLog(logger, 'info', 'phase3.started', {
     jobId,
     actor,
+    sourceMode: sourceMode === 'username' ? 'username' : 'token',
     email: email || null,
     phone: phone || null,
   });
@@ -2122,8 +2236,11 @@ async function runPhase3JobNow({
       throw error;
     }
     startedAt = phase3WallClockMilliseconds();
-    if ((requireExecutionBinding && !executionBinding)
-        || (executionBinding && (executionBinding.version !== 1
+    const localMode = sourceMode === 'username';
+    if (!['token', 'username'].includes(sourceMode)
+        || (localMode && !validLocalExecutionBinding(executionBinding))
+        || (requireExecutionBinding && !executionBinding)
+        || (!localMode && executionBinding && (executionBinding.version !== 1
           || !executionBinding.token || !executionBinding.username))) {
       throw phase3BindingError(
         'PHASE3_EXECUTION_BINDING_INVALID',
@@ -2141,12 +2258,20 @@ async function runPhase3JobNow({
       rootHandle,
       strictCompleteSnapshot: true,
     });
+    if (localMode) {
+      const snapshot = readLocalPhase3Snapshot(rootHandle, beforeSources.usernameContentHash);
+      const target = localPhase3TargetsFromSnapshot(snapshot, beforeSources.tokens)[executionBinding.username.index];
+      if (!target?.eligible || target.selectedKey !== executionBinding.selectedKey) {
+        throw phase3BindingError('PHASE3_USERNAME_BINDING_CHANGED',
+          '本地恢复账号在排队期间已变化或不再唯一，拒绝启动 Phase3');
+      }
+    }
     entry = findUsernameEntry({
       email,
       phone,
       expectedExecutionBinding: executionBinding?.username || null,
     }, rootHandle);
-    const selectedToken = executionBinding
+    const selectedToken = executionBinding && !localMode
       ? assertTokenExecutionBinding(executionBinding.token, beforeSources, entry, { email, phone })
       : null;
     const beforeTokens = beforeSources.tokens;
@@ -2163,6 +2288,7 @@ async function runPhase3JobNow({
     writeLog(logger, 'info', 'phase3.account_resolved', {
       jobId,
       actor,
+      sourceMode,
       email: entry.email,
       createdAt: entry.createdAt,
     });
@@ -2171,7 +2297,7 @@ async function runPhase3JobNow({
     let processError = null;
     try {
       throwIfJobInterrupted(signal);
-      const phase3Argument = phone && entry.phone
+      const phase3Argument = !localMode && phone && entry.phone
         ? '--phone=' + entry.phone
         : '--email=' + entry.email;
       const pinnedRootPath = '/proc/self/fd/' + PHASE3_ROOT_CHILD_FD;
@@ -2288,8 +2414,9 @@ async function runPhase3JobNow({
       return fingerprintChanged || mtimeChangedWithoutFingerprint;
     });
     if (observedChangedTokens.some(
-      (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken),
-    ) || (selectedToken && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
+      (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken)
+        || (localMode && !hasStrongIdentity(item.identityKeys || [])),
+    ) || ((selectedToken || localMode) && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
       throw phase3TokenIdentityMismatchError();
     }
     const artifactScopeValid = artifactChanges.replacements.every((replacement) => (
@@ -2305,6 +2432,23 @@ async function runPhase3JobNow({
       (item) => phase3TokenArtifactBelongsToTarget(item, entry, selectedToken),
     );
     if (!artifactScopeValid) throw phase3TokenScopeViolationError();
+    if (localMode) {
+      const outputIdentity = observedChangedTokens[0]?.identityKeys || [];
+      const belongsToLocalOutput = (item) => Boolean(item
+        && item.historical !== true && item.parseStatus === 'ok'
+        && normalizeEmail(item.email) === entry.email
+        && hasStrongIdentity(outputIdentity)
+        && strongIdentitiesFullyMatch(outputIdentity, item.identityKeys || []));
+      // With no reviewed token, email alone cannot authorize replacing or
+      // removing an existing credential. Every affected old and new artifact
+      // must independently agree with the new output's strong identity.
+      if (!artifactChanges.replacements.every((replacement) => (
+        (!replacement.before || belongsToLocalOutput(replacement.before))
+        && belongsToLocalOutput(replacement.after)
+      )) || !artifactChanges.removed.every(belongsToLocalOutput)) {
+        throw phase3TokenScopeViolationError();
+      }
+    }
     // A second path reusing an access token that was already present before
     // the child started is only a copy or metadata/refresh-token rewrite, not
     // proof that OAuth produced a fresh access credential.
@@ -2417,6 +2561,7 @@ async function runPhase3JobNow({
     writeLog(logger, 'info', 'phase3.completed', {
       jobId,
       actor,
+      sourceMode,
       email: entry.email,
       tokenFile: token.relativePath,
       fingerprint: token.fingerprints?.access || null,
@@ -2507,6 +2652,53 @@ function phase3IdentityError(code = 'PHASE3_IDENTITY_INVALID') {
   return error;
 }
 
+function resolveLocalPhase3Request(request, snapshot, targets) {
+  const identity = normalizePhase3Identity(request || {});
+  const selectedKey = normalizeLocalPhase3SelectedKey(request?.selectedKey);
+  const index = selectedKey ? Number(selectedKey.slice('username:'.length)) : -1;
+  const target = targets[index];
+  let code = null;
+  if (!identity || !selectedKey) code = 'phase3_request_invalid';
+  else if (!target || target.selectedKey !== selectedKey) code = 'phase3_account_not_found';
+  else if (!target.eligible) code = target.reason;
+  else if ((identity.email && identity.email !== target.email)
+      || (identity.phone && identity.phone !== (target.phone || ''))) {
+    code = 'phase3_source_identity_mismatch';
+  } else if (!localPhase3TargetRevisionMatches(request.phase3TargetRevision, {
+    username: { index, email: target.email, phone: target.phone || '',
+      status: target.status, hasPassword: true, phoneValid: true },
+    usernameContentHash: snapshot.contentHash,
+  })) code = 'phase3_target_revision_changed';
+  if (code) return { rejected: {
+    index: request?.originalIndex,
+    email: identity?.email || null,
+    phone: identity?.phone || null,
+    error: code,
+    message: '本地 Phase3 目标不满足执行条件或快照已变化，请刷新本地账号清单',
+  } };
+  const rawEntry = findUsernameEntry({
+    email: target.email,
+    phone: target.phone || '',
+    expectedFileContentHash: snapshot.contentHash,
+    createExecutionBinding: true,
+  });
+  if (rawEntry.index !== index || rawEntry.email !== target.email
+      || rawEntry.phone !== (target.phone || '')) {
+    throw phase3BindingError('PHASE3_USERNAME_CHANGED_DURING_ADMISSION',
+      'username.json 在 Phase3 入队检查期间发生变化');
+  }
+  const resolvedIdentity = normalizePhase3Identity({ email: target.email, phone: target.phone || '' });
+  const resolved = { ...request, sourceMode: 'username', email: target.email,
+    phone: target.phone, selectedKey, canonicalKeys: [...resolvedIdentity.keys].sort() };
+  Object.defineProperty(resolved, 'executionBinding', {
+    value: createLocalExecutionBinding(selectedKey, rawEntry.executionBinding),
+    enumerable: false,
+    configurable: false,
+    writable: false,
+  });
+  return { eligible: resolved };
+}
+
 function resolvePhase3Requests(requests = []) {
   const root = registerRoot();
   const sources = readGptRegisterSources({
@@ -2519,7 +2711,16 @@ function resolvePhase3Requests(requests = []) {
   const records = sources.usernames || [];
   const eligible = [];
   const rejected = [];
+  const localSnapshot = requests.some((request) => request?.sourceMode === 'username')
+    ? readLocalPhase3Snapshot(null, sources.usernameContentHash) : null;
+  const localTargets = localSnapshot ? localPhase3TargetsFromSnapshot(localSnapshot, sources.tokens) : null;
   for (const request of requests) {
+    if (request?.sourceMode === 'username') {
+      const result = resolveLocalPhase3Request(request, localSnapshot, localTargets);
+      if (result.eligible) eligible.push(result.eligible);
+      else rejected.push(result.rejected);
+      continue;
+    }
     const identity = normalizePhase3Identity(request || {});
     const email = identity?.email || '';
     const phone = identity?.phone || '';
@@ -2544,7 +2745,8 @@ function resolvePhase3Requests(requests = []) {
       username: record,
       usernameContentHash: sources.usernameContentHash,
     } : null;
-    if (!identity || !selectedKey) {
+    if (!identity || !selectedKey
+        || (request?.sourceMode !== undefined && request.sourceMode !== 'token')) {
       code = 'phase3_request_invalid';
       message = 'Phase3 账号身份或 token 选择键无效';
     } else if (selectedTokenMatches.length !== 1) {
@@ -2745,6 +2947,7 @@ function runPhase3Job(args = {}) {
   writeLog(args.logger, 'info', 'phase3.queued', {
     jobId: args.jobId || null,
     actor: args.actor || 'local',
+    sourceMode: args.sourceMode === 'username' ? 'username' : 'token',
     email: normalizeEmail(args.email) || null,
     phone: String(args.phone || '').trim() || null,
     queueWaitMs: null,
@@ -2755,6 +2958,7 @@ function runPhase3Job(args = {}) {
     writeLog(args.logger, 'info', 'phase3.started_after_queue', {
       jobId: args.jobId || null,
       actor: args.actor || 'local',
+      sourceMode: args.sourceMode === 'username' ? 'username' : 'token',
       email: normalizeEmail(args.email) || null,
       phone: String(args.phone || '').trim() || null,
       queueWaitMs,
@@ -2817,6 +3021,7 @@ module.exports = {
   classifyPhase3ProcessError,
   comparePhase3TokenFreshness,
   findUsernameEntry,
+  listLocalPhase3Targets,
   canonicalPhase3Keys,
   resolvePhase3Requests,
   persistAccountDisposition,

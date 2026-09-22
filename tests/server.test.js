@@ -48,10 +48,11 @@ const { buildSnapshot, buildImportPlan } = require('../backend/sync');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 const validImportPlanIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
 
-test('static routing exposes only the three declared frontend assets', () => {
+test('static routing exposes only the declared frontend assets', () => {
   assert.equal(path.basename(safeStaticPath('/')), 'index.html');
   assert.equal(path.basename(safeStaticPath('/app.js')), 'app.js');
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
+  assert.equal(path.basename(safeStaticPath('/local-phase3.js')), 'local-phase3.js');
   assert.equal(safeStaticPath('/debug.json'), null);
   assert.equal(safeStaticPath('/nested/asset.js'), null);
 });

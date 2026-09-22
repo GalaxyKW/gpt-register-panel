@@ -96,6 +96,14 @@ h2 { margin-bottom: 5px; font-size: 18px; letter-spacing: .01em; }
 .action-hints { flex: 1 1 100%; min-width: 0; color: var(--muted); font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .action-hints p { margin: 0 0 3px; }
 .action-hints:has(> p:not([hidden])) { padding: 8px 10px; border-left: 3px solid var(--line); background: var(--canvas); }
+.local-recovery-actions { border-top: 1px solid var(--line); padding-top: 10px; }
+.local-recovery-hint { flex: 1 1 100%; margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.auth-dialog.local-phase3-dialog { width: min(850px, calc(100vw - 24px)); max-width: 850px; }
+.local-phase3-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+.local-phase3-controls label { font-size: 13px; }
+.local-phase3-table-wrap { max-height: 42vh; overflow: auto; }
+.local-phase3-table-wrap table { min-width: 560px; }
+.local-phase3-table-wrap td { white-space: normal; overflow-wrap: anywhere; }
 .maintenance-actions { margin-top: 2px; padding-top: 10px; border-top: 1px solid var(--line); }
 .maintenance-label { color: var(--muted); font-size: 11px; font-weight: 750; letter-spacing: .02em; }
 .toolbar-check { display: inline-flex !important; align-items: center; gap: 7px; min-width: auto !important; min-height: 38px; color: var(--ink-soft) !important; font-size: 12px !important; font-weight: 700 !important; white-space: nowrap; }

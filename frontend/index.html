@@ -103,6 +103,11 @@
         <span class="maintenance-label">全局维护 · 不受筛选和选择影响</span>
         <button id="cleanupButton" class="button button-danger" type="button" disabled title="全局扫描 tokens 和 use_token 活动目录，并将已过期 JSON 文件移入隔离目录；不含 historical/old_codex 历史备份，不受当前筛选和选择影响"><span class="button-icon" aria-hidden="true">⌫</span><span>全局扫描并隔离过期 token</span></button>
       </div>
+      <div class="toolbar-actions local-recovery-actions" aria-label="本地账号恢复">
+        <span class="maintenance-label">没有活动 token？从 username.json 独立选择账号，不关联上表的远程邮箱</span>
+        <button id="localPhase3Button" class="button button-secondary" type="button" aria-describedby="localPhase3ActionHint" disabled>从本地账号获取 token</button>
+        <p id="localPhase3ActionHint" class="local-recovery-hint">正在确认本地 Phase 3 是否可用</p>
+      </div>
     </section>
 
     <section id="planPanel" class="plan-panel" hidden>
@@ -202,6 +207,33 @@
       </div>
     </form>
   </dialog>
+  <dialog id="localPhase3Dialog" class="auth-dialog local-phase3-dialog" aria-labelledby="localPhase3Title" aria-describedby="localPhase3Help">
+    <form id="localPhase3Form" method="dialog" class="auth-dialog-form">
+      <div>
+        <h2 id="localPhase3Title">从本地账号获取 token</h2>
+        <p id="localPhase3Help">仅选择 username.json 中核验通过且没有活动 token 的本地记录；历史备份不影响恢复。已有活动 token（即使过期）请从账号表发起 Phase 3，不从 Sub2API 邮箱推断身份。每批最多 100 个，串行执行；获取后仍需单独预览并确认导入。</p>
+      </div>
+      <p id="localPhase3Summary" aria-live="polite">正在读取本地账号…</p>
+      <div class="local-phase3-controls">
+        <label><input id="localPhase3SelectAll" type="checkbox"> 勾选当前页可用记录（跨页选择保留）</label>
+        <button id="localPhase3Reload" class="button button-secondary" type="button">重新读取并清除选择</button>
+      </div>
+      <div class="local-phase3-table-wrap">
+        <table><thead><tr><th>选择</th><th>本地记录</th><th>邮箱 / 手机</th><th>状态 / 条件</th></tr></thead><tbody id="localPhase3Rows"></tbody></table>
+      </div>
+      <div class="local-phase3-controls">
+        <span id="localPhase3Page">第 1/1 页</span>
+        <button id="localPhase3Previous" class="button button-secondary" type="button">上一页</button>
+        <button id="localPhase3Next" class="button button-secondary" type="button">下一页</button>
+      </div>
+      <p id="localPhase3Error" class="dialog-error" aria-live="polite" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="localPhase3Cancel" class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
+        <button id="localPhase3Confirm" class="button button-primary" type="submit" value="confirm" disabled>确认获取所选账号 token</button>
+      </div>
+    </form>
+  </dialog>
   <script src="/app.js" defer></script>
+  <script src="/local-phase3.js" defer></script>
 </body>
 </html>

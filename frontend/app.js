@@ -4,6 +4,7 @@ const state = {
   selected: new Set(),
   plan: null,
   phase3RequestPending: false,
+  localPhase3ListingPending: false,
   previewRequestPending: false,
   importRequestPending: false,
   accountTestRequestPending: false,
@@ -269,6 +270,8 @@ function mutationRejectionSummary(rejected, workflow) {
       phase3_account_ambiguous: 'username.json 中账号不唯一',
       phase3_password_missing: 'username.json 中缺少密码',
       phase3_account_terminal: '账号已处置',
+      phase3_account_invalid: '本地账号资料无效',
+      phase3_source_present: '已有活动 token，请从账号表发起 Phase 3',
       phase3_target_revision_changed: '目标快照已变化',
     }
     : {
@@ -978,6 +981,7 @@ function actionRequestPending() {
   return state.previewRequestPending
     || state.importRequestPending
     || state.phase3RequestPending
+    || state.localPhase3ListingPending
     || state.accountTestRequestPending
     || state.cleanupRequestPending
     || state.reconciliationAckPending;
@@ -2341,6 +2345,21 @@ function reconciliationTargetIsValid(workflow, target) {
       && typeof target.baselineSchedulable === 'boolean';
   }
   if (workflow === 'phase3') {
+    if (target.sourceMode === 'username') {
+      return target.sourcePath === undefined
+        && Object.keys(target).every((key) => [
+          'sourceMode', 'usernameIndex', 'email', 'phone', 'phase3TargetRevision',
+        ].includes(key))
+        && typeof target.usernameIndex === 'number'
+        && Number.isSafeInteger(target.usernameIndex)
+        && target.usernameIndex >= 0 && target.usernameIndex < 100_000
+        && Boolean(canonicalEmail)
+        && (target.phone === undefined || Boolean(phone))
+        && /^phase3-local-v1\.[A-Za-z0-9_-]{43}$/.test(
+          String(target.phase3TargetRevision || ''),
+        );
+    }
+    if (target.sourceMode !== undefined || target.usernameIndex !== undefined) return false;
     if (!sourcePath || !canonicalEmail
         || !/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(
           String(target.phase3TargetRevision || ''),
@@ -2547,6 +2566,9 @@ function reconciliationTargetContextText(detail) {
       fields.push('目标数量 ' + target.targetCount);
     }
     if (target.sourcePath) fields.push('文件 ' + target.sourcePath);
+    if (target.sourceMode === 'username') {
+      fields.push('本地记录 username.json #' + target.usernameIndex + '（0 基索引）');
+    }
     if (target.sourceContentHash) fields.push('来源内容 SHA-256 ' + target.sourceContentHash);
     if (target.contentHash) fields.push('内容 SHA-256 ' + target.contentHash);
     if (target.remoteAccountId) fields.push('Sub2API ID ' + target.remoteAccountId);
@@ -3709,6 +3731,7 @@ function updateActionState() {
       ? label + '：' + (button.title || '当前不可执行，请刷新快照后检查选择')
       : '';
   }
+  if (typeof updateLocalPhase3ActionState === 'function') updateLocalPhase3ActionState();
 }
 
 function applyColumnVisibility() {

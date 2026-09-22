@@ -38,6 +38,7 @@ const {
   PHASE3_TERMINATION_MAX_TOTAL_MS,
   runPhase3Job,
   canonicalPhase3Keys,
+  listLocalPhase3Targets,
   resolvePhase3Requests,
 } = require('./phase3Worker');
 const {
@@ -67,6 +68,7 @@ const { assertDirectoryTree } = require('./lib/safeFs');
 const {
   normalizePhase3CanonicalKeys,
   normalizePhase3Identity,
+  normalizeLocalPhase3SelectedKey,
   normalizePhase3SelectedKey,
 } = require('./lib/phase3Identity');
 const {
@@ -95,17 +97,19 @@ const CONTENT_TYPES = {
 };
 const MIN_PHASE3_SHUTDOWN_TIMEOUT_MS = PHASE3_TERMINATION_MAX_TOTAL_MS + 1000;
 const CONTENT_SECURITY_POLICY = "default-src 'self'; base-uri 'none'; object-src 'none'; form-action 'none'; style-src 'self'; script-src 'self'; frame-ancestors 'none'";
-const STATIC_ALLOWLIST = new Set(['/index.html', '/app.js', '/styles.css']);
+const STATIC_ALLOWLIST = new Set(['/index.html', '/app.js', '/styles.css', '/local-phase3.js']);
 const JSON_BODY_ENDPOINTS = new Set([
   '/api/sync/preview',
   '/api/sync/import',
   '/api/phase3',
+  '/api/phase3/local',
   '/api/tokens/expired/delete',
   '/api/account-tests',
 ]);
 const GET_API_ENDPOINTS = new Set([
   '/api/health',
   '/api/snapshot',
+  '/api/phase3/local-accounts',
   '/api/account-tests/models',
   '/api/tokens/expired',
   '/api/jobs',
@@ -1074,6 +1078,8 @@ const HTTP_LOG_FIXED_PATHS = new Set([
   '/api/sync/preview',
   '/api/sync/import',
   '/api/phase3',
+  '/api/phase3/local',
+  '/api/phase3/local-accounts',
   '/api/account-tests',
   '/api/account-tests/models',
   '/api/tokens/expired',
@@ -1193,11 +1199,15 @@ function sourcePathFromSelectionKey(value) {
   return normalizedReviewSourcePath(source, text.slice(separator + 1));
 }
 
-function phase3SelectedKeyDigest(value) {
-  const selectedKey = normalizePhase3SelectedKey(value);
+function phase3SelectedKeyDigest(value, sourceMode = 'token') {
+  const selectedKey = sourceMode === 'username'
+    ? normalizeLocalPhase3SelectedKey(value)
+    : sourceMode === 'token' ? normalizePhase3SelectedKey(value) : null;
   if (!selectedKey) return null;
   return crypto.createHash('sha256')
-    .update('gpt-register-panel/phase3-selected-key/v1\0')
+    .update(sourceMode === 'username'
+      ? 'gpt-register-panel/phase3-local-selected-key/v1\0'
+      : 'gpt-register-panel/phase3-selected-key/v1\0')
     .update(selectedKey)
     .digest('hex');
 }
@@ -1524,6 +1534,10 @@ function phase3ReviewTargets(job) {
     ? job.payload
     : {};
   const sourcePath = safeReviewSourcePath(payload.sourcePath);
+  const localMode = payload.sourceMode === 'username';
+  const validSourceMode = localMode || payload.sourceMode === undefined || payload.sourceMode === 'token';
+  const usernameIndex = Number.isSafeInteger(payload.usernameIndex) && payload.usernameIndex >= 0
+    ? payload.usernameIndex : null;
   const safeEmail = boundedReviewText(payload.email, 320);
   const safePhone = payload.phone === null ? null : boundedReviewText(payload.phone, 80);
   const safeCanonicalKeys = Array.isArray(payload.canonicalKeys)
@@ -1542,13 +1556,16 @@ function phase3ReviewTargets(job) {
     && safeCanonicalKeys.length === canonicalKeys.length
     && safeCanonicalKeys.every((key, index) => key === canonicalKeys[index]);
   const phase3TargetRevision = typeof payload.phase3TargetRevision === 'string'
-    && /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(payload.phase3TargetRevision)
+    && (localMode ? /^phase3-local-v1\.[A-Za-z0-9_-]{43}$/
+      : /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/).test(payload.phase3TargetRevision)
     ? payload.phase3TargetRevision
     : null;
   const source = sourcePath?.split('/', 1)[0];
-  const reconstructedSelectedKey = sourcePath && ['tokens', 'use_token'].includes(source)
-    ? 'token:' + source + ':' + sourcePath
-    : null;
+  const reconstructedSelectedKey = localMode
+    ? usernameIndex === null ? null : normalizeLocalPhase3SelectedKey('username:' + usernameIndex)
+    : sourcePath && ['tokens', 'use_token'].includes(source)
+      ? 'token:' + source + ':' + sourcePath
+      : null;
   const selectedKeyDigest = typeof payload.selectedKeyDigest === 'string'
     && /^[a-f0-9]{64}$/.test(payload.selectedKeyDigest)
     ? payload.selectedKeyDigest
@@ -1558,15 +1575,18 @@ function phase3ReviewTargets(job) {
     && (safePhone === null || safePhone === identity.phone)
     && canonicalKeysExact
     && canonicalKeys.length === identity.keys.length;
-  if (!sourcePath || !identityCanonical || !phase3TargetRevision || !selectedKeyDigest
-      || phase3SelectedKeyDigest(reconstructedSelectedKey) !== selectedKeyDigest) {
+  const validSource = localMode
+    ? usernameIndex !== null && (payload.sourcePath === undefined || payload.sourcePath === null)
+    : Boolean(sourcePath);
+  if (!validSourceMode || !validSource || !identityCanonical || !phase3TargetRevision || !selectedKeyDigest
+      || phase3SelectedKeyDigest(reconstructedSelectedKey, localMode ? 'username' : 'token') !== selectedKeyDigest) {
     return { total: 1, targets: [], complete: false };
   }
   return {
     total: 1,
     complete: true,
     targets: [{
-      sourcePath,
+      ...(localMode ? { sourceMode: 'username', usernameIndex } : { sourcePath }),
       email: identity.email,
       phone: identity.phone || undefined,
       phase3TargetRevision,
@@ -1968,7 +1988,9 @@ function requestBodyObjectError(body) {
   return error;
 }
 
-function normalizePhase3Requests(body) {
+function normalizePhase3Requests(body, options = {}) {
+  const localMode = options.sourceMode === 'username';
+  const normalizeSelectedKey = localMode ? normalizeLocalPhase3SelectedKey : normalizePhase3SelectedKey;
   const hasBatch = body && body.accounts !== undefined;
   const rawItems = hasBatch ? body.accounts : [body];
   if (!Array.isArray(rawItems) || rawItems.length === 0 || rawItems.length > 100) {
@@ -1984,7 +2006,7 @@ function normalizePhase3Requests(body) {
     error.code = 'PHASE3_SELECTION_INVALID';
     throw error;
   }
-  const selectedKeys = rawSelectedKeys.map(normalizePhase3SelectedKey);
+  const selectedKeys = rawSelectedKeys.map((key) => normalizeSelectedKey(key));
   if (selectedKeys.some((value) => !value)
       || new Set(selectedKeys).size !== selectedKeys.length) {
     const error = new Error('Phase 3 账号选择键格式无效或重复');
@@ -2001,7 +2023,7 @@ function normalizePhase3Requests(body) {
       error.code = 'PHASE3_ACCOUNT_INVALID';
       throw error;
     }
-    const selectedKey = normalizePhase3SelectedKey(rawItem.selectedKey);
+    const selectedKey = normalizeSelectedKey(rawItem.selectedKey);
     if (!selectedKey || itemSelectedKeys.has(selectedKey)
         || selectedKey !== selectedKeys[index]) {
       const error = new Error('每个 Phase 3 账号必须提供唯一的 selectedKey');
@@ -2012,7 +2034,8 @@ function normalizePhase3Requests(body) {
     const phase3TargetRevision = typeof rawItem.phase3TargetRevision === 'string'
       ? rawItem.phase3TargetRevision
       : '';
-    if (!/^phase3-target-v1\.[A-Za-z0-9_-]{43}$/.test(phase3TargetRevision)) {
+    if (!(localMode ? /^phase3-local-v1\.[A-Za-z0-9_-]{43}$/
+      : /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/).test(phase3TargetRevision)) {
       const error = new Error('每个 Phase 3 账号必须提供当前快照的目标 revision');
       error.code = 'PHASE3_TARGET_REVISION_INVALID';
       throw error;
@@ -2030,6 +2053,7 @@ function normalizePhase3Requests(body) {
     }
     keys.forEach((key) => seenKeys.add(key));
     requests.push({
+      ...(localMode ? { sourceMode: 'username' } : {}),
       originalIndex: index,
       email,
       phone,
@@ -2652,6 +2676,7 @@ function observePhase3Job({
   phone,
   canonicalKeys,
   executionBinding,
+  sourceMode = 'token',
   actor,
   db,
   logger,
@@ -2698,6 +2723,7 @@ function observePhase3Job({
     phone,
     canonicalKeys,
     executionBinding,
+    sourceMode,
     requireExecutionBinding: true,
     actor,
     db,
@@ -3195,7 +3221,7 @@ function createServer(options = {}) {
       );
       const requiresWrite = request.method === 'POST'
         && (reconciliationAckPath.matched
-          || ['/api/sync/import', '/api/phase3', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
+          || ['/api/sync/import', '/api/phase3', '/api/phase3/local', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
       const authError = requestUrl.pathname.startsWith('/api/')
         ? authorizationError(request, requiresWrite)
         : null;
@@ -3595,8 +3621,36 @@ function createServer(options = {}) {
       return;
     }
 
-    if (request.method === 'POST' && requestUrl.pathname === '/api/phase3') {
+    if (request.method === 'GET' && requestUrl.pathname === '/api/phase3/local-accounts') {
+      writeLog(logger, 'info', 'phase3.local_accounts_started', { requestId, actor });
+      try {
+        const listing = listLocalPhase3Targets();
+        writeLog(logger, 'info', 'phase3.local_accounts_completed', {
+          requestId, actor,
+          total: listing.summary.total,
+          eligible: listing.summary.eligible,
+        });
+        jsonResponse(response, 200, {
+          ...listing,
+          readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
+          capabilities: { phase3Enabled: booleanEnvEnabled('PANEL_PHASE3_ENABLED', false) },
+        });
+      } catch (error) {
+        writeLog(logger, 'error', 'phase3.local_accounts_failed', {
+          requestId, actor, error: safeHttpErrorMessage(error),
+        });
+        sendPublicApiError(response, error, {
+          fallbackCode: 'phase3_local_accounts_failed',
+          fallbackMessage: '本地 Phase 3 账号清单读取失败，请稍后重试',
+        });
+      }
+      return;
+    }
+
+    if (request.method === 'POST'
+        && ['/api/phase3', '/api/phase3/local'].includes(requestUrl.pathname)) {
       const phase3RequestStartedAt = performance.now();
+      const sourceMode = requestUrl.pathname === '/api/phase3/local' ? 'username' : 'token';
       try {
         const body = await readJsonBody(request);
         const bodyError = requestBodyObjectError(body);
@@ -3605,8 +3659,9 @@ function createServer(options = {}) {
           requests,
           duplicateIndexes,
           selectedKeys: normalizedSelectedKeys,
-        } = normalizePhase3Requests(body);
+        } = normalizePhase3Requests(body, { sourceMode });
         const idempotency = mutationContext(request, MUTATION_WORKFLOWS.phase3, {
+          ...(sourceMode === 'username' ? { sourceMode } : {}),
           accounts: requests.map((item) => ({
             originalIndex: item.originalIndex,
             email: item.email,
@@ -3715,6 +3770,10 @@ function createServer(options = {}) {
                 jobs: resolvedRequests.map((requestItem) => ({
                   type: 'phase3',
                   payload: {
+                    ...(sourceMode === 'username' ? {
+                      sourceMode,
+                      usernameIndex: Number(requestItem.selectedKey.slice('username:'.length)),
+                    } : {}),
                     email: requestItem.email || null,
                     phone: requestItem.phone || null,
                     canonicalKeys: requestItem.canonicalKeys,
@@ -3722,7 +3781,7 @@ function createServer(options = {}) {
                     // selectedKey itself is redacted in persisted job payloads;
                     // retain only its validated source-relative path for review.
                     sourcePath: sourcePathFromSelectionKey(requestItem.selectedKey),
-                    selectedKeyDigest: phase3SelectedKeyDigest(requestItem.selectedKey),
+                    selectedKeyDigest: phase3SelectedKeyDigest(requestItem.selectedKey, sourceMode),
                     // This opaque revision binds the reviewed token and
                     // username.json evidence without persisting credentials.
                     phase3TargetRevision: requestItem.phase3TargetRevision,
@@ -3775,6 +3834,7 @@ function createServer(options = {}) {
                 phone: item.phone,
                 canonicalKeys: item.canonicalKeys,
                 executionBinding: item.executionBinding,
+                sourceMode,
                 actor,
                 db,
                 logger,

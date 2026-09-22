@@ -5,11 +5,13 @@ const {
   PHASE3_PHONE_USERNAME_MAX_BYTES,
   normalizePhase3Phone,
   normalizePhase3RelativePath,
+  normalizeLocalPhase3SelectedKey,
   phase3SelectedKeyForToken,
 } = require('./lib/phase3Identity');
 
 const REVISION_PREFIX = 'phase3-target-v1.';
 const REVISION_PATTERN = /^phase3-target-v1\.[A-Za-z0-9_-]{43}$/;
+const LOCAL_REVISION_PATTERN = /^phase3-local-v1\.[A-Za-z0-9_-]{43}$/;
 const CANONICAL_STRONG_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 const TERMINAL_USERNAME_STATUSES = new Set([
   'account_deactivated',
@@ -151,7 +153,59 @@ function createPhase3TargetRevisionIssuer(secret = crypto.randomBytes(32)) {
   return Object.freeze({ issue, matches });
 }
 
+function canonicalLocalPhase3Target(evidence = {}) {
+  if (!isPlainObject(evidence)) return null;
+  const username = ownValue(evidence, 'username');
+  const hash = ownValue(evidence, 'usernameContentHash');
+  if (!isPlainObject(username) || typeof hash !== 'string' || !/^[a-f0-9]{64}$/.test(hash)) {
+    return null;
+  }
+  const index = ownValue(username, 'index');
+  const email = typeof ownValue(username, 'email') === 'string'
+    ? normalizeEmail(username.email) : '';
+  const phone = normalizePhase3Phone(ownValue(username, 'phone'), {
+    maximumBytes: PHASE3_PHONE_USERNAME_MAX_BYTES,
+    allowNumber: true,
+    allowNull: true,
+  });
+  const rawStatus = ownValue(username, 'status');
+  const status = rawStatus === undefined ? ''
+    : typeof rawStatus === 'string' ? rawStatus.trim().toLowerCase() : null;
+  if (!Number.isSafeInteger(index) || index < 0
+      || !normalizeLocalPhase3SelectedKey('username:' + index)
+      || !email || phone === null || ownValue(username, 'phoneValid') === false
+      || ownValue(username, 'hasPassword') !== true
+      || status === null || status.length > 64 || (status && !/^[a-z0-9_-]+$/.test(status))
+      || TERMINAL_USERNAME_STATUSES.has(status)) return null;
+  return {
+    version: 1,
+    sourceMode: 'username',
+    username: { fileContentHash: hash, index, email, phone, status, hasPassword: true },
+  };
+}
+
+function createLocalPhase3TargetRevisionIssuer(secret = crypto.randomBytes(32)) {
+  const key = Buffer.from(secret);
+  if (key.length < 32) throw new Error('Phase3 revision 密钥长度不足');
+  function issue(evidence) {
+    const target = canonicalLocalPhase3Target(evidence);
+    if (!target) return null;
+    return 'phase3-local-v1.' + crypto.createHmac('sha256', key)
+      .update('gpt-register-panel/phase3-local/v1\0')
+      .update(JSON.stringify(target)).digest('base64url');
+  }
+  function matches(revision, evidence) {
+    if (typeof revision !== 'string' || !LOCAL_REVISION_PATTERN.test(revision)) return false;
+    const expected = issue(evidence);
+    return Boolean(expected && crypto.timingSafeEqual(
+      Buffer.from(revision, 'ascii'), Buffer.from(expected, 'ascii'),
+    ));
+  }
+  return Object.freeze({ issue, matches });
+}
+
 const processIssuer = createPhase3TargetRevisionIssuer();
+const localProcessIssuer = createLocalPhase3TargetRevisionIssuer();
 
 function phase3TargetRevision(evidence) {
   return processIssuer.issue(evidence);
@@ -163,6 +217,11 @@ function phase3TargetRevisionMatches(revision, evidence) {
 
 module.exports = {
   REVISION_PATTERN,
+  LOCAL_REVISION_PATTERN,
+  canonicalLocalPhase3Target,
+  createLocalPhase3TargetRevisionIssuer,
+  localPhase3TargetRevision: (evidence) => localProcessIssuer.issue(evidence),
+  localPhase3TargetRevisionMatches: (revision, evidence) => localProcessIssuer.matches(revision, evidence),
   canonicalPhase3Target,
   createPhase3TargetRevisionIssuer,
   phase3TargetRevision,
