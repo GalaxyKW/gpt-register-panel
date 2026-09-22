@@ -30,6 +30,18 @@ async function makeOwnerDead(db, jobId) {
   });
 }
 
+async function markLegacyTokenImportRunning(db, jobId) {
+  await db.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET status = 'running', started_at = ? WHERE id = ?`);
+    try {
+      statement.run([new Date().toISOString(), jobId]);
+    } finally {
+      statement.free();
+    }
+  });
+}
+
 function acknowledge(db, job, resolution = 'state_manually_reconciled', extra = {}) {
   return db.acknowledgeJobReconciliation(job.id, {
     actor: 'panel-admin',
@@ -89,7 +101,9 @@ test('restart releases clean queued work but persistently holds an unknown runni
   const db = new PanelDb(file);
   const claimKey = 'token_import';
   const running = await db.createJob('token_import', {}, 'tester', { claimKeys: [claimKey] });
-  await db.updateJob(running.id, { status: 'running', startedAt: new Date().toISOString() });
+  // Simulate a row written by an older panel version. Current code must force
+  // token imports through startMutationJob() so running always has a manifest.
+  await markLegacyTokenImportRunning(db, running.id);
   await makeOwnerDead(db, running.id);
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -231,10 +245,7 @@ test('an already-open database converts every provably dead running owner before
   const running = await first.createJob('token_import', {}, 'tester', {
     claimKeys: ['token_import'],
   });
-  await first.updateJob(running.id, {
-    status: 'running',
-    startedAt: new Date().toISOString(),
-  });
+  await markLegacyTokenImportRunning(first, running.id);
   await makeOwnerDead(first, running.id);
 
   await assert.rejects(

@@ -410,6 +410,17 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     canonicalKeys: ['email:phase3@example.test', 'phone:13800138000'],
     phase3TargetRevision: 'phase3-target-v1.' + 'B'.repeat(43),
   }, 'tester', { claimKeys: ['phase3:email:phase3@example.test'] });
+  // Simulate a pre-context panel version. Current token-import workers must
+  // enter running through startMutationJob() with a persisted manifest.
+  await db.write((database) => {
+    const statement = database.prepare(`UPDATE sync_jobs
+      SET status = 'running', started_at = ? WHERE id = ?`);
+    try {
+      statement.run([new Date().toISOString(), job.id]);
+    } finally {
+      statement.free();
+    }
+  });
   await db.updateJob(job.id, {
     status: 'failed',
     result: {
@@ -477,6 +488,7 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     assert.match(response.json.reconciliationContextDigest, /^[a-f0-9]{64}$/);
     assert.deepEqual(response.json.targetContext, {
       available: true,
+      coverage: 'exact_unknown_targets',
       total: 1,
       returned: 1,
       truncated: false,

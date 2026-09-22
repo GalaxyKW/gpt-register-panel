@@ -44,13 +44,19 @@ const {
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
+const {
+  MAX_TOKEN_IMPORT_CREATE_GROUP_IDS,
+  MAX_TOKEN_IMPORT_CONTEXT_TARGETS,
+  buildTokenImportReconciliationContext,
+} = require('./reconciliationContext');
 
 let syncQueue = Promise.resolve();
 const OPENAI_CODEX_OAUTH_CLIENT_ID = 'app_EMoamEEZ73f0CkXaXp7hrann';
 const POSTFLIGHT_READ_ATTEMPTS = 3;
 const POSTFLIGHT_RETRY_DELAY_MS = 25;
 const BACKUP_DIRECTORY_SCAN_LIMIT = 20_000;
-const MAX_IMPORT_GROUP_IDS = 1_000;
+const MAX_IMPORT_GROUP_IDS = MAX_TOKEN_IMPORT_CREATE_GROUP_IDS;
+const MAX_IMPORT_EXECUTABLE_TARGETS = MAX_TOKEN_IMPORT_CONTEXT_TARGETS;
 const IMPORT_GROUP_ELIGIBILITY_POLICY = 'active-openai-v1';
 const IMPORT_TARGET_BINDING_SCHEMA = 'sub2api-admin-target-v1';
 const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
@@ -1499,6 +1505,30 @@ function importPlanSummary(plan) {
   const counts = {};
   for (const item of plan) counts[item.action] = (counts[item.action] || 0) + 1;
   return { counts, items: plan.map(safeImportItem) };
+}
+
+function assertImportExecutableTargetLimit(plan) {
+  if (!Array.isArray(plan)) {
+    const error = new Error('导入计划无效，无法确认安全对账规模');
+    error.code = 'IMPORT_RECONCILIATION_TARGET_LIMIT';
+    throw error;
+  }
+  const executableCount = plan.reduce((count, item) => (
+    item?.conflictingVersions !== true
+      && (item?.action === 'create' || item?.action === 'update')
+      ? count + 1
+      : count
+  ), 0);
+  if (executableCount > MAX_IMPORT_EXECUTABLE_TARGETS) {
+    const error = new Error(
+      `单次最多导入 ${MAX_IMPORT_EXECUTABLE_TARGETS} 个新增或更新账号，请分批选择后重新检查差异`,
+    );
+    error.code = 'IMPORT_RECONCILIATION_TARGET_LIMIT';
+    error.actualCount = executableCount;
+    error.maximumCount = MAX_IMPORT_EXECUTABLE_TARGETS;
+    throw error;
+  }
+  return executableCount;
 }
 
 function configuredGroupIds() {
@@ -3102,6 +3132,7 @@ async function executeImport({
       }
       throwIfJobInterrupted(signal);
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
+      assertImportExecutableTargetLimit(fullPlan);
       const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
       const executionBinding = resolveImportExecutionBinding(client, fullPlan);
       throwIfJobInterrupted(signal);
@@ -3117,16 +3148,6 @@ async function executeImport({
         error.code = 'IMPORT_PLAN_STALE';
         throw error;
       }
-      throwIfJobInterrupted(signal);
-      if (db && jobId) {
-        if (typeof db.startMutationJob !== 'function') {
-          const error = new Error('任务执行安全检查不可用，尚未开始导入');
-          error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
-          throw error;
-        }
-        await db.startMutationJob(jobId);
-      }
-      throwIfJobInterrupted(signal);
       const fullSummary = importPlanSummary(fullPlan);
       writeLog(logger, 'info', 'import.plan_built', {
         jobId,
@@ -3199,6 +3220,23 @@ async function executeImport({
           skipped: true,
         };
       }
+
+      throwIfJobInterrupted(signal);
+      if (db && jobId) {
+        if (typeof db.startMutationJob !== 'function') {
+          const error = new Error('任务执行安全检查不可用，尚未开始导入');
+          error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+          throw error;
+        }
+        const reconciliationContext = buildTokenImportReconciliationContext(plan, {
+          snapshotVersion: current.version,
+          planIntentVersion: currentPlanIntentVersion,
+          groupBinding,
+          executionBinding,
+        });
+        await db.startMutationJob(jobId, { reconciliationContext });
+      }
+      throwIfJobInterrupted(signal);
 
       let backupPath = null;
       writeLog(logger, 'info', 'import.backup_started', { jobId, actor });
@@ -3532,6 +3570,7 @@ module.exports = {
   buildSnapshot,
   buildImportPlan,
   buildImportPlanIntentVersion,
+  assertImportExecutableTargetLimit,
   collectCandidates,
   compareTokenRecordFreshness,
   buildOAuthUpdatePayload,

@@ -11,6 +11,7 @@ const { PanelDb } = require('../backend/db');
 const {
   buildImportPlan,
   buildImportPlanIntentVersion,
+  assertImportExecutableTargetLimit,
   buildOAuthUpdatePayload,
   buildCodexSessionDocument,
   buildCodexImportIdempotencyKey,
@@ -70,6 +71,26 @@ const TEST_CREATE_POLICY = Object.freeze({
   updateExisting: false,
   skipDefaultGroupBind: true,
   confirmMixedChannelRisk: false,
+});
+
+test('import reconciliation target limit counts only executable create and update actions', () => {
+  const atLimit = [
+    ...Array.from({ length: 50 }, () => ({ action: 'create' })),
+    ...Array.from({ length: 50 }, () => ({ action: 'update' })),
+    ...Array.from({ length: 400 }, () => ({ action: 'skip' })),
+    { action: 'create', conflictingVersions: true },
+  ];
+  assert.equal(assertImportExecutableTargetLimit(atLimit), 100);
+
+  assert.throws(
+    () => assertImportExecutableTargetLimit([
+      ...atLimit,
+      { action: 'update' },
+    ]),
+    (error) => error.code === 'IMPORT_RECONCILIATION_TARGET_LIMIT'
+      && error.actualCount === 101
+      && error.maximumCount === 100,
+  );
 });
 
 test('Sub2API configured state requires a locally constructible client without network access', async () => {
@@ -4002,13 +4023,14 @@ test('skip-only imports preserve reviewed rows and report zero attempted mutatio
       resolveImportExecutionBinding(client, plan),
     );
 
+    let mutationStarts = 0;
     const result = await executeImport({
       snapshotVersion: preview.version,
       planIntentVersion,
       selectedKeys,
       actor: 'tester',
       jobId: 'skip-only-import-job',
-      db: { async startMutationJob() {} },
+      db: { async startMutationJob() { mutationStarts += 1; } },
       client,
     });
     assert.equal(result.imported.length, 1);
@@ -4024,6 +4046,97 @@ test('skip-only imports preserve reviewed rows and report zero attempted mutatio
     assert.equal(result.skippedCount, 1);
     assert.equal(result.skipped, true);
     assert.equal(result.backupPath, null);
+    assert.equal(mutationStarts, 0);
+  } finally {
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  }
+});
+
+test('token import persists a bounded reconciliation manifest before backup or remote write', async () => {
+  const { root } = fixture();
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+  ]);
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.SUB2API_BASE_URL = TEST_SUB2API_BASE_URL;
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  process.env.SUB2API_GROUP_IDS = '7';
+  delete process.env.SUB2API_GROUP_NAME;
+  try {
+    const previewClient = {
+      async listAccounts() { return []; },
+      async listGroups() { return [{ id: 7, platform: 'openai', status: 'active' }]; },
+    };
+    const preview = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: previewClient,
+    });
+    const selectedKeys = buildImportPlan(preview._internal.sources, [], [])
+      .map((item) => item.key);
+    const planIntentVersion = importPlanIntentForSnapshot(preview, selectedKeys, {
+      mode: 'explicit',
+      groupIds: [7],
+    });
+    let startOptions = null;
+    let backups = 0;
+    let writes = 0;
+    const startFailure = Object.assign(new Error('test start failure'), {
+      code: 'TEST_START_FAILURE',
+    });
+    await assert.rejects(
+      executeImport({
+        snapshotVersion: preview.version,
+        planIntentVersion,
+        selectedKeys,
+        actor: 'tester',
+        jobId: 'manifest-before-write-job',
+        db: {
+          async startMutationJob(_jobId, options) {
+            startOptions = options;
+            throw startFailure;
+          },
+        },
+        client: {
+          async listAccounts() { return []; },
+          async listGroups() { return [{ id: 7, platform: 'openai', status: 'active' }]; },
+          async exportAccounts() { backups += 1; return { accounts: [] }; },
+          async importCodexSession() { writes += 1; },
+          async applyOAuthCredentials() { writes += 1; },
+        },
+      }),
+      (error) => error === startFailure,
+    );
+    assert.equal(backups, 0);
+    assert.equal(writes, 0);
+    assert.equal(startOptions?.reconciliationContext?.schema,
+      'token-import-reconciliation-v1');
+    assert.equal(startOptions?.reconciliationContext?.coverage,
+      'conservative_all_planned_targets');
+    assert.equal(startOptions?.reconciliationContext?.snapshotVersion, preview.version);
+    assert.equal(startOptions?.reconciliationContext?.planIntentVersion, planIntentVersion);
+    assert.deepEqual(startOptions?.reconciliationContext?.createGroupBinding, {
+      mode: 'explicit',
+      groupIds: [7],
+    });
+    assert.deepEqual(
+      startOptions?.reconciliationContext?.executionTarget,
+      resolveImportTargetBinding({ baseUrl: TEST_SUB2API_BASE_URL }),
+    );
+    assert.equal(startOptions?.reconciliationContext?.targets.length, 1);
+    assert.match(startOptions.reconciliationContext.targets[0].targetDigest, /^[a-f0-9]{64}$/);
+    assert.match(startOptions.reconciliationContext.targets[0].sourceContentHash, /^[a-f0-9]{64}$/);
   } finally {
     for (const [name, value] of previous) {
       if (value === undefined) delete process.env[name];

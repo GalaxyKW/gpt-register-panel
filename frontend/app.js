@@ -1085,6 +1085,12 @@ function importPlanContractProblem(plan) {
       return '导入计划包含无法安全显示的文件路径，请重新检查差异';
     }
   }
+  const executableCount = plan.items.filter((item) => (
+    item.conflictingVersions !== true && ['create', 'update'].includes(item.action)
+  )).length;
+  if (executableCount > 100) {
+    return '单次 Token 导入最多执行 100 个新增/更新目标；跳过项不计入上限，请减少选择后重新检查差异';
+  }
   return '';
 }
 
@@ -2215,11 +2221,26 @@ function boundedReconciliationDisplay(value, maximum = 256) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   return text && text === value && text.length <= maximum
+    && text.normalize('NFC') === text
+    && !reconciliationDisplayLooksLikeCredential(text)
     && !/\[(?:redacted(?:-key-\d+| encoded text)?|uninspectable|unsupported|binary redacted|circular|accessor omitted|truncated|redaction(?: [a-z]+)* reached|oversized(?: [a-z]+)* omitted|oversized)\]/i
       .test(text)
-    && !/[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u.test(text)
+    && !/[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u.test(text)
     ? text
     : null;
+}
+
+function reconciliationDisplayLooksLikeCredential(value) {
+  const text = String(value || '');
+  return /(?:^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?=$|[^A-Za-z0-9_-])/.test(text)
+    || /(?:^|[^A-Za-z0-9])(?:bearer|basic)[ \t]+\S/i.test(text)
+    || /(?:^|[^A-Za-z0-9])["']?(?:(?:access|refresh|id)[._ -]?tokens?|api[._ -]?keys?|(?:client[._ -]?)?secrets?(?:[._ -]?keys?)?|tokens?|passwords?|passwds?|credentials?)["']?[ \t]*(?:=>|->|:=|[:=：＝→])/i.test(text)
+    || text.split(/[^A-Za-z0-9_+./=-]+/).some((chunk) => (
+      chunk.length >= 96
+        && !/^(?:[A-Za-z0-9_.-]+\/)*(?:(?:access|refresh|id)[._-]?tokens?|api[._-]?keys?|credentials?)[._-]?sha256=[a-f0-9]{64}(?:\.json)?$/i.test(chunk)
+        && /[A-Za-z]/.test(chunk)
+        && /\d/.test(chunk)
+    ));
 }
 
 function reconciliationSourcePath(value) {
@@ -2231,6 +2252,10 @@ function reconciliationSourcePath(value) {
   return segments.length >= 2
     && ['tokens', 'use_token'].includes(segments[0])
     && segments.every((segment) => segment && segment !== '.' && segment !== '..')
+    && segments.every((segment) => !reconciliationDisplayLooksLikeCredential(segment))
+    && !reconciliationDisplayLooksLikeCredential(
+      segments.at(-1).slice(0, -'.json'.length),
+    )
     && segments.at(-1).toLowerCase().endsWith('.json')
     ? text
     : null;
@@ -2250,22 +2275,31 @@ function reconciliationTargetIsValid(workflow, target) {
     ? target.phone
     : null;
   if (workflow === 'token_import') {
+    const sourceContentHashPresent = target.sourceContentHash !== undefined;
+    const targetDigestPresent = target.targetDigest !== undefined;
     if (!sourcePath || !['create', 'update'].includes(target.action)
         || !/^[a-f0-9]{16}$/.test(String(target.accessFingerprint || ''))
+        || sourceContentHashPresent !== targetDigestPresent
+        || (sourceContentHashPresent
+          && !/^[a-f0-9]{64}$/.test(String(target.sourceContentHash || '')))
+        || (targetDigestPresent
+          && !/^[a-f0-9]{64}$/.test(String(target.targetDigest || '')))
         || !Array.isArray(target.strongIdentityKeys)
         || target.strongIdentityKeys.length === 0
         || target.strongIdentityKeys.length > 10
         || new Set(target.strongIdentityKeys).size !== target.strongIdentityKeys.length
         || target.strongIdentityKeys.some((key) => {
           const text = boundedReconciliationDisplay(key, 520);
-          return !text || !/^(?:account|user):[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/
-            .test(text);
+          const match = /^(?:account|user):([A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511})$/
+            .exec(text || '');
+          return !match || !boundedReconciliationDisplay(match[1], 512);
         })) return false;
     const dimensions = target.strongIdentityKeys.map((key) => key.slice(0, key.indexOf(':')));
     if (new Set(dimensions).size !== dimensions.length) return false;
     const createTargetValid = target.action === 'create'
       && target.remoteAccountId === undefined
       && /^free\d{5}$/.test(String(target.accountName || ''))
+      && target.accountName !== 'free00000'
       && target.availability === 'not_present'
       && target.availabilityReason === 'not_in_sub2api';
     const updateTargetValid = target.action === 'update'
@@ -2322,14 +2356,21 @@ function reconciliationTargetSetIsValid(workflow, targets, total) {
   }
   if (workflow === 'token_import') {
     const paths = new Set();
-    const identities = new Set();
+    const identities = [];
     const remoteIds = new Set();
     const createNames = new Set();
+    const targetDigests = new Set();
     for (const target of targets) {
       if (paths.has(target.sourcePath)) return false;
       paths.add(target.sourcePath);
-      if (target.strongIdentityKeys.some((key) => identities.has(key))) return false;
-      for (const key of target.strongIdentityKeys) identities.add(key);
+      if (target.targetDigest !== undefined) {
+        if (targetDigests.has(target.targetDigest)) return false;
+        targetDigests.add(target.targetDigest);
+      }
+      if (identities.some((keys) => (
+        reconciliationStrongIdentitiesCompatible(target.strongIdentityKeys, keys)
+      ))) return false;
+      identities.push(target.strongIdentityKeys);
       if (target.action === 'update') {
         if (remoteIds.has(target.remoteAccountId)) return false;
         remoteIds.add(target.remoteAccountId);
@@ -2350,6 +2391,63 @@ function reconciliationTargetSetIsValid(workflow, targets, total) {
   return false;
 }
 
+function reconciliationStrongIdentitiesCompatible(leftKeys, rightKeys) {
+  const dimensions = (keys) => {
+    const result = Object.create(null);
+    for (const key of keys) {
+      const separator = key.indexOf(':');
+      result[key.slice(0, separator)] = key.slice(separator + 1);
+    }
+    return result;
+  };
+  const left = dimensions(leftKeys);
+  const right = dimensions(rightKeys);
+  let strongMatch = false;
+  for (const dimension of ['account', 'user']) {
+    if (left[dimension] !== undefined && right[dimension] !== undefined) {
+      if (left[dimension] !== right[dimension]) return false;
+      strongMatch = true;
+    }
+  }
+  return strongMatch;
+}
+
+function reconciliationCreateGroupBindingIsValid(context, targets, coverage) {
+  const binding = context?.createGroupBinding;
+  if (coverage !== 'conservative_all_planned_targets') return binding === undefined;
+  if (!binding || typeof binding !== 'object' || Array.isArray(binding)
+      || Object.keys(binding).length !== 2
+      || !Object.hasOwn(binding, 'mode') || !Object.hasOwn(binding, 'groupIds')
+      || !Array.isArray(binding.groupIds) || binding.groupIds.length > 1000
+      || binding.groupIds.some((id) => typeof id !== 'number'
+        || !Number.isSafeInteger(id) || id <= 0)
+      || binding.groupIds.some((id, index) => index > 0 && binding.groupIds[index - 1] >= id)) {
+    return false;
+  }
+  const hasCreates = targets.some((target) => target.action === 'create');
+  return hasCreates
+    ? ['explicit', 'sub2api_default'].includes(binding.mode) && binding.groupIds.length > 0
+    : binding.mode === 'not_applicable' && binding.groupIds.length === 0;
+}
+
+function reconciliationExecutionTargetIsValid(context, coverage) {
+  if (coverage !== 'conservative_all_planned_targets') {
+    return context.manifestDigest === undefined
+      && context.snapshotVersion === undefined
+      && context.planIntentVersion === undefined
+      && context.executionTarget === undefined;
+  }
+  const target = context.executionTarget;
+  return /^[a-f0-9]{64}$/.test(String(context.manifestDigest || ''))
+    && /^[a-f0-9]{64}$/.test(String(context.snapshotVersion || ''))
+    && /^sync-plan-v1\.[A-Za-z0-9_-]{43}$/.test(String(context.planIntentVersion || ''))
+    && target && typeof target === 'object' && !Array.isArray(target)
+    && Object.keys(target).length === 2
+    && Object.hasOwn(target, 'fingerprint') && Object.hasOwn(target, 'currentMatches')
+    && /^sha256\.[A-Za-z0-9_-]{43}$/.test(String(target.fingerprint || ''))
+    && typeof target.currentMatches === 'boolean';
+}
+
 function reconciliationReviewDetailError(detail, expected) {
   if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return '人工核对详情格式无效';
   if (detail.version !== 1 || detail.id !== expected.id
@@ -2363,19 +2461,39 @@ function reconciliationReviewDetailError(detail, expected) {
   }
   if (!terminalJob(detail.status) || detail.reconciliationHold !== true
       || detail.reconciliationResolved !== false) return '任务已不再处于可确认的待核对状态';
+  if (!['claim_keys', 'all_future_jobs'].includes(detail.reconciliationHoldScope)
+      || detail.reconciliationBlockScope !== 'all_mutating_operations') {
+    return '任务持久保护范围无效';
+  }
   const context = detail.targetContext;
   if (!context || context.available !== true || !Array.isArray(context.targets)
       || context.targets.length === 0 || context.targets.length > 100) {
     return '任务未提供可安全核对的目标信息';
+  }
+  const coverage = context.coverage;
+  if (!['exact_unknown_targets', 'conservative_all_planned_targets'].includes(coverage)
+      || (coverage === 'conservative_all_planned_targets' && detail.type !== 'token_import')) {
+    return '人工核对目标覆盖范围无效';
   }
   const total = context.total;
   const returned = context.returned;
   if (!Number.isSafeInteger(total) || !Number.isSafeInteger(returned)
       || total < returned || returned !== context.targets.length
       || context.truncated !== (total > returned)
+      || (coverage === 'conservative_all_planned_targets'
+        && context.targets.some((target) => (
+          !/^[a-f0-9]{64}$/.test(String(target.sourceContentHash || ''))
+          || !/^[a-f0-9]{64}$/.test(String(target.targetDigest || ''))
+        )))
+      || !reconciliationExecutionTargetIsValid(context, coverage)
+      || !reconciliationCreateGroupBindingIsValid(context, context.targets, coverage)
       || !context.targets.every((target) => reconciliationTargetIsValid(detail.type, target))
       || !reconciliationTargetSetIsValid(detail.type, context.targets, total)) {
     return '人工核对目标详情不完整或格式无效';
+  }
+  if (coverage === 'conservative_all_planned_targets'
+      && context.executionTarget.currentMatches !== true) {
+    return '当前 Sub2API 执行目标与原任务不一致，请恢复原配置后再核对';
   }
   return null;
 }
@@ -2388,6 +2506,25 @@ function reconciliationTargetContextText(detail) {
     token_cleanup: '过期 Token 清理',
   };
   const lines = ['工作流：' + workflowLabels[detail.type]];
+  if (detail.targetContext.coverage === 'conservative_all_planned_targets') {
+    lines.push('重要：任务在执行中断后无法确定实际写到哪一项；以下列出本次计划内所有可能受影响目标。请使用来源内容摘要对应的文件版本和任务前备份逐项核对并修正实际状态；无法证明时不要确认。只能选择“实际状态已人工修正为期望值”。');
+    const binding = detail.targetContext.createGroupBinding;
+    lines.push('Sub2API 执行目标指纹：'
+      + detail.targetContext.executionTarget.fingerprint
+      + (detail.targetContext.executionTarget.currentMatches
+        ? '（与当前配置一致）'
+        : '（与当前配置不一致）'));
+    lines.push('对账清单摘要：' + detail.targetContext.manifestDigest);
+    if (binding.mode === 'not_applicable') {
+      lines.push('本次计划不包含创建账号，无创建分组绑定。');
+    } else {
+      const label = binding.mode === 'sub2api_default'
+        ? '预览时的 Sub2API 默认分组已解析为固定 ID'
+        : '显式分组 ID';
+      lines.push('本次所有创建目标的' + label + '：'
+        + binding.groupIds.map((id) => '#' + id).join('、'));
+    }
+  }
   detail.targetContext.targets.forEach((target, index) => {
     const fields = [];
     if (target.cleanupScope === 'expired_tokens') {
@@ -2396,6 +2533,7 @@ function reconciliationTargetContextText(detail) {
       fields.push('目标数量 ' + target.targetCount);
     }
     if (target.sourcePath) fields.push('文件 ' + target.sourcePath);
+    if (target.sourceContentHash) fields.push('来源内容 SHA-256 ' + target.sourceContentHash);
     if (target.contentHash) fields.push('内容 SHA-256 ' + target.contentHash);
     if (target.remoteAccountId) fields.push('Sub2API ID ' + target.remoteAccountId);
     if (target.accountName) fields.push('名称 ' + target.accountName);
@@ -2407,7 +2545,11 @@ function reconciliationTargetContextText(detail) {
       fields.push('提交时调度 ' + (target.baselineSchedulable ? '启用' : '停用'));
     }
     if (target.identityDigest) fields.push('强身份摘要 ' + target.identityDigest);
-    if (target.targetDigest) fields.push('目标状态摘要 ' + target.targetDigest);
+    if (target.targetDigest) {
+      fields.push((detail.type === 'account_test'
+        ? '提交时目标状态摘要 '
+        : '对账计划摘要 ') + target.targetDigest);
+    }
     if (target.phase3TargetRevision) fields.push('Phase 3 目标版本 ' + target.phase3TargetRevision);
     if (target.strongIdentityKeys) {
       fields.push('来源强身份 ' + target.strongIdentityKeys.join(' / '));
@@ -2466,13 +2608,14 @@ async function openReconciliationDialog() {
     state.reconciliationAckTarget = {
       ...expected,
       contextDigest: detail.reconciliationContextDigest,
+      coverage: detail.targetContext.coverage,
       reviewVerified: true,
     };
     if (elements.reconciliationAckJobId) elements.reconciliationAckJobId.textContent = detail.id;
     if (elements.reconciliationAckScope) {
       elements.reconciliationAckScope.textContent = detail.reconciliationHoldScope === 'all_future_jobs'
         ? '全部新写操作（旧版任务无法还原原保护键）'
-        : '当前键已保留；安全策略阻止全部新写操作';
+        : '原任务保护键已保留；安全策略阻止全部新写操作';
     }
     if (elements.reconciliationAckDigest) {
       elements.reconciliationAckDigest.textContent = detail.reconciliationClaimDigest;
@@ -2480,7 +2623,18 @@ async function openReconciliationDialog() {
     if (elements.reconciliationAckContext) {
       elements.reconciliationAckContext.textContent = reconciliationTargetContextText(detail);
     }
-    if (elements.reconciliationAckResolution) elements.reconciliationAckResolution.value = '';
+    if (elements.reconciliationAckResolution) {
+      const conservative = detail.targetContext.coverage === 'conservative_all_planned_targets';
+      for (const option of Array.from(elements.reconciliationAckResolution.options || [])) {
+        option.disabled = conservative
+          && option.value !== ''
+          && option.value !== 'state_manually_reconciled';
+      }
+      // Keep the placeholder selected even when only the manual-repair
+      // conclusion remains enabled, so the administrator must make an
+      // explicit choice after reviewing every conservative target.
+      elements.reconciliationAckResolution.value = '';
+    }
     if (elements.reconciliationAckConfirmation) elements.reconciliationAckConfirmation.value = '';
     setReconciliationDialogError('');
     setReconciliationDialogPending(false);
@@ -2519,6 +2673,11 @@ async function submitReconciliationAcknowledgement(event) {
   const confirmation = String(elements.reconciliationAckConfirmation?.value || '');
   if (!RECONCILIATION_ACK_RESOLUTIONS.has(resolution)) {
     setReconciliationDialogError('请选择与人工核对结果完全一致的结论。');
+    return;
+  }
+  if (target.coverage === 'conservative_all_planned_targets'
+      && resolution !== 'state_manually_reconciled') {
+    setReconciliationDialogError('该任务列出了所有可能受影响目标；请逐项核对并修正后选择“实际状态已人工修正为期望值”。');
     return;
   }
   if (confirmation !== RECONCILIATION_ACK_CONFIRMATION) {

@@ -268,6 +268,27 @@ test('frontend refuses import plans with visually ambiguous operational paths', 
   assert.match(context.invisibleSuperseded, /无法安全显示的文件路径/);
 });
 
+test('frontend import plan limit counts writes while allowing a 500-row review', () => {
+  const planContract = sourceSection(
+    'function validImportPlanIntentVersion',
+    'function planItemCreatesAccount',
+  );
+  const context = {};
+  vm.runInNewContext(planContract + `
+    const atLimit = [
+      ...Array.from({ length: 50 }, () => ({ action: 'create', reason: 'token_only' })),
+      ...Array.from({ length: 50 }, () => ({ action: 'update', reason: 'token_changed' })),
+      ...Array.from({ length: 400 }, () => ({ action: 'skip', reason: 'already_in_sync' })),
+    ];
+    accepted = importPlanContractProblem({ items: atLimit });
+    rejected = importPlanContractProblem({
+      items: [...atLimit, { action: 'update', reason: 'token_changed' }],
+    });
+  `, context);
+  assert.equal(context.accepted, '');
+  assert.match(context.rejected, /最多执行 100 个新增\/更新目标/);
+});
+
 test('frontend treats prototype property names as unknown contract values', () => {
   const labelContract = sourceSection('function badgeClass', 'function sourceClass');
   const planContract = sourceSection(

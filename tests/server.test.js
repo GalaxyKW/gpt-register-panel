@@ -44,6 +44,7 @@ const {
 const { listExpiredTokens } = require('../backend/tokenCleanup');
 const { PanelDb } = require('../backend/db');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
+const { buildSnapshot, buildImportPlan } = require('../backend/sync');
 const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 const validImportPlanIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
 
@@ -117,6 +118,7 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
     [409, [
       'IDEMPOTENCY_KEY_REUSED',
       'IMPORT_PLAN_STALE',
+      'IMPORT_RECONCILIATION_TARGET_LIMIT',
       'PHASE3_DUPLICATE',
       'JOB_ALREADY_CLAIMED',
       'JOB_QUEUE_FULL',
@@ -135,6 +137,8 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH',
       'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
       'JOB_RECONCILIATION_CONTEXT_INCOMPLETE',
+      'JOB_RECONCILIATION_TARGET_MISMATCH',
+      'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION',
     ]],
     [413, ['REQUEST_BODY_TOO_LARGE']],
     [502, [
@@ -189,6 +193,17 @@ test('public API errors expose only fixed codes, messages, and statuses', () => 
       assert.equal(JSON.stringify(output.body).includes(privateMarker), false, code);
     }
   }
+
+  const importLimit = publicApiError(Object.assign(new Error('private import plan'), {
+    code: 'IMPORT_RECONCILIATION_TARGET_LIMIT',
+  }), { write: true });
+  assert.deepEqual(importLimit, {
+    statusCode: 409,
+    body: {
+      error: 'IMPORT_RECONCILIATION_TARGET_LIMIT',
+      message: '单次 Token 导入最多执行 100 个新增/更新目标；跳过项不计入上限，请减少选择后重新检查差异',
+    },
+  });
 
   const malicious = new Error('private-message-must-not-escape');
   malicious.code = 'MALICIOUS_PUBLIC_CODE';
@@ -816,8 +831,11 @@ test('reconciliation review enforces the exact token-import producer matrix', ()
   };
   assert.equal(review(updateItem).targetContext.targets[0].remoteAccountId, 266);
 
+  const compactJwt = 'abcdefgh.ijklmnop.qrstuvwx';
+
   const invalidItems = [
     { ...baseItem, accountId: 266 },
+    { ...baseItem, accountName: 'free00000' },
     { ...baseItem, availability: 'unknown', availabilityReason: 'panel_clock_invalid' },
     { ...updateItem, accountId: '266' },
     { ...updateItem, availability: 'available', availabilityReason: 'sub2api_available' },
@@ -837,6 +855,12 @@ test('reconciliation review enforces the exact token-import producer matrix', ()
     { ...baseItem, relativePath: 'vis\u00adible.json' },
     { ...baseItem, sourceIdentityKeys: ['account:visible\u061cvalue'] },
     { ...baseItem, accountName: 'free00001\ufe0f' },
+    { ...baseItem, relativePath: compactJwt + '.json' },
+    { ...baseItem, relativePath: 'Bearer test-only-canary.json' },
+    { ...baseItem, relativePath: 'api_key=test-only-canary.json' },
+    { ...baseItem, sourceIdentityKeys: [`account:${compactJwt}`] },
+    { ...baseItem, sourceIdentityKeys: [`account:${'opaque9'.repeat(16)}`] },
+    { ...baseItem, email: 'te\u0301st@example.test' },
   ];
   for (const item of invalidItems) {
     assert.throws(
@@ -844,6 +868,65 @@ test('reconciliation review enforces the exact token-import producer matrix', ()
       (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
     );
   }
+});
+
+test('legacy token-import review distinguishes users within a shared account', () => {
+  const imported = [1, 2].map((number) => ({
+    source: 'tokens',
+    relativePath: `shared-account-${number}.json`,
+    accountId: null,
+    accountName: `free0000${number}`,
+    email: `user-${number}@example.test`,
+    action: 'create',
+    fingerprints: { access: String(number).repeat(16) },
+    sourceIdentityKeys: [
+      'account:shared-workspace',
+      `user:distinct-user-${number}`,
+      `email:user-${number}@example.test`,
+    ],
+    availability: 'not_present',
+    availabilityReason: 'not_in_sub2api',
+    requiresReconciliation: true,
+  }));
+  const detail = reconciliationReviewDetail({
+    id: 'job_' + 'e'.repeat(24),
+    type: 'token_import',
+    status: 'failed',
+    payload: {},
+    result: {
+      requiresReconciliation: true,
+      reconciliationHold: true,
+      reconciliationResolved: false,
+      reconciliationClaimDigest: 'f'.repeat(64),
+      reconciliationCount: imported.length,
+      imported,
+    },
+  });
+  assert.equal(detail.targetContext.complete, undefined);
+  assert.equal(detail.targetContext.total, 2);
+  assert.equal(detail.targetContext.targets.length, 2);
+
+  imported[1].sourceIdentityKeys = [
+    'account:shared-workspace',
+    'email:user-2@example.test',
+  ];
+  assert.throws(
+    () => reconciliationReviewDetail({
+      id: 'job_' + 'e'.repeat(24),
+      type: 'token_import',
+      status: 'failed',
+      payload: {},
+      result: {
+        requiresReconciliation: true,
+        reconciliationHold: true,
+        reconciliationResolved: false,
+        reconciliationClaimDigest: 'f'.repeat(64),
+        reconciliationCount: imported.length,
+        imported,
+      },
+    }),
+    (error) => error.code === 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
+  );
 });
 
 test('reconciliation review requires the complete account-test result identity set', () => {
@@ -2458,7 +2541,7 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
   process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
   process.env.PANEL_PHASE3_ENABLED = '1';
   const receiptCalls = new Map();
-  const liveCalls = { phase3: 0, accountTest: 0, cleanup: 0, create: 0 };
+  const liveCalls = { sync: 0, phase3: 0, accountTest: 0, cleanup: 0, create: 0 };
   let admissions = 0;
   let server;
   const responseJobId = 'job_' + '2'.repeat(24);
@@ -2487,6 +2570,10 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
       accountTestClientFactory() {
         liveCalls.accountTest += 1;
         throw new Error('Sub2API live read must not run after a locked replay');
+      },
+      syncClientFactory() {
+        liveCalls.sync += 1;
+        throw new Error('large import live preflight must not run after a locked replay');
       },
       expiredTokenLister() {
         liveCalls.cleanup += 1;
@@ -2519,7 +2606,11 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
       ['/api/sync/import', {
         snapshotVersion: 'a'.repeat(64),
         planIntentVersion: validImportPlanIntentVersion,
-        selectedKeys: ['token:tokens:tokens/not-present.json'],
+        selectedKeys: Array.from({ length: 101 }, (_, index) => (
+          'token:tokens:tokens/not-present-'
+            + String(index).padStart(3, '0')
+            + '.json'
+        )),
       }],
       ['/api/phase3', {
         accounts: [{
@@ -2556,7 +2647,13 @@ test('the locked receipt recheck wins before every mutable live validator', asyn
       account_test: 2,
       token_cleanup: 2,
     });
-    assert.deepEqual(liveCalls, { phase3: 0, accountTest: 0, cleanup: 0, create: 0 });
+    assert.deepEqual(liveCalls, {
+      sync: 0,
+      phase3: 0,
+      accountTest: 0,
+      cleanup: 0,
+      create: 0,
+    });
   } finally {
     await closeHttpServer(server);
     if (previous.writeEnabled === undefined) delete process.env.PANEL_WRITE_ENABLED;
@@ -3312,6 +3409,148 @@ test('Phase3 claim keys include every canonical email and phone identity', () =>
   } finally {
     if (previousRoot === undefined) delete process.env.GPT_REGISTER_ROOT;
     else process.env.GPT_REGISTER_ROOT = previousRoot;
+  }
+});
+
+test('sync preview and fresh import reject 101 executable targets before persistence or enqueue', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'gpt-register-panel-import-limit-'));
+  const previous = new Map([
+    ['GPT_REGISTER_ROOT', process.env.GPT_REGISTER_ROOT],
+    ['PANEL_WRITE_ENABLED', process.env.PANEL_WRITE_ENABLED],
+    ['PANEL_ALLOW_INSECURE_WRITE', process.env.PANEL_ALLOW_INSECURE_WRITE],
+    ['SUB2API_BASE_URL', process.env.SUB2API_BASE_URL],
+    ['SUB2API_ADMIN_API_KEY', process.env.SUB2API_ADMIN_API_KEY],
+    ['SUB2API_GROUP_IDS', process.env.SUB2API_GROUP_IDS],
+    ['SUB2API_GROUP_NAME', process.env.SUB2API_GROUP_NAME],
+  ]);
+  let server = null;
+  process.env.GPT_REGISTER_ROOT = root;
+  process.env.PANEL_WRITE_ENABLED = '1';
+  process.env.PANEL_ALLOW_INSECURE_WRITE = '1';
+  process.env.SUB2API_BASE_URL = 'http://127.0.0.1:18080';
+  process.env.SUB2API_ADMIN_API_KEY = 'test-only-key';
+  delete process.env.SUB2API_GROUP_IDS;
+  delete process.env.SUB2API_GROUP_NAME;
+  try {
+    fs.mkdirSync(path.join(root, 'tokens'));
+    fs.mkdirSync(path.join(root, 'use_token'));
+    fs.writeFileSync(path.join(root, 'username.json'), '[]');
+    for (let index = 0; index < 101; index += 1) {
+      const suffix = String(index).padStart(3, '0');
+      const accessToken = [
+        'header',
+        Buffer.from(JSON.stringify({
+          sub: 'limit-subject-' + suffix,
+          'https://api.openai.com/auth': {
+            chatgpt_account_id: 'limit-account-' + suffix,
+            chatgpt_user_id: 'limit-user-' + suffix,
+          },
+        })).toString('base64url'),
+        'signature',
+      ].join('.');
+      fs.writeFileSync(path.join(root, 'tokens', 'limit-' + suffix + '.json'), JSON.stringify({
+        access_token: accessToken,
+        expires_at: '2099-01-01T00:00:00.000Z',
+      }));
+    }
+
+    const setupSnapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
+      rootDirectory: root,
+      includeRaw: true,
+      includeInternal: true,
+      requireCompleteSources: true,
+      client: { async listAccounts() { return []; } },
+    });
+    const setupPlan = buildImportPlan(
+      setupSnapshot._internal.sources,
+      setupSnapshot._internal.accounts,
+      [],
+    );
+    assert.equal(setupPlan.length, 101);
+    assert.equal(setupPlan.every((item) => item.action === 'create'), true);
+    const selectedKeys = setupPlan.map((item) => item.key);
+
+    let snapshotSaves = 0;
+    let receiptReads = 0;
+    let submissionCreates = 0;
+    let admissions = 0;
+    let factoryCalls = 0;
+    let accountReads = 0;
+    let groupReads = 0;
+    const client = {
+      baseUrl: 'http://127.0.0.1:18080',
+      async listAccounts() { accountReads += 1; return []; },
+      async listGroups() { groupReads += 1; return []; },
+    };
+    server = createServer({
+      db: {
+        dbPath: '/tmp/unused-panel-import-target-limit.sqlite3',
+        async saveSnapshot() {
+          snapshotSaves += 1;
+          return 'unexpected-snapshot';
+        },
+        async getMutationReceipt() {
+          receiptReads += 1;
+          return null;
+        },
+        async createMutationSubmission() {
+          submissionCreates += 1;
+          throw new Error('oversized import must not be durably enqueued');
+        },
+      },
+      jobManager: {
+        shuttingDown: false,
+        activeCount: 0,
+        async withAdmission(callback) {
+          admissions += 1;
+          return callback(new AbortController().signal);
+        },
+        begin() { throw new Error('oversized import worker must not start'); },
+        async shutdown() { return { active: 0, interrupted: [] }; },
+      },
+      admissionControlPlaneLock: async (callback) => callback(),
+      syncClientFactory() {
+        factoryCalls += 1;
+        return client;
+      },
+      logger: {
+        requestId: () => 'import-target-limit-test',
+        info() {},
+        warn() {},
+        error() {},
+        probe() { return true; },
+      },
+    });
+    await new Promise((resolve, reject) => {
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    const baseUrl = 'http://127.0.0.1:' + server.address().port;
+    const preview = await postJson(baseUrl, '/api/sync/preview', { selectedKeys });
+    assert.equal(preview.status, 409);
+    assert.equal(JSON.parse(preview.body).error, 'IMPORT_RECONCILIATION_TARGET_LIMIT');
+    assert.equal(snapshotSaves, 0);
+    assert.equal(groupReads, 0);
+
+    const submitted = await postJson(baseUrl, '/api/sync/import', {
+      snapshotVersion: setupSnapshot.version,
+      planIntentVersion: validImportPlanIntentVersion,
+      selectedKeys,
+    });
+    assert.equal(submitted.status, 409);
+    assert.equal(JSON.parse(submitted.body).error, 'IMPORT_RECONCILIATION_TARGET_LIMIT');
+    assert.equal(receiptReads, 2);
+    assert.equal(admissions, 1);
+    assert.equal(submissionCreates, 0);
+    assert.equal(factoryCalls, 2);
+    assert.equal(accountReads, 2);
+    assert.equal(groupReads, 0);
+  } finally {
+    await closeHttpServer(server);
+    for (const [name, value] of previous) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
 

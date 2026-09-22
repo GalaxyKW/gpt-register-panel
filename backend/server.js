@@ -16,10 +16,12 @@ const {
   buildSnapshot,
   buildImportPlan,
   buildImportPlanIntentVersion,
+  assertImportExecutableTargetLimit,
   importPlanSummary,
   executeImport,
   resolveImportGroupBinding,
   resolveImportExecutionBinding,
+  resolveImportTargetBinding,
   configuredForSub2Api,
   confirmedSub2ApiRead,
   isImportPlanIntentVersion,
@@ -78,6 +80,11 @@ const {
   promptDigest,
   requestIdempotencyKey,
 } = require('./idempotency');
+const {
+  MAX_TOKEN_IMPORT_CONTEXT_TARGETS,
+  TOKEN_IMPORT_CONTEXT_COVERAGE,
+  normalizeReconciliationContext,
+} = require('./reconciliationContext');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -118,6 +125,7 @@ const TOKEN_CLEANUP_JOB_TYPE = 'token_cleanup';
 const TOKEN_CLEANUP_CLAIM_KEY = 'token_cleanup:expired_tokens';
 // One additional summary target is included in reconciliation responses.
 const MAX_TOKEN_CLEANUP_REVIEW_TARGETS = 99;
+const EXACT_RECONCILIATION_COVERAGE = 'exact_unknown_targets';
 const MUTATION_WORKFLOWS = Object.freeze({
   import: 'token_import',
   phase3: 'phase3',
@@ -302,6 +310,7 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
 const PUBLIC_CONFLICT_ERRORS = new Set([
   'IDEMPOTENCY_KEY_REUSED',
   'IMPORT_PLAN_STALE',
+  'IMPORT_RECONCILIATION_TARGET_LIMIT',
   'PHASE3_DUPLICATE',
   'JOB_ALREADY_CLAIMED',
   'JOB_QUEUE_FULL',
@@ -320,6 +329,8 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH',
   'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
   'JOB_RECONCILIATION_CONTEXT_INCOMPLETE',
+  'JOB_RECONCILIATION_TARGET_MISMATCH',
+  'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION',
 ]);
 const PUBLIC_FORBIDDEN_ERRORS = new Set([
   'PHASE3_DISABLED',
@@ -380,6 +391,8 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   ACCOUNT_TEST_BASELINE_INVALID: '无法安全确认账号测试基线，请稍后重试',
   IMPORT_PLAN_VERSION_REQUIRED: '缺少有效的导入计划版本，请重新检查差异',
   IMPORT_PLAN_STALE: '导入计划已变化，请重新检查差异',
+  IMPORT_RECONCILIATION_TARGET_LIMIT:
+    '单次 Token 导入最多执行 100 个新增/更新目标；跳过项不计入上限，请减少选择后重新检查差异',
   PHASE3_DISABLED: 'Phase 3 未启用',
   WRITE_DISABLED: '写操作未启用',
   SUB2API_READ_FAILED: '无法确认 Sub2API 当前账号列表',
@@ -395,6 +408,10 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   TOKEN_CLEANUP_REVIEW_TARGET_LIMIT: '过期 token 超过 99 个，当前无法安全一次清理，已拒绝操作',
   JOB_RECONCILIATION_NOT_FOUND: '待对账任务不存在',
   JOB_RECONCILIATION_ADMIN_REQUIRED: '只允许经过认证的面板管理员执行该操作',
+  JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION:
+    '保守对账范围必须先人工修正全部列出的目标状态',
+  JOB_RECONCILIATION_TARGET_MISMATCH:
+    '当前 Sub2API 执行目标与原任务不一致，保护键未解除',
   AUDIT_LOG_UNAVAILABLE: '审计日志不可用，已拒绝写操作',
   GPT_REGISTER_PATH_INVALID: 'gpt_register 来源路径不可信或不可读取',
   GPT_REGISTER_PATH_PERMISSIONS_INVALID: 'gpt_register 来源权限不安全',
@@ -1084,7 +1101,7 @@ function requestLogPath(pathname) {
   return pathname.startsWith('/api/') ? '/api/<unknown>' : '<unknown-path>';
 }
 
-const UNSAFE_REVIEW_TEXT = /[\p{Cc}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
+const UNSAFE_REVIEW_TEXT = /[\p{Cc}\p{Cs}\p{Default_Ignorable_Code_Point}\p{Zl}\p{Zp}]/u;
 const REVIEW_REDACTION_SENTINEL = /\[(?:redacted(?:-key-\d+| encoded text)?|uninspectable|unsupported|binary redacted|circular|accessor omitted|truncated|redaction(?: [a-z]+)* reached|oversized(?: [a-z]+)* omitted|oversized)\]/i;
 const REVIEW_STRONG_IDENTITY_VALUE = /^[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/;
 const REVIEW_UNAVAILABLE_REASONS = new Set([
@@ -1120,11 +1137,26 @@ const REVIEW_AVAILABILITY_REASONS = new Set([
   'panel_clock_invalid',
 ]);
 
+function reviewTextLooksLikeCredential(value) {
+  const text = String(value || '');
+  return /(?:^|[^A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?=$|[^A-Za-z0-9_-])/.test(text)
+    || /(?:^|[^A-Za-z0-9])(?:bearer|basic)[ \t]+\S/i.test(text)
+    || /(?:^|[^A-Za-z0-9])["']?(?:(?:access|refresh|id)[._ -]?tokens?|api[._ -]?keys?|(?:client[._ -]?)?secrets?(?:[._ -]?keys?)?|tokens?|passwords?|passwds?|credentials?)["']?[ \t]*(?:=>|->|:=|[:=：＝→])/i.test(text)
+    || text.split(/[^A-Za-z0-9_+./=-]+/).some((chunk) => (
+      chunk.length >= 96
+        && !/^(?:[A-Za-z0-9_.-]+\/)*(?:(?:access|refresh|id)[._-]?tokens?|api[._-]?keys?|credentials?)[._-]?sha256=[a-f0-9]{64}(?:\.json)?$/i.test(chunk)
+        && /[A-Za-z]/.test(chunk)
+        && /\d/.test(chunk)
+    ));
+}
+
 function boundedReviewText(value, maximum = 256) {
   if (typeof value !== 'string') return null;
   const text = value.trim();
   if (!text || text !== value || text.length > maximum
-      || UNSAFE_REVIEW_TEXT.test(text) || REVIEW_REDACTION_SENTINEL.test(text)) return null;
+      || text.normalize('NFC') !== text
+      || UNSAFE_REVIEW_TEXT.test(text) || REVIEW_REDACTION_SENTINEL.test(text)
+      || reviewTextLooksLikeCredential(text)) return null;
   return redactText(text) === text ? text : null;
 }
 
@@ -1135,6 +1167,8 @@ function safeReviewRelativePath(value) {
       || path.isAbsolute(text) || text.includes('\\')) return null;
   const segments = text.split('/');
   if (segments.some((segment) => !segment || segment === '.' || segment === '..')
+      || segments.some(reviewTextLooksLikeCredential)
+      || reviewTextLooksLikeCredential(segments.at(-1).slice(0, -'.json'.length))
       || !segments.at(-1).toLowerCase().endsWith('.json')) return null;
   return text;
 }
@@ -1236,7 +1270,70 @@ function safeReviewStrongIdentities(value) {
   return { keys, email, valid: keys.length > 0 };
 }
 
+function reviewStrongIdentitiesCompatible(leftKeys, rightKeys) {
+  const dimensions = (keys) => {
+    const result = Object.create(null);
+    for (const key of keys) {
+      const separator = key.indexOf(':');
+      result[key.slice(0, separator)] = key.slice(separator + 1);
+    }
+    return result;
+  };
+  const left = dimensions(leftKeys);
+  const right = dimensions(rightKeys);
+  let strongMatch = false;
+  for (const dimension of ['account', 'user']) {
+    if (left[dimension] !== undefined && right[dimension] !== undefined) {
+      if (left[dimension] !== right[dimension]) return false;
+      strongMatch = true;
+    }
+  }
+  return strongMatch;
+}
+
 function tokenImportReviewTargets(job) {
+  const storedContext = safeOwnDataProperty(job, 'reconciliationContext');
+  if (storedContext !== undefined && storedContext !== null) {
+    const context = normalizeReconciliationContext('token_import', storedContext);
+    if (!context) {
+      return {
+        total: 0,
+        targets: [],
+        complete: false,
+        coverage: TOKEN_IMPORT_CONTEXT_COVERAGE,
+      };
+    }
+    const targets = context.targets.map((target) => ({
+      targetDigest: target.targetDigest,
+      sourcePath: target.sourcePath,
+      sourceContentHash: target.sourceContentHash,
+      remoteAccountId: target.remoteAccountId || undefined,
+      accountName: target.accountName || undefined,
+      email: target.email || undefined,
+      action: target.action,
+      accessFingerprint: target.accessFingerprint,
+      strongIdentityKeys: [...target.strongIdentityKeys],
+      availability: target.availability,
+      availabilityReason: target.availabilityReason,
+    }));
+    return {
+      total: targets.length,
+      targets,
+      complete: targets.length > 0,
+      coverage: context.coverage,
+      manifestDigest: context.manifestDigest,
+      snapshotVersion: context.snapshotVersion,
+      planIntentVersion: context.planIntentVersion,
+      executionTarget: {
+        schema: context.executionTarget.schema,
+        fingerprint: context.executionTarget.fingerprint,
+      },
+      createGroupBinding: {
+        mode: context.createGroupBinding.mode,
+        groupIds: [...context.createGroupBinding.groupIds],
+      },
+    };
+  }
   const resultItems = job?.result?.imported;
   const expectedTotal = job?.result?.reconciliationCount;
   if (!Array.isArray(resultItems) || resultItems.length > 1000
@@ -1252,7 +1349,7 @@ function tokenImportReviewTargets(job) {
   }
   const targets = [];
   const seenPaths = new Set();
-  const seenStrongIdentities = new Set();
+  const seenStrongIdentities = [];
   const seenRemoteAccountIds = new Set();
   const seenCreateNames = new Set();
   for (const item of uncertain) {
@@ -1286,11 +1383,14 @@ function tokenImportReviewTargets(job) {
       && /^[^\s@]+@[^\s@]+$/.test(email)
       ? email
       : null;
-    const overlappingIdentity = strongIdentities.keys.some((key) => seenStrongIdentities.has(key));
+    const overlappingIdentity = seenStrongIdentities.some((keys) => (
+      reviewStrongIdentitiesCompatible(strongIdentities.keys, keys)
+    ));
     const createTargetValid = action === 'create'
       && item.accountId === null
       && !remoteAccountId
       && /^free\d{5}$/.test(accountName || '')
+      && accountName !== 'free00000'
       && availability === 'not_present'
       && availabilityReason === 'not_in_sub2api';
     const updateTargetValid = action === 'update'
@@ -1316,7 +1416,7 @@ function tokenImportReviewTargets(job) {
       return { total: expectedTotal, targets: [], complete: false };
     }
     seenPaths.add(sourcePath);
-    for (const key of strongIdentities.keys) seenStrongIdentities.add(key);
+    seenStrongIdentities.push(strongIdentities.keys);
     if (action === 'update') seenRemoteAccountIds.add(remoteAccountId);
     else seenCreateNames.add(accountName);
     targets.push({
@@ -1331,7 +1431,12 @@ function tokenImportReviewTargets(job) {
       availabilityReason: availabilityReason || undefined,
     });
   }
-  return { total: expectedTotal, targets, complete: targets.length === expectedTotal };
+  return {
+    total: expectedTotal,
+    targets,
+    complete: targets.length === expectedTotal,
+    coverage: EXACT_RECONCILIATION_COVERAGE,
+  };
 }
 
 function accountTestReviewTargets(job) {
@@ -1516,7 +1621,7 @@ function tokenCleanupReviewContext(job) {
   };
 }
 
-function reconciliationReviewDetail(job) {
+function reconciliationReviewDetail(job, options = {}) {
   if (!job) {
     const error = new Error('待对账任务不存在');
     error.code = 'JOB_RECONCILIATION_NOT_FOUND';
@@ -1524,11 +1629,32 @@ function reconciliationReviewDetail(job) {
   }
   const digest = String(job?.result?.reconciliationClaimDigest || '');
   if (!['succeeded', 'partial', 'failed', 'interrupted'].includes(job.status)
+      || (job.reconciliationHold !== undefined && job.reconciliationHold !== true)
       || job?.result?.requiresReconciliation !== true
       || job?.result?.reconciliationHold !== true
       || job?.result?.reconciliationResolved === true
       || !/^[a-f0-9]{64}$/.test(digest)) {
     const error = new Error('该任务当前没有可供人工核对的持久阻挡');
+    error.code = 'JOB_RECONCILIATION_NOT_HELD';
+    throw error;
+  }
+  const durableDigest = safeOwnDataProperty(job, 'reconciliationClaimDigest');
+  const durableScope = safeOwnDataProperty(job, 'reconciliationScope');
+  const durableClaimKeys = safeOwnDataProperty(job, 'claimKeys');
+  const authoritativeHoldMetadataPresent = durableDigest !== undefined
+    || durableScope !== undefined || durableClaimKeys !== undefined;
+  const expectedHoldScope = durableScope === 'global'
+    ? 'all_future_jobs'
+    : durableScope === 'claims' ? 'claim_keys' : null;
+  if (authoritativeHoldMetadataPresent
+      && (job.reconciliationHold !== true
+        || !/^[a-f0-9]{64}$/.test(String(durableDigest || ''))
+        || durableDigest !== digest
+        || !expectedHoldScope
+        || !Array.isArray(durableClaimKeys) || durableClaimKeys.length === 0
+        || job.result.reconciliationHoldScope !== expectedHoldScope
+        || job.result.reconciliationBlockScope !== 'all_mutating_operations')) {
+    const error = new Error('待对账任务的持久保护信息不一致');
     error.code = 'JOB_RECONCILIATION_NOT_HELD';
     throw error;
   }
@@ -1545,6 +1671,13 @@ function reconciliationReviewDetail(job) {
   }
   const returnedTargets = context.targets.slice(0, 100);
   const totalTargets = context.total;
+  const coverage = context.coverage || EXACT_RECONCILIATION_COVERAGE;
+  if (![EXACT_RECONCILIATION_COVERAGE, TOKEN_IMPORT_CONTEXT_COVERAGE].includes(coverage)
+      || (coverage === TOKEN_IMPORT_CONTEXT_COVERAGE && job.type !== 'token_import')) {
+    const error = new Error('人工对账目标覆盖范围无效，保护键未解除');
+    error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE';
+    throw error;
+  }
   const detail = {
     version: 1,
     id: job.id,
@@ -1557,10 +1690,35 @@ function reconciliationReviewDetail(job) {
     reconciliationBlockScope: safeReviewCode(job.result.reconciliationBlockScope) || null,
     targetContext: {
       available: true,
+      coverage,
       total: totalTargets,
       returned: returnedTargets.length,
       truncated: totalTargets > returnedTargets.length,
       targets: returnedTargets,
+      ...(context.manifestDigest
+        ? {
+            manifestDigest: context.manifestDigest,
+            snapshotVersion: context.snapshotVersion,
+            planIntentVersion: context.planIntentVersion,
+          }
+        : {}),
+      ...(context.executionTarget
+        ? {
+            executionTarget: {
+              fingerprint: context.executionTarget.fingerprint,
+              currentMatches: typeof options.currentImportTargetFingerprint === 'string'
+                && /^sha256\.[A-Za-z0-9_-]{43}$/.test(options.currentImportTargetFingerprint)
+                ? tokensEqual(
+                    context.executionTarget.fingerprint,
+                    options.currentImportTargetFingerprint,
+                  )
+                : null,
+            },
+          }
+        : {}),
+      ...(context.createGroupBinding
+        ? { createGroupBinding: context.createGroupBinding }
+        : {}),
     },
   };
   detail.reconciliationContextDigest = crypto.createHash('sha256')
@@ -1579,8 +1737,19 @@ function reconciliationReviewDetail(job) {
   return detail;
 }
 
-function validateReconciliationAcknowledgeContext(job, expectedContextDigest) {
-  const detail = reconciliationReviewDetail(job);
+function validateReconciliationAcknowledgeContext(
+  job,
+  expectedContextDigest,
+  resolution,
+  options = {},
+) {
+  const detail = reconciliationReviewDetail(job, options);
+  if (detail.targetContext.executionTarget
+      && detail.targetContext.executionTarget.currentMatches !== true) {
+    const error = new Error('当前 Sub2API 执行目标与原任务不一致，保护键未解除');
+    error.code = 'JOB_RECONCILIATION_TARGET_MISMATCH';
+    throw error;
+  }
   if (typeof expectedContextDigest !== 'string'
       || !/^[a-f0-9]{64}$/.test(expectedContextDigest)
       || !tokensEqual(detail.reconciliationContextDigest, expectedContextDigest)) {
@@ -1595,6 +1764,12 @@ function validateReconciliationAcknowledgeContext(job, expectedContextDigest) {
       || context.returned !== context.targets.length) {
     const error = new Error('人工对账目标信息不完整，保护键未解除');
     error.code = 'JOB_RECONCILIATION_CONTEXT_INCOMPLETE';
+    throw error;
+  }
+  if (context.coverage === TOKEN_IMPORT_CONTEXT_COVERAGE
+      && resolution !== 'state_manually_reconciled') {
+    const error = new Error('该任务保守列出了所有可能受影响目标，必须逐项核对并修正状态后再确认');
+    error.code = 'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION';
     throw error;
   }
   const actualClaims = Array.isArray(job.claimKeys) ? job.claimKeys : [];
@@ -2937,6 +3112,19 @@ function createServer(options = {}) {
     || ((clientOptions) => new Sub2ApiAdminClient(clientOptions));
   const syncClientFactory = options.syncClientFactory
     || ((clientOptions) => new Sub2ApiAdminClient(clientOptions));
+  const syncTargetBindingResolver = options.syncTargetBindingResolver
+    || ((clientOptions) => resolveImportTargetBinding(syncClientFactory(clientOptions)));
+  const currentImportTargetFingerprint = (logContext) => {
+    const binding = syncTargetBindingResolver({ logger, logContext });
+    if (!binding || typeof binding !== 'object' || Array.isArray(binding)
+        || binding.schema !== 'sub2api-admin-target-v1'
+        || !/^sha256\.[A-Za-z0-9_-]{43}$/.test(String(binding.fingerprint || ''))) {
+      const error = new Error('无法安全确认当前 Sub2API 执行目标');
+      error.code = 'IMPORT_TARGET_BINDING_INVALID';
+      throw error;
+    }
+    return binding.fingerprint;
+  };
   const expiredTokenLister = options.expiredTokenLister || listExpiredTokens;
   const admissionControlPlaneLock = options.admissionControlPlaneLock || withControlPlaneLock;
   let server;
@@ -3193,6 +3381,7 @@ function createServer(options = {}) {
           throw error;
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
+        assertImportExecutableTargetLimit(plan);
         const client = getSyncClient({ logger, logContext: { requestId, actor } });
         const groupBinding = await resolveImportGroupBinding(client, plan, {
           signal: requestDisconnectController.signal,
@@ -3277,6 +3466,52 @@ function createServer(options = {}) {
               const lockedReceipt = await existingMutationReceipt(db, idempotency, actor);
               if (lockedReceipt) {
                 return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
+              }
+              if (selectedKeys.length > MAX_TOKEN_IMPORT_CONTEXT_TARGETS) {
+                let admissionSyncClient = null;
+                const current = await buildSnapshot(
+                  new URLSearchParams('withSub2api=1'),
+                  {
+                    includeRaw: true,
+                    includeInternal: true,
+                    requireCompleteSources: true,
+                    logger,
+                    requestId,
+                    actor,
+                    clientFactory: (clientOptions = {}) => {
+                      if (!admissionSyncClient) {
+                        admissionSyncClient = syncClientFactory(clientOptions);
+                      }
+                      return admissionSyncClient;
+                    },
+                    signal,
+                  },
+                );
+                if (!confirmedSub2ApiRead(current)) {
+                  const error = new Error(
+                    '无法确认 Sub2API 当前账号列表，已停止创建导入任务',
+                  );
+                  error.code = 'SUB2API_READ_FAILED';
+                  throw error;
+                }
+                if (current.version !== normalizedSnapshotVersion) {
+                  const error = new Error('导入计划已变化，请重新检查差异');
+                  error.code = 'IMPORT_PLAN_STALE';
+                  throw error;
+                }
+                const currentPlan = buildImportPlan(
+                  current._internal.sources,
+                  current._internal.accounts,
+                  selectedKeys,
+                );
+                const executableCount = assertImportExecutableTargetLimit(currentPlan);
+                writeLog(logger, 'info', 'import.admission_plan_checked', {
+                  requestId,
+                  actor,
+                  selectedCount: selectedKeys.length,
+                  executableCount,
+                });
+                throwIfJobInterrupted(signal);
               }
               const createdSubmission = await db.createMutationSubmission({
                 ...idempotency,
@@ -4006,10 +4241,24 @@ function createServer(options = {}) {
             resolution: body.resolution,
             claimDigest: body.claimDigest,
             contextDigest: body.contextDigest,
-            validateContext: (job) => validateReconciliationAcknowledgeContext(
-              job,
-              body.contextDigest,
-            ),
+            validateContext: (job) => {
+              const reviewOptions = job.type === 'token_import'
+                  && job.reconciliationContext?.executionTarget
+                ? {
+                    currentImportTargetFingerprint: currentImportTargetFingerprint({
+                      requestId,
+                      actor,
+                      workflow: 'reconciliation_acknowledge',
+                    }),
+                  }
+                : {};
+              return validateReconciliationAcknowledgeContext(
+                job,
+                body.contextDigest,
+                body.resolution,
+                reviewOptions,
+              );
+            },
             beforeRelease: (fields) => {
               throwIfJobInterrupted(signal);
               assertAuditLogCheckpoint(logger, 'job.reconciliation_acknowledge_checkpoint', {
@@ -4071,8 +4320,23 @@ function createServer(options = {}) {
         return;
       }
       try {
-        const job = await db.getJob(reconciliationReviewRoute.jobId);
-        jsonResponse(response, 200, reconciliationReviewDetail(job));
+        if (!db || typeof db.getJobForReconciliation !== 'function') {
+          const error = new Error('人工对账安全读取不可用');
+          error.code = 'JOB_RECONCILIATION_GUARD_UNAVAILABLE';
+          throw error;
+        }
+        const job = await db.getJobForReconciliation(reconciliationReviewRoute.jobId);
+        const reviewOptions = job?.type === 'token_import'
+            && job.reconciliationContext?.executionTarget
+          ? {
+              currentImportTargetFingerprint: currentImportTargetFingerprint({
+                requestId,
+                actor,
+                workflow: 'reconciliation_detail',
+              }),
+            }
+          : {};
+        jsonResponse(response, 200, reconciliationReviewDetail(job, reviewOptions));
       } catch (error) {
         sendPublicApiError(response, error, {
           fallbackCode: 'JOB_RECONCILIATION_DETAIL_FAILED',

@@ -44,9 +44,11 @@ function validReviewDetail(job) {
     reconciliationResolved: false,
     reconciliationClaimDigest: job.result.reconciliationClaimDigest,
     reconciliationContextDigest: 'd'.repeat(64),
-    reconciliationHoldScope: 'claims',
+    reconciliationHoldScope: 'claim_keys',
+    reconciliationBlockScope: 'all_mutating_operations',
     targetContext: {
       available: true,
+      coverage: 'exact_unknown_targets',
       total: 1,
       returned: 1,
       truncated: false,
@@ -166,6 +168,10 @@ test('frontend rejects weak reconciliation targets for every mutating workflow',
   }), false);
   assert.equal(context.reconciliationTargetIsValid('token_import', {
     ...validCreate,
+    accountName: 'free00000',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
     availability: 'unknown',
     availabilityReason: 'panel_clock_invalid',
   }), false);
@@ -176,6 +182,10 @@ test('frontend rejects weak reconciliation targets for every mutating workflow',
   assert.equal(context.reconciliationTargetIsValid('token_import', {
     ...validCreate,
     sourcePath: 'tokens/[unsupported].json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/ambiguous-\ud800.json',
   }), false);
   assert.equal(context.reconciliationTargetIsValid('token_import', {
     ...validCreate,
@@ -205,9 +215,48 @@ test('frontend rejects weak reconciliation targets for every mutating workflow',
     ...validCreate,
     strongIdentityKeys: ['account:one', 'account:two'],
   }), false);
+  const compactJwt = 'eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ0ZXN0LW9ubHkifQ.signature12345';
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: `tokens/${compactJwt}.json`,
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/access_token=test-only-canary.json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/Bearer test-only-canary.json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/Basic test-only-canary.json',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: [`account:${compactJwt}`],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: [`account:${'opaque9'.repeat(16)}`],
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    strongIdentityKeys: ['account:sk-account-structured'],
+  }), true);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    sourcePath: 'tokens/sk-live-structured-name.json',
+    email: 'sk-live-user@example.test',
+    strongIdentityKeys: ['account:sk-account-structured', 'user:sk-user-structured'],
+  }), true);
   assert.equal(context.reconciliationTargetIsValid('token_import', {
     ...validCreate,
     email: 'UPPER@example.test',
+  }), false);
+  assert.equal(context.reconciliationTargetIsValid('token_import', {
+    ...validCreate,
+    email: 'te\u0301st@example.test',
   }), false);
   const validUpdate = {
     ...validCreate,
@@ -227,6 +276,221 @@ test('frontend rejects weak reconciliation targets for every mutating workflow',
     availability: 'available',
     availabilityReason: 'sub2api_available',
   }), false);
+  const sharedAccountTargets = [
+    {
+      ...validCreate,
+      sourcePath: 'tokens/shared-account-user-1.json',
+      accountName: 'free00003',
+      strongIdentityKeys: ['account:workspace-a', 'user:user-1'],
+    },
+    {
+      ...validCreate,
+      sourcePath: 'tokens/shared-account-user-2.json',
+      accountName: 'free00004',
+      strongIdentityKeys: ['account:workspace-a', 'user:user-2'],
+    },
+  ];
+  assert.equal(context.reconciliationTargetSetIsValid(
+    'token_import',
+    sharedAccountTargets,
+    sharedAccountTargets.length,
+  ), true);
+  const ambiguousPartialIdentity = {
+    ...validCreate,
+    sourcePath: 'tokens/shared-account-partial.json',
+    accountName: 'free00005',
+    strongIdentityKeys: ['account:workspace-a'],
+  };
+  assert.equal(context.reconciliationTargetSetIsValid(
+    'token_import',
+    [sharedAccountTargets[0], ambiguousPartialIdentity],
+    2,
+  ), false);
+});
+
+test('frontend requires complete digests and manual repair for conservative import coverage', () => {
+  const contracts = section(
+    'function boundedReconciliationDisplay',
+    'async function openReconciliationDialog',
+  );
+  const context = {
+    terminalJob: (status) => ['succeeded', 'partial', 'failed', 'interrupted'].includes(status),
+  };
+  vm.runInNewContext(contracts, context);
+  const job = heldJob();
+  const detail = validReviewDetail(job);
+  const invalidScope = validReviewDetail(job);
+  invalidScope.reconciliationHoldScope = 'claims';
+  assert.equal(context.reconciliationReviewDetailError(invalidScope, {
+    id: job.id,
+    type: job.type,
+    digest: job.result.reconciliationClaimDigest,
+  }), '任务持久保护范围无效');
+  detail.targetContext.coverage = 'conservative_all_planned_targets';
+  detail.targetContext.manifestDigest = '1'.repeat(64);
+  detail.targetContext.snapshotVersion = '2'.repeat(64);
+  detail.targetContext.planIntentVersion = `sync-plan-v1.${'A'.repeat(43)}`;
+  detail.targetContext.executionTarget = {
+    fingerprint: `sha256.${'T'.repeat(43)}`,
+    currentMatches: true,
+  };
+  detail.targetContext.createGroupBinding = {
+    mode: 'not_applicable',
+    groupIds: [],
+  };
+  detail.targetContext.targets[0].sourceContentHash = 'e'.repeat(64);
+  detail.targetContext.targets[0].targetDigest = 'f'.repeat(64);
+  assert.equal(context.reconciliationReviewDetailError(detail, {
+    id: job.id,
+    type: job.type,
+    digest: job.result.reconciliationClaimDigest,
+  }), null);
+  delete detail.targetContext.targets[0].sourceContentHash;
+  assert.equal(context.reconciliationReviewDetailError(detail, {
+    id: job.id,
+    type: job.type,
+    digest: job.result.reconciliationClaimDigest,
+  }), '人工核对目标详情不完整或格式无效');
+  detail.targetContext.targets[0].sourceContentHash = 'e'.repeat(64);
+  detail.targetContext.executionTarget.currentMatches = false;
+  assert.equal(context.reconciliationReviewDetailError(detail, {
+    id: job.id,
+    type: job.type,
+    digest: job.result.reconciliationClaimDigest,
+  }), '当前 Sub2API 执行目标与原任务不一致，请恢复原配置后再核对');
+  const createTarget = {
+    ...detail.targetContext.targets[0],
+    action: 'create',
+    remoteAccountId: undefined,
+    accountName: 'free00001',
+    availability: 'not_present',
+    availabilityReason: 'not_in_sub2api',
+  };
+  for (const mode of ['explicit', 'sub2api_default']) {
+    assert.equal(context.reconciliationCreateGroupBindingIsValid({
+      createGroupBinding: { mode, groupIds: [7, 9] },
+    }, [createTarget], 'conservative_all_planned_targets'), true);
+  }
+  for (const createGroupBinding of [
+    { mode: 'explicit', groupIds: [9, 7] },
+    { mode: 'explicit', groupIds: [7, 7] },
+    { mode: 'explicit', groupIds: ['7'] },
+    { mode: 'explicit', groupIds: [7], extra: true },
+  ]) {
+    assert.equal(context.reconciliationCreateGroupBindingIsValid({
+      createGroupBinding,
+    }, [createTarget], 'conservative_all_planned_targets'), false);
+  }
+  const createDetail = JSON.parse(JSON.stringify(detail));
+  createDetail.targetContext.executionTarget.currentMatches = true;
+  createDetail.targetContext.targets = [createTarget];
+  createDetail.targetContext.createGroupBinding = {
+    mode: 'sub2api_default',
+    groupIds: [7, 9],
+  };
+  const display = context.reconciliationTargetContextText(createDetail);
+  assert.match(display, /默认分组已解析为固定 ID/);
+  assert.match(display, /#7、#9/);
+  assert.match(source,
+    /target\.coverage === 'conservative_all_planned_targets'[\s\S]*resolution !== 'state_manually_reconciled'/);
+  assert.match(source, /以下列出本次计划内所有可能受影响目标/);
+});
+
+test('conservative reconciliation dialog permits only an explicit manual-repair conclusion', async () => {
+  const holdContracts = section('function reconciliationHoldJobs', 'function renderJob');
+  const dialogContracts = section('function setReconciliationDialogError', 'function stopJobPolling');
+  const job = heldJob();
+  const conservativeDetail = validReviewDetail(job);
+  conservativeDetail.targetContext.coverage = 'conservative_all_planned_targets';
+  conservativeDetail.targetContext.manifestDigest = '1'.repeat(64);
+  conservativeDetail.targetContext.snapshotVersion = '2'.repeat(64);
+  conservativeDetail.targetContext.planIntentVersion = `sync-plan-v1.${'A'.repeat(43)}`;
+  conservativeDetail.targetContext.executionTarget = {
+    fingerprint: `sha256.${'T'.repeat(43)}`,
+    currentMatches: true,
+  };
+  conservativeDetail.targetContext.createGroupBinding = {
+    mode: 'not_applicable',
+    groupIds: [],
+  };
+  conservativeDetail.targetContext.targets[0].sourceContentHash = 'e'.repeat(64);
+  conservativeDetail.targetContext.targets[0].targetDigest = 'f'.repeat(64);
+  const exactDetail = validReviewDetail(job);
+  const options = [
+    { value: '', disabled: false },
+    { value: 'operation_applied', disabled: false },
+    { value: 'operation_not_applied', disabled: false },
+    { value: 'state_manually_reconciled', disabled: false },
+  ];
+  const requests = [];
+  let confirmCalls = 0;
+  let getCount = 0;
+  const context = {
+    state: {
+      job,
+      snapshot: { readOnly: false },
+      reconciliationAckPending: false,
+      reconciliationAckTarget: null,
+      reconciliationHolds: { total: 1 },
+    },
+    elements: {
+      reconciliationAckButton: {},
+      reconciliationAckDialog: { showModal() {}, returnValue: '' },
+      reconciliationAckJobId: { textContent: '' },
+      reconciliationAckScope: { textContent: '' },
+      reconciliationAckDigest: { textContent: '' },
+      reconciliationAckContext: { textContent: '' },
+      reconciliationAckResolution: {
+        value: '',
+        disabled: false,
+        options,
+        focus() {},
+      },
+      reconciliationAckConfirmation: { value: '', disabled: false },
+      reconciliationAckCancel: { disabled: false },
+      reconciliationAckConfirm: { disabled: false },
+      reconciliationAckError: { hidden: true, textContent: '' },
+    },
+    terminalJob: (status) => ['succeeded', 'partial', 'failed', 'interrupted'].includes(status),
+    RECONCILIATION_ACK_CONFIRMATION: '我已按强身份完成人工核对',
+    RECONCILIATION_ACK_RESOLUTIONS: new Set([
+      'operation_applied', 'operation_not_applied', 'state_manually_reconciled',
+    ]),
+    RECONCILIATION_AVAILABILITY_REASONS: new Set(['sub2api_status_error']),
+    window: { confirm() { confirmCalls += 1; return true; } },
+    async apiFetch(url, requestOptions) {
+      requests.push({ url, options: requestOptions });
+      if (requestOptions) throw new Error('conservative acknowledgement must not be posted');
+      getCount += 1;
+      const detail = getCount === 1 ? conservativeDetail : exactDetail;
+      return { ok: true, status: 200, json: async () => detail };
+    },
+    async resumeActiveJob() {},
+    updateActionState() {},
+    showNotice() {},
+    jobNeedsReconciliation: () => false,
+    reconciliationNoticeForJobs: () => '',
+  };
+  vm.runInNewContext(holdContracts + '\n' + dialogContracts, context);
+
+  await context.openReconciliationDialog();
+  assert.equal(context.elements.reconciliationAckResolution.value, '');
+  assert.deepEqual(options.map((option) => option.disabled), [false, true, true, false]);
+
+  context.elements.reconciliationAckResolution.value = 'operation_applied';
+  context.elements.reconciliationAckConfirmation.value = '我已按强身份完成人工核对';
+  await context.submitReconciliationAcknowledgement({
+    preventDefault() {},
+    submitter: { value: 'confirm' },
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(confirmCalls, 0);
+  assert.match(context.elements.reconciliationAckError.textContent, /逐项核对并修正/);
+
+  await context.openReconciliationDialog();
+  assert.equal(context.elements.reconciliationAckResolution.value, '');
+  assert.deepEqual(options.map((option) => option.disabled), [false, false, false, false]);
+  assert.equal(requests.length, 2);
 });
 
 test('frontend offers acknowledgement only for an unresolved persisted hold', () => {
@@ -399,8 +663,10 @@ test('frontend fetches and validates target detail before submitting the path-bo
             reconciliationClaimDigest: job.result.reconciliationClaimDigest,
             reconciliationContextDigest: 'd'.repeat(64),
             reconciliationHoldScope: 'all_future_jobs',
+            reconciliationBlockScope: 'all_mutating_operations',
             targetContext: {
               available: true,
+              coverage: 'exact_unknown_targets',
               total: 1,
               returned: 1,
               truncated: false,
