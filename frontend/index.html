@@ -160,7 +160,7 @@
   </main>
 
   <dialog id="adminTokenDialog" class="auth-dialog" aria-labelledby="adminTokenTitle" aria-describedby="adminTokenHelp">
-    <form method="dialog" class="auth-dialog-form">
+    <form id="adminTokenForm" method="dialog" class="auth-dialog-form">
       <div class="auth-dialog-heading">
         <span class="auth-dialog-mark" aria-hidden="true"></span>
         <div>
@@ -170,8 +170,10 @@
       </div>
       <label class="auth-dialog-field" for="adminTokenInput">
         <span>面板管理员令牌</span>
-        <input id="adminTokenInput" name="panel-token" type="password" autocomplete="off" spellcheck="false" maxlength="4096" required>
+        <input id="adminTokenInput" name="panel-token" type="password" autocomplete="off" spellcheck="false" minlength="16" maxlength="4096" pattern="[\x21-\x7e]{16,4096}" aria-describedby="adminTokenFormat adminTokenError" required>
       </label>
+      <p id="adminTokenFormat">请输入登录面板的管理员令牌：16–4096 位英文、数字或半角符号，不含空格或中文。这里不是人工核对确认语的输入框。</p>
+      <p id="adminTokenError" class="dialog-error" role="alert" hidden></p>
       <div class="auth-dialog-actions">
         <button class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
         <button class="button button-primary" type="submit" value="confirm">验证并重试</button>

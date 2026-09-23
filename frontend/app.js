@@ -84,8 +84,10 @@ const elements = {
   reconciliationAckCancel: document.querySelector('#reconciliationAckCancel'),
   reconciliationAckConfirm: document.querySelector('#reconciliationAckConfirm'),
   adminTokenDialog: document.querySelector('#adminTokenDialog'),
+  adminTokenForm: document.querySelector('#adminTokenForm'),
   adminTokenInput: document.querySelector('#adminTokenInput'),
   adminTokenOrigin: document.querySelector('#adminTokenOrigin'),
+  adminTokenError: document.querySelector('#adminTokenError'),
 };
 
 const RECONCILIATION_ACK_CONFIRMATION = '我已按强身份完成人工核对';
@@ -333,23 +335,61 @@ function sourceClass(value) {
 }
 
 let memoryPanelToken = '';
+let panelTokenStorageUnavailable = false;
+let panelTokenNeedsReplacement = false;
+
+function isValidPanelToken(token) {
+  // Match the server's credential policy before passing a value to Headers.
+  // Do not trim, encode or otherwise turn invalid input into a different
+  // credential. A reconciliation confirmation is not an administrator token.
+  return typeof token === 'string' && /^[\x21-\x7e]{16,4096}$/.test(token);
+}
+
+function panelTokenFormatMessage() {
+  return '管理员令牌须为 16–4096 位英文、数字或半角符号，不能含中文、空格、换行或不可见字符；请勿填写人工核对确认语。';
+}
 
 function readPanelToken() {
-  try {
-    const stored = sessionStorage.getItem('panelToken');
-    if (stored) memoryPanelToken = stored;
-  } catch {}
+  if (!panelTokenStorageUnavailable) {
+    try {
+      memoryPanelToken = sessionStorage.getItem('panelToken') || '';
+    } catch {
+      panelTokenStorageUnavailable = true;
+    }
+  }
+  if (memoryPanelToken && !isValidPanelToken(memoryPanelToken)) {
+    clearPanelToken();
+    panelTokenNeedsReplacement = true;
+  }
   return memoryPanelToken;
 }
 
 function savePanelToken(token) {
-  memoryPanelToken = String(token || '');
-  try { sessionStorage.setItem('panelToken', memoryPanelToken); } catch {}
+  if (!isValidPanelToken(token)) {
+    const error = new Error(panelTokenFormatMessage());
+    error.code = 'PANEL_ADMIN_TOKEN_INVALID';
+    throw error;
+  }
+  memoryPanelToken = token;
+  panelTokenNeedsReplacement = false;
+  try {
+    sessionStorage.setItem('panelToken', token);
+    panelTokenStorageUnavailable = sessionStorage.getItem('panelToken') !== token;
+  } catch {
+    // A readable but unwritable store may retain an old rejected value. Do
+    // not let it replace this tab's newly entered valid in-memory credential.
+    panelTokenStorageUnavailable = true;
+  }
 }
 
 function clearPanelToken() {
   memoryPanelToken = '';
-  try { sessionStorage.removeItem('panelToken'); } catch {}
+  try {
+    sessionStorage.removeItem('panelToken');
+    panelTokenStorageUnavailable = sessionStorage.getItem('panelToken') !== null;
+  } catch {
+    panelTokenStorageUnavailable = true;
+  }
 }
 
 function apiHeaders(options = {}) {
@@ -368,6 +408,7 @@ let adminTokenRequest = null;
 function requestAdminToken() {
   if (adminTokenRequest) return adminTokenRequest;
   const dialog = elements.adminTokenDialog;
+  const form = elements.adminTokenForm;
   const input = elements.adminTokenInput;
   if (!dialog || !input || typeof dialog.showModal !== 'function') return Promise.resolve('');
 
@@ -375,18 +416,56 @@ function requestAdminToken() {
   let finished = false;
   const request = new Promise((resolve) => { resolveRequest = resolve; });
   adminTokenRequest = request;
+  const showInputError = (message) => {
+    if (elements.adminTokenError) {
+      elements.adminTokenError.hidden = !message;
+      elements.adminTokenError.textContent = message;
+    }
+    input.setCustomValidity?.(message);
+    if (message) input.setAttribute?.('aria-invalid', 'true');
+    else input.removeAttribute?.('aria-invalid');
+  };
+  const onInput = () => showInputError('');
+  const onInvalid = () => showInputError(panelTokenFormatMessage());
+  const onSubmit = (event) => {
+    if (event.submitter?.value === 'cancel') return;
+    if (!isValidPanelToken(input.value)) {
+      event.preventDefault();
+      showInputError(panelTokenFormatMessage());
+      input.focus();
+    }
+  };
   const finish = (token) => {
     if (finished) return;
     finished = true;
     dialog.removeEventListener('close', onClose);
+    form?.removeEventListener?.('submit', onSubmit);
+    input.removeEventListener?.('input', onInput);
+    input.removeEventListener?.('invalid', onInvalid);
     input.value = '';
+    showInputError('');
     if (adminTokenRequest === request) adminTokenRequest = null;
     resolveRequest(token);
   };
-  const onClose = () => finish(dialog.returnValue === 'confirm' ? input.value : '');
-  dialog.addEventListener('close', onClose, { once: true });
+  const onClose = () => {
+    if (dialog.returnValue !== 'confirm') { finish(''); return; }
+    if (isValidPanelToken(input.value)) { finish(input.value); return; }
+    // Programmatic close() bypasses form validation. Do not save such input
+    // or complete the shared authentication request with an invalid value.
+    input.value = '';
+    dialog.returnValue = '';
+    showInputError(panelTokenFormatMessage());
+    try { dialog.showModal(); input.focus(); } catch { finish(''); }
+  };
+  dialog.addEventListener('close', onClose);
+  form?.addEventListener?.('submit', onSubmit);
+  input.addEventListener?.('input', onInput);
+  input.addEventListener?.('invalid', onInvalid);
   dialog.returnValue = '';
   input.value = '';
+  showInputError(panelTokenNeedsReplacement
+    ? '浏览器保存的管理员令牌格式无效，已忽略。请重新输入管理员令牌，不要填写人工核对确认语。'
+    : '');
   if (elements.adminTokenOrigin) elements.adminTokenOrigin.textContent = window.location.origin;
   try {
     dialog.showModal();

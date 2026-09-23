@@ -2134,7 +2134,7 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
     },
     showModal() {
       queueMicrotask(() => {
-        input.value = 'new-admin-token';
+        input.value = 'new-admin-token-16';
         this.returnValue = 'confirm';
         listeners.get('close')?.();
       });
@@ -2182,7 +2182,7 @@ test('frontend retries a 401 with a fresh bounded signal and a password dialog t
   assert.equal(calls.length, 2);
   assert.notEqual(calls[0].options.signal, calls[1].options.signal);
   assert.equal(calls[0].options.headers.get('x-panel-token'), null);
-  assert.equal(calls[1].options.headers.get('x-panel-token'), 'new-admin-token');
+  assert.equal(calls[1].options.headers.get('x-panel-token'), 'new-admin-token-16');
   assert.equal(calls[0].options.headers.get('idempotency-key'), 'idem_v1_401_retry_12345678901234567890');
   assert.equal(calls[1].options.headers.get('idempotency-key'), 'idem_v1_401_retry_12345678901234567890');
   assert.equal(calls.every((call) => call.options.redirect === 'error'), true);
