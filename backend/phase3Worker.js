@@ -39,6 +39,7 @@ const { compareNaturalStrings } = require('./lib/stableOrder');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { installPhase3ChildLifecycle } = require('./lib/phase3ChildLifecycle');
+const { phase3FailureHint } = require('./lib/phase3FailureHint');
 const {
   PROFILE_ENV, assertPhase3ProfileParent, createPhase3BrowserProfile,
   removePhase3BrowserProfile, configurePhase3BrowserProfile,
@@ -1702,6 +1703,13 @@ function classifyPhase3ProcessError(error, entry = null, rootHandle = null) {
       },
     };
   } else if (hasProcessDetails) {
+    // Improve only an ordinary non-zero exit's presentation. Safety failures
+    // (interruption, timeout, tree leak, reconciliation) keep their own codes
+    // and messages; no policy or account state is inferred from child text.
+    if (!error.code && /^phase3 进程失败（退出码 \d{1,3}）$/.test(error.message || '')) {
+      const hint = phase3FailureHint(details);
+      if (hint) error.message = `phase3 进程失败（退出码 ${details.code}）：${hint.message} [${hint.code}]`;
+    }
     // Child output can contain arbitrary unlabelled credentials. It is used
     // above for the in-memory classifier only and must never escape through a
     // job error, API response, audit record, or persistent logger.

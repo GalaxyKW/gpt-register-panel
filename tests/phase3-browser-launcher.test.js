@@ -81,3 +81,16 @@ test('terminal bootstrap failure exits promptly and supervisor reaps a detached 
   assert.ok(!status || /^\S+ \(.*\) [ZX] /.test(status), 'supervised helper must not remain live');
   assert.equal(fs.existsSync(f.observed().profile), false);
 });
+
+test('real child failure reaches the job as a fixed actionable hint without child output', async (t) => {
+  const f = fixture(t, "console.error('[主程序] EMAIL_CODE_SUBMIT_NOT_DISPATCHED: synthetic-private-payload'); process.exitCode=1;");
+  await assert.rejects(runPhase3Job(f.args), (error) => {
+    assert.match(error.message, /未确认表单提交/);
+    assert.match(error.message, /EMAIL_CODE_SUBMIT_NOT_DISPATCHED/);
+    assert.equal(error.details?.terminationConfirmed, true);
+    assert.equal(error.code, undefined);
+    assert.equal(error.accountDisposition, undefined);
+    assert.equal(JSON.stringify(error).includes('synthetic-private-payload'), false);
+    return true;
+  });
+});
