@@ -26,6 +26,16 @@ test('unknown last diagnostic, success, incomplete termination and stdout cannot
   }
 });
 
+test('uncertain verification dispatch has an explicit fixed hint without enabling retries', () => {
+  const error = new Error('phase3 进程失败（退出码 1）');
+  error.details = details('[主程序] VERIFICATION_DISPATCH_UNKNOWN: synthetic-private-body');
+  classifyPhase3ProcessError(error);
+  assert.match(error.message, /提交状态未知/);
+  assert.match(error.message, /未补点或重发/);
+  assert.equal(error.message.includes('synthetic-private'), false);
+  for (const key of ['code', 'retryable', 'retryAllowed', 'accountDisposition']) assert.equal(error[key], undefined);
+});
+
 test('ordinary failure displays a hint while raw output and policy fields stay absent', () => {
   const error = new Error('phase3 进程失败（退出码 1）');
   error.details = details('[主程序] MAIL_CODE_PARSE_FAILED: fixture-private-body', { stdout: 'fixture-private-stdout' });

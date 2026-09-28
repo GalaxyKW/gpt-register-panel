@@ -3,6 +3,7 @@
 const HINTS = Object.freeze({
   EMAIL_CODE_SUBMIT_NOT_DISPATCHED: '邮箱验证码已填入，但未确认表单提交；已停止，未重复提交',
   VERIFICATION_CODE_SUBMIT_NOT_DISPATCHED: '验证码已填入，但未确认表单提交；已停止，未重复提交',
+  VERIFICATION_DISPATCH_UNKNOWN: '验证码输入期间出现无法确认用途的请求，提交状态未知；已停止，未补点或重发',
   EMAIL_CODE_PAGE_STUCK: '邮箱验证码处理后页面未跳转；已停止，未重复提交旧验证码',
   EMAIL_CODE_REJECTED: '页面拒绝了邮箱验证码；请检查验证码是否失效',
   MAIL_CODE_PARSE_FAILED: '邮件已到达，但无法安全提取验证码；未自动重发',
