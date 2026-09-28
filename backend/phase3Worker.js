@@ -37,6 +37,12 @@ const { queueCancelableRun, withControlPlaneLock } = require('./taskCoordinator'
 const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
+const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
+const {
+  validateBoundRemoteTarget,
+  assertRemotePhase3TargetCurrent,
+  remotePhase3EndpointDigest,
+} = require('./remotePhase3');
 
 // Phase 3 drives a real browser and gpt_register uses a shared profile. Only
 // one process may run at a time; jobs for different accounts wait in order.
@@ -2210,6 +2216,8 @@ async function runPhase3JobNow({
   logger = null,
   signal = null,
   persistSuccess = null,
+  remoteTarget = null,
+  remoteClientFactory = (options) => new Sub2ApiAdminClient(options),
 }) {
   throwIfJobInterrupted(signal);
   if (phase3ProcessTreeUnsafe) throw phase3SupervisionError();
@@ -2222,6 +2230,29 @@ async function runPhase3JobNow({
   let rootHandle = null;
   let scriptHandle = null;
   let nodeHandle = null;
+  let boundRemoteTarget = null;
+  let remoteClient = null;
+  const checkRemoteEndpoint = () => {
+    if (remotePhase3EndpointDigest(remoteClient) !== boundRemoteTarget.endpointDigest) {
+      throw phase3BindingError('PHASE3_REMOTE_ENDPOINT_CHANGED',
+        'Sub2API 管理实例已变化，未启动本地 Phase3');
+    }
+  };
+  const checkRemoteTarget = async () => {
+    checkRemoteEndpoint();
+    let account;
+    try {
+      account = await remoteClient.getAccount(boundRemoteTarget.accountId, { signal });
+    } catch {
+      throwIfJobInterrupted(signal);
+      const error = new Error('无法核实所选远端账号，未启动本地 Phase3');
+      error.code = 'PHASE3_REMOTE_READ_FAILED';
+      throw error;
+    }
+    throwIfJobInterrupted(signal);
+    checkRemoteEndpoint();
+    assertRemotePhase3TargetCurrent(boundRemoteTarget, account);
+  };
   writeLog(logger, 'info', 'phase3.started', {
     jobId,
     actor,
@@ -2246,6 +2277,18 @@ async function runPhase3JobNow({
         'PHASE3_EXECUTION_BINDING_INVALID',
         'Phase3 执行目标绑定缺失或无效，拒绝启动',
       );
+    }
+    if (remoteTarget !== null && remoteTarget !== undefined) {
+      if (!localMode || requireExecutionBinding !== true) {
+        throw phase3BindingError('PHASE3_REMOTE_SOURCE_INVALID',
+          '远端 Phase3 必须绑定明确选择的本地登录记录');
+      }
+      boundRemoteTarget = validateBoundRemoteTarget(remoteTarget);
+      remoteClient = remoteClientFactory({ logger, logContext: { jobId, actor } });
+      await checkRemoteTarget();
+      writeLog(logger, 'info', 'phase3.remote_target_verified', {
+        jobId, actor, accountId: boundRemoteTarget.accountId, checkpoint: 'after_queue',
+      });
     }
     const root = registerRoot();
     rootHandle = openPinnedPhase3Root(root);
@@ -2285,6 +2328,26 @@ async function runPhase3JobNow({
         access: item.fingerprints?.access || null,
         refresh: item.fingerprints?.refresh || null,
       }));
+    if (boundRemoteTarget) {
+      await checkRemoteTarget();
+      // A management request yields to other actors. Recheck the local ledger
+      // and complete artifact baseline after that request, before the browser
+      // can use credentials from a concurrently edited local record.
+      const latestSources = readGptRegisterSources({
+        rootDirectory: root, rootHandle, strictCompleteSnapshot: true,
+      });
+      const changes = changedPhase3TokenArtifacts(beforeTokens, latestSources.tokens);
+      if (latestSources.usernameContentHash !== beforeSources.usernameContentHash
+          || latestSources.tokens.length !== beforeTokens.length
+          || changes.changed.length || changes.removedCount) {
+        throw phase3BindingError('PHASE3_LOCAL_BASELINE_CHANGED',
+          '远端核验期间本地账号或 token 已变化，未启动 Phase3');
+      }
+      findUsernameEntry({ email, phone, expectedExecutionBinding: executionBinding.username }, rootHandle);
+      writeLog(logger, 'info', 'phase3.remote_target_verified', {
+        jobId, actor, accountId: boundRemoteTarget.accountId, checkpoint: 'before_spawn',
+      });
+    }
     writeLog(logger, 'info', 'phase3.account_resolved', {
       jobId,
       actor,
@@ -2415,7 +2478,10 @@ async function runPhase3JobNow({
     });
     if (observedChangedTokens.some(
       (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken)
-        || (localMode && !hasStrongIdentity(item.identityKeys || [])),
+        || (localMode && !hasStrongIdentity(item.identityKeys || []))
+        || (boundRemoteTarget && !strongIdentitiesFullyMatch(
+          boundRemoteTarget.identityKeys, item.identityKeys || [],
+        )),
     ) || ((selectedToken || localMode) && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
       throw phase3TokenIdentityMismatchError();
     }
@@ -2479,10 +2545,10 @@ async function runPhase3JobNow({
       throw error;
     }
     if (usernamePostflight.passwordChanged) {
-      const selectedIdentityKeys = Array.isArray(selectedToken?.identityKeys)
+      const selectedIdentityKeys = boundRemoteTarget?.identityKeys || (Array.isArray(selectedToken?.identityKeys)
         ? selectedToken.identityKeys
-        : [];
-      if (requireExecutionBinding !== true || !executionBinding || !selectedToken
+        : []);
+      if (requireExecutionBinding !== true || !executionBinding || (!selectedToken && !boundRemoteTarget)
           || !hasStrongIdentity(selectedIdentityKeys)
           || !hasStrongIdentity(Array.isArray(token.identityKeys) ? token.identityKeys : [])) {
         throw phase3UsernameOutputUnconfirmedError(
@@ -2508,6 +2574,15 @@ async function runPhase3JobNow({
       fingerprint: token.fingerprints?.access || null,
       process: processSummary,
     };
+    if (boundRemoteTarget) {
+      const contentHash = phase3TokenArtifactHash(token);
+      if (!contentHash || !['tokens', 'use_token'].includes(token.source)) {
+        throw phase3TokenOutputUnconfirmedError();
+      }
+      output.remoteTarget = boundRemoteTarget;
+      output.tokenSource = token.source;
+      output.tokenContentHash = contentHash;
+    }
     if (processError) {
       output.processEndedWithError = true;
       output.processErrorCode = /^[A-Z0-9_]{1,96}$/.test(String(processError.code || ''))
@@ -2544,6 +2619,7 @@ async function runPhase3JobNow({
         result: 'ok',
         details: {
           tokenFile: token.relativePath,
+          ...(boundRemoteTarget ? { accountId: boundRemoteTarget.accountId } : {}),
           processEndedWithError: output.processEndedWithError === true,
           processErrorCode: output.processErrorCode || null,
         },
@@ -2564,6 +2640,7 @@ async function runPhase3JobNow({
       sourceMode,
       email: entry.email,
       tokenFile: token.relativePath,
+      ...(boundRemoteTarget ? { accountId: boundRemoteTarget.accountId } : {}),
       fingerprint: token.fingerprints?.access || null,
       processEndedWithError: output.processEndedWithError === true,
       processErrorCode: output.processErrorCode || null,

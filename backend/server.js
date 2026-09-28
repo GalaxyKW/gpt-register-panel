@@ -17,6 +17,9 @@ const {
   buildImportPlan,
   buildImportPlanIntentVersion,
   assertImportExecutableTargetLimit,
+  normalizeRemoteImportTargets,
+  assertRemoteImportPlan,
+  assertRemoteImportSources,
   importPlanSummary,
   executeImport,
   resolveImportGroupBinding,
@@ -41,6 +44,12 @@ const {
   listLocalPhase3Targets,
   resolvePhase3Requests,
 } = require('./phase3Worker');
+const {
+  validateRemoteTarget,
+  validateBoundRemoteTarget,
+  bindRemotePhase3Targets,
+  remotePhase3EndpointDigest,
+} = require('./remotePhase3');
 const {
   activeAccountTestJobs,
   accountTestJobStatus,
@@ -100,6 +109,7 @@ const CONTENT_SECURITY_POLICY = "default-src 'self'; base-uri 'none'; object-src
 const STATIC_ALLOWLIST = new Set([
   '/index.html', '/app.js', '/styles.css', '/local-phase3.js',
   '/account-test-batch.js', '/account-test-batch-ui.js',
+  '/remote-phase3.js',
 ]);
 const JSON_BODY_ENDPOINTS = new Set([
   '/api/sync/preview',
@@ -295,6 +305,16 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'PHASE3_ACCOUNT_INVALID',
   'PHASE3_TARGET_REVISION_INVALID',
   'PHASE3_BATCH_EMPTY',
+  'PHASE3_REMOTE_TARGET_INVALID',
+  'PHASE3_REMOTE_BINDING_INVALID',
+  'PHASE3_REMOTE_SOURCE_INVALID',
+  'PHASE3_REMOTE_ENDPOINT_INVALID',
+  'PHASE3_REMOTE_DUPLICATE',
+  'PHASE3_REMOTE_CONFIRMATION_REQUIRED',
+  'REMOTE_IMPORT_TARGETS_INVALID',
+  'REMOTE_IMPORT_SOURCES_INVALID',
+  'REMOTE_IMPORT_BASELINES_INVALID',
+  'REMOTE_IMPORT_JOBS_INVALID',
   'ACCOUNT_TEST_REQUEST_INVALID',
   'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
   'ACCOUNT_TEST_SELECTION_INVALID',
@@ -319,6 +339,22 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'IMPORT_PLAN_STALE',
   'IMPORT_RECONCILIATION_TARGET_LIMIT',
   'PHASE3_DUPLICATE',
+  'PHASE3_REMOTE_TARGET_CHANGED',
+  'PHASE3_REMOTE_NOT_FOUND',
+  'PHASE3_REMOTE_NOT_UNAVAILABLE',
+  'PHASE3_REMOTE_ENDPOINT_CHANGED',
+  'PHASE3_REMOTE_TARGET_UNAVAILABLE',
+  'PHASE3_REMOTE_TARGET_INVALID_STATE',
+  'REMOTE_IMPORT_PLAN_INVALID',
+  'REMOTE_IMPORT_TARGET_CHANGED',
+  'REMOTE_IMPORT_TARGET_STALE',
+  'REMOTE_IMPORT_SOURCE_SUPERSEDED',
+  'REMOTE_IMPORT_OUTSIDE_SCOPE',
+  'REMOTE_IMPORT_IDENTITY_MISMATCH',
+  'REMOTE_IMPORT_TARGET_UNCOVERED',
+  'REMOTE_IMPORT_SOURCE_CHANGED',
+  'REMOTE_IMPORT_JOBS_CHANGED',
+  'REMOTE_IMPORT_ENDPOINT_CHANGED',
   'JOB_ALREADY_CLAIMED',
   'JOB_QUEUE_FULL',
   'JOB_RECONCILIATION_REQUIRED',
@@ -1538,6 +1574,12 @@ function phase3ReviewTargets(job) {
     : {};
   const sourcePath = safeReviewSourcePath(payload.sourcePath);
   const localMode = payload.sourceMode === 'username';
+  let remoteTarget = null;
+  if (Object.hasOwn(payload, 'remoteTarget')) {
+    try { remoteTarget = validateBoundRemoteTarget(payload.remoteTarget); }
+    catch { return { total: 1, targets: [], complete: false }; }
+    if (!localMode) return { total: 1, targets: [], complete: false };
+  }
   const validSourceMode = localMode || payload.sourceMode === undefined || payload.sourceMode === 'token';
   const usernameIndex = Number.isSafeInteger(payload.usernameIndex) && payload.usernameIndex >= 0
     ? payload.usernameIndex : null;
@@ -1593,6 +1635,11 @@ function phase3ReviewTargets(job) {
       email: identity.email,
       phone: identity.phone || undefined,
       phase3TargetRevision,
+      ...(remoteTarget ? {
+        remoteAccountId: remoteTarget.accountId,
+        remoteIdentityKeys: remoteTarget.identityKeys,
+        remoteTargetRevision: remoteTarget.targetRevision,
+      } : {}),
     }],
   };
 }
@@ -1815,6 +1862,10 @@ function validateReconciliationAcknowledgeContext(
         })
         : null;
       expectedClaims = canonicalKeys?.map((key) => 'phase3:' + key) || null;
+      if (expectedClaims && job.payload.remoteTarget) {
+        const target = validateBoundRemoteTarget(job.payload.remoteTarget);
+        expectedClaims.push('phase3:remote:' + target.accountId);
+      }
     } else if (job.type === TOKEN_CLEANUP_JOB_TYPE) {
       expectedClaims = [TOKEN_CLEANUP_CLAIM_KEY];
     }
@@ -2019,6 +2070,14 @@ function normalizePhase3Requests(body, options = {}) {
   const requests = [];
   const duplicateIndexes = [];
   const seenKeys = new Set();
+  const remoteIds = new Set();
+  const remoteMode = rawItems.some((item) => item && Object.hasOwn(item, 'remoteTarget'));
+  if (remoteMode && (!localMode || body.remoteMappingConfirmed !== true
+      || rawItems.some((item) => !item || !Object.hasOwn(item, 'remoteTarget')))) {
+    const error = new Error('定向 Phase3 必须逐项确认本地登录映射，不能混合独立本地任务');
+    error.code = 'PHASE3_REMOTE_CONFIRMATION_REQUIRED';
+    throw error;
+  }
   const itemSelectedKeys = new Set();
   rawItems.forEach((rawItem, index) => {
     if (!rawItem || typeof rawItem !== 'object' || Array.isArray(rawItem)) {
@@ -2050,6 +2109,14 @@ function normalizePhase3Requests(body, options = {}) {
       throw error;
     }
     const { email, phone, keys } = identity;
+    const remoteTarget = remoteMode ? validateRemoteTarget(rawItem.remoteTarget) : null;
+    if (remoteMode && (!remoteTarget || remoteIds.has(remoteTarget.accountId)
+        || keys.some((key) => seenKeys.has(key)))) {
+      const error = new Error('定向 Phase3 的远端 ID 或本地登录记录重复或无效');
+      error.code = 'PHASE3_REMOTE_TARGET_INVALID';
+      throw error;
+    }
+    if (remoteTarget) remoteIds.add(remoteTarget.accountId);
     if (keys.some((key) => seenKeys.has(key))) {
       duplicateIndexes.push(index);
       return;
@@ -2062,6 +2129,7 @@ function normalizePhase3Requests(body, options = {}) {
       phone,
       selectedKey,
       phase3TargetRevision,
+      ...(remoteTarget ? { remoteTarget } : {}),
     });
   });
   if (requests.length === 0) {
@@ -2073,7 +2141,12 @@ function normalizePhase3Requests(body, options = {}) {
 }
 
 function phase3ClaimKeys(requestItem = {}) {
-  return canonicalPhase3Keys(requestItem).map((key) => 'phase3:' + key);
+  const keys = canonicalPhase3Keys(requestItem).map((key) => 'phase3:' + key);
+  if (requestItem.remoteTarget) {
+    const target = validateBoundRemoteTarget(requestItem.remoteTarget);
+    keys.push('phase3:remote:' + target.accountId);
+  }
+  return keys;
 }
 
 function safeExpiredTokenItem(item) {
@@ -2679,6 +2752,8 @@ function observePhase3Job({
   phone,
   canonicalKeys,
   executionBinding,
+  remoteTarget,
+  remoteClientFactory,
   sourceMode = 'token',
   actor,
   db,
@@ -2726,6 +2801,8 @@ function observePhase3Job({
     phone,
     canonicalKeys,
     executionBinding,
+    remoteTarget,
+    remoteClientFactory,
     sourceMode,
     requireExecutionBinding: true,
     actor,
@@ -2950,6 +3027,10 @@ function observeImportJob({
   snapshotVersion,
   planIntentVersion,
   selectedKeys,
+  remoteTargets,
+  remoteSourceHashes,
+  remoteTargetBaselines,
+  clientFactory,
   actor,
   db,
   logger,
@@ -2998,6 +3079,10 @@ function observeImportJob({
       snapshotVersion,
       planIntentVersion,
       selectedKeys,
+      remoteTargets,
+      remoteSourceHashes,
+      remoteTargetBaselines,
+      client: clientFactory ? clientFactory({ logger, logContext: { jobId: job.id, actor } }) : null,
       actor,
       db,
       jobId: job.id,
@@ -3094,6 +3179,75 @@ function importRequestError(body) {
     return error;
   }
   return null;
+}
+
+function remoteImportError(code) {
+  const error = new Error('定向回写的 Phase3 任务或输出已变化，请重新核对；未执行普通导入');
+  error.code = code;
+  return error;
+}
+
+function normalizeRemotePhase3JobIds(body, remoteTargets) {
+  if (remoteTargets === undefined) {
+    if (body.phase3JobIds !== undefined) throw remoteImportError('REMOTE_IMPORT_JOBS_INVALID');
+    return undefined;
+  }
+  const ids = body.phase3JobIds;
+  if (!Array.isArray(ids) || ids.length !== remoteTargets.length
+      || ids.some((id) => typeof id !== 'string' || !/^job_[a-f0-9]{24}$/.test(id))
+      || new Set(ids).size !== ids.length) throw remoteImportError('REMOTE_IMPORT_JOBS_INVALID');
+  return [...ids].sort();
+}
+
+async function remotePhase3ImportBinding(db, jobIds, remoteTargets, selectedKeys, endpointDigest) {
+  if (remoteTargets === undefined) return undefined;
+  if (!Array.isArray(selectedKeys) || selectedKeys.length !== remoteTargets.length) {
+    throw remoteImportError('REMOTE_IMPORT_JOBS_INVALID');
+  }
+  const targets = new Map(remoteTargets.map((target) => [target.accountId, target]));
+  const sources = [];
+  const baselines = [];
+  const selected = new Set(selectedKeys);
+  const seen = new Set();
+  for (const id of jobIds) {
+    const job = await db.getJob(id);
+    if (!job || job.id !== id || job.type !== 'phase3' || job.status !== 'succeeded'
+        || job.payload?.sourceMode !== 'username'
+        || job.result?.requiresReconciliation === true || job.result?.writeOutcomeUnknown === true
+        || job.result?.reconciliationHold === true) throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED');
+    let payloadTarget;
+    let resultTarget;
+    try {
+      payloadTarget = validateBoundRemoteTarget(job.payload.remoteTarget);
+      resultTarget = validateBoundRemoteTarget(job.result.remoteTarget);
+    } catch { throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED'); }
+    if (!payloadTarget || !resultTarget
+        || JSON.stringify(payloadTarget) !== JSON.stringify(resultTarget)) {
+      throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED');
+    }
+    if (typeof endpointDigest !== 'string' || resultTarget.endpointDigest !== endpointDigest) {
+      throw remoteImportError('REMOTE_IMPORT_ENDPOINT_CHANGED');
+    }
+    const target = targets.get(resultTarget.accountId);
+    if (!target || seen.has(target.accountId) || target.targetRevision !== resultTarget.targetRevision) {
+      throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED');
+    }
+    const sourcePath = safeReviewSourcePath(job.result.tokenFile);
+    const source = job.result.tokenSource;
+    const contentHash = job.result.tokenContentHash;
+    const selectedKey = sourcePath && sourcePath.split('/', 1)[0] === source
+      ? normalizePhase3SelectedKey('token:' + source + ':' + sourcePath) : null;
+    if (!selectedKey || !selected.delete(selectedKey)
+        || typeof contentHash !== 'string' || !/^[a-f0-9]{64}$/.test(contentHash)) {
+      throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED');
+    }
+    seen.add(target.accountId);
+    sources.push({ selectedKey, contentHash });
+    baselines.push({ accountId: target.accountId, targetRevision: target.targetRevision,
+      targetDigest: resultTarget.targetDigest });
+  }
+  if (seen.size !== targets.size || selected.size) throw remoteImportError('REMOTE_IMPORT_JOBS_CHANGED');
+  return { sources, baselines };
 }
 
 function serveStatic(pathname, response) {
@@ -3389,11 +3543,19 @@ function createServer(options = {}) {
           error.code = 'IMPORT_SELECTION_INVALID';
           throw error;
         }
+        const remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
+        const phase3JobIds = normalizeRemotePhase3JobIds(body, remoteTargets);
         let syncClient = null;
         const getSyncClient = (clientOptions = {}) => {
           if (!syncClient) syncClient = syncClientFactory(clientOptions);
           return syncClient;
         };
+        const recoveryBinding = await remotePhase3ImportBinding(
+          db, phase3JobIds, remoteTargets, selectedKeys,
+          remoteTargets ? remotePhase3EndpointDigest(getSyncClient({ logger, logContext: { requestId, actor } })) : undefined,
+        );
+        const remoteSourceHashes = recoveryBinding?.sources;
+        const remoteTargetBaselines = recoveryBinding?.baselines;
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
           includeInternal: true,
@@ -3410,6 +3572,10 @@ function createServer(options = {}) {
           throw error;
         }
         const plan = buildImportPlan(snapshot._internal.sources, snapshot._internal.accounts, selectedKeys);
+        if (remoteTargets) {
+          assertRemoteImportSources(snapshot._internal.sources, selectedKeys, remoteSourceHashes);
+          assertRemoteImportPlan(plan, snapshot._internal.accounts, remoteTargets, remoteTargetBaselines);
+        }
         assertImportExecutableTargetLimit(plan);
         const client = getSyncClient({ logger, logContext: { requestId, actor } });
         const groupBinding = await resolveImportGroupBinding(client, plan, {
@@ -3422,6 +3588,7 @@ function createServer(options = {}) {
           plan,
           groupBinding,
           executionBinding,
+          remoteTargets,
         );
         throwIfJobInterrupted(requestDisconnectController.signal);
         const snapshotId = await db.saveSnapshot(snapshot);
@@ -3443,6 +3610,7 @@ function createServer(options = {}) {
           groupBinding,
           generatedAt: snapshot.generatedAt,
           selectedKeys,
+          ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
           ...importPlanSummary(plan),
         });
       } catch (error) {
@@ -3469,10 +3637,15 @@ function createServer(options = {}) {
         const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
         const normalizedSnapshotVersion = String(body.snapshotVersion).toLowerCase();
         const planIntentVersion = body.planIntentVersion;
+        const remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
+        const phase3JobIds = normalizeRemotePhase3JobIds(body, remoteTargets);
+        let remoteSourceHashes;
+        let remoteTargetBaselines;
         const idempotency = mutationContext(request, MUTATION_WORKFLOWS.import, {
           snapshotVersion: normalizedSnapshotVersion,
           planIntentVersion,
           selectedKeys,
+          ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
         });
         const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
         if (priorReceipt) {
@@ -3496,8 +3669,20 @@ function createServer(options = {}) {
               if (lockedReceipt) {
                 return { receipt: lockedReceipt, replayed: true, createdJobs: [], rejections: [] };
               }
-              if (selectedKeys.length > MAX_TOKEN_IMPORT_CONTEXT_TARGETS) {
-                let admissionSyncClient = null;
+              let admissionSyncClient = null;
+              const getAdmissionSyncClient = (clientOptions = {}) => {
+                if (!admissionSyncClient) admissionSyncClient = syncClientFactory(clientOptions);
+                return admissionSyncClient;
+              };
+              if (remoteTargets) {
+                const binding = await remotePhase3ImportBinding(
+                  db, phase3JobIds, remoteTargets, selectedKeys,
+                  remotePhase3EndpointDigest(getAdmissionSyncClient({ logger, logContext: { requestId, actor } })),
+                );
+                remoteSourceHashes = binding.sources;
+                remoteTargetBaselines = binding.baselines;
+              }
+              if (remoteTargets || selectedKeys.length > MAX_TOKEN_IMPORT_CONTEXT_TARGETS) {
                 const current = await buildSnapshot(
                   new URLSearchParams('withSub2api=1'),
                   {
@@ -3507,12 +3692,7 @@ function createServer(options = {}) {
                     logger,
                     requestId,
                     actor,
-                    clientFactory: (clientOptions = {}) => {
-                      if (!admissionSyncClient) {
-                        admissionSyncClient = syncClientFactory(clientOptions);
-                      }
-                      return admissionSyncClient;
-                    },
+                    clientFactory: getAdmissionSyncClient,
                     signal,
                   },
                 );
@@ -3533,6 +3713,10 @@ function createServer(options = {}) {
                   current._internal.accounts,
                   selectedKeys,
                 );
+                if (remoteTargets) {
+                  assertRemoteImportSources(current._internal.sources, selectedKeys, remoteSourceHashes);
+                  assertRemoteImportPlan(currentPlan, current._internal.accounts, remoteTargets, remoteTargetBaselines);
+                }
                 const executableCount = assertImportExecutableTargetLimit(currentPlan);
                 writeLog(logger, 'info', 'import.admission_plan_checked', {
                   requestId,
@@ -3551,6 +3735,7 @@ function createServer(options = {}) {
                     snapshotVersion: normalizedSnapshotVersion,
                     planIntentVersion,
                     selectedKeys,
+                    ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
                     // Keep a separately validated, non-secret display path because
                     // generic text redaction intentionally masks `token:...` values.
                     selectedSourcePaths: selectedKeys
@@ -3592,6 +3777,10 @@ function createServer(options = {}) {
               snapshotVersion: normalizedSnapshotVersion,
               planIntentVersion,
               selectedKeys,
+              remoteTargets,
+              remoteSourceHashes,
+              remoteTargetBaselines,
+              clientFactory: syncClientFactory,
               actor,
               db,
               logger,
@@ -3671,6 +3860,7 @@ function createServer(options = {}) {
             phone: item.phone,
             selectedKey: item.selectedKey,
             phase3TargetRevision: item.phase3TargetRevision,
+            ...(item.remoteTarget ? { remoteTarget: item.remoteTarget } : {}),
           })),
           duplicateIndexes,
           selectedKeys: normalizedSelectedKeys,
@@ -3754,6 +3944,22 @@ function createServer(options = {}) {
               // held; otherwise a concurrent committed submission could be
               // rejected as stale instead of replayed.
               const resolved = phase3RequestResolver(requests);
+              if (requests.some((item) => item.remoteTarget)) {
+                // A changed local record must not silently shrink the reviewed
+                // remote selection. The operator confirms any skips in the UI.
+                if (resolved.rejected.length || resolved.eligible.length !== requests.length) {
+                  const error = new Error('本地登录清单已变化，请重新核对定向 Phase3 映射');
+                  error.code = 'PHASE3_REMOTE_TARGET_CHANGED';
+                  throw error;
+                }
+                const client = syncClientFactory({ logger, logContext: { requestId, actor } });
+                const accounts = await client.listAccounts({
+                  platform: 'openai', type: 'oauth', pageSize: 200,
+                  requireTotal: true, requirePaginationMetadata: true, signal,
+                });
+                throwIfJobInterrupted(signal);
+                bindRemotePhase3Targets(resolved.eligible, accounts, client);
+              }
               resolvedRequests = resolved.eligible;
               initiallyRejected = duplicateIndexes.map((index) => ({
                 index,
@@ -3766,7 +3972,7 @@ function createServer(options = {}) {
               const created = await db.createMutationSubmission({
                 ...idempotency,
                 requestedBy: actor,
-                allowPartial: true,
+                allowPartial: !requests.some((item) => item.remoteTarget),
                 maximumActiveByType: {
                   phase3: boundedEnvNumber('PANEL_PHASE3_MAX_ACTIVE_JOBS', 100, 1, 100),
                 },
@@ -3788,6 +3994,7 @@ function createServer(options = {}) {
                     // This opaque revision binds the reviewed token and
                     // username.json evidence without persisting credentials.
                     phase3TargetRevision: requestItem.phase3TargetRevision,
+                    ...(requestItem.remoteTarget ? { remoteTarget: requestItem.remoteTarget } : {}),
                     batch: resolvedRequests.length > 1,
                   },
                   claimKeys: phase3ClaimKeys(requestItem),
@@ -3807,6 +4014,12 @@ function createServer(options = {}) {
                     jobId: jobIds.length === 1 ? jobIds[0] : null,
                     jobIds,
                     jobs: queuedJobs,
+                    ...(requests.some((item) => item.remoteTarget) ? {
+                      remoteTargets: requests.map((item) => ({
+                        accountId: item.remoteTarget.accountId,
+                        targetRevision: item.remoteTarget.targetRevision,
+                      })),
+                    } : {}),
                     rejected: initiallyRejected.concat(rejections.map(rejectionFromDatabase)),
                   };
                 },
@@ -3837,6 +4050,8 @@ function createServer(options = {}) {
                 phone: item.phone,
                 canonicalKeys: item.canonicalKeys,
                 executionBinding: item.executionBinding,
+                remoteTarget: item.remoteTarget,
+                remoteClientFactory: syncClientFactory,
                 sourceMode,
                 actor,
                 db,

@@ -99,6 +99,10 @@ h2 { margin-bottom: 5px; font-size: 18px; letter-spacing: .01em; }
 .local-recovery-actions { border-top: 1px solid var(--line); padding-top: 10px; }
 .local-recovery-hint { flex: 1 1 100%; margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .auth-dialog.local-phase3-dialog { width: min(850px, calc(100vw - 24px)); max-width: 850px; }
+.auth-dialog.remote-phase3-dialog { width: min(980px, calc(100vw - 24px)); max-width: 980px; max-height: calc(100dvh - 24px); overflow-y: auto; }
+.remote-phase3-dialog p, .remote-phase3-dialog label { overflow-wrap: anywhere; line-height: 1.6; }
+.remote-phase3-dialog .auth-dialog-actions { flex-wrap: wrap; }
+.remote-phase3-dialog .local-phase3-table-wrap { max-height: 38vh; }
 .local-phase3-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
 .local-phase3-controls label { font-size: 13px; }
 .local-phase3-table-wrap { max-height: 42vh; overflow: auto; }

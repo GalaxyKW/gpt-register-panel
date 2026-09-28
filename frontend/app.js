@@ -1720,7 +1720,11 @@ function renderRows() {
     const displayName = sides.remote?.name || row.accountName || row.fileName || '(未命名)';
     const issueText = row.issues?.length ? ' title="' + escapeHtml(row.issues.join(', ')) + '"' : '';
     const usageTitle = row.usageError ? ' title="' + escapeHtml(row.usageError) + '"' : '';
-    const phase3Note = row.phase3Eligible === false
+    const remotePhase3Note = row.source === 'sub2api'
+      && typeof remotePhase3SelectionApplicable === 'function';
+    const phase3Note = remotePhase3Note
+      ? '<small>本地重新登录：选择后确认登录映射</small>'
+      : row.phase3Eligible === false
       ? '<small class="availability-note">Phase 3：' + escapeHtml(phase3ReasonLabel(row.phase3Reason)) + '</small>'
       : (row.phone ? '<small>手机号 ' + escapeHtml(row.phone) + '</small>' : '');
     return '<tr class="' + (state.selected.has(row.key) ? 'is-selected' : '') + '">'
@@ -2427,9 +2431,22 @@ function reconciliationTargetIsValid(workflow, target) {
   }
   if (workflow === 'phase3') {
     if (target.sourceMode === 'username') {
+      const remoteFields = ['remoteAccountId', 'remoteIdentityKeys', 'remoteTargetRevision'];
+      const hasRemoteBinding = remoteFields.some((key) => Object.hasOwn(target, key));
+      const identityKeys = target.remoteIdentityKeys;
+      if (hasRemoteBinding && (!hasRemoteAccountId
+          || !/^account-test-v1\.[A-Za-z0-9_-]{43}$/.test(String(target.remoteTargetRevision || ''))
+          || !Array.isArray(identityKeys) || identityKeys.length === 0 || identityKeys.length > 2
+          || identityKeys.some((key) => {
+            const match = /^(?:account|user):([A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511})$/
+              .exec(boundedReconciliationDisplay(key, 520) || '');
+            return !match || !boundedReconciliationDisplay(match[1], 512);
+          })
+          || new Set(identityKeys.map((key) => key.slice(0, key.indexOf(':')))).size !== identityKeys.length)) return false;
       return target.sourcePath === undefined
         && Object.keys(target).every((key) => [
           'sourceMode', 'usernameIndex', 'email', 'phone', 'phase3TargetRevision',
+          ...remoteFields,
         ].includes(key))
         && typeof target.usernameIndex === 'number'
         && Number.isSafeInteger(target.usernameIndex)
@@ -2668,6 +2685,8 @@ function reconciliationTargetContextText(detail) {
         : '对账计划摘要 ') + target.targetDigest);
     }
     if (target.phase3TargetRevision) fields.push('Phase 3 目标版本 ' + target.phase3TargetRevision);
+    if (target.remoteTargetRevision) fields.push('远端目标版本 ' + target.remoteTargetRevision);
+    if (target.remoteIdentityKeys) fields.push('远端强身份 ' + target.remoteIdentityKeys.join(' / '));
     if (target.strongIdentityKeys) {
       fields.push('来源强身份 ' + target.strongIdentityKeys.join(' / '));
     }
@@ -3445,6 +3464,10 @@ elements.importButton.addEventListener('click', async () => {
 });
 
 elements.phase3Button.addEventListener('click', async () => {
+  if (typeof remotePhase3SelectionApplicable === 'function' && remotePhase3SelectionApplicable()) {
+    await openRemotePhase3Dialog();
+    return;
+  }
   if (state.phase3RequestPending) return;
   if (!phase3CapabilityAvailable()) {
     showNotice('无法提交 Phase 3：服务端未声明 Phase 3 已启用。', 'notice-warning');
@@ -3680,7 +3703,11 @@ function updateActionState() {
   const syncProblem = syncSelectionProblem();
   const importSelectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   const phase3Targets = phase3TargetsFromRows(selectedRows);
-  const phase3Problem = phase3SelectionProblem(selectedRows, state.selected.size);
+  const remotePhase3 = typeof remotePhase3SelectionApplicable === 'function'
+    && remotePhase3SelectionApplicable(selectedRows);
+  const phase3Problem = remotePhase3
+    ? remotePhase3SelectionProblem(selectedRows)
+    : phase3SelectionProblem(selectedRows, state.selected.size);
   const testSelection = typeof accountTestBatchSelection === 'function'
     ? accountTestBatchSelection(selectedRows)
     : accountTestTargetsFromRows(selectedRows);
@@ -3701,7 +3728,7 @@ function updateActionState() {
     && phase3CapabilityAvailable()
     && !selectionVisibilityProblem
     && selectedRows.length === state.selected.size
-    && phase3Targets.length > 0
+    && (remotePhase3 ? comparisonAvailable() : phase3Targets.length > 0)
     && !phase3Problem
     && state.snapshot?.readOnly === false;
   const locked = actionsLocked();
@@ -3711,7 +3738,7 @@ function updateActionState() {
   if (elements.phase3ButtonLabel) {
     elements.phase3ButtonLabel.textContent = state.snapshot && !phase3CapabilityAvailable()
       ? '本地 Phase 3（未启用）'
-      : '本地 Phase 3';
+      : remotePhase3 ? '所选远端 → 本地 Phase 3' : '本地 Phase 3';
   }
   if (elements.accountTestButton) {
     elements.accountTestButton.disabled = mutationLocked || !canRunAccountTest;
@@ -3794,7 +3821,9 @@ function updateActionState() {
   } else if (!canRunPhase3) {
     elements.phase3Button.title = phase3Problem || '请选择至少一个符合条件的账号';
   } else {
-    elements.phase3Button.title = '按顺序为已选本地 gpt_register 账号运行 Phase 3';
+    elements.phase3Button.title = remotePhase3
+      ? '确认所选远端 ID 的本地登录记录，重新获取 token 后定向回写原账号'
+      : '按顺序为已选本地 gpt_register 账号运行 Phase 3';
   }
   const previewScopeTitle = state.selected.size > 0
     ? '预览所选本地 token 的导入动作；仅 Sub2API 账号不参与导入'
@@ -3811,7 +3840,7 @@ function updateActionState() {
   for (const [hint, button, label] of [
     [elements.previewActionHint, elements.previewButton, '本地导入预览'],
     [elements.importActionHint, elements.importButton, '确认导入'],
-    [elements.phase3ActionHint, elements.phase3Button, '所选 token 的 Phase 3'],
+    [elements.phase3ActionHint, elements.phase3Button, remotePhase3 ? '所选远端的本地 Phase 3' : '所选 token 的 Phase 3'],
     [elements.accountTestActionHint, elements.accountTestButton, 'Sub2API 账号测试'],
   ]) {
     if (!hint || !button) continue;
@@ -3822,6 +3851,7 @@ function updateActionState() {
   }
   if (typeof updateLocalPhase3ActionState === 'function') updateLocalPhase3ActionState();
   if (typeof updateAccountTestBatchUi === 'function') updateAccountTestBatchUi();
+  if (typeof updateRemotePhase3Ui === 'function') updateRemotePhase3Ui();
 }
 
 function applyColumnVisibility() {

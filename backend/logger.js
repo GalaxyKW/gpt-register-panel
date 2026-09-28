@@ -79,6 +79,29 @@ function isSecretKey(normalizedKey) {
   return /(^|_)(?:client|saml|signed)_assertions?$/.test(candidate);
 }
 
+function isSignedRevisionMetadata(value, key) {
+  // These are public SHA-256/HMAC revision wire formats, never credentials.
+  // Random base64url digests can contain `sk-`/`rt-` by chance; applying the
+  // free-text credential patterns would corrupt durable execution bindings.
+  // Match exact field names and their exact domains, not normalized aliases
+  // or arbitrary fingerprint/token fields. Secret parent/field handling and
+  // all resource limits run before this exception.
+  let prefixes;
+  switch (key) {
+    case 'phase3TargetRevision': prefixes = ['phase3-target-v1.', 'phase3-local-v1.']; break;
+    case 'targetRevision':
+    case 'remoteTargetRevision': prefixes = ['account-test-v1.']; break;
+    case 'planIntentVersion': prefixes = ['sync-plan-v1.']; break;
+    default: return false;
+  }
+  return prefixes.some((prefix) => value.startsWith(prefix)
+    && value.length === prefix.length + 43
+    // A canonical 32-byte base64url value has 43 characters and two zero
+    // padding bits in the final character. Exact length also excludes the
+    // trailing-newline exception of the regular-expression `$` anchor.
+    && /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/.test(value.slice(prefix.length)));
+}
+
 function jsonRedaction(value) {
   const trimmed = String(value || '').trim();
   if (!trimmed || !['{', '['].includes(trimmed[0])) return null;
@@ -495,6 +518,7 @@ function redactValueAt(value, key, context, depth) {
       return '[redaction text budget reached]';
     }
     context.textChars += value.length;
+    if (isSignedRevisionMetadata(value, key)) return value;
     return redactText(value);
   }
   if (typeof value === 'bigint') return String(value);

@@ -33,6 +33,11 @@ const {
   availabilityOptions,
 } = require('./view');
 const { getAccountAvailability } = require('./accountAvailability');
+const {
+  REVISION_PATTERN: ACCOUNT_TARGET_REVISION_PATTERN,
+  accountTestTargetDigest,
+  matchesAccountTestTargetRevision,
+} = require('./accountTargetRevision');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 const { assertAuditLogCheckpoint, safeFailureMessage } = require('./logger');
 const {
@@ -61,6 +66,7 @@ const IMPORT_GROUP_ELIGIBILITY_POLICY = 'active-openai-v1';
 const IMPORT_TARGET_BINDING_SCHEMA = 'sub2api-admin-target-v1';
 const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
 const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
+const MAX_REMOTE_IMPORT_TARGETS = 100;
 
 function safeErrorMessage(error) {
   return safeFailureMessage(error);
@@ -98,6 +104,202 @@ function canonicalPositiveAccountId(value) {
   if (typeof value !== 'string' || !/^[1-9]\d*$/.test(value)) return null;
   const id = Number(value);
   return Number.isSafeInteger(id) && id > 0 && String(id) === value ? id : null;
+}
+
+function normalizeRemoteImportTargets(value) {
+  // Only absence selects the ordinary local-token workflow. An empty or
+  // malformed scope must never silently authorize unrestricted imports.
+  if (value === undefined) return undefined;
+  const invalid = () => importBindingError(
+    'REMOTE_IMPORT_TARGETS_INVALID',
+    '定向导入必须提供 1 至 100 个唯一远端账号及其版本',
+  );
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_REMOTE_IMPORT_TARGETS) {
+    throw invalid();
+  }
+  const seen = new Set();
+  return value.map((target) => {
+    if (!target || typeof target !== 'object' || Array.isArray(target)
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(target))
+        || Object.keys(target).length !== 2
+        || !Object.prototype.hasOwnProperty.call(target, 'accountId')
+        || !Object.prototype.hasOwnProperty.call(target, 'targetRevision')) throw invalid();
+    const accountId = canonicalPositiveAccountId(target.accountId);
+    if (accountId === null || seen.has(accountId)
+        || typeof target.targetRevision !== 'string'
+        || !ACCOUNT_TARGET_REVISION_PATTERN.test(target.targetRevision)) throw invalid();
+    seen.add(accountId);
+    return { accountId, targetRevision: target.targetRevision };
+  }).sort((left, right) => left.accountId - right.accountId);
+}
+
+function normalizeRemoteImportSourceHashes(value) {
+  if (value === undefined) return undefined;
+  const invalid = () => importBindingError(
+    'REMOTE_IMPORT_SOURCES_INVALID',
+    '定向导入缺少有效的 Phase3 输出文件绑定',
+  );
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_REMOTE_IMPORT_TARGETS) {
+    throw invalid();
+  }
+  const seen = new Set();
+  return value.map((source) => {
+    if (!source || typeof source !== 'object' || Array.isArray(source)
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(source))
+        || Object.keys(source).length !== 2
+        || !Object.prototype.hasOwnProperty.call(source, 'selectedKey')
+        || !Object.prototype.hasOwnProperty.call(source, 'contentHash')
+        || typeof source.selectedKey !== 'string' || !source.selectedKey.startsWith('token:')
+        || source.selectedKey.length > 512 || source.selectedKey.trim() !== source.selectedKey
+        || seen.has(source.selectedKey)
+        || typeof source.contentHash !== 'string' || !/^[a-f0-9]{64}$/.test(source.contentHash)) {
+      throw invalid();
+    }
+    seen.add(source.selectedKey);
+    return { selectedKey: source.selectedKey, contentHash: source.contentHash };
+  }).sort((left, right) => compareNaturalStrings(left.selectedKey, right.selectedKey));
+}
+
+function normalizeRemoteImportTargetBaselines(value) {
+  if (value === undefined) return undefined;
+  const invalid = () => importBindingError(
+    'REMOTE_IMPORT_BASELINES_INVALID',
+    '定向导入缺少有效的原远端账号基线，请从已核验的成功任务恢复',
+  );
+  if (!Array.isArray(value) || value.length === 0 || value.length > MAX_REMOTE_IMPORT_TARGETS) {
+    throw invalid();
+  }
+  const seen = new Set();
+  return value.map((baseline) => {
+    if (!baseline || typeof baseline !== 'object' || Array.isArray(baseline)
+        || ![Object.prototype, null].includes(Object.getPrototypeOf(baseline))
+        || Object.keys(baseline).length !== 3
+        || !Object.prototype.hasOwnProperty.call(baseline, 'accountId')
+        || !Object.prototype.hasOwnProperty.call(baseline, 'targetRevision')
+        || !Object.prototype.hasOwnProperty.call(baseline, 'targetDigest')) throw invalid();
+    const accountId = canonicalPositiveAccountId(baseline.accountId);
+    if (accountId === null || seen.has(accountId)
+        || typeof baseline.targetRevision !== 'string'
+        || !ACCOUNT_TARGET_REVISION_PATTERN.test(baseline.targetRevision)
+        || typeof baseline.targetDigest !== 'string'
+        || !/^[a-f0-9]{64}$/.test(baseline.targetDigest)) throw invalid();
+    seen.add(accountId);
+    return { accountId, targetRevision: baseline.targetRevision, targetDigest: baseline.targetDigest };
+  }).sort((left, right) => left.accountId - right.accountId);
+}
+
+function assertRemoteImportBaselines(targets, baselines) {
+  if (!targets || !baselines || targets.length !== baselines.length
+      || targets.some((target, index) => target.accountId !== baselines[index].accountId
+        || target.targetRevision !== baselines[index].targetRevision)) {
+    throw importBindingError(
+      'REMOTE_IMPORT_BASELINES_INVALID',
+      '定向导入基线与成功任务绑定的原远端目标不一致',
+    );
+  }
+}
+
+function assertRemoteImportSources(sources, selectedKeys, remoteSourceHashes) {
+  const hashes = normalizeRemoteImportSourceHashes(remoteSourceHashes);
+  if (!sources || !Array.isArray(sources.tokens)
+      || !hashes || !Array.isArray(selectedKeys) || selectedKeys.length !== hashes.length
+      || new Set(selectedKeys).size !== selectedKeys.length
+      || hashes.some((source) => !selectedKeys.includes(source.selectedKey))) {
+    throw importBindingError(
+      'REMOTE_IMPORT_SOURCES_INVALID',
+      '定向导入只能使用本次 Phase3 已确认成功的输出文件',
+    );
+  }
+  const candidates = collectCandidates(sources);
+  for (const source of hashes) {
+    const records = (sources?.tokens || []).filter((record) => (
+      candidateKey(record) === source.selectedKey
+    ));
+    if (records.length !== 1 || records[0].parseStatus !== 'ok'
+        || records[0].historical === true || records[0].contentHash !== source.contentHash) {
+      throw importBindingError(
+        'REMOTE_IMPORT_SOURCE_CHANGED',
+        'Phase3 输出文件已缺失或改变，请重新核对后再导入',
+      );
+    }
+    // Ordinary imports deliberately promote a newer token from the same
+    // identity group. A scoped recovery must not replace its job-bound
+    // output with an unrelated path merely because that file is newer.
+    const winners = candidates.filter((candidate) => candidate.key === source.selectedKey);
+    if (winners.length !== 1 || winners[0].record.contentHash !== source.contentHash) {
+      throw importBindingError(
+        'REMOTE_IMPORT_SOURCE_SUPERSEDED',
+        'Phase3 输出已被另一 token 版本替代，请重新核对定向导入来源',
+      );
+    }
+  }
+}
+
+function assertRemoteImportPlan(plan, accounts, remoteTargets, remoteTargetBaselines = undefined) {
+  const targets = normalizeRemoteImportTargets(remoteTargets);
+  const baselines = normalizeRemoteImportTargetBaselines(remoteTargetBaselines);
+  if (baselines !== undefined) assertRemoteImportBaselines(targets, baselines);
+  if (targets === undefined) return;
+  if (!Array.isArray(plan) || !Array.isArray(accounts)) {
+    throw importBindingError('REMOTE_IMPORT_PLAN_INVALID', '定向导入计划结构无效');
+  }
+  const scopedAccounts = new Map();
+  for (const [index, target] of targets.entries()) {
+    const matches = accounts.filter((account) => (
+      canonicalPositiveAccountId(account?.id) === target.accountId
+    ));
+    // Revisions authenticate the original browser selection, but their HMAC
+    // issuer is process-local. Only the server may supply a durable baseline,
+    // read from the successful job that also binds this ID and old revision.
+    // Rechecking its complete state digest permits safe restart recovery
+    // without signing a changed target or trusting a client-provided digest.
+    const unchanged = matches.length === 1 && (baselines
+      ? baselines[index].targetDigest === accountTestTargetDigest(matches[0])
+      : matchesAccountTestTargetRevision(target.targetRevision, matches[0]));
+    if (!unchanged) {
+      throw importBindingError(
+        'REMOTE_IMPORT_TARGET_STALE',
+        '选中的远端账号缺失、重复或版本已变化，请重新核对定向导入目标',
+      );
+    }
+    scopedAccounts.set(target.accountId, matches[0]);
+  }
+  const covered = new Set();
+  const writes = new Set();
+  for (const item of plan) {
+    const accountId = canonicalPositiveAccountId(item?.accountId);
+    const account = scopedAccounts.get(accountId);
+    if (!account || !['update', 'skip'].includes(item?.action)
+        || item?.conflictingVersions === true || item?.identityConflict === true) {
+      throw importBindingError(
+        'REMOTE_IMPORT_OUTSIDE_SCOPE',
+        '定向导入只能更新所选的既有远端账号，禁止新增或写入其他账号',
+      );
+    }
+    if (!Array.isArray(item.sourceIdentityKeys)
+        || !strongIdentitiesFullyMatch(item.sourceIdentityKeys, accountKeys(account))) {
+      throw importBindingError(
+        'REMOTE_IMPORT_IDENTITY_MISMATCH',
+        '新 token 的强身份与选中的远端账号不完全一致，已拒绝定向导入',
+      );
+    }
+    if (item.action === 'update') {
+      if (writes.has(accountId) || getAccountAvailability(account).key !== 'unavailable') {
+        throw importBindingError(
+          'REMOTE_IMPORT_PLAN_INVALID',
+          '定向导入不得重复更新同一账号，也不得更新当前可用或状态未知的账号',
+        );
+      }
+      writes.add(accountId);
+    }
+    covered.add(accountId);
+  }
+  if (covered.size !== scopedAccounts.size) {
+    throw importBindingError(
+      'REMOTE_IMPORT_TARGET_UNCOVERED',
+      '部分选中的远端账号没有对应的新 token 计划，请核对后重新确认',
+    );
+  }
 }
 
 function safeRemoteError(value, message = 'Sub2API 已报告远程错误（详情已隐藏）') {
@@ -1204,6 +1406,7 @@ function buildImportPlanIntentVersion(
   plan,
   groupBinding = null,
   executionBinding = null,
+  remoteTargets = undefined,
 ) {
   const normalizedSnapshotVersion = typeof snapshotVersionValue === 'string'
     ? snapshotVersionValue.toLowerCase()
@@ -1231,6 +1434,7 @@ function buildImportPlanIntentVersion(
   }
   const createGroupBinding = normalizeImportGroupBinding(plan, groupBinding);
   const normalizedExecutionBinding = normalizeImportExecutionBinding(plan, executionBinding);
+  const normalizedRemoteTargets = normalizeRemoteImportTargets(remoteTargets);
   const material = {
     // The public `sync-plan-v1` prefix describes the digest wire format. This
     // inner schema versions the hashed fields, so old previews fail closed
@@ -1253,6 +1457,7 @@ function buildImportPlanIntentVersion(
           eligibilityPolicy: IMPORT_GROUP_ELIGIBILITY_POLICY,
         },
     items: plan.map(importPlanIntentItem),
+    ...(normalizedRemoteTargets === undefined ? {} : { remoteTargets: normalizedRemoteTargets }),
   };
   return 'sync-plan-v1.' + crypto.createHash('sha256')
     .update(JSON.stringify(material))
@@ -2349,6 +2554,18 @@ async function preflightUpdateAccount(client, item, options = {}) {
   if (availability.key !== 'unavailable') {
     return { account, skipReason: availability.reason || 'sub2api_availability_unknown' };
   }
+  const remoteTargetChanged = options.remoteTargetDigest !== undefined
+    ? typeof options.remoteTargetDigest !== 'string'
+      || !/^[a-f0-9]{64}$/.test(options.remoteTargetDigest)
+      || options.remoteTargetDigest !== accountTestTargetDigest(account)
+    : options.remoteTargetRevision !== undefined
+      && !matchesAccountTestTargetRevision(options.remoteTargetRevision, account);
+  if (remoteTargetChanged) {
+    throw importBindingError(
+      'REMOTE_IMPORT_TARGET_STALE',
+      '选中的远端账号在定向写入前已变化，已停止更新',
+    );
+  }
   if (isExpiryInvalid(item?._record) || isExpired(item?._record, nowMs)) {
     return { account, skipReason: isExpiryInvalid(item?._record) ? 'source_expiry_invalid' : 'source_token_expired' };
   }
@@ -2468,6 +2685,8 @@ async function executeImportPlanItem({
   sourceRoot = null,
   signal = null,
   now = Date.now,
+  remoteTargetRevision = undefined,
+  remoteTargetDigest = undefined,
 }) {
   throwIfJobInterrupted(signal);
   if (item.action === 'update') {
@@ -2475,7 +2694,8 @@ async function executeImportPlanItem({
       ? revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now))
       : null;
     throwIfJobInterrupted(signal);
-    let preflight = await preflightUpdateAccount(client, item, { signal, now });
+    const preflightOptions = { signal, now, remoteTargetRevision, remoteTargetDigest };
+    let preflight = await preflightUpdateAccount(client, item, preflightOptions);
     if (preflight.skipReason) {
       return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
     }
@@ -2486,7 +2706,7 @@ async function executeImportPlanItem({
       // strong-identity and availability check of the remote target.
       freshRecord = revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now));
       throwIfJobInterrupted(signal);
-      preflight = await preflightUpdateAccount(client, item, { signal, now });
+      preflight = await preflightUpdateAccount(client, item, preflightOptions);
       if (preflight.skipReason) {
         return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
       }
@@ -3060,6 +3280,9 @@ async function executeImport({
   snapshotVersion: expectedVersion,
   planIntentVersion: expectedPlanIntentVersion,
   selectedKeys = [],
+  remoteTargets = undefined,
+  remoteSourceHashes = undefined,
+  remoteTargetBaselines = undefined,
   actor = 'local',
   db,
   jobId = null,
@@ -3077,6 +3300,20 @@ async function executeImport({
     selectedCount: Array.isArray(selectedKeys) ? selectedKeys.length : 0,
   });
   try {
+    const normalizedRemoteTargets = normalizeRemoteImportTargets(remoteTargets);
+    const normalizedRemoteSources = normalizeRemoteImportSourceHashes(remoteSourceHashes);
+    const normalizedRemoteBaselines = normalizeRemoteImportTargetBaselines(remoteTargetBaselines);
+    if (normalizedRemoteTargets !== undefined || normalizedRemoteBaselines !== undefined) {
+      assertRemoteImportBaselines(normalizedRemoteTargets, normalizedRemoteBaselines);
+    }
+    if ((normalizedRemoteTargets !== undefined || normalizedRemoteSources !== undefined)
+        && (!normalizedRemoteTargets || !normalizedRemoteSources
+          || normalizedRemoteTargets.length !== normalizedRemoteSources.length)) {
+      throw importBindingError(
+        'REMOTE_IMPORT_SOURCES_INVALID',
+        '定向导入目标与 Phase3 输出文件绑定不完整',
+      );
+    }
     throwIfJobInterrupted(signal);
     if (process.env.PANEL_WRITE_ENABLED !== '1') {
       const error = new Error('写操作未启用，请设置 PANEL_WRITE_ENABLED=1 后重启面板');
@@ -3131,7 +3368,11 @@ async function executeImport({
         throw error;
       }
       throwIfJobInterrupted(signal);
+      if (normalizedRemoteTargets !== undefined) {
+        assertRemoteImportSources(current._internal.sources, selectedKeys, normalizedRemoteSources);
+      }
       const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
+      assertRemoteImportPlan(fullPlan, current._internal.accounts, normalizedRemoteTargets, normalizedRemoteBaselines);
       assertImportExecutableTargetLimit(fullPlan);
       const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
       const executionBinding = resolveImportExecutionBinding(client, fullPlan);
@@ -3142,6 +3383,7 @@ async function executeImport({
         fullPlan,
         groupBinding,
         executionBinding,
+        normalizedRemoteTargets,
       );
       if (!importPlanIntentVersionsEqual(expectedPlanIntentVersion, currentPlanIntentVersion)) {
         const error = new Error('导入计划在确认前已变化，请重新检查差异');
@@ -3309,6 +3551,12 @@ async function executeImport({
             context: baseFields,
             sourceRoot: current._internal.sources.rootDirectory,
             signal,
+            remoteTargetRevision: normalizedRemoteTargets?.find((target) => (
+              target.accountId === canonicalPositiveAccountId(item.accountId)
+            ))?.targetRevision,
+            remoteTargetDigest: normalizedRemoteBaselines?.find((target) => (
+              target.accountId === canonicalPositiveAccountId(item.accountId)
+            ))?.targetDigest,
           });
           if (outcome.skipped) {
             const skippedItem = { ...item, action: 'skip', reason: outcome.reason };
@@ -3567,6 +3815,11 @@ async function executeImport({
 }
 
 module.exports = {
+  normalizeRemoteImportTargets,
+  normalizeRemoteImportSourceHashes,
+  normalizeRemoteImportTargetBaselines,
+  assertRemoteImportSources,
+  assertRemoteImportPlan,
   buildSnapshot,
   buildImportPlan,
   buildImportPlanIntentVersion,

@@ -107,6 +107,7 @@
       <div class="toolbar-actions local-recovery-actions" aria-label="本地账号恢复">
         <span class="maintenance-label">没有活动 token？从 username.json 独立选择账号，不关联上表的远程邮箱</span>
         <button id="localPhase3Button" class="button button-secondary" type="button" aria-describedby="localPhase3ActionHint" disabled>从本地账号获取 token</button>
+        <button id="remotePhase3RecoveryButton" class="button button-secondary" type="button" disabled>Phase 3 成功任务回写</button>
         <p id="localPhase3ActionHint" class="local-recovery-hint">正在确认本地 Phase 3 是否可用</p>
       </div>
     </section>
@@ -241,6 +242,40 @@
       </div>
     </form>
   </dialog>
+  <dialog id="remotePhase3Dialog" class="auth-dialog remote-phase3-dialog" aria-labelledby="remotePhase3Title" aria-describedby="remotePhase3Help">
+    <form id="remotePhase3Form" method="dialog" class="auth-dialog-form">
+      <div>
+        <h2 id="remotePhase3Title">所选远端账号 → 本地 Phase 3</h2>
+        <p id="remotePhase3Help">直接重新登录本地账号获取新 token，不尝试远端续期。邮箱只用于列出登录候选，不代表身份已验证；请逐项确认远端 ID 对应的本地记录。新 token 必须与冻结的远端强身份一致，之后仍需预览并确认回写原 ID，不新增账号。</p>
+      </div>
+      <p id="remotePhase3Summary" aria-live="polite"></p>
+      <div class="local-phase3-table-wrap">
+        <table><thead><tr><th>确认</th><th>冻结的远端账号</th><th>本地登录候选</th><th>核对要求 / 跳过原因</th></tr></thead><tbody id="remotePhase3Rows"></tbody></table>
+      </div>
+      <label id="remotePhase3Skipped" hidden><input id="remotePhase3SkipAcknowledged" type="checkbox"> 我已核对表中跳过原因，确认本批不处理这些账号（不会删除账号）</label>
+      <p>每批最多 100 个，串行执行。不自动续批；关闭或刷新页面不会重新提交。完成后使用“Phase 3 成功任务回写”恢复预览。</p>
+      <p id="remotePhase3Error" class="dialog-error" aria-live="polite" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="remotePhase3Cancel" class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
+        <button id="remotePhase3Confirm" class="button button-primary" type="submit" value="confirm" disabled>确认映射并重新登录</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="remotePhase3RecoveryDialog" class="auth-dialog remote-phase3-dialog" aria-labelledby="remotePhase3RecoveryTitle">
+    <div class="auth-dialog-form">
+      <div><h2 id="remotePhase3RecoveryTitle">Phase 3 新 token 定向回写</h2>
+        <p>手动选择已成功且绑定远端 ID 的任务。服务端重新核对成功任务、新文件内容和远端强身份；只更新原 ID，可用账号跳过，不新增账号，不重新运行 Phase 3。最多显示最近 200 个任务。</p></div>
+      <p id="remotePhase3RecoverySummary" aria-live="polite"></p>
+      <div class="local-phase3-table-wrap"><table><thead><tr><th>选择</th><th>原远端 ID / 完成时间</th><th>新 token 文件 / 任务</th></tr></thead><tbody id="remotePhase3RecoveryRows"></tbody></table></div>
+      <pre id="remotePhase3RecoveryPlan" class="batch-target-list" aria-live="polite"></pre>
+      <p id="remotePhase3RecoveryError" class="dialog-error" aria-live="polite" hidden></p>
+      <div class="auth-dialog-actions">
+        <button id="remotePhase3RecoveryClose" class="button button-secondary" type="button">关闭</button>
+        <button id="remotePhase3RecoveryPreview" class="button button-secondary" type="button" disabled>预览定向回写</button>
+        <button id="remotePhase3RecoveryImport" class="button button-primary" type="button" disabled>确认更新原 ID</button>
+      </div>
+    </div>
+  </dialog>
   <dialog id="accountTestBatchDialog" class="auth-dialog account-test-batch-dialog" aria-labelledby="accountTestBatchTitle" aria-describedby="accountTestBatchHelp">
     <form id="accountTestBatchForm" method="dialog" class="auth-dialog-form">
       <div>
@@ -265,6 +300,7 @@
   <script src="/account-test-batch.js" defer></script>
   <script src="/app.js" defer></script>
   <script src="/local-phase3.js" defer></script>
+  <script src="/remote-phase3.js" defer></script>
   <script src="/account-test-batch-ui.js" defer></script>
 </body>
 </html>
