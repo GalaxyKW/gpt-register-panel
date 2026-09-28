@@ -249,15 +249,20 @@
         <p id="remotePhase3Help">直接重新登录本地账号获取新 token，不尝试远端续期。邮箱只用于列出登录候选，不代表身份已验证；请逐项确认远端 ID 对应的本地记录。新 token 必须与冻结的远端强身份一致，之后仍需预览并确认回写原 ID，不新增账号。</p>
       </div>
       <p id="remotePhase3Summary" aria-live="polite"></p>
+      <div class="remote-phase3-confirmation-controls">
+        <label><input id="remotePhase3ConfirmAll" type="checkbox" disabled> 我已核对下表，确认全部可执行映射</label>
+        <strong id="remotePhase3ConfirmationProgress" aria-live="polite"></strong>
+      </div>
       <div class="local-phase3-table-wrap">
         <table><thead><tr><th>确认</th><th>冻结的远端账号</th><th>本地登录候选</th><th>核对要求 / 跳过原因</th></tr></thead><tbody id="remotePhase3Rows"></tbody></table>
       </div>
       <label id="remotePhase3Skipped" hidden><input id="remotePhase3SkipAcknowledged" type="checkbox"> 我已核对表中跳过原因，确认本批不处理这些账号（不会删除账号）</label>
       <p>每批最多 100 个，串行执行。不自动续批；关闭或刷新页面不会重新提交。完成后使用“Phase 3 成功任务回写”恢复预览。</p>
       <p id="remotePhase3Error" class="dialog-error" aria-live="polite" hidden></p>
+      <p id="remotePhase3SubmitStatus" class="remote-phase3-submit-status" role="status" aria-live="polite"></p>
       <div class="auth-dialog-actions">
         <button id="remotePhase3Cancel" class="button button-secondary" type="submit" value="cancel" formnovalidate>取消</button>
-        <button id="remotePhase3Confirm" class="button button-primary" type="submit" value="confirm" disabled>确认映射并重新登录</button>
+        <button id="remotePhase3Confirm" class="button button-primary" type="submit" value="confirm" aria-describedby="remotePhase3SubmitStatus" disabled>确认映射并重新登录</button>
       </div>
     </form>
   </dialog>
@@ -269,10 +274,11 @@
       <div class="local-phase3-table-wrap"><table><thead><tr><th>选择</th><th>原远端 ID / 完成时间</th><th>新 token 文件 / 任务</th></tr></thead><tbody id="remotePhase3RecoveryRows"></tbody></table></div>
       <pre id="remotePhase3RecoveryPlan" class="batch-target-list" aria-live="polite"></pre>
       <p id="remotePhase3RecoveryError" class="dialog-error" aria-live="polite" hidden></p>
+      <p id="remotePhase3RecoveryStatus" class="remote-phase3-submit-status" role="status" aria-live="polite"></p>
       <div class="auth-dialog-actions">
         <button id="remotePhase3RecoveryClose" class="button button-secondary" type="button">关闭</button>
-        <button id="remotePhase3RecoveryPreview" class="button button-secondary" type="button" disabled>预览定向回写</button>
-        <button id="remotePhase3RecoveryImport" class="button button-primary" type="button" disabled>确认更新原 ID</button>
+        <button id="remotePhase3RecoveryPreview" class="button button-secondary" type="button" aria-describedby="remotePhase3RecoveryStatus" disabled>预览定向回写</button>
+        <button id="remotePhase3RecoveryImport" class="button button-primary" type="button" aria-describedby="remotePhase3RecoveryStatus" disabled>确认更新原 ID</button>
       </div>
     </div>
   </dialog>

@@ -11,6 +11,7 @@ const source = fs.readFileSync(path.join(__dirname, '../frontend/remote-phase3.j
 const localSource = fs.readFileSync(path.join(__dirname, '../frontend/local-phase3.js'), 'utf8');
 const app = fs.readFileSync(path.join(__dirname, '../frontend/app.js'), 'utf8');
 const html = fs.readFileSync(path.join(__dirname, '../frontend/index.html'), 'utf8');
+const styles = fs.readFileSync(path.join(__dirname, '../frontend/styles.css'), 'utf8');
 const targetRevision = 'account-test-v1.' + 'A'.repeat(43);
 const phase3TargetRevision = 'phase3-local-v1.' + 'B'.repeat(43);
 const jobId = 'job_' + 'a'.repeat(24);
@@ -105,6 +106,127 @@ test('remote-only rows reach explicit local login mapping without requiring acti
   assert.match(elements['#remotePhase3Rows'].innerHTML, /邮箱仅作候选提示/);
   assert.deepEqual(clone(run('remotePhase3ConfirmedTargets().targets')), [{ selectedKey: 'username:0',
     email: 'login@example.test', phone: '', phase3TargetRevision, remoteTarget: { accountId: 124, targetRevision } }]);
+});
+
+function mappingBatchHarness(overrides = {}) {
+  const rows = Array.from({ length: 22 }, (_, index) => row(124 + index, {
+    remoteDetails: { email: 'login' + index + '@example.test', chatgptAccountId: index === 21 ? '' : 'account-' + index },
+  }));
+  const accounts = rows.map((entry, index) => local(index, { email: entry.remoteDetails.email }));
+  const instance = harness({ apiFetch: async () => ({ ok: true, json: async () => listing(accounts) }), ...overrides });
+  instance.context.state.snapshot.rows = rows;
+  instance.context.state.selected = new Set(rows.map((entry) => entry.key));
+  instance.change = (name, checked, dataset = {}) => {
+    const target = instance.elements['#remotePhase3' + name];
+    target.checked = checked;
+    for (const handler of instance.handlers['#remotePhase3' + name + ':change'] || []) {
+      handler({ target: { ...target, checked, dataset } });
+    }
+  };
+  return instance;
+}
+
+test('screenshot regression: acknowledging one skip visibly explains the 21 unconfirmed mappings', async () => {
+  let mutations = 0;
+  const { run, elements, change } = mappingBatchHarness({
+    idempotentMutationFetch: async () => { mutations += 1; throw new Error('must not submit'); },
+  });
+  await run('openRemotePhase3Dialog()');
+  assert.match(elements['#remotePhase3SubmitStatus'].textContent, /还需确认 21.*还需明确确认本次跳过 1/s);
+  change('SkipAcknowledged', true);
+  assert.equal(elements['#remotePhase3Confirm'].disabled, true);
+  assert.match(elements['#remotePhase3SubmitStatus'].textContent, /还需确认 21.*确认全部可执行映射/);
+  assert.doesNotMatch(elements['#remotePhase3SubmitStatus'].textContent, /还需明确确认本次跳过/);
+  assert.equal(elements['#remotePhase3ConfirmationProgress'].textContent, '已确认 0 / 21 个可执行映射');
+  await run('submitRemotePhase3({preventDefault(){},submitter:{value:"confirm"}})');
+  assert.equal(mutations, 0);
+  change('ConfirmAll', true);
+  assert.equal(elements['#remotePhase3Confirm'].disabled, false);
+  assert.equal(elements['#remotePhase3SubmitStatus'].dataset.state, 'ready');
+  assert.equal(elements['#remotePhase3Error'].hidden, true, 'corrected consent must not retain a stale validation error');
+  assert.match(elements['#remotePhase3SubmitStatus'].textContent, /重新登录 21 个账号、跳过 1 个/);
+  assert.match(elements['#remotePhase3Confirm'].textContent, /21 个/);
+  assert.equal(run('remotePhase3ConfirmedTargets().targets.length'), 21);
+  assert.equal(mutations, 0, 'bulk confirmation never submits');
+});
+
+test('bulk confirmation excludes skips, keeps skip consent separate, and reflects partial selections', async () => {
+  const { run, elements, change } = mappingBatchHarness();
+  await run('openRemotePhase3Dialog()');
+  const inputs = Array.from({ length: 21 }, (_, index) => ({ dataset: { remotePhase3Id: String(124 + index) } }));
+  elements['#remotePhase3Rows'].querySelectorAll = () => inputs;
+  change('ConfirmAll', true);
+  assert.equal(run('remotePhase3State.confirmed.size'), 21);
+  assert.equal(run('remotePhase3State.confirmed.has(145)'), false);
+  assert.equal(elements['#remotePhase3SkipAcknowledged'].checked, false);
+  assert.equal(elements['#remotePhase3Confirm'].disabled, true);
+  assert.match(elements['#remotePhase3SubmitStatus'].textContent, /跳过 1 个/);
+  assert.ok(inputs.every((input) => input.checked));
+  change('Rows', false, { remotePhase3Id: '124' });
+  assert.equal(elements['#remotePhase3ConfirmAll'].checked, false);
+  assert.equal(elements['#remotePhase3ConfirmAll'].indeterminate, true);
+  assert.equal(inputs[0].checked, false);
+  assert.match(elements['#remotePhase3ConfirmationProgress'].textContent, /20 \/ 21/);
+  change('ConfirmAll', false);
+  assert.equal(run('remotePhase3State.confirmed.size'), 0);
+  assert.equal(elements['#remotePhase3ConfirmAll'].indeterminate, false);
+  assert.ok(inputs.every((input) => !input.checked));
+  change('ConfirmAll', true);
+  change('SkipAcknowledged', true);
+  assert.equal(elements['#remotePhase3Confirm'].disabled, false);
+  change('Rows', false, { remotePhase3Id: '125' });
+  assert.equal(elements['#remotePhase3Confirm'].disabled, true);
+  assert.match(elements['#remotePhase3SubmitStatus'].textContent, /还需确认 1 个/);
+});
+
+test('bulk confirmation cannot bypass changed selections, task locks, loading or read-only state', async () => {
+  const { run, context, elements, change } = mappingBatchHarness();
+  await run('openRemotePhase3Dialog()');
+  for (const [enable, disable, message] of [
+    [() => { context.state.selectionRevision += 1; }, () => { context.state.selectionRevision -= 1; }, /已变化/],
+    [() => { context.state.jobInventoryVerified = false; }, () => { context.state.jobInventoryVerified = true; }, /任务状态尚未核实/],
+    [() => { context.state.snapshot.readOnly = true; }, () => { context.state.snapshot.readOnly = false; }, /未确认可写/],
+    [() => { context.state.phase3RequestPending = true; }, () => { context.state.phase3RequestPending = false; }, /正在执行/],
+    [() => run('remotePhase3State.loading = true'), () => run('remotePhase3State.loading = false'), /正在读取/],
+    [() => run('remotePhase3State.submitting = true'), () => run('remotePhase3State.submitting = false'), /正在提交/],
+  ]) {
+    enable(); run('updateRemotePhase3Ui()');
+    assert.equal(elements['#remotePhase3ConfirmAll'].disabled, true);
+    assert.equal(elements['#remotePhase3Confirm'].disabled, true);
+    assert.match(elements['#remotePhase3SubmitStatus'].textContent, message);
+    change('ConfirmAll', true);
+    assert.equal(run('remotePhase3State.confirmed.size'), 0);
+    assert.equal(elements['#remotePhase3ConfirmAll'].checked, false);
+    disable();
+  }
+  change('ConfirmAll', true); change('SkipAcknowledged', true);
+  elements['#remotePhase3Dialog'].close();
+  await run('openRemotePhase3Dialog()');
+  assert.equal(run('remotePhase3State.confirmed.size'), 0);
+  assert.equal(elements['#remotePhase3ConfirmAll'].checked, false);
+  assert.equal(elements['#remotePhase3SkipAcknowledged'].checked, false);
+});
+
+test('mapping read failure and empty eligibility show actionable reasons without exposing errors', async () => {
+  const failed = mappingBatchHarness({ apiFetch: async () => { throw new Error('private failure text'); } });
+  await failed.run('openRemotePhase3Dialog()');
+  assert.equal(failed.elements['#remotePhase3ConfirmAll'].disabled, true);
+  assert.match(failed.elements['#remotePhase3SubmitStatus'].textContent, /未读取成功.*关闭后重新打开/);
+  assert.doesNotMatch(failed.elements['#remotePhase3SubmitStatus'].textContent, /private/);
+  const empty = mappingBatchHarness({ apiFetch: async () => ({ ok: true, json: async () => listing([]) }) });
+  await empty.run('openRemotePhase3Dialog()');
+  empty.change('ConfirmAll', true);
+  assert.equal(empty.elements['#remotePhase3ConfirmAll'].disabled, true);
+  assert.equal(empty.elements['#remotePhase3Confirm'].disabled, true);
+  assert.match(empty.elements['#remotePhase3SubmitStatus'].textContent, /没有可安全执行/);
+});
+
+test('compact layouts avoid sticky toolbar obstruction and expose confirmation status to assistive technology', () => {
+  assert.match(styles, /@media \(max-width: 980px\), \(max-height: 760px\)\s*\{\s*\.toolbar\s*\{\s*position: static;/);
+  for (const id of ['remotePhase3SubmitStatus', 'remotePhase3RecoveryStatus']) {
+    assert.match(html, new RegExp('id="' + id + '"[^>]+role="status"[^>]+aria-live="polite"'));
+    assert.match(html, new RegExp('aria-describedby="' + id + '"'));
+  }
 });
 
 test('missing identity, duplicate/missing candidates, unavailable records and available accounts remain explicit skips', () => {

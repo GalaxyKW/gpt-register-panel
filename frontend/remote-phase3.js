@@ -11,8 +11,9 @@ const remotePhase3State = {
 };
 const remotePhase3Elements = Object.fromEntries([
   'Dialog', 'Form', 'Summary', 'Rows', 'Skipped', 'SkipAcknowledged', 'Error', 'Confirm', 'Cancel',
+  'ConfirmAll', 'ConfirmationProgress', 'SubmitStatus',
   'RecoveryButton', 'RecoveryDialog', 'RecoverySummary', 'RecoveryRows', 'RecoveryError',
-  'RecoveryPreview', 'RecoveryImport', 'RecoveryClose', 'RecoveryPlan',
+  'RecoveryPreview', 'RecoveryImport', 'RecoveryClose', 'RecoveryPlan', 'RecoveryStatus',
 ].map((name) => [name, document.querySelector('#remotePhase3' + name)]));
 const REMOTE_PHASE3_REVISION = /^account-test-v1\.[A-Za-z0-9_-]{43}$/;
 
@@ -86,12 +87,13 @@ function remotePhase3ConfirmedTargets() {
   const eligible = mappings.filter((entry) => !entry.reason);
   const skipped = mappings.filter((entry) => entry.reason);
   if (!mappings.length || !eligible.length) return { problem: '所选账号没有可安全执行的本地登录映射', targets: [] };
-  if (eligible.some((entry) => !remotePhase3State.confirmed.has(entry.accountId))) {
-    return { problem: '请逐项确认远端 ID → 本地登录记录映射；不会静默执行已勾选的子集', targets: [] };
-  }
+  const remaining = eligible.filter((entry) => !remotePhase3State.confirmed.has(entry.accountId)).length;
+  const problems = [];
+  if (remaining) problems.push('还需确认 ' + remaining + ' 个本地登录映射：请逐项确认左侧勾选框，或核对后勾选“确认全部可执行映射”');
   if (skipped.length && !remotePhase3Elements.SkipAcknowledged.checked) {
-    return { problem: '请明确确认本次跳过列出的不可执行账号', targets: [] };
+    problems.push('还需明确确认本次跳过 ' + skipped.length + ' 个不可执行账号（表格下方勾选框）');
   }
+  if (problems.length) return { problem: problems.join('。') + '。不会静默执行已勾选的子集。', targets: [] };
   return { problem: '', targets: eligible.map((entry) => ({
     selectedKey: entry.local.selectedKey, email: entry.local.email, phone: entry.local.phone || '',
     phase3TargetRevision: entry.local.phase3TargetRevision,
@@ -113,6 +115,14 @@ function remotePhase3Error(message, recovery = false) {
   element.textContent = message || '';
 }
 
+function remotePhase3MappingSubmitProblem() {
+  if (remotePhase3State.loading) return '正在读取并核验本地登录候选，请稍候；尚未提交任务。';
+  if (remotePhase3State.submitting) return '正在提交本地 Phase 3 任务，请勿重复提交或关闭页面。';
+  if (!remotePhase3State.listing) return '本地登录清单未读取成功，请关闭后重新打开；未提交任务。';
+  if (!remotePhase3SelectionUnchanged()) return '所选远端账号或快照已变化，请关闭后重新核对。';
+  return remotePhase3ActionProblem() || remotePhase3ConfirmedTargets().problem;
+}
+
 function updateRemotePhase3Ui() {
   const problem = remotePhase3ActionProblem();
   if (remotePhase3Elements.RecoveryButton) {
@@ -121,22 +131,53 @@ function updateRemotePhase3Ui() {
   }
   if (remotePhase3Elements.Dialog?.open) {
     const busy = remotePhase3State.loading || remotePhase3State.submitting;
-    const selection = remotePhase3ConfirmedTargets();
-    remotePhase3Elements.Confirm.disabled = busy || Boolean(problem) || Boolean(selection.problem)
-      || !remotePhase3SelectionUnchanged();
+    const eligible = remotePhase3State.mappings.filter((entry) => !entry.reason);
+    const skipped = remotePhase3State.mappings.length - eligible.length;
+    const confirmed = eligible.filter((entry) => remotePhase3State.confirmed.has(entry.accountId)).length;
+    const controlsLocked = busy || Boolean(problem) || !remotePhase3State.listing || !remotePhase3SelectionUnchanged();
+    const submitProblem = remotePhase3MappingSubmitProblem();
+    const progress = '已确认 ' + confirmed + ' / ' + eligible.length + ' 个可执行映射';
+    remotePhase3Elements.ConfirmationProgress.textContent = progress;
+    remotePhase3Elements.ConfirmAll.checked = eligible.length > 0 && confirmed === eligible.length;
+    remotePhase3Elements.ConfirmAll.indeterminate = confirmed > 0 && confirmed < eligible.length;
+    remotePhase3Elements.ConfirmAll.disabled = controlsLocked || eligible.length === 0;
+    remotePhase3Elements.SubmitStatus.textContent = submitProblem
+      ? '暂不能提交：' + submitProblem
+      : progress + '；将重新登录 ' + eligible.length + ' 个账号、跳过 ' + skipped + ' 个。不会自动导入，完成后还需预览并确认回写。';
+    remotePhase3Elements.SubmitStatus.dataset.state = submitProblem ? 'blocked' : 'ready';
+    remotePhase3Elements.Confirm.disabled = Boolean(submitProblem);
+    remotePhase3Elements.Confirm.title = remotePhase3Elements.SubmitStatus.textContent;
+    remotePhase3Elements.Confirm.textContent = remotePhase3State.submitting ? '正在提交…'
+      : '确认映射并重新登录' + (eligible.length ? '（' + eligible.length + ' 个）' : '');
     remotePhase3Elements.Cancel.disabled = remotePhase3State.submitting;
-    remotePhase3Elements.SkipAcknowledged.disabled = busy || Boolean(problem);
+    remotePhase3Elements.SkipAcknowledged.disabled = controlsLocked;
     for (const input of remotePhase3Elements.Rows.querySelectorAll('input[data-remote-phase3-id]')) {
-      input.disabled = busy || Boolean(problem);
+      input.disabled = controlsLocked;
+      input.checked = remotePhase3State.confirmed.has(Number(input.dataset.remotePhase3Id));
     }
   }
   if (remotePhase3Elements.RecoveryDialog?.open) {
     const busy = remotePhase3State.recoveryBusy;
-    remotePhase3Elements.RecoveryPreview.disabled = busy || Boolean(problem)
-      || remotePhase3State.recoverySelected.size === 0;
-    remotePhase3Elements.RecoveryImport.disabled = busy || Boolean(problem)
-      || !remotePhase3State.recoveryPlan
-      || !remotePhase3State.recoveryPlan.items.some((item) => item.action === 'update');
+    const selection = remotePhase3RecoverySelection();
+    const busyReason = busy ? state.importRequestPending
+      ? '正在提交定向回写，请等待结果，不要重复操作'
+      : state.previewRequestPending ? '正在核验成功任务和定向回写预览，请稍候'
+        : '正在读取并核验最近的成功任务，请稍候' : '';
+    const previewProblem = busyReason || problem || selection.problem;
+    const importProblem = previewProblem || remotePhase3RecoveryImportProblem(selection);
+    remotePhase3Elements.RecoveryPreview.disabled = Boolean(previewProblem);
+    remotePhase3Elements.RecoveryPreview.title = previewProblem || '核验所选成功任务并预览原 ID 的回写动作';
+    remotePhase3Elements.RecoveryImport.disabled = Boolean(importProblem);
+    remotePhase3Elements.RecoveryImport.title = importProblem || '确认预览中的更新项，只更新原 ID，不新增账号';
+    if (remotePhase3Elements.RecoveryStatus) {
+      const plan = remotePhase3State.recoveryPlan;
+      remotePhase3Elements.RecoveryStatus.textContent = previewProblem
+        || (plan ? importProblem || '预览已核验：更新 ' + plan.items.filter((item) => item.action === 'update').length
+          + ' 个，跳过 ' + plan.items.filter((item) => item.action === 'skip').length + ' 个。核对后可确认更新原 ID。'
+          : '已选 ' + selection.entries.length + ' 个成功任务，请先点击“预览定向回写”。');
+      remotePhase3Elements.RecoveryStatus.dataset.state = busy ? 'busy'
+        : previewProblem || (plan && importProblem) ? 'blocked' : 'ready';
+    }
     remotePhase3Elements.RecoveryClose.disabled = busy;
     for (const input of remotePhase3Elements.RecoveryRows.querySelectorAll('input[data-remote-phase3-job]')) {
       input.disabled = busy || Boolean(problem);
@@ -230,9 +271,10 @@ async function submitRemotePhase3(event) {
   if (remotePhase3State.submitting) return;
   if (event.submitter?.value !== 'confirm') { remotePhase3Elements.Dialog.close('cancel'); return; }
   const selection = remotePhase3ConfirmedTargets();
-  const problem = remotePhase3ActionProblem() || selection.problem
-    || (!remotePhase3SelectionUnchanged() ? '所选远端账号已变化，请关闭后重新核对' : '');
-  if (problem) { remotePhase3Error(problem); return; }
+  const problem = remotePhase3MappingSubmitProblem();
+  // The live status follows later checkbox changes; do not leave a stale copy
+  // of this validation error next to an otherwise ready submit button.
+  if (problem) { updateRemotePhase3Ui(); return; }
   const targets = selection.targets;
   if (!window.confirm('确认对这 ' + targets.length + ' 个远端 ID 对应的本地记录重新登录？\n远端 ID：'
       + targets.map((entry) => entry.remoteTarget.accountId).join('、')
@@ -283,6 +325,34 @@ function remotePhase3SuccessfulResult(job) {
     remoteTargetDigest: remote.targetDigest,
     remoteEndpointDigest: remote.endpointDigest,
     remoteTarget: { accountId: remote.accountId, targetRevision: remote.targetRevision } };
+}
+
+function remotePhase3RecoverySelection(jobs = remotePhase3State.recoveryJobs,
+  selected = remotePhase3State.recoverySelected) {
+  const entries = jobs.filter(({ job }) => selected.has(job.id));
+  let problem = '';
+  if (!selected.size) problem = jobs.length ? '请先勾选需要回写的成功任务'
+    : '没有可核验的成功任务；请先完成绑定远端 ID 的本地 Phase 3，再重新打开回写窗口';
+  else if (entries.length !== selected.size) problem = '所选任务已不在当前清单中，请关闭后重新读取';
+  else if (entries.length > 100) problem = '每批最多回写 100 个成功任务，请减少选择；不会自动省略超出项';
+  else if (new Set(entries.map(({ target }) => target.remoteTarget.accountId)).size !== entries.length) {
+    problem = '同一远端 ID 只能选择一个成功任务，请取消重复项后预览';
+  } else if (new Set(entries.map(({ target }) => target.selectedKey)).size !== entries.length) {
+    problem = '同一新 token 文件只能选择一次，请取消重复项后预览';
+  }
+  return { entries, problem };
+}
+
+function remotePhase3RecoveryImportProblem(selection = remotePhase3RecoverySelection()) {
+  if (selection.problem) return selection.problem;
+  const plan = remotePhase3State.recoveryPlan;
+  if (!plan || !remotePhase3State.recoveryBinding) return '请先点击“预览定向回写”，核对每个原 ID 的动作';
+  const invalid = remotePhase3ImportPlanProblem(plan, selection.entries.map((entry) => entry.target));
+  if (invalid) return invalid;
+  if (!plan.items.some((item) => item.action === 'update')) {
+    return '本次预览全部跳过，无需更新；请查看上方每一项的跳过原因';
+  }
+  return '';
 }
 
 function renderRemotePhase3Recovery() {
@@ -386,11 +456,12 @@ function remotePhase3ImportPlanProblem(plan, targets) {
 
 async function previewRemotePhase3Import() {
   if (remotePhase3State.recoveryBusy || remotePhase3ActionProblem()) return;
-  const entries = remotePhase3State.recoveryJobs.filter(({ job }) => remotePhase3State.recoverySelected.has(job.id));
-  if (!entries.length || entries.length !== remotePhase3State.recoverySelected.size || entries.length > 100
-      || new Set(entries.map(({ target }) => target.remoteTarget.accountId)).size !== entries.length
-      || new Set(entries.map(({ target }) => target.selectedKey)).size !== entries.length) {
-    remotePhase3Error('请为每个远端 ID 选择唯一成功任务，本次最多 100 个；不会静默省略重复项。', true); return;
+  const { entries, problem } = remotePhase3RecoverySelection();
+  if (problem) {
+    remotePhase3Error(problem, true);
+    remotePhase3Elements.RecoveryError.dataset.kind = 'selection';
+    updateRemotePhase3Ui();
+    return;
   }
   const generation = remotePhase3State.recoveryGeneration;
   remotePhase3State.recoveryBusy = true;
@@ -422,6 +493,7 @@ async function previewRemotePhase3Import() {
       + '\n仅更新以上原 ID；可用账号跳过，绝不新增。';
   } catch {
     remotePhase3Error('任务、新 token 文件或目标快照已变化，或回写预览不能保证原 ID。未执行导入；请刷新核对，勿改用普通导入绕过。', true);
+    remotePhase3Elements.RecoveryError.dataset.kind = 'preview';
   } finally {
     remotePhase3State.recoveryBusy = false;
     state.previewRequestPending = false;
@@ -431,11 +503,16 @@ async function previewRemotePhase3Import() {
 
 async function importRemotePhase3Tokens() {
   if (remotePhase3State.recoveryBusy || remotePhase3ActionProblem()) return;
+  const selection = remotePhase3RecoverySelection();
+  const problem = remotePhase3RecoveryImportProblem(selection);
+  if (problem) {
+    remotePhase3Error(problem, true);
+    remotePhase3Elements.RecoveryError.dataset.kind = selection.problem ? 'selection' : 'preview';
+    updateRemotePhase3Ui();
+    return;
+  }
   const plan = remotePhase3State.recoveryPlan;
   const binding = remotePhase3State.recoveryBinding;
-  const entries = remotePhase3State.recoveryJobs.filter(({ job }) => remotePhase3State.recoverySelected.has(job.id));
-  if (!plan || !binding || remotePhase3ImportPlanProblem(plan, entries.map((entry) => entry.target))
-      || !plan.items.some((item) => item.action === 'update')) return;
   if (!window.confirm('确认仅向预览中的原 Sub2API ID 回写新 token？\n'
       + plan.items.map((item) => '#' + item.accountId + ' ' + actionLabel(item.action)).join('、')
       + '\n不会新增账号；当前已可用账号跳过。')) return;
@@ -458,6 +535,7 @@ async function importRemotePhase3Tokens() {
     remotePhase3State.recoveryPlan = null;
     remotePhase3State.recoveryBinding = null;
     remotePhase3Error('回写提交结果无法确认，后台可能已执行。请先核对任务状态，不要改选目标重复导入。', true);
+    remotePhase3Elements.RecoveryError.dataset.kind = 'submission';
     await loadSnapshot({ resumeJobs: true });
   } finally {
     remotePhase3State.recoveryBusy = false;
@@ -468,11 +546,21 @@ async function importRemotePhase3Tokens() {
 
 remotePhase3Elements.Form?.addEventListener('submit', submitRemotePhase3);
 remotePhase3Elements.Rows?.addEventListener('change', (event) => {
-  if (remotePhase3State.loading || remotePhase3State.submitting || remotePhase3ActionProblem()) return;
+  if (remotePhase3State.loading || remotePhase3State.submitting || remotePhase3ActionProblem()
+      || !remotePhase3State.listing || !remotePhase3SelectionUnchanged()) { updateRemotePhase3Ui(); return; }
   const id = Number(event.target?.dataset?.remotePhase3Id);
   if (!remotePhase3State.mappings.some((entry) => entry.accountId === id && !entry.reason)) return;
   if (event.target.checked) remotePhase3State.confirmed.add(id);
   else remotePhase3State.confirmed.delete(id);
+  updateRemotePhase3Ui();
+});
+remotePhase3Elements.ConfirmAll?.addEventListener('change', (event) => {
+  if (remotePhase3State.loading || remotePhase3State.submitting || remotePhase3ActionProblem()
+      || !remotePhase3State.listing || !remotePhase3SelectionUnchanged()) { updateRemotePhase3Ui(); return; }
+  // An explicit operator gesture confirms only the frozen, actionable mappings.
+  // It neither acknowledges skipped rows nor submits a task.
+  remotePhase3State.confirmed = new Set(event.target.checked
+    ? remotePhase3State.mappings.filter((entry) => !entry.reason).map((entry) => entry.accountId) : []);
   updateRemotePhase3Ui();
 });
 remotePhase3Elements.SkipAcknowledged?.addEventListener('change', updateRemotePhase3Ui);
@@ -503,6 +591,10 @@ remotePhase3Elements.RecoveryRows?.addEventListener('change', (event) => {
   remotePhase3State.recoveryPlan = null;
   remotePhase3State.recoveryBinding = null;
   remotePhase3Elements.RecoveryPlan.textContent = '';
+  if (['selection', 'preview'].includes(remotePhase3Elements.RecoveryError.dataset.kind)) {
+    remotePhase3Error('', true);
+    remotePhase3Elements.RecoveryError.dataset.kind = '';
+  }
   renderRemotePhase3Recovery();
 });
 remotePhase3Elements.RecoveryDialog?.addEventListener('cancel', (event) => {
