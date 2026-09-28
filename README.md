@@ -200,7 +200,13 @@ unit 使用只读文件系统视图，只开放以下已经绑定并固定的服
 
 没有 `access_token` 或可匹配身份的来源文件会标记为“文件异常”，不会进入导入计划；过期字段存在但无法解析的文件会单独标记为“过期时间无效”，同样禁止自动导入。导入任务只把远程接口的计数、状态和账号 ID 保存到面板 SQLite，不保存远程返回中的凭据字段。统计接口部分账号失败时，概览和对应单元格都会明确显示读取失败，不会伪装成 `0`。
 
-Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 或 `--phone=...`，禁止 shell 拼接和任意路径；实际启动前会分别打开并验证 Node、`index.js` 和源码根目录，再通过继承的 `/proc/self/fd/4`、fd 3 与 `/proc/self/fd/5` 执行，避免路径在校验后被替换。`gpt_register` 的非交互参数向后兼容原有交互选择。成功后会要求对应 token 指纹发生变化；识别到账号被删除/停用时，会把 `username.json` 标记为 `account_deleted` 和 `phase3Disposition=discard`，后续不会重复排队。面板允许一次提交最多 100 个账号，但仍按共享浏览器 profile 串行执行；队列总量也受 `PANEL_PHASE3_MAX_ACTIVE_JOBS` 限制。同一请求和已有队列中的重复账号会逐项返回并跳过，浏览器刷新后会恢复整批任务状态。Phase 3 对 `username.json` 使用 32 MiB 不可上调硬上限；TERM/KILL 后仍未关闭管道时会在最终期限强制收口任务。
+Phase 3 的逻辑接口固定为 `node /mnt/nvme/gpt_register/index.js --phase3 --email=...` 或 `--phone=...`，禁止 shell 拼接和任意路径；实际启动前会分别打开并验证 Node、`index.js` 和源码根目录，再通过继承的 `/proc/self/fd/4`、fd 3 与 `/proc/self/fd/5` 执行，避免路径在校验后被替换。`gpt_register` 的非交互参数向后兼容原有交互选择。成功后会要求对应 token 指纹发生变化；识别到账号被删除/停用时，会把 `username.json` 标记为 `account_deleted` 和 `phase3Disposition=discard`，后续不会重复排队。面板允许一次提交最多 100 个账号，但因共享账号账本仍串行执行；队列总量也受 `PANEL_PHASE3_MAX_ACTIVE_JOBS` 限制。同一请求和已有队列中的重复账号会逐项返回并跳过，浏览器刷新后会恢复整批任务状态。Phase 3 对 `username.json` 使用 32 MiB 不可上调硬上限；TERM/KILL 后仍未关闭管道时会在最终期限强制收口任务。
+
+面板启动的每次 Phase3 使用独立、随机命名、权限为 `0700` 的临时 Chrome profile，不复用或删除 `gpt_register/browser-profile`。只有 `config.browserUserDataDir` 被替换为子进程也能访问的真实绝对路径；源码、配置、账号与 token 路径仍由继承 FD 固定。不能把 Node 的 `/proc/self/fd/5/browser-profile` 直接传给 Chrome，因为 Chrome 中的 `self` 和 fd 5 指向不同进程资源。临时目录及祖先必须满足所有者、权限和非符号链接检查；只有完整进程树确认退出后才按原 inode 清理，退出不明或目录被替换时保留并记录警告。
+
+启动器对 `gpt_register` 顶层失败设置的非零 `process.exitCode` 增加约 1 秒的日志收尾期限。失败后有 Chrome/Xvfb 残留引用也会退出主进程，交由面板执行原有的进程树身份核验、TERM/KILL 和 token/账号文件后置检查；不通过日志文字判断退出，不缩短正常任务的超时，不把未知文件写入当作安全失败。一次普通失败仍按原规则结束该项；人工对账保护不会被自动解除。
+
+可重复的真实浏览器检查脚本为 `tests/manual/phase3-browser-smoke.cjs`，参数是 `gpt_register` 的源码根路径。它只复制 `BrowserService` 和日志代码到临时夹具、引用真实依赖，使用虚构配置打开 `about:blank`，不读取真实配置、账号或 token。检查包括正常关闭与故意留下浏览器引用后的失败回收。生产验收应在与面板相同的 systemd 文件系统/权限隔离下运行，并限制网络仅允许 loopback；`npm test` 不会自动启动此浏览器检查。此检查通过代表启动和回收链路可用，不代表远端 OAuth 登录一定成功。
 
 “清理过期 token”只扫描 `GPT_REGISTER_ROOT/tokens` 和 `GPT_REGISTER_ROOT/use_token` 下的普通 JSON 文件，要求能解析且明确存在过期时间；扫描结果带版本号，确认操作时会重新校验版本，文件发生变化就拒绝处理。所谓删除实际是移动到 `GPT_REGISTER_ROOT/.panel-quarantine/expired-tokens`（或 `PANEL_TOKEN_QUARANTINE_DIR` 指定的目录），并按批次保留原相对路径，便于恢复；跨文件系统时会先完整复制并刷盘，再移除来源。删除列表、跳过项和操作者会写入结构化日志与 SQLite 审计，不会记录 token 原文；无 access token、无法解析、无过期时间或未过期文件不会处理。恢复时将隔离目录中的文件移回原来的 `tokens/` 或 `use_token/` 目录。
 

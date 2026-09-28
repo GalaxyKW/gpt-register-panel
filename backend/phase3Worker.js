@@ -38,14 +38,19 @@ const { assertDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
 const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
+const { installPhase3ChildLifecycle } = require('./lib/phase3ChildLifecycle');
+const {
+  PROFILE_ENV, assertPhase3ProfileParent, createPhase3BrowserProfile,
+  removePhase3BrowserProfile, configurePhase3BrowserProfile,
+} = require('./lib/phase3BrowserProfile');
 const {
   validateBoundRemoteTarget,
   assertRemotePhase3TargetCurrent,
   remotePhase3EndpointDigest,
 } = require('./remotePhase3');
 
-// Phase 3 drives a real browser and gpt_register uses a shared profile. Only
-// one process may run at a time; jobs for different accounts wait in order.
+// Phase 3 drives a real browser and updates gpt_register's shared account
+// ledger. Only one process may run at a time, even with isolated profiles.
 let phase3Queue = Promise.resolve();
 const activePhase3Jobs = new Map();
 const TERMINAL_ACCOUNT_STATUSES = new Set([
@@ -722,6 +727,8 @@ const PHASE3_LAUNCHER_SOURCE = [
   'process.mainModule = main;',
   'Module._cache[script] = main;',
   'try {',
+  `  (${installPhase3ChildLifecycle.toString()})();`,
+  `  (${configurePhase3BrowserProfile.toString()})(main, root, (${assertPhase3ProfileParent.toString()}));`,
   '  main._compile(source, script);',
   '  main.loaded = true;',
   '} catch (error) {',
@@ -2230,6 +2237,8 @@ async function runPhase3JobNow({
   let rootHandle = null;
   let scriptHandle = null;
   let nodeHandle = null;
+  let browserProfile = null;
+  let browserProfileCleanupAllowed = true;
   let boundRemoteTarget = null;
   let remoteClient = null;
   const checkRemoteEndpoint = () => {
@@ -2381,9 +2390,10 @@ async function runPhase3JobNow({
         command: path.basename(nodePath),
         script: 'index.js',
       };
+      browserProfile = createPhase3BrowserProfile();
       const commandOptions = {
         cwd: pinnedRootPath,
-        env: phase3Environment(),
+        env: { ...phase3Environment(), [PROFILE_ENV]: browserProfile.path },
         timeoutMs: process.env.PANEL_PHASE3_TIMEOUT_MS,
         maxOutputBytes: process.env.PANEL_PHASE3_MAX_OUTPUT_BYTES,
         terminationGraceMs: process.env.PANEL_PHASE3_KILL_GRACE_MS,
@@ -2397,8 +2407,11 @@ async function runPhase3JobNow({
       };
       writeLog(logger, 'info', 'phase3.process_starting', processLogFields);
       assertAuditLogCheckpoint(logger, 'phase3.process_spawn_checkpoint', processLogFields);
+      browserProfileCleanupAllowed = false;
       result = await runCommand(command, commandArguments, commandOptions);
+      browserProfileCleanupAllowed = result?.terminationConfirmed === true;
     } catch (error) {
+      if (error?.details?.terminationConfirmed === true) browserProfileCleanupAllowed = true;
       const shutdownInterruption = error?.code === 'JOB_INTERRUPTED';
       classifyPhase3ProcessError(error, entry, rootHandle);
       const processSummary = phase3ProcessSummary(error?.details);
@@ -2717,6 +2730,19 @@ async function runPhase3JobNow({
     });
     throw error;
   } finally {
+    if (browserProfile) {
+      if (browserProfileCleanupAllowed) {
+        try {
+          removePhase3BrowserProfile(browserProfile);
+          writeLog(logger, 'info', 'phase3.browser_profile_removed', { jobId, actor });
+        } catch {
+          writeLog(logger, 'warn', 'phase3.browser_profile_cleanup_failed', { jobId, actor });
+        }
+      } else {
+        writeLog(logger, 'warn', 'phase3.browser_profile_retained', { jobId, actor,
+          reason: 'process_tree_not_confirmed_stopped' });
+      }
+    }
     closeRegularFileHandle(scriptHandle);
     closeRegularFileHandle(nodeHandle);
     closeDirectoryHandle(rootHandle);
