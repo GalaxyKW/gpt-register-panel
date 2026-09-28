@@ -2591,8 +2591,50 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
       user_id: 'test-user-4',
     })],
   ]);
+  // The real admin list/detail/scheduler APIs omit raw token values. Export
+  // returns current credentials separately while import-time hashes may be
+  // stale; keep that cross-endpoint contract in this HTTP integration fixture.
+  const remoteDto = (account) => ({
+    id: account.id,
+    name: account.name,
+    platform: account.platform,
+    type: account.type,
+    status: account.status,
+    schedulable: account.schedulable,
+    credentials: {
+      chatgpt_account_id: account.account_id,
+      chatgpt_user_id: account.user_id,
+    },
+    credentials_status: {
+      has_access_token: true,
+      has_refresh_token: true,
+      has_id_token: true,
+    },
+    extra: {
+      access_token_sha256: crypto.createHash('sha256')
+        .update('fixture-old-access-' + account.id).digest('hex'),
+      refresh_token_sha256: crypto.createHash('sha256')
+        .update('fixture-old-refresh-' + account.id).digest('hex'),
+    },
+  });
+  const exportedAccount = (account) => {
+    const dto = remoteDto(account);
+    return {
+      name: dto.name,
+      platform: dto.platform,
+      type: dto.type,
+      credentials: {
+        ...dto.credentials,
+        access_token: 'fixture-current-access-' + account.id,
+        refresh_token: 'fixture-current-refresh-' + account.id,
+        id_token: 'fixture-current-id-' + account.id,
+      },
+      extra: dto.extra,
+    };
+  };
   const testCalls = [];
   const schedulableCalls = [];
+  const exportCalls = [];
   let omitPaginationMetadataOnce = false;
   const upstream = http.createServer((request, response) => {
     const url = new URL(request.url, 'http://upstream.test');
@@ -2601,7 +2643,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
       response.setHeader('content-type', 'application/json');
       const page = Number(url.searchParams.get('page') || 1);
       const pageSize = Number(url.searchParams.get('page_size') || 20);
-      const rows = page === 1 ? [...accounts.values()] : [];
+      const rows = page === 1 ? [...accounts.values()].map(remoteDto) : [];
       const data = {
         items: rows,
         total: accounts.size,
@@ -2617,6 +2659,19 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
         code: 0,
         message: 'success',
         data,
+      }));
+      return;
+    }
+    if (request.method === 'GET' && url.pathname === '/api/v1/admin/accounts/data') {
+      const ids = String(url.searchParams.get('ids') || '').split(',').filter(Boolean).map(Number);
+      assert.ok(ids.length > 0 && ids.length <= 100, 'current credentials require bounded ID-scoped export');
+      assert.equal(new Set(ids).size, ids.length);
+      assert.equal(ids.every((id) => Number.isSafeInteger(id) && accounts.has(id)), true);
+      assert.equal(url.searchParams.get('include_proxies'), 'false');
+      exportCalls.push(ids);
+      response.setHeader('content-type', 'application/json');
+      response.end(JSON.stringify({
+        data: { accounts: ids.map((id) => exportedAccount(accounts.get(id))), proxies: [] },
       }));
       return;
     }
@@ -2640,7 +2695,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     }
     if (request.method === 'GET' && suffix === '') {
       response.setHeader('content-type', 'application/json');
-      response.end(JSON.stringify({ data: account }));
+      response.end(JSON.stringify({ data: remoteDto(account) }));
       return;
     }
     if (request.method === 'POST' && suffix === 'test') {
@@ -2671,7 +2726,7 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
         schedulableCalls.push({ id, body: JSON.parse(body || '{}') });
         account.schedulable = JSON.parse(body || '{}').schedulable === true;
         response.setHeader('content-type', 'application/json');
-        response.end(JSON.stringify({ data: account }));
+        response.end(JSON.stringify({ data: remoteDto(account) }));
       });
       return;
     }
@@ -2869,6 +2924,10 @@ test('panel account-test endpoint tests error and non-error accounts with scoped
     assert.equal(accounts.get(4).account_id, 'replacement-account-4');
     assert.equal(accounts.get(4).schedulable, false);
     assert.equal(admissionLookupCalls, 2);
+    assert.deepEqual(exportCalls[0], [1, 2, 3, 4]);
+    assert.equal(exportCalls.some((ids) => ids.length === 1 && ids[0] === 1), true);
+    assert.equal(exportCalls.some((ids) => ids.length === 1 && ids[0] === 2), true);
+    assert.equal(JSON.stringify(job).includes('fixture-current-'), false);
   } finally {
     let closeFailure = null;
     try {

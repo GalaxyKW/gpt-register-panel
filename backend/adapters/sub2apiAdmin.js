@@ -878,6 +878,63 @@ function safeAccount(account) {
   };
 }
 
+// Sub2API retains import-time digests in extra after OAuth refreshes. They
+// cannot prove the current value (or even presence) of a masked credential.
+// Keep safeAccount's strict raw+digest checks for ordinary raw DTOs; only
+// remove historical evidence for masked fields or authoritative exports.
+function withoutHistoricalDigests(value, maskedOnly = false) {
+  if (!isPlainObject(value)) return value;
+  const credentials = isPlainObject(value.credentials) ? { ...value.credentials } : value.credentials;
+  const extra = isPlainObject(value.extra) ? { ...value.extra } : value.extra;
+  for (const [digest, snake, camel] of [
+    ['access_token_sha256', 'access_token', 'accessToken'],
+    ['refresh_token_sha256', 'refresh_token', 'refreshToken'],
+  ]) {
+    if (maskedOnly && [credentials?.[snake], credentials?.[camel]]
+      .some((raw) => raw !== undefined && raw !== null && raw !== '')) continue;
+    if (isPlainObject(credentials)) delete credentials[digest];
+    if (isPlainObject(extra)) delete extra[digest];
+  }
+  return { ...value, credentials, extra };
+}
+
+function currentAccount(value) {
+  return safeAccount(value?.platform === 'openai' && value?.type === 'oauth'
+    ? withoutHistoricalDigests(value, true)
+    : value);
+}
+
+function currentCredentialReadRequired(account) {
+  return account?.schemaValid === true
+    && account.platform === 'openai' && account.type === 'oauth'
+    && Boolean(account.accountId || account.userId)
+    && ['access', 'refresh', 'id'].some((kind) => (
+      account.credentialPresence[kind] === 'unknown'
+        || (account.credentialPresence[kind] === 'present' && !account.tokenFingerprints[kind])
+    ));
+}
+
+function currentCredentialMappingKey(account) {
+  if (!account?.schemaValid || !account.name || !(account.accountId || account.userId)) return null;
+  return JSON.stringify([
+    account.name, account.platform, account.type, account.accountId, account.userId,
+  ]);
+}
+
+function currentCredentialError(changed = false) {
+  const error = new Error(changed
+    ? 'Sub2API 账号在当前凭据核验期间发生变化，请刷新后重新预览'
+    : 'Sub2API 当前凭据无法与请求账号唯一核验，已停止操作');
+  error.code = changed ? 'SUB2API_CURRENT_CREDENTIALS_CHANGED' : 'SUB2API_CURRENT_CREDENTIALS_INVALID';
+  return error;
+}
+
+function currentAccountEvidence(account) {
+  if (!account) return null;
+  const { usage, ...evidence } = account;
+  return JSON.stringify(evidence);
+}
+
 function optionalNumber(value) {
   if (value === undefined || value === null || typeof value === 'boolean') return null;
   if (typeof value === 'string' && !value.trim()) return null;
@@ -1811,7 +1868,7 @@ class Sub2ApiAdminClient {
           throw error;
         }
       }
-      const normalizedRows = pageRows.map(safeAccount);
+      const normalizedRows = pageRows.map(currentAccount);
       if (normalizedRows.some((account) => !account)) {
         const error = new Error('Sub2API 账号列表包含无效账号标识');
         error.code = 'SUB2API_ACCOUNTS_SCHEMA_INVALID';
@@ -1852,7 +1909,60 @@ class Sub2ApiAdminClient {
       error.code = 'SUB2API_PAGE_LIMIT';
       throw error;
     }
-    return [...rows.values()];
+    return this.readCurrentCredentials([...rows.values()], options);
+  }
+
+  async readCurrentCredentials(accounts, options = {}) {
+    const candidates = accounts.filter(currentCredentialReadRequired);
+    const keys = new Set();
+    for (const account of candidates) {
+      const key = currentCredentialMappingKey(account);
+      if (!key || keys.has(key)) throw currentCredentialError();
+      keys.add(key);
+    }
+    const replacements = new Map();
+    // DataAccount exports have no ID. Exact-ID filtering alone is insufficient:
+    // require a bijection by name, platform/type and every strong identity, not
+    // email or result order. Never retain or return the raw export credentials.
+    for (let offset = 0; offset < candidates.length; offset += 100) {
+      const batch = candidates.slice(offset, offset + 100);
+      const targets = new Map(batch.map((account) => [currentCredentialMappingKey(account), account]));
+      const exported = await this.exportAccounts(batch.map((account) => account.id), {
+        signal: options.signal,
+        includeProxies: false,
+      });
+      if (options.signal?.aborted) throw interruptedRequestError('Sub2API 当前凭据核验已取消');
+      if (exported.accounts.length !== batch.length) throw currentCredentialError();
+      for (const raw of exported.accounts) {
+        if (!isPlainObject(raw) || !isPlainObject(raw.credentials)) throw currentCredentialError();
+        const actual = safeAccount({ ...withoutHistoricalDigests(raw), id: 1 });
+        const key = currentCredentialMappingKey(actual);
+        const target = targets.get(key);
+        if (!target || raw.name !== target.name || raw.platform !== target.platform
+            || raw.type !== target.type
+            || (hasOwn(raw, 'id') && positiveAccountId(raw.id) !== target.id)) {
+          throw currentCredentialError();
+        }
+        const presence = {};
+        for (const kind of ['access', 'refresh', 'id']) {
+          presence[kind] = actual.tokenFingerprints[kind] ? 'present' : 'absent';
+          if ((target.credentialPresence[kind] !== 'unknown'
+                && target.credentialPresence[kind] !== presence[kind])
+              || (target.tokenFingerprints[kind]
+                && target.tokenFingerprints[kind] !== actual.tokenFingerprints[kind])) {
+            throw currentCredentialError();
+          }
+        }
+        replacements.set(target.id, {
+          ...target,
+          tokenFingerprints: actual.tokenFingerprints,
+          credentialPresence: presence,
+        });
+        targets.delete(key);
+      }
+      if (targets.size !== 0) throw currentCredentialError();
+    }
+    return accounts.map((account) => replacements.get(account.id) || account);
   }
 
   async listGroups(options = {}) {
@@ -1883,7 +1993,7 @@ class Sub2ApiAdminClient {
       undefined,
       { signal: options.signal },
     );
-    const account = safeAccount(value);
+    const account = currentAccount(value);
     if (!account) {
       const error = new Error('Sub2API 账号详情响应结构无效');
       error.code = 'SUB2API_ACCOUNT_SCHEMA_INVALID';
@@ -1894,7 +2004,23 @@ class Sub2ApiAdminClient {
       error.code = 'SUB2API_ACCOUNT_RESPONSE_MISMATCH';
       throw error;
     }
-    return account;
+    return this.confirmCurrentAccount(account, options);
+  }
+
+  async confirmCurrentAccount(account, options = {}) {
+    if (!currentCredentialReadRequired(account)) return account;
+    const [current] = await this.readCurrentCredentials([account], options);
+    const after = currentAccount(await this.request(
+      'GET',
+      '/api/v1/admin/accounts/' + encodeURIComponent(String(account.id)),
+      undefined,
+      { signal: options.signal },
+    ));
+    if (options.signal?.aborted) throw interruptedRequestError('Sub2API 当前凭据核验已取消');
+    if (currentAccountEvidence(account) !== currentAccountEvidence(after)) {
+      throw currentCredentialError(true);
+    }
+    return current;
   }
 
   async getAvailableModels(id) {
@@ -2176,7 +2302,7 @@ class Sub2ApiAdminClient {
       { schedulable: expectedSchedulable },
       { signal: options.signal, writeOperation: true },
     );
-    const account = safeAccount(value);
+    const account = currentAccount(value);
     if (!account) {
       const error = new Error('Sub2API 调度设置响应结构无效');
       error.code = 'SUB2API_SCHEDULABLE_SCHEMA_INVALID';
@@ -2189,7 +2315,13 @@ class Sub2ApiAdminClient {
       error.code = 'SUB2API_SCHEDULABLE_RESPONSE_MISMATCH';
       throw markWriteOutcomeUnknown(error, 'response_mismatch');
     }
-    return account;
+    try {
+      return await this.confirmCurrentAccount(account, options);
+    } catch (error) {
+      // The scheduler write has already been dispatched. A failed subsequent
+      // credential read is not a safe pre-dispatch failure or permission to retry.
+      throw markWriteOutcomeUnknown(error, 'response_credentials_unverified');
+    }
   }
 
   async getAccountStats(id, days = 30) {
@@ -2291,7 +2423,8 @@ class Sub2ApiAdminClient {
 
   async exportAccounts(ids = [], options = {}) {
     const accountIds = normalizedExportAccountIds(ids);
-    const query = accountIds.length > 0 ? '?ids=' + encodeURIComponent(accountIds.join(',')) : '';
+    let query = accountIds.length > 0 ? '?ids=' + encodeURIComponent(accountIds.join(',')) : '';
+    if (options.includeProxies === false) query += (query ? '&' : '?') + 'include_proxies=false';
     const value = await this.request(
       'GET',
       '/api/v1/admin/accounts/data' + query,
