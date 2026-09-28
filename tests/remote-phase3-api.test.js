@@ -10,7 +10,8 @@ require('./test-isolation');
 const { createServer, shutdownServer, reconciliationReviewDetail } = require('../backend/server');
 const { PanelDb } = require('../backend/db');
 const { safeAccount } = require('../backend/adapters/sub2apiAdmin');
-const { accountTestTargetRevision, createAccountTargetRevisionIssuer } = require('../backend/accountTargetRevision');
+const { accountTestTargetRevision, accountTestTargetDigest,
+  createAccountTargetRevisionIssuer } = require('../backend/accountTargetRevision');
 
 const EMAIL = 'remote-phase3-api@example.test';
 const logger = {
@@ -18,7 +19,7 @@ const logger = {
   requestId() { return 'remote-phase3-api-test'; },
 };
 
-async function fixture(t) {
+async function fixture(t, options = {}) {
   // Entirely synthetic runtime material; no deployment config or real account
   // data is read. Never print these values, including in assertion failures.
   const synthetic = () => crypto.randomBytes(24).toString('hex');
@@ -42,10 +43,12 @@ async function fixture(t) {
     id: 124, name: 'free00011', platform: 'openai', type: 'oauth', status: 'error', schedulable: false,
     credentials: { ...outputDocument, access_token: synthetic(), refresh_token: synthetic() }, group_ids: [],
   };
+  if (options.userOnly) delete raw.credentials.chatgpt_account_id;
+  const additionalAccounts = [];
   const writes = [];
   const client = {
     baseUrl: 'http://127.0.0.1:9',
-    listAccounts: async () => [safeAccount(raw)],
+    listAccounts: async () => [raw, ...additionalAccounts].map(safeAccount),
     getAccount: async (id) => { assert.equal(id, raw.id); return safeAccount(raw); },
     getBatchTableUsageStats: async () => ({ stats: {}, errors: {} }),
     exportAccounts: async () => ({ accounts: [structuredClone(raw)] }),
@@ -107,8 +110,128 @@ async function fixture(t) {
       assert.equal(text.includes(value), false, 'job must not expose synthetic credential material');
     }
   };
-  return { root, raw, client, writes, db, request, selection, waitJob, assertRedacted, synthetic };
+  return { root, raw, additionalAccounts, client, writes, db, request, selection, waitJob,
+    assertRedacted, synthetic };
 }
+
+test('successful bound Phase3 alone may complete missing account identity on the original remote ID', async (t) => {
+  const f = await fixture(t, { userOnly: true });
+  const body = await f.selection();
+  const accepted = await f.request('/api/phase3/local', body);
+  assert.equal(accepted.status, 202);
+  const id = accepted.body.jobIds[0];
+  const phase3Job = await f.waitJob(id);
+  assert.equal(phase3Job.status, 'succeeded');
+  f.assertRedacted(phase3Job);
+  const selectedKeys = ['token:tokens:tokens/result.json'];
+  const normal = await f.request('/api/sync/preview', { selectedKeys });
+  assert.equal(normal.status, 200);
+  assert.equal(normal.body.counts.update || 0, 0, 'ordinary import must retain strict identity matching');
+  assert.equal(normal.body.counts.create || 0, 0);
+  const forged = await f.request('/api/sync/preview', { selectedKeys, remoteSourceBindings: [{
+    accountId: 124, selectedKey: selectedKeys[0], contentHash: phase3Job.result.tokenContentHash,
+    identityKeys: ['user:fixture-remote-user'], targetDigest: phase3Job.result.remoteTarget.targetDigest,
+  }] });
+  assert.equal(forged.status, 200);
+  assert.equal(forged.body.counts.update || 0, 0, 'client-supplied source bindings carry no authority');
+  const scoped = { selectedKeys, remoteTargets: [body.accounts[0].remoteTarget], phase3JobIds: [id] };
+  const preview = await f.request('/api/sync/preview', scoped);
+  assert.equal(preview.status, 200);
+  assert.equal(preview.body.counts.update, 1);
+  assert.equal(preview.body.items[0].identityCompletion, 'account_id');
+  const imported = await f.request('/api/sync/import', { ...scoped,
+    snapshotVersion: preview.body.version, planIntentVersion: preview.body.planIntentVersion });
+  assert.equal(imported.status, 202);
+  const importJob = await f.waitJob(imported.body.jobId);
+  assert.equal(importJob.status, 'succeeded');
+  f.assertRedacted(importJob);
+  assert.deepEqual(f.writes, [124]);
+  assert.equal(f.raw.credentials.chatgpt_account_id, 'fixture-remote-account');
+  assert.equal(f.raw.credentials.chatgpt_user_id, 'fixture-remote-user');
+  assert.equal(f.raw.name, 'free00011');
+  assert.equal(f.raw.status, 'error', 'identity completion is not proof of a successful account test');
+});
+
+test('identity completion rejects shared remote identities and substituted successful-job output', async (t) => {
+  const f = await fixture(t, { userOnly: true });
+  const body = await f.selection();
+  const accepted = await f.request('/api/phase3/local', body);
+  assert.equal(accepted.status, 202);
+  const id = accepted.body.jobIds[0];
+  assert.equal((await f.waitJob(id)).status, 'succeeded');
+  const scoped = { selectedKeys: ['token:tokens:tokens/result.json'],
+    remoteTargets: [body.accounts[0].remoteTarget], phase3JobIds: [id] };
+  for (const shared of ['user', 'account']) {
+    const other = structuredClone(f.raw);
+    other.id = 125;
+    other.name = 'free00012';
+    other.credentials.chatgpt_account_id = shared === 'account'
+      ? 'fixture-remote-account' : 'different-fixture-account';
+    if (shared === 'account') other.credentials.chatgpt_user_id = 'different-fixture-user';
+    f.additionalAccounts.push(other);
+    assert.equal((await f.request('/api/sync/preview', scoped)).status, 409,
+      'another remote sharing either completed strong identity must block completion');
+    f.additionalAccounts.pop();
+  }
+  const swapped = path.join(f.root, 'tokens/swapped.json');
+  fs.copyFileSync(path.join(f.root, 'tokens/result.json'), swapped);
+  assert.equal((await f.request('/api/sync/preview', { ...scoped,
+    selectedKeys: ['token:tokens:tokens/swapped.json'] })).status, 409,
+  'even identical file content cannot substitute the successful job output path');
+  fs.rmSync(swapped);
+  const resultFile = path.join(f.root, 'tokens/result.json');
+  const modified = JSON.parse(fs.readFileSync(resultFile, 'utf8'));
+  modified.chatgpt_account_id = 'different-fixture-account';
+  fs.writeFileSync(resultFile, JSON.stringify(modified));
+  assert.equal((await f.request('/api/sync/preview', scoped)).status, 409,
+    'a modified identity cannot reuse the successful job content binding');
+  assert.deepEqual(f.writes, []);
+});
+
+test('identity completion does not exchange successful outputs between two frozen remote IDs', async (t) => {
+  const f = await fixture(t, { userOnly: true });
+  const selection = await f.selection();
+  const accepted = await f.request('/api/phase3/local', selection);
+  assert.equal(accepted.status, 202);
+  const original = await f.waitJob(accepted.body.jobIds[0]);
+  assert.equal(original.status, 'succeeded');
+  const secondRaw = structuredClone(f.raw);
+  secondRaw.id = 125;
+  secondRaw.name = 'free00012';
+  secondRaw.credentials.chatgpt_user_id = 'second-fixture-user';
+  f.additionalAccounts.push(secondRaw);
+  const secondTarget = { ...original.result.remoteTarget, accountId: 125,
+    targetRevision: accountTestTargetRevision(safeAccount(secondRaw)),
+    targetDigest: accountTestTargetDigest(safeAccount(secondRaw)),
+    identityKeys: ['user:second-fixture-user'] };
+  const secondDocument = JSON.parse(fs.readFileSync(path.join(f.root, 'tokens/result.json'), 'utf8'));
+  secondDocument.chatgpt_account_id = 'second-fixture-account';
+  secondDocument.chatgpt_user_id = 'second-fixture-user';
+  secondDocument.email = 'second-fixture@example.test';
+  secondDocument.access_token = f.synthetic();
+  const secondBytes = JSON.stringify(secondDocument);
+  fs.writeFileSync(path.join(f.root, 'tokens/second.json'), secondBytes, { mode: 0o600 });
+  const secondHash = crypto.createHash('sha256').update(secondBytes).digest('hex');
+  const swappedJobs = [];
+  for (const [remoteTarget, tokenFile, tokenContentHash] of [
+    [original.result.remoteTarget, 'tokens/second.json', secondHash],
+    [secondTarget, original.result.tokenFile, original.result.tokenContentHash],
+  ]) {
+    const copied = await f.db.createJob('phase3', { ...original.payload, remoteTarget }, 'panel-admin');
+    await f.db.updateJob(copied.id, { status: 'succeeded', result: {
+      ...original.result, remoteTarget, tokenFile, tokenContentHash,
+    } });
+    swappedJobs.push(copied.id);
+  }
+  const preview = await f.request('/api/sync/preview', {
+    selectedKeys: ['token:tokens:tokens/result.json', 'token:tokens:tokens/second.json'],
+    remoteTargets: [selection.accounts[0].remoteTarget,
+      { accountId: 125, targetRevision: secondTarget.targetRevision }], phase3JobIds: swappedJobs,
+  });
+  assert.equal(preview.status, 409,
+    'complete coverage and correct hashes cannot replace the per-job identity-to-ID binding');
+  assert.deepEqual(f.writes, []);
+});
 
 test('remote Phase3 requires explicit mapping and current remote revision before admission', async (t) => {
   const f = await fixture(t);

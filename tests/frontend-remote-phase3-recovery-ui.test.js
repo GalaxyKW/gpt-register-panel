@@ -148,6 +148,44 @@ test('recovery plan readiness requires original IDs and shows update and skip co
   assert.equal(h.writes(), 0);
 });
 
+test('recovery refuses unknown identity completion enums and completion on create or conflict actions', async () => {
+  const h = harness();
+  const jobs = [entry(1)];
+  h.install(jobs);
+  for (const identityCompletion of ['user_id', 'account_id ', '', null, true, {}, ['account_id']]) {
+    const preview = plan(jobs);
+    preview.items[0].identityCompletion = identityCompletion;
+    h.setPlan(preview);
+    assert.equal(h.elements['#remotePhase3RecoveryImport'].disabled, true);
+    assert.match(h.elements['#remotePhase3RecoveryImport'].title, /身份补全.*无效/);
+    await h.run('importRemotePhase3Tokens()');
+  }
+  for (const action of ['create', 'conflict']) {
+    const preview = plan(jobs, action);
+    preview.items[0].identityCompletion = 'account_id';
+    h.setPlan(preview);
+    assert.equal(h.elements['#remotePhase3RecoveryImport'].disabled, true);
+    await h.run('importRemotePhase3Tokens()');
+  }
+  assert.equal(h.writes(), 0);
+});
+
+test('recovery allows only explicit account-id completion on updates and leaves skip-only plans non-writable', async () => {
+  const h = harness();
+  const jobs = [entry(1)];
+  h.install(jobs);
+  const preview = plan(jobs);
+  preview.items[0].identityCompletion = 'account_id';
+  h.setPlan(preview);
+  assert.equal(h.elements['#remotePhase3RecoveryImport'].disabled, false);
+  preview.items[0].action = 'skip';
+  h.setPlan(preview);
+  assert.equal(h.elements['#remotePhase3RecoveryImport'].disabled, true);
+  assert.match(h.elements['#remotePhase3RecoveryStatus'].textContent, /全部跳过/);
+  await h.run('importRemotePhase3Tokens()');
+  assert.equal(h.writes(), 0);
+});
+
 test('selection change preserves unknown submission errors and never removes a reconciliation lock', () => {
   const h = harness();
   const jobs = [entry(1), entry(2)];

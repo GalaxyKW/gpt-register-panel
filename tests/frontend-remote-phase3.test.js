@@ -108,6 +108,21 @@ test('remote-only rows reach explicit local login mapping without requiring acti
     email: 'login@example.test', phone: '', phase3TargetRevision, remoteTarget: { accountId: 124, targetRevision } }]);
 });
 
+test('user-only remote login mapping explains narrow account completion without adding client authorization fields', async () => {
+  let confirmation = '';
+  const { run, context, elements } = harness({ window: { confirm: (message) => { confirmation = message; return false; } } });
+  context.state.snapshot.rows = [row(124, {
+    remoteDetails: { email: 'login@example.test', chatgptAccountId: '', userId: 'user-124' },
+  })];
+  await run('openRemotePhase3Dialog()');
+  assert.match(elements['#remotePhase3Rows'].innerHTML, /同一 User ID.*仅可补缺失 Account ID.*已有身份不改/);
+  run('remotePhase3State.confirmed.add(124)');
+  await run('submitRemotePhase3({preventDefault(){},submitter:{value:"confirm"}})');
+  assert.match(confirmation, /仅有 User ID.*相同 User ID.*补缺失 Account ID.*不改已有/);
+  assert.deepEqual(clone(run('remotePhase3ConfirmedTargets().targets')), [{ selectedKey: 'username:0',
+    email: 'login@example.test', phone: '', phase3TargetRevision, remoteTarget: { accountId: 124, targetRevision } }]);
+});
+
 function mappingBatchHarness(overrides = {}) {
   const rows = Array.from({ length: 22 }, (_, index) => row(124 + index, {
     remoteDetails: { email: 'login' + index + '@example.test', chatgptAccountId: index === 21 ? '' : 'account-' + index },
@@ -359,6 +374,53 @@ test('targeted preview binds successful task IDs and import never degrades to or
   assert.doesNotMatch(JSON.stringify(mutation[2]), /endpointDigest|targetDigest/);
   assert.ok(mutation[2].planIntentVersion);
   assert.deepEqual([...context.state.selected], ['account:124']);
+});
+
+test('identity completion preview and final confirmation describe the exact update without sending a new authorization field', async () => {
+  for (const completionAction of ['update', 'skip']) {
+    const completionJob = job();
+    completionJob.result.remoteTarget.identityKeys = ['user:user-124'];
+    const completionPlan = plan();
+    completionPlan.items[0].identityCompletion = 'account_id';
+    completionPlan.items[0].action = completionAction;
+    let confirmation = '';
+    let mutation = null;
+    const calls = [];
+    const { run, context, elements } = harness({
+      window: { confirm: (message) => { confirmation = message; return true; } },
+      apiFetch: async (url, options) => {
+        calls.push([url, options?.body ? JSON.parse(options.body) : null]);
+        return { ok: true, json: async () => url.startsWith('/api/jobs?')
+          ? { jobs: [completionJob] } : url.startsWith('/api/jobs/') ? completionJob : completionPlan };
+      },
+      idempotentMutationFetch: async (...args) => {
+        mutation = clone(args);
+        return { response: { ok: true }, body: { jobId: 'job_' + 'e'.repeat(24) } };
+      },
+    });
+    await run('openRemotePhase3Recovery()');
+    context.sampleJobId = jobId;
+    run('remotePhase3State.recoverySelected.add(sampleJobId)');
+    await run('previewRemotePhase3Import()');
+    const previewText = elements['#remotePhase3RecoveryPlan'].textContent;
+    if (completionAction === 'update') {
+      assert.match(previewText, /同 User ID 核验一致，仅补缺失 Account ID，保留原 ID \/ 已有身份/);
+      await run('importRemotePhase3Tokens()');
+      assert.match(confirmation, /同 User ID 核验一致，仅补缺失 Account ID，保留原 ID \/ 已有身份/);
+      assert.deepEqual(Object.keys(mutation[2]).sort(), [
+        'phase3JobIds', 'planIntentVersion', 'remoteTargets', 'selectedKeys', 'snapshotVersion',
+      ]);
+      assert.doesNotMatch(JSON.stringify(mutation[2]), /identityCompletion|allowIdentity|force/);
+    } else {
+      assert.match(previewText, /跳过：本次不补 Account ID，保留原 ID \/ 已有身份/);
+      await run('importRemotePhase3Tokens()');
+      assert.equal(mutation, null);
+      assert.equal(confirmation, '');
+    }
+    const preview = calls.find(([url]) => url === '/api/sync/preview')[1];
+    assert.deepEqual(preview, { selectedKeys: ['token:tokens:tokens/new.json'],
+      remoteTargets: [{ accountId: 124, targetRevision }], phase3JobIds: [jobId] });
+  }
 });
 
 test('targeted preview rejects creates, different IDs, paths, superseded copies and duplicate choices', () => {

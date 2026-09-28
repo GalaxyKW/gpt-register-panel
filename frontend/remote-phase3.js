@@ -67,6 +67,9 @@ function remotePhase3MappingPlan(rows, listing) {
     else if (!local.eligible) reason = localPhase3Reason(local.reason);
     return { accountId: row.accountId, name: boundedReconciliationDisplay(row.accountName, 128) || '',
       email, local, reason, targetRevision: row.targetRevision,
+      identityNotice: !remote.chatgptAccountId && remote.userId
+        ? '远端仅有 User ID：新 token 必须保持同一 User ID；仅可补缺失 Account ID，已有身份不改。'
+        : '新 token 必须与已有 Account ID / User ID 一致；不替换已有身份。',
       remoteIdentity: [remote.chatgptAccountId, remote.userId]
         .map((value) => boundedReconciliationDisplay(value, 512)).filter(Boolean).join(' / ') };
   });
@@ -196,7 +199,8 @@ function renderRemotePhase3Mappings() {
       + '</small><small>远端强身份：' + escapeHtml(entry.remoteIdentity || '缺失') + '</small></td><td>'
       + (entry.local ? 'username.json #' + escapeHtml(entry.local.selectedKey.slice(9))
         + '<small>' + escapeHtml(entry.local.email) + '</small>' : '没有唯一候选')
-      + '</td><td>' + escapeHtml(entry.reason || '邮箱仅作候选提示；需人工确认登录映射，新 token 仍须通过强身份核验')
+      + '</td><td>' + escapeHtml(entry.reason || '邮箱仅作候选提示；需人工确认登录映射，新 token 仍须通过强身份核验。'
+        + (entry.identityNotice || ''))
       + '</td></tr>';
   }).join('');
   const skipped = mappings.filter((entry) => entry.reason);
@@ -278,6 +282,7 @@ async function submitRemotePhase3(event) {
   const targets = selection.targets;
   if (!window.confirm('确认对这 ' + targets.length + ' 个远端 ID 对应的本地记录重新登录？\n远端 ID：'
       + targets.map((entry) => entry.remoteTarget.accountId).join('、')
+      + '\n远端仅有 User ID 时，新 token 必须保持相同 User ID，才可补缺失 Account ID；不改已有 Account ID / User ID。'
       + '\n本批串行执行；新 token 必须通过强身份核验，完成后需单独确认定向回写，不自动新增或导入。')) return;
   remotePhase3State.submitting = true;
   state.phase3RequestPending = true;
@@ -442,6 +447,10 @@ function remotePhase3ImportPlanProblem(plan, targets) {
       || !plan.version || plan.items.length !== targets.length) return '回写预览版本或完整性无法确认';
   const seen = new Set();
   for (const item of plan.items) {
+    if (Object.prototype.hasOwnProperty.call(item, 'identityCompletion')
+        && item.identityCompletion !== 'account_id') {
+      return '回写预览身份补全标记无效，已禁止导入';
+    }
     const target = targets.find((entry) => entry.remoteTarget.accountId === item.accountId);
     if (!target || seen.has(item.accountId) || !['update', 'skip'].includes(item.action)
         || item.conflictingVersions === true || item.identityConflict === true
@@ -452,6 +461,13 @@ function remotePhase3ImportPlanProblem(plan, targets) {
     seen.add(item.accountId);
   }
   return '';
+}
+
+function remotePhase3IdentityCompletionLabel(item) {
+  if (item.identityCompletion !== 'account_id') return '';
+  return item.action === 'update'
+    ? '同 User ID 核验一致，仅补缺失 Account ID，保留原 ID / 已有身份'
+    : item.action === 'skip' ? '跳过：本次不补 Account ID，保留原 ID / 已有身份' : '';
 }
 
 async function previewRemotePhase3Import() {
@@ -489,7 +505,8 @@ async function previewRemotePhase3Import() {
     remotePhase3State.recoveryPlan = plan;
     remotePhase3State.recoveryBinding = binding;
     remotePhase3Elements.RecoveryPlan.textContent = plan.items.map((item) => 'Sub2API #' + item.accountId
-      + '：' + actionLabel(item.action) + ' · ' + actionReasonLabel(item.reason) + ' · ' + item.relativePath).join('\n')
+      + '：' + actionLabel(item.action) + ' · ' + actionReasonLabel(item.reason) + ' · ' + item.relativePath
+      + (remotePhase3IdentityCompletionLabel(item) ? ' · ' + remotePhase3IdentityCompletionLabel(item) : '')).join('\n')
       + '\n仅更新以上原 ID；可用账号跳过，绝不新增。';
   } catch {
     remotePhase3Error('任务、新 token 文件或目标快照已变化，或回写预览不能保证原 ID。未执行导入；请刷新核对，勿改用普通导入绕过。', true);
@@ -514,7 +531,8 @@ async function importRemotePhase3Tokens() {
   const plan = remotePhase3State.recoveryPlan;
   const binding = remotePhase3State.recoveryBinding;
   if (!window.confirm('确认仅向预览中的原 Sub2API ID 回写新 token？\n'
-      + plan.items.map((item) => '#' + item.accountId + ' ' + actionLabel(item.action)).join('、')
+      + plan.items.map((item) => '#' + item.accountId + ' ' + actionLabel(item.action)
+        + (remotePhase3IdentityCompletionLabel(item) ? '（' + remotePhase3IdentityCompletionLabel(item) + '）' : '')).join('、')
       + '\n不会新增账号；当前已可用账号跳过。')) return;
   remotePhase3State.recoveryBusy = true;
   state.importRequestPending = true;

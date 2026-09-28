@@ -47,6 +47,7 @@ const {
   tokenFingerprint,
 } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
+const { canCompleteAccountIdentity } = require('./identityCompletion');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
 const {
@@ -67,6 +68,9 @@ const IMPORT_TARGET_BINDING_SCHEMA = 'sub2api-admin-target-v1';
 const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
 const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
 const MAX_REMOTE_IMPORT_TARGETS = 100;
+// An API/client flag is never authority to relax a write preflight. Only the
+// server's successful-job scoped planner can mint this process-local proof.
+const identityCompletionProofs = new WeakMap();
 
 function safeErrorMessage(error) {
   return safeFailureMessage(error);
@@ -277,7 +281,8 @@ function assertRemoteImportPlan(plan, accounts, remoteTargets, remoteTargetBasel
       );
     }
     if (!Array.isArray(item.sourceIdentityKeys)
-        || !strongIdentitiesFullyMatch(item.sourceIdentityKeys, accountKeys(account))) {
+        || (!strongIdentitiesFullyMatch(item.sourceIdentityKeys, accountKeys(account))
+          && !hasIdentityCompletionProof(item, account))) {
       throw importBindingError(
         'REMOTE_IMPORT_IDENTITY_MISMATCH',
         '新 token 的强身份与选中的远端账号不完全一致，已拒绝定向导入',
@@ -1196,6 +1201,7 @@ function importPlanIntentItem(item) {
     sourceTerminalUsernameMatch: item?.sourceTerminalUsernameMatch || null,
     conflictingVersions: item?.conflictingVersions === true,
     identityConflict: item?.identityConflict === true,
+    identityCompletion: item?.identityCompletion === 'account_id' ? 'account_id' : null,
     supersededBy: item?.supersededBy || null,
     selectedSourcePaths: Array.isArray(item?.selectedSourcePaths)
       ? [...item.selectedSourcePaths]
@@ -1669,6 +1675,107 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   return plan;
 }
 
+function identityCompletionError() {
+  return importBindingError('REMOTE_IMPORT_IDENTITY_COMPLETION_INVALID',
+    '身份补全缺少唯一的成功任务、原 ID 或新文件证明，已拒绝定向回写');
+}
+
+function assertIdentityCompletionUnique(accountId, outputKeys, accounts) {
+  if (!Array.isArray(accounts)
+      || accounts.filter((account) => canonicalPositiveAccountId(account?.id) === accountId).length !== 1
+      || accounts.some((account) => canonicalPositiveAccountId(account?.id) !== accountId
+        && accountsSharingStrongIdentity(outputKeys, [account]).length > 0)) {
+    throw identityCompletionError();
+  }
+}
+
+function hasIdentityCompletionProof(item, account) {
+  const proof = identityCompletionProofs.get(item);
+  return Boolean(proof && item.accountId === proof.accountId && account?.id === proof.accountId
+    && item.key === proof.selectedKey && item._record?.contentHash === proof.contentHash
+    && strongIdentitiesFullyMatch(proof.identityKeys, accountKeys(account))
+    && strongIdentitiesFullyMatch(proof.outputKeys, item.sourceIdentityKeys || [])
+    && canCompleteAccountIdentity(proof.identityKeys, item.sourceIdentityKeys || []));
+}
+
+// sourceBindings are generated from authenticated successful Phase3 jobs, not
+// from request-body data. Keep the job -> original ID -> exact artifact mapping
+// intact; a pair of unordered target/source sets cannot authorize enrichment.
+function buildScopedImportPlan(sources, accounts, selectedKeys = [], sourceBindings = undefined) {
+  if (sourceBindings === undefined) return buildImportPlan(sources, accounts, selectedKeys);
+  if (!Array.isArray(sourceBindings) || sourceBindings.length < 1
+      || sourceBindings.length > MAX_REMOTE_IMPORT_TARGETS
+      || !Array.isArray(selectedKeys) || sourceBindings.length !== selectedKeys.length) {
+    throw identityCompletionError();
+  }
+  const ids = new Set();
+  const keys = new Set();
+  for (const binding of sourceBindings) {
+    if (!plainBackupObject(binding) || Object.keys(binding).length !== 5
+        || !['accountId', 'selectedKey', 'contentHash', 'identityKeys', 'targetDigest']
+          .every((key) => Object.hasOwn(binding, key))
+        || !Number.isSafeInteger(binding.accountId) || binding.accountId < 1
+        || ids.has(binding.accountId) || keys.has(binding.selectedKey)
+        || !selectedKeys.includes(binding.selectedKey)
+        || typeof binding.targetDigest !== 'string' || !/^[a-f0-9]{64}$/.test(binding.targetDigest)
+        || !Array.isArray(binding.identityKeys) || binding.identityKeys.length < 1
+        || binding.identityKeys.length > 2
+        || binding.identityKeys.some((key) => typeof key !== 'string'
+          || !/^(account|user):[A-Za-z0-9][A-Za-z0-9._:@/+~-]{0,511}$/.test(key)
+          || normalizeIdentityValue(key.slice(0, key.indexOf(':') + 1), key.slice(key.indexOf(':') + 1))
+            !== key.slice(key.indexOf(':') + 1))
+        || new Set(binding.identityKeys.map((key) => key.split(':', 1)[0])).size !== binding.identityKeys.length) {
+      throw identityCompletionError();
+    }
+    ids.add(binding.accountId);
+    keys.add(binding.selectedKey);
+  }
+  assertRemoteImportSources(sources, selectedKeys, sourceBindings.map(({ selectedKey, contentHash }) => (
+    { selectedKey, contentHash }
+  )));
+  const plan = buildImportPlan(sources, accounts, selectedKeys);
+  for (const item of plan) {
+    const binding = sourceBindings.find((entry) => entry.selectedKey === item.key);
+    const targets = accounts.filter((account) => canonicalPositiveAccountId(account?.id) === binding?.accountId);
+    const account = targets[0];
+    if (!binding || targets.length !== 1 || accountTestTargetDigest(account) !== binding.targetDigest
+        || !strongIdentitiesFullyMatch(binding.identityKeys, accountKeys(account))) {
+      throw identityCompletionError();
+    }
+    if (strongIdentitiesFullyMatch(item.sourceIdentityKeys, binding.identityKeys)) {
+      if (item.accountId !== binding.accountId) throw identityCompletionError();
+      continue;
+    }
+    if (!canCompleteAccountIdentity(binding.identityKeys, item.sourceIdentityKeys)
+        || item.identityConflict || item.conflictingVersions
+        || !strongIdentitiesFullyMatch(item.sourceIdentityKeys, item._groupIdentityKeys)
+        || !(item.action === 'skip'
+          || (item.action === 'conflict' && item.reason === 'ambiguous_sub2api_identity'))) {
+      throw identityCompletionError();
+    }
+    assertIdentityCompletionUnique(binding.accountId, item.sourceIdentityKeys, accounts);
+    // Do not synthesize account/accountId metadata on the remote snapshot:
+    // backups and concurrent-state guards must still see the original user-only row.
+    if (item.action !== 'skip') {
+      const decision = matchedAccountImportDecision(item._record, account);
+      item.action = decision.action;
+      item.reason = decision.reason;
+    }
+    item.accountId = binding.accountId;
+    item.accountName = account.name;
+    item._account = account;
+    item.availability = getAccountAvailability(account).key;
+    item.availabilityReason = getAccountAvailability(account).reason;
+    item.identityCompletion = 'account_id';
+    identityCompletionProofs.set(item, Object.freeze({
+      ...binding,
+      identityKeys: Object.freeze([...binding.identityKeys]),
+      outputKeys: Object.freeze([...item.sourceIdentityKeys]),
+    }));
+  }
+  return plan;
+}
+
 function safeImportItem(item) {
   return {
     key: item.key,
@@ -1689,6 +1796,7 @@ function safeImportItem(item) {
     conflictingVersions: item.conflictingVersions,
     identityConflict: item.identityConflict === true,
     identityConflictReason: item.identityConflictReason || null,
+    ...(item.identityCompletion === 'account_id' ? { identityCompletion: 'account_id' } : {}),
     availability: item.availability,
     availabilityReason: item.availabilityReason,
     sourceExpired: item.sourceExpired,
@@ -2541,9 +2649,22 @@ async function preflightUpdateAccount(client, item, options = {}) {
   if (expectedId === null) {
     throw targetVerificationError('更新计划缺少有效的 Sub2API 账号 ID', 'SUB2API_TARGET_ID_REQUIRED');
   }
+  const completion = identityCompletionProofs.get(item);
+  if (completion) {
+    if (options.remoteTargetDigest !== completion.targetDigest) throw identityCompletionError();
+    const accounts = await client.listAccounts({
+      pageSize: 200, requireTotal: true, requirePaginationMetadata: true, signal,
+    });
+    throwIfJobInterrupted(signal);
+    assertIdentityCompletionUnique(expectedId, completion.outputKeys, accounts);
+  }
   const account = await client.getAccount(expectedId, { signal });
   throwIfJobInterrupted(signal);
-  verifyTargetIdentity(item, account, expectedId);
+  // Only the pre-write check may retain the reviewed user-only identity. The
+  // post-write checks below still require the complete identity from the token.
+  if (completion && !hasIdentityCompletionProof(item, account)) throw identityCompletionError();
+  verifyTargetIdentity(completion ? { ...item, sourceIdentityKeys: completion.identityKeys } : item,
+    account, expectedId);
   verifyPlannedTargetIdentity(item, account);
   // Evaluate transient scheduler state only after the remote read completes.
   // A reset/overload window can expire while GET is in flight; using a
@@ -2746,6 +2867,17 @@ async function executeImportPlanItem({
       const accountId = verifyTargetIdentity(item, account, item.accountId);
       verifyUpdatedTargetIdentity(writeItem, account);
       const fingerprint = verifyTargetFingerprint(item, account);
+      if (identityCompletionProofs.has(item)) {
+        const accounts = await retryPostflightRead(() => client.listAccounts({
+          pageSize: 200, requireTotal: true, requirePaginationMetadata: true, signal,
+        }), { signal });
+        throwIfPostWriteInterrupted(signal);
+        assertIdentityCompletionUnique(item.accountId, item.sourceIdentityKeys, accounts);
+        const finalAccount = accounts.find((entry) => entry.id === item.accountId);
+        verifyTargetIdentity(item, finalAccount, item.accountId);
+        verifyUpdatedTargetIdentity(writeItem, finalAccount);
+        verifyTargetFingerprint(item, finalAccount);
+      }
       const verification = {
         accountId,
         accountName: account.name || null,
@@ -3283,6 +3415,7 @@ async function executeImport({
   remoteTargets = undefined,
   remoteSourceHashes = undefined,
   remoteTargetBaselines = undefined,
+  remoteSourceBindings = undefined,
   actor = 'local',
   db,
   jobId = null,
@@ -3371,7 +3504,11 @@ async function executeImport({
       if (normalizedRemoteTargets !== undefined) {
         assertRemoteImportSources(current._internal.sources, selectedKeys, normalizedRemoteSources);
       }
-      const fullPlan = buildImportPlan(current._internal.sources, current._internal.accounts, selectedKeys);
+      if (remoteSourceBindings !== undefined && normalizedRemoteTargets === undefined) {
+        throw identityCompletionError();
+      }
+      const fullPlan = buildScopedImportPlan(current._internal.sources, current._internal.accounts,
+        selectedKeys, remoteSourceBindings);
       assertRemoteImportPlan(fullPlan, current._internal.accounts, normalizedRemoteTargets, normalizedRemoteBaselines);
       assertImportExecutableTargetLimit(fullPlan);
       const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
@@ -3822,6 +3959,7 @@ module.exports = {
   assertRemoteImportPlan,
   buildSnapshot,
   buildImportPlan,
+  buildScopedImportPlan,
   buildImportPlanIntentVersion,
   assertImportExecutableTargetLimit,
   collectCandidates,

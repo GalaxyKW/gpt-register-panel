@@ -18,6 +18,9 @@ const {
 } = require('../backend/phase3Worker');
 const { withControlPlaneLock } = require('../backend/taskCoordinator');
 const { redactValue } = require('../backend/logger');
+const {
+  canCompleteAccountIdentity, remotePhase3OutputIdentityMatches,
+} = require('../backend/identityCompletion');
 
 const EMAIL = 'remote-phase3@example.test';
 const BASE_URL = 'https://remote-phase3.example.test/admin';
@@ -44,7 +47,7 @@ function binding(value = account()) {
   return bindRemotePhase3Targets([{ sourceMode: 'username', remoteTarget: remoteSelection(value) }], [value], endpointClient)[0].remoteTarget;
 }
 
-function fixture(t, output = { account: 'bound-workspace', user: 'bound-user' }, extraScript = '') {
+function fixture(t, output = { account: 'bound-workspace', user: 'bound-user' }, extraScript = '', remoteAccount = account()) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-remote-phase3-'));
   fs.mkdirSync(path.join(root, 'tokens'), { mode: 0o700 });
   fs.mkdirSync(path.join(root, 'use_token'), { mode: 0o700 });
@@ -79,10 +82,10 @@ function fixture(t, output = { account: 'bound-workspace', user: 'bound-user' },
   const target = listLocalPhase3Targets().accounts[0];
   const resolved = resolvePhase3Requests([{
     sourceMode: 'username', email: target.email, phone: '', selectedKey: target.selectedKey,
-    phase3TargetRevision: target.phase3TargetRevision, remoteTarget: remoteSelection(),
+    phase3TargetRevision: target.phase3TargetRevision, remoteTarget: remoteSelection(remoteAccount),
   }]);
   assert.deepEqual(resolved.rejected, []);
-  bindRemotePhase3Targets(resolved.eligible, [account()], endpointClient);
+  bindRemotePhase3Targets(resolved.eligible, [remoteAccount], endpointClient);
   const request = resolved.eligible[0];
   let reads = 0;
   const args = {
@@ -90,10 +93,63 @@ function fixture(t, output = { account: 'bound-workspace', user: 'bound-user' },
     logger, jobId: 'remote-phase3-fixture',
     db: { async startMutationJob() {}, async audit() {} },
     remoteClientFactory: () => ({ baseUrl: BASE_URL,
-      async getAccount(id) { reads += 1; assert.equal(id, 19); return account(); } }),
+      async getAccount(id) { reads += 1; assert.equal(id, 19); return remoteAccount; } }),
   };
   return { root, record, args, readCount: () => reads };
 }
+
+test('account identity completion accepts only a canonical user-only to same-user account addition', () => {
+  const userOnly = ['user:bound-user'];
+  const complete = ['account:bound-workspace', 'user:bound-user'];
+  assert.equal(canCompleteAccountIdentity(userOnly, complete), true);
+  assert.equal(canCompleteAccountIdentity(
+    [...userOnly, 'email:old@example.test'], [...complete, 'email:new@example.test'],
+  ), true, 'email is not identity evidence');
+  assert.equal(canCompleteAccountIdentity(userOnly, [...complete].reverse()), true);
+  assert.equal(canCompleteAccountIdentity(complete, complete), false);
+  assert.equal(remotePhase3OutputIdentityMatches(complete, complete), true);
+  assert.equal(remotePhase3OutputIdentityMatches(userOnly, userOnly), true);
+  assert.equal(remotePhase3OutputIdentityMatches(userOnly, complete), true);
+  for (const [expected, actual] of [
+    [['email:same@example.test'], [...complete, 'email:same@example.test']],
+    [userOnly, ['account:bound-workspace']],
+    [userOnly, ['account:bound-workspace', 'user:changed-user']],
+    [['account:bound-workspace'], complete],
+    [complete, ['account:changed-workspace', 'user:bound-user']],
+    [complete, userOnly],
+  ]) {
+    assert.equal(canCompleteAccountIdentity(expected, actual), false);
+    assert.equal(remotePhase3OutputIdentityMatches(expected, actual), false);
+  }
+});
+
+test('account identity completion rejects malformed duplicate and unknown fields without invoking accessors', () => {
+  const userOnly = ['user:bound-user'];
+  const complete = ['account:bound-workspace', 'user:bound-user'];
+  let reads = 0;
+  const accessor = [];
+  Object.defineProperty(accessor, '0', { enumerable: true, get() { reads += 1; return 'user:bound-user'; } });
+  const invalid = [
+    null, {}, 'user:bound-user', [], new Array(1), accessor,
+    ['user:bound-user', 'user:bound-user'],
+    ['user:bound-user', 'user:other-user'],
+    ['account:bound-workspace', 'account:bound-workspace', 'user:bound-user'],
+    ['user:bound-user', 'organization:unknown'],
+    ['user:bound-user', 'email:a@example.test', 'email:a@example.test'],
+    ['user:bound-user', 'email:invalid-email'],
+    ['User:bound-user'], ['user: bound-user'], ['user:bound-user '], ['user:bound-user\n'],
+    ['user:'], ['user:' + 'x'.repeat(513)], ['user:bound\u200b-user'],
+    ['user:{123e4567-e89b-12d3-a456-426614174000}'],
+    ['user:123E4567-E89B-12D3-A456-426614174000'],
+  ];
+  for (const keys of invalid) {
+    assert.equal(canCompleteAccountIdentity(keys, complete), false);
+    assert.equal(canCompleteAccountIdentity(userOnly, keys), false);
+    assert.equal(remotePhase3OutputIdentityMatches(keys, keys), false);
+    assert.equal(remotePhase3OutputIdentityMatches(userOnly, keys), false);
+  }
+  assert.equal(reads, 0);
+});
 
 test('remote Phase3 validates exact bounded IDs, versions and strong-only identity bindings', () => {
   const selection = remoteSelection();
@@ -204,6 +260,63 @@ test('remote Phase3 refuses same-email output with a different or incomplete str
       assert.equal(success, false);
     });
   }
+});
+
+test('remote Phase3 accepts a new account identity only for a bound user-only target with the same user', async (t) => {
+  const before = account({
+    accountId: '', identityKeys: ['user:bound-user', 'email:' + EMAIL],
+  });
+  const { args, root, readCount } = fixture(t,
+    { account: 'newly-observed-workspace', user: 'bound-user' }, '', before);
+  let persisted = null;
+  const result = await runPhase3Job({ ...args, persistSuccess(value) { persisted = value; } });
+  assert.equal(readCount(), 2);
+  assert.deepEqual(result.remoteTarget, binding(before));
+  assert.deepEqual(result.remoteTarget.identityKeys, ['user:bound-user']);
+  assert.equal(result.remoteTarget.accountId, 19);
+  assert.equal(result.tokenFile, 'tokens/bound.json');
+  assert.equal(result.tokenContentHash, crypto.createHash('sha256')
+    .update(fs.readFileSync(path.join(root, result.tokenFile))).digest('hex'));
+  assert.equal(persisted, result);
+  assert.equal(before.accountId, '', 'Phase3 must not mutate or automatically import into the remote account');
+  assert.doesNotMatch(JSON.stringify(result), /fixture-access|fixture-refresh|fixture-password/);
+});
+
+test('remote Phase3 identity completion refuses changed or missing users and reverse account-only completion', async (t) => {
+  const userOnly = account({ accountId: '', identityKeys: ['user:bound-user', 'email:' + EMAIL] });
+  const accountOnly = account({ userId: '', identityKeys: ['account:bound-workspace', 'email:' + EMAIL] });
+  for (const [label, before, output] of [
+    ['changed-user', userOnly, { account: 'newly-observed-workspace', user: 'other-user' }],
+    ['missing-user', userOnly, { account: 'newly-observed-workspace' }],
+    ['email-only', userOnly, {}],
+    ['existing-account-conflict', account(), { account: 'other-workspace', user: 'bound-user' }],
+    ['account-only-add-user', accountOnly, { account: 'bound-workspace', user: 'bound-user' }],
+  ]) {
+    await t.test(label, async (subtest) => {
+      const { args } = fixture(subtest, output, '', before);
+      let persisted = false;
+      await assert.rejects(runPhase3Job({ ...args, persistSuccess() { persisted = true; } }),
+        (error) => error.code === 'PHASE3_TOKEN_IDENTITY_MISMATCH'
+          && error.requiresReconciliation === true && error.doNotRetry === true);
+      assert.equal(persisted, false);
+    });
+  }
+});
+
+test('remote Phase3 identity completion does not relax concurrent remote target revision checks', async (t) => {
+  const before = account({ accountId: '', identityKeys: ['user:bound-user', 'email:' + EMAIL] });
+  const { root, args } = fixture(t,
+    { account: 'newly-observed-workspace', user: 'bound-user' }, '', before);
+  let reads = 0;
+  await assert.rejects(runPhase3Job({ ...args,
+    remoteClientFactory: () => ({ baseUrl: BASE_URL, async getAccount() {
+      reads += 1;
+      return reads === 1 ? before : account({ accountId: 'newly-observed-workspace',
+        identityKeys: ['account:newly-observed-workspace', 'user:bound-user', 'email:' + EMAIL] });
+    } }),
+  }), (error) => error.code === 'PHASE3_REMOTE_TARGET_CHANGED');
+  assert.equal(reads, 2);
+  assert.equal(fs.existsSync(path.join(root, 'tokens', 'bound.json')), false);
 });
 
 test('remote Phase3 validates queued remote state before spawning any local process', async (t) => {

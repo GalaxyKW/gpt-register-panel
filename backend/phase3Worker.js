@@ -40,6 +40,7 @@ const { interruptedJobError, throwIfJobInterrupted } = require('./jobLifecycle')
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
 const { installPhase3ChildLifecycle } = require('./lib/phase3ChildLifecycle');
 const { phase3FailureHint } = require('./lib/phase3FailureHint');
+const { remotePhase3OutputIdentityMatches } = require('./identityCompletion');
 const {
   PROFILE_ENV, assertPhase3ProfileParent, createPhase3BrowserProfile,
   removePhase3BrowserProfile, configurePhase3BrowserProfile,
@@ -2500,7 +2501,7 @@ async function runPhase3JobNow({
     if (observedChangedTokens.some(
       (item) => !phase3TokenMatchesBoundIdentity(item, selectedToken)
         || (localMode && !hasStrongIdentity(item.identityKeys || []))
-        || (boundRemoteTarget && !strongIdentitiesFullyMatch(
+        || (boundRemoteTarget && !remotePhase3OutputIdentityMatches(
           boundRemoteTarget.identityKeys, item.identityKeys || [],
         )),
     ) || ((selectedToken || localMode) && !phase3ChangedTokensShareStrongIdentity(observedChangedTokens))) {
