@@ -3,6 +3,7 @@ const state = {
   rows: [],
   selected: new Set(),
   plan: null,
+  identityCompletionBinding: null,
   phase3RequestPending: false,
   localPhase3ListingPending: false,
   previewRequestPending: false,
@@ -67,6 +68,9 @@ const elements = {
   planSummary: document.querySelector('#planSummary'),
   planVersion: document.querySelector('#planVersion'),
   planRows: document.querySelector('#planRows'),
+  identityCompletionReview: document.querySelector('#identityCompletionReview'),
+  identityCompletionReviewButton: document.querySelector('#identityCompletionReviewButton'),
+  identityCompletionReviewHint: document.querySelector('#identityCompletionReviewHint'),
   jobPanel: document.querySelector('#jobPanel'),
   jobTitle: document.querySelector('#jobTitle'),
   jobStatus: document.querySelector('#jobStatus'),
@@ -1183,6 +1187,125 @@ function importPlanContractProblem(plan) {
   return '';
 }
 
+function identityCompletionSourceKey(item) {
+  const source = item?.source;
+  const relativePath = item?.relativePath;
+  if (!['tokens', 'use_token'].includes(source) || typeof relativePath !== 'string'
+      || relativePath.length > 512 || relativePath.includes('\\')
+      || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(relativePath)) return '';
+  const segments = relativePath.split('/');
+  return segments.length >= 2 && segments[0] === source
+    && segments.every((segment) => segment && segment !== '.' && segment !== '..')
+    && segments.at(-1).toLowerCase().endsWith('.json')
+    ? 'token:' + source + ':' + relativePath : '';
+}
+
+function identityCompletionTarget(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+      || typeof value.selectedKey !== 'string'
+      || !Number.isSafeInteger(value.accountId) || value.accountId <= 0
+      || typeof value.targetRevision !== 'string'
+      || !/^account-test-v1\.[A-Za-z0-9_-]{43}$/.test(value.targetRevision)
+      || typeof value.sourceContentHash !== 'string'
+      || !/^[a-f0-9]{64}$/.test(value.sourceContentHash)) return null;
+  const match = /^token:(tokens|use_token):(.+)$/.exec(value.selectedKey);
+  if (!match || identityCompletionSourceKey({ source: match[1], relativePath: match[2] }) !== value.selectedKey) return null;
+  return { selectedKey: value.selectedKey, accountId: value.accountId,
+    targetRevision: value.targetRevision, sourceContentHash: value.sourceContentHash };
+}
+
+function identityCompletionSelection(plan = state.plan) {
+  const selectedKeys = plan?.selectedKeys;
+  const candidates = plan?.identityCompletionCandidates;
+  const problem = '身份补全候选不能精确覆盖全部选择；请仅选择可补全项后重新生成本地导入预览，不会自动忽略其他项目';
+  if (!Array.isArray(selectedKeys) || !selectedKeys.length || selectedKeys.length > 100
+      || new Set(selectedKeys).size !== selectedKeys.length
+      || !Array.isArray(candidates) || candidates.length !== selectedKeys.length
+      || !Array.isArray(plan?.items) || plan.items.length !== selectedKeys.length) return { targets: [], problem };
+  const targets = [];
+  const seenIds = new Set();
+  for (const key of selectedKeys) {
+    const matches = candidates.filter((candidate) => candidate?.selectedKey === key);
+    const candidate = matches[0];
+    const target = identityCompletionTarget(candidate);
+    const items = plan.items.filter((item) => identityCompletionSourceKey(item) === key);
+    if (matches.length !== 1 || !target || candidate.identityCompletion !== 'account_id'
+        || typeof candidate.accountName !== 'string' || !candidate.accountName
+        || candidate.accountName.length > 200
+        || /[\u0000-\u001f\u007f-\u009f\u061c\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/.test(candidate.accountName)
+        || seenIds.has(target.accountId) || items.length !== 1
+        || effectivePlanAction(items[0]) !== 'conflict'
+        || items[0].selectedSourceSuperseded === true) return { targets: [], problem };
+    targets.push(target);
+    seenIds.add(target.accountId);
+  }
+  return { targets, problem: '' };
+}
+
+function identityCompletionPlanProblem(plan, binding = state.identityCompletionBinding) {
+  const hasReviewFields = Object.prototype.hasOwnProperty.call(plan || {}, 'identityCompletionConfirmed')
+    || Object.prototype.hasOwnProperty.call(plan || {}, 'identityCompletionTargets');
+  if (!binding && !hasReviewFields) return '';
+  const problem = '身份补全预览与人工核对的原 ID、来源文件或版本不一致，已禁止导入；请重新核对';
+  if (!Array.isArray(binding) || !binding.length || binding.length > 100
+      || plan?.identityCompletionConfirmed !== true
+      || Object.prototype.hasOwnProperty.call(plan, 'remoteTargets')
+      || Object.prototype.hasOwnProperty.call(plan, 'phase3JobIds')
+      || !Array.isArray(plan.identityCompletionCandidates) || plan.identityCompletionCandidates.length
+      || !Array.isArray(plan.identityCompletionTargets) || plan.identityCompletionTargets.length !== binding.length
+      || !Array.isArray(plan.selectedKeys) || plan.selectedKeys.length !== binding.length
+      || new Set(plan.selectedKeys).size !== binding.length
+      || !Array.isArray(plan.items) || plan.items.length !== binding.length
+      || typeof plan.version !== 'string' || !/^[a-f0-9]{64}$/.test(plan.version)
+      || !validImportPlanIntentVersion(plan.planIntentVersion)) return problem;
+  const seenIds = new Set();
+  for (const original of binding) {
+    const baseline = identityCompletionTarget(original);
+    if (!baseline || seenIds.has(baseline.accountId) || !plan.selectedKeys.includes(baseline.selectedKey)) return problem;
+    const targets = plan.identityCompletionTargets.filter((item) => item?.selectedKey === baseline.selectedKey);
+    const target = identityCompletionTarget(targets[0]);
+    if (targets.length !== 1 || !target
+        || Object.keys(targets[0]).some((key) => !Object.prototype.hasOwnProperty.call(baseline, key))
+        || Object.keys(baseline).some((key) => baseline[key] !== target[key])) return problem;
+    const items = plan.items.filter((item) => identityCompletionSourceKey(item) === baseline.selectedKey);
+    const item = items[0];
+    if (items.length !== 1 || item.accountId !== baseline.accountId
+        || item.identityCompletion !== 'account_id' || !['update', 'skip'].includes(item.action)
+        || item.conflictingVersions === true || item.identityConflict === true
+        || item.selectedSourceSuperseded === true) return problem;
+    seenIds.add(baseline.accountId);
+  }
+  return '';
+}
+
+function identityCompletionReviewProblem() {
+  if (state.identityCompletionBinding || state.plan?.identityCompletionConfirmed === true) {
+    return '已生成原 ID 身份补全预览；请核对更新内容后使用“确认导入”';
+  }
+  if (actionsLocked()) return '正在确认后台任务或有其他请求执行中';
+  if (reconciliationWriteBlocked()) return '存在待人工对账任务，当前全部写操作已阻止';
+  if (state.snapshot?.readOnly !== false) return '当前未确认可写模式，不能补全身份';
+  if (!comparisonAvailable()) return 'Sub2API 账号尚未成功读取，无法核对身份';
+  const selectedKeys = state.plan?.selectedKeys || [];
+  if (!selectionStillCurrent(state.selectionRevision, selectedKeys)) return '选择已变化，请重新生成本地导入预览';
+  return hiddenSelectionProblem(selectedKeys) || syncSelectionProblem(selectedKeys)
+    || identityCompletionSelection().problem;
+}
+
+function updateIdentityCompletionReview() {
+  if (!elements.identityCompletionReviewButton) return;
+  const candidates = state.plan?.identityCompletionCandidates;
+  const reviewing = Boolean(state.identityCompletionBinding || state.plan?.identityCompletionConfirmed);
+  const visible = reviewing || (candidates !== undefined && (!Array.isArray(candidates) || candidates.length > 0));
+  elements.identityCompletionReview.hidden = !visible;
+  elements.identityCompletionReviewButton.hidden = reviewing;
+  const problem = visible ? identityCompletionReviewProblem() : '';
+  elements.identityCompletionReviewButton.disabled = !visible || Boolean(problem);
+  elements.identityCompletionReviewButton.title = problem || '人工核对同 User ID 唯一对应的原账号，仅补缺失 Account ID';
+  elements.identityCompletionReviewHint.textContent = !visible ? '' : problem
+    || '远端缺少 Account ID：同 User ID 唯一对应，可人工核对后仅补缺失 Account ID 并更新 token。仅回写下列原 ID，不新增账号、不重新登录。';
+}
+
 function planItemCreatesAccount(item) {
   return item?.action === 'create' && item?.conflictingVersions !== true;
 }
@@ -1275,6 +1398,10 @@ function updateImportButtonState() {
   const hiddenSelection = hiddenSelectionProblem(state.plan?.selectedKeys);
   const selectionProblem = syncSelectionProblem(state.plan?.selectedKeys);
   const groupBindingProblem = importGroupBindingProblem(state.plan);
+  const completionProblem = state.identityCompletionBinding
+    || Object.prototype.hasOwnProperty.call(state.plan || {}, 'identityCompletionConfirmed')
+    || Object.prototype.hasOwnProperty.call(state.plan || {}, 'identityCompletionTargets')
+    ? identityCompletionPlanProblem(state.plan) : '';
   elements.importButton.disabled = !state.plan
     || actionsLocked()
     || reconciliationWriteBlocked()
@@ -1282,6 +1409,7 @@ function updateImportButtonState() {
     || Boolean(selectionProblem)
     || Boolean(groupBindingProblem)
     || Boolean(planContractProblem)
+    || Boolean(completionProblem)
     || !comparisonAvailable()
     // Only an explicit boolean false is an affirmative write capability.
     // Missing or malformed snapshot metadata must never be presented as
@@ -1291,7 +1419,7 @@ function updateImportButtonState() {
     || state.plan.selectedKeys.length === 0
     || hasBlockingConflict
     || !items.some((item) => ['create', 'update'].includes(effectivePlanAction(item)));
-  elements.importButton.title = planContractProblem || groupBindingProblem
+  elements.importButton.title = completionProblem || planContractProblem || groupBindingProblem
     || (!comparisonAvailable() ? 'Sub2API 账号尚未成功读取，无法比较或同步' : '')
     || (state.plan && !validImportPlanIntentVersion(state.plan.planIntentVersion)
       ? '导入预览凭证无效，请重新生成本地导入预览' : '')
@@ -1769,10 +1897,12 @@ function renderPlan(plan) {
   const items = plan?.items || [];
   elements.planPanel.hidden = !plan;
   if (!plan) {
+    state.identityCompletionBinding = null;
     elements.planSummary.textContent = '-';
     elements.planVersion.textContent = '';
     elements.planRows.innerHTML = '';
     elements.importButton.disabled = true;
+    if (elements.identityCompletionReviewButton) updateIdentityCompletionReview();
     return;
   }
   const counts = items.reduce((result, item) => {
@@ -1789,10 +1919,21 @@ function renderPlan(plan) {
     + (supersededSelectionCount ? ' · 旧副本改用最新 ' + supersededSelectionCount : '');
   elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12)
     + ' · 选择 ' + state.plan.selectedKeys.length
+    + (plan.identityCompletionConfirmed === true ? ' · 已核对原 ID 身份补全' : '')
     + (importGroupBindingLabel(plan) ? ' · ' + importGroupBindingLabel(plan) : '');
   elements.planRows.innerHTML = items.map((item) => {
     const action = effectivePlanAction(item);
     const reason = effectivePlanReason(item);
+    const candidates = Array.isArray(plan.identityCompletionCandidates)
+      ? plan.identityCompletionCandidates.filter((candidate) => candidate?.selectedKey === identityCompletionSourceKey(item)
+        && candidate.identityCompletion === 'account_id' && identityCompletionTarget(candidate)) : [];
+    const candidate = candidates.length === 1 ? candidates[0] : null;
+    const completionNote = plan.identityCompletionConfirmed === true && item.identityCompletion === 'account_id'
+      ? (action === 'update' ? '同 User ID 核验一致，仅补缺失 Account ID 并更新 token；保留原 ID #' + item.accountId
+        : '跳过：本次不补 Account ID、不更新 token；保留原 ID #' + item.accountId) : '';
+    const reasonLabel = candidate
+      ? '远端缺少 Account ID，同 User ID 唯一对应 #' + candidate.accountId + '，需核对补全'
+      : completionNote || actionReasonLabel(reason);
     const selectedSupersededPaths = Array.isArray(item.selectedSupersededPaths)
       ? item.selectedSupersededPaths.filter(Boolean)
       : [];
@@ -1809,14 +1950,16 @@ function renderPlan(plan) {
       : '';
     return '<tr>'
     + '<td><span class="badge ' + (action === 'conflict' ? 'badge-danger' : action === 'skip' ? 'badge-neutral' : action === 'update' ? 'badge-warning' : 'badge-success') + '">' + escapeHtml(actionLabel(action)) + '</span></td>'
-    + '<td>' + escapeHtml(item.accountName || '-') + '</td>'
+    + '<td>' + escapeHtml(candidate ? '#' + candidate.accountId + ' ' + candidate.accountName
+      : item.accountName || '-') + '</td>'
     + '<td>' + escapeHtml(item.email || '-') + '</td>'
     + '<td><strong>' + escapeHtml(item.source || '-') + '</strong><small title="' + escapeHtml(actualPath)
     + '">实际文件 ' + escapeHtml(actualPath) + '</small>' + duplicateNote + selectionNote + '</td>'
     + '<td><code>' + escapeHtml(formatFingerprint(item.fingerprints?.access)) + '</code></td>'
-    + '<td>' + escapeHtml(actionReasonLabel(reason)) + '</td></tr>';
+    + '<td>' + escapeHtml(reasonLabel) + '</td></tr>';
   }).join('');
   updateImportButtonState();
+  if (elements.identityCompletionReviewButton) updateIdentityCompletionReview();
 }
 
 function applyFilters() {
@@ -3396,10 +3539,74 @@ async function previewSelection() {
   }
 }
 
+async function previewIdentityCompletion() {
+  const problem = identityCompletionReviewProblem();
+  if (problem) {
+    showNotice('无法核对补全：' + problem + '。', 'notice-warning');
+    return false;
+  }
+  const { targets } = identityCompletionSelection();
+  const selectedKeys = [...state.plan.selectedKeys];
+  const selectionRevision = state.selectionRevision;
+  const snapshotRequestSequence = state.snapshotRequestSequence;
+  const snapshot = state.snapshot;
+  const originalPlan = state.plan;
+  const mapping = targets.map((target) => {
+    const candidate = originalPlan.identityCompletionCandidates.find((entry) => entry.selectedKey === target.selectedKey);
+    return '#' + target.accountId + ' ' + candidate.accountName + ' ← ' + target.selectedKey.replace(/^token:(?:tokens|use_token):/, '');
+  }).join('\n');
+  if (!window.confirm('请核对以下原账号 ID 与本地 token 文件。仅限同 User ID 唯一对应，'
+      + '仅补缺失 Account ID 并更新 token；不依据邮箱认定身份，不新增账号、不重新登录，不写入其他 ID。\n\n'
+      + mapping + '\n\n本步骤只生成定向预览，之后仍需“确认导入”。确认已核对？')) return false;
+  if (state.plan !== originalPlan || !selectionStillCurrent(selectionRevision, selectedKeys)
+      || identityCompletionReviewProblem()) return false;
+  const binding = Object.freeze(targets.map((target) => Object.freeze({ ...target })));
+  state.previewRequestPending = true;
+  renderPlan(null);
+  updateActionState();
+  try {
+    const response = await apiFetch('/api/sync/preview', {
+      method: 'POST',
+      body: JSON.stringify({ selectedKeys, identityCompletionConfirmed: true, identityCompletionTargets: binding }),
+    });
+    const body = await response.json();
+    if (!selectionStillCurrent(selectionRevision, selectedKeys)
+        || state.snapshotRequestSequence !== snapshotRequestSequence || state.snapshot !== snapshot) return false;
+    if (!response.ok) throw new Error(body.message || body.error || '身份补全预览失败');
+    const responseProblem = importPlanContractProblem(body) || importGroupBindingProblem(body)
+      || identityCompletionPlanProblem(body, binding);
+    if (responseProblem) throw new Error(responseProblem);
+    state.identityCompletionBinding = binding;
+    renderPlan({ ...body, selectedKeys });
+    showNotice('已核对原 ID 身份补全预览；只允许更新列出的原账号，不会新增或重新登录。请核对后使用“确认导入”。', 'notice-warning');
+    return true;
+  } catch (error) {
+    if (selectionStillCurrent(selectionRevision, selectedKeys)) showNotice(error.message, 'notice-danger');
+    return false;
+  } finally {
+    state.previewRequestPending = false;
+    updateActionState();
+  }
+}
+
 elements.previewButton.addEventListener('click', previewSelection);
+if (elements.identityCompletionReviewButton) {
+  elements.identityCompletionReviewButton.addEventListener('click', previewIdentityCompletion);
+}
 
 elements.importButton.addEventListener('click', async () => {
   if (!state.plan || state.importRequestPending) return;
+  const completionMode = Boolean(state.identityCompletionBinding)
+    || Object.prototype.hasOwnProperty.call(state.plan, 'identityCompletionConfirmed')
+    || Object.prototype.hasOwnProperty.call(state.plan, 'identityCompletionTargets');
+  const completionProblem = completionMode ? identityCompletionPlanProblem(state.plan) : '';
+  const completionPlan = completionMode ? state.plan : null;
+  const completionSelectionRevision = state.selectionRevision;
+  if (completionProblem || (completionMode && (actionsLocked() || reconciliationWriteBlocked()
+      || state.snapshot?.readOnly !== false || !selectionStillCurrent(state.selectionRevision, state.plan.selectedKeys)))) {
+    showNotice('无法确认导入：' + (completionProblem || '操作已锁定或选择已变化，请重新核对身份补全预览'), 'notice-warning');
+    return;
+  }
   const planContractProblem = importPlanContractProblem(state.plan);
   if (planContractProblem) {
     showNotice('无法确认导入：' + planContractProblem + '。', 'notice-warning');
@@ -3439,7 +3646,20 @@ elements.importButton.addEventListener('click', async () => {
   const replacementWarning = supersededSelectionCount
     ? '其中 ' + supersededSelectionCount + ' 个所选旧副本将改用预览所示的排序首选版本。\n'
     : '';
-  if (!window.confirm(replacementWarning + '确认将预览中的新增/更新写入 Sub2API？')) return;
+  const completionWarning = completionMode
+    ? '仅补缺失 Account ID 并更新以下原账号的 token：'
+      + state.identityCompletionBinding.map((target) => '#' + target.accountId).join('、')
+      + '。同 User ID 已核对；不新增账号、不重新登录、不写入其他 ID。\n'
+    : '';
+  if (!window.confirm(completionWarning + replacementWarning + (completionMode
+    ? '确认将身份补全预览中的更新写入 Sub2API？' : '确认将预览中的新增/更新写入 Sub2API？'))) return;
+  if (completionMode && (state.plan !== completionPlan
+      || !selectionStillCurrent(completionSelectionRevision, selectedKeys)
+      || actionsLocked() || reconciliationWriteBlocked() || state.snapshot?.readOnly !== false
+      || identityCompletionPlanProblem(state.plan))) {
+    showNotice('身份补全预览或操作状态已变化，请重新核对后导入。', 'notice-warning');
+    return;
+  }
   state.importRequestPending = true;
   updateActionState();
   try {
@@ -3450,6 +3670,10 @@ elements.importButton.addEventListener('click', async () => {
         snapshotVersion: state.plan.version,
         planIntentVersion: state.plan.planIntentVersion,
         selectedKeys,
+        ...(completionMode ? {
+          identityCompletionConfirmed: true,
+          identityCompletionTargets: state.identityCompletionBinding.map((target) => ({ ...target })),
+        } : {}),
       },
     );
     if (!response.ok) throw new Error(body.message || body.error || '导入任务创建失败');
@@ -3852,6 +4076,7 @@ function updateActionState() {
   if (typeof updateLocalPhase3ActionState === 'function') updateLocalPhase3ActionState();
   if (typeof updateAccountTestBatchUi === 'function') updateAccountTestBatchUi();
   if (typeof updateRemotePhase3Ui === 'function') updateRemotePhase3Ui();
+  if (elements.identityCompletionReviewButton) updateIdentityCompletionReview();
 }
 
 function applyColumnVisibility() {

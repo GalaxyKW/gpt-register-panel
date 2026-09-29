@@ -35,6 +35,7 @@ const {
 const { getAccountAvailability } = require('./accountAvailability');
 const {
   REVISION_PATTERN: ACCOUNT_TARGET_REVISION_PATTERN,
+  accountTestTargetRevision,
   accountTestTargetDigest,
   matchesAccountTestTargetRevision,
 } = require('./accountTargetRevision');
@@ -48,6 +49,7 @@ const {
 } = require('./lib/token');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { canCompleteAccountIdentity } = require('./identityCompletion');
+const { normalizePhase3SelectedKey } = require('./lib/phase3Identity');
 const { ensureDirectoryTree, syncDirectory } = require('./lib/safeFs');
 const { compareNaturalStrings } = require('./lib/stableOrder');
 const {
@@ -69,7 +71,8 @@ const IMPORT_CREATE_POLICY_SCHEMA = 'sub2api-codex-create-v1';
 const IMPORT_TARGET_FINGERPRINT_PATTERN = /^sha256\.[A-Za-z0-9_-]{43}$/;
 const MAX_REMOTE_IMPORT_TARGETS = 100;
 // An API/client flag is never authority to relax a write preflight. Only the
-// server's successful-job scoped planner can mint this process-local proof.
+// server's verified scoped planner can mint this process-local proof, from
+// either a successful job or an explicitly reviewed current source/target.
 const identityCompletionProofs = new WeakMap();
 
 function safeErrorMessage(error) {
@@ -1675,9 +1678,110 @@ function buildImportPlan(sources, accounts, selectedKeys = []) {
   return plan;
 }
 
+function identityCompletionReviewError(code = 'IDENTITY_COMPLETION_REVIEW_INVALID') {
+  return importBindingError(code,
+    '身份补全核对已失效或存在真实冲突，请重新预览；不会按邮箱合并或自动新增账号');
+}
+
+function normalizeIdentityCompletionTargets(value, selectedKeys) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_REMOTE_IMPORT_TARGETS
+      || !Array.isArray(selectedKeys) || selectedKeys.length !== value.length
+      || new Set(selectedKeys).size !== selectedKeys.length
+      || Array.from(selectedKeys).some((key) => !normalizePhase3SelectedKey(key))) {
+    throw identityCompletionReviewError();
+  }
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw identityCompletionReviewError();
+  }
+  const ids = new Set();
+  const keys = new Set();
+  return value.map((target) => {
+    const fields = ['selectedKey', 'accountId', 'targetRevision', 'sourceContentHash'];
+    if (!plainBackupObject(target) || Object.keys(target).length !== fields.length
+        || fields.some((key) => !Object.hasOwn(target, key)
+          || !Object.hasOwn(Object.getOwnPropertyDescriptor(target, key), 'value'))
+        || !normalizePhase3SelectedKey(target.selectedKey)
+        || !selectedKeys.includes(target.selectedKey) || keys.has(target.selectedKey)
+        || !Number.isSafeInteger(target.accountId) || target.accountId < 1 || ids.has(target.accountId)
+        || typeof target.targetRevision !== 'string' || target.targetRevision !== target.targetRevision.trim()
+        || !ACCOUNT_TARGET_REVISION_PATTERN.test(target.targetRevision)
+        || typeof target.sourceContentHash !== 'string' || target.sourceContentHash.length !== 64
+        || !/^[a-f0-9]{64}$/.test(target.sourceContentHash)) {
+      throw identityCompletionReviewError();
+    }
+    ids.add(target.accountId);
+    keys.add(target.selectedKey);
+    return Object.fromEntries(fields.map((key) => [key, target[key]]));
+  }).sort((left, right) => left.accountId - right.accountId);
+}
+
+// These are review hints, not operational targets on diff rows. Ordinary
+// import stays strict until the operator explicitly confirms this mapping.
+function listIdentityCompletionCandidates(sources, accounts, selectedKeys = []) {
+  const plan = buildImportPlan(sources, accounts, selectedKeys);
+  const candidates = [];
+  for (const item of plan) {
+    if (item.action !== 'conflict' || item.reason !== 'ambiguous_sub2api_identity'
+        || item.identityConflict || item.conflictingVersions || item.selectedSourceSuperseded
+        || item.sourceExpired || item.sourceDisabled || item.sourceTerminalStatus
+        || !strongIdentitiesFullyMatch(item.sourceIdentityKeys, item._groupIdentityKeys)
+        || !/^[a-f0-9]{64}$/.test(String(item._record?.contentHash || ''))) continue;
+    // An unselected/expired sibling with a contradictory account/user pair
+    // must not be mistaken for a newer version of this source identity.
+    if ((sources.tokens || []).some((record) => record.historical !== true
+      && record.parseStatus === 'ok'
+      && strongIdentityOverlaps(item.sourceIdentityKeys, record.identityKeys || [])
+      && strongIdentityContradiction(item.sourceIdentityKeys, record.identityKeys || []))) continue;
+    const overlaps = accountsSharingStrongIdentity(item.sourceIdentityKeys, accounts);
+    if (overlaps.length !== 1) continue;
+    const account = overlaps[0];
+    if (!Number.isSafeInteger(account.id) || account.id < 1
+        || accounts.filter((entry) => entry.id === account.id).length !== 1
+        || !canCompleteAccountIdentity(accountKeys(account), item.sourceIdentityKeys)
+        || matchedAccountImportDecision(item._record, account).action !== 'update') continue;
+    const targetRevision = accountTestTargetRevision(account);
+    if (!targetRevision || !accountTestTargetDigest(account)) continue;
+    candidates.push({ selectedKey: item.key, accountId: account.id, accountName: account.name,
+      targetRevision, sourceContentHash: item._record.contentHash, identityCompletion: 'account_id' });
+  }
+  return candidates;
+}
+
+function resolveIdentityCompletionReview(sources, accounts, selectedKeys, value) {
+  const targets = normalizeIdentityCompletionTargets(value, selectedKeys);
+  const candidates = listIdentityCompletionCandidates(sources, accounts, selectedKeys);
+  const bindings = [];
+  for (const target of targets) {
+    const matching = candidates.filter((entry) => entry.selectedKey === target.selectedKey
+      && entry.accountId === target.accountId && entry.sourceContentHash === target.sourceContentHash);
+    const account = accounts.find((entry) => entry.id === target.accountId);
+    // Verify the browser's current-process HMAC BEFORE minting a durable
+    // baseline. A client-supplied digest or old successful job is not enough.
+    if (matching.length !== 1 || !account
+        || !matchesAccountTestTargetRevision(target.targetRevision, account)) {
+      throw identityCompletionReviewError('IDENTITY_COMPLETION_REVIEW_STALE');
+    }
+    bindings.push({ accountId: target.accountId, selectedKey: target.selectedKey,
+      contentHash: target.sourceContentHash,
+      identityKeys: accountKeys(account).filter((key) => /^(account|user):/.test(key)),
+      targetDigest: accountTestTargetDigest(account) });
+  }
+  const hashes = bindings.map(({ selectedKey, contentHash }) => ({ selectedKey, contentHash }));
+  assertRemoteImportSources(sources, selectedKeys, hashes);
+  return {
+    sources: normalizeRemoteImportSourceHashes(hashes),
+    sourceBindings: bindings,
+    remoteTargets: targets.map(({ accountId, targetRevision }) => ({ accountId, targetRevision })),
+    baselines: targets.map(({ accountId, targetRevision }, index) => (
+      { accountId, targetRevision, targetDigest: bindings[index].targetDigest }
+    )),
+  };
+}
+
 function identityCompletionError() {
   return importBindingError('REMOTE_IMPORT_IDENTITY_COMPLETION_INVALID',
-    '身份补全缺少唯一的成功任务、原 ID 或新文件证明，已拒绝定向回写');
+    '身份补全缺少已核验的原 ID 或新文件证明，已拒绝定向回写');
 }
 
 function assertIdentityCompletionUnique(accountId, outputKeys, accounts) {
@@ -1698,9 +1802,9 @@ function hasIdentityCompletionProof(item, account) {
     && canCompleteAccountIdentity(proof.identityKeys, item.sourceIdentityKeys || []));
 }
 
-// sourceBindings are generated from authenticated successful Phase3 jobs, not
-// from request-body data. Keep the job -> original ID -> exact artifact mapping
-// intact; a pair of unordered target/source sets cannot authorize enrichment.
+// sourceBindings come from authenticated successful jobs or a server-verified
+// explicit review, never from request-body bindings. Keep each source -> ID ->
+// exact artifact mapping intact; unordered sets cannot authorize enrichment.
 function buildScopedImportPlan(sources, accounts, selectedKeys = [], sourceBindings = undefined) {
   if (sourceBindings === undefined) return buildImportPlan(sources, accounts, selectedKeys);
   if (!Array.isArray(sourceBindings) || sourceBindings.length < 1
@@ -3416,6 +3520,7 @@ async function executeImport({
   remoteSourceHashes = undefined,
   remoteTargetBaselines = undefined,
   remoteSourceBindings = undefined,
+  identityCompletionTargets = undefined,
   actor = 'local',
   db,
   jobId = null,
@@ -3506,6 +3611,16 @@ async function executeImport({
       }
       if (remoteSourceBindings !== undefined && normalizedRemoteTargets === undefined) {
         throw identityCompletionError();
+      }
+      if (identityCompletionTargets !== undefined) {
+        const reviewed = resolveIdentityCompletionReview(current._internal.sources,
+          current._internal.accounts, selectedKeys, identityCompletionTargets);
+        if (JSON.stringify(reviewed.remoteTargets) !== JSON.stringify(normalizedRemoteTargets)
+            || JSON.stringify(reviewed.sources) !== JSON.stringify(normalizedRemoteSources)
+            || JSON.stringify(reviewed.baselines) !== JSON.stringify(normalizedRemoteBaselines)) {
+          throw identityCompletionReviewError('IDENTITY_COMPLETION_REVIEW_STALE');
+        }
+        remoteSourceBindings = reviewed.sourceBindings;
       }
       const fullPlan = buildScopedImportPlan(current._internal.sources, current._internal.accounts,
         selectedKeys, remoteSourceBindings);
@@ -3960,6 +4075,9 @@ module.exports = {
   buildSnapshot,
   buildImportPlan,
   buildScopedImportPlan,
+  normalizeIdentityCompletionTargets,
+  listIdentityCompletionCandidates,
+  resolveIdentityCompletionReview,
   buildImportPlanIntentVersion,
   assertImportExecutableTargetLimit,
   collectCandidates,

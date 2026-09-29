@@ -156,6 +156,9 @@ input[type="checkbox"] { width: 16px; min-height: 16px; margin: 0; accent-color:
 .table-section, .plan-panel { margin-top: 20px; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); box-shadow: 0 3px 14px rgba(29, 62, 68, .045); }
 .table-section { border-top: 3px solid #b5d5d0; }
 .plan-panel { border-top: 3px solid #dfc58c; }
+.identity-completion-review { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 19px; border-bottom: 1px solid var(--line); background: var(--warning-soft); overflow-wrap: anywhere; }
+.identity-completion-review p { flex: 1 1 340px; margin: 0; font-size: 13px; line-height: 1.6; }
+.identity-completion-review .button { flex: 0 1 auto; white-space: normal; }
 .section-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 19px 15px; border-bottom: 1px solid var(--line); }
 .section-heading p { margin-bottom: 0; color: var(--muted); font-size: 12px; }
 .loading-label { color: var(--muted); font-size: 12px; }

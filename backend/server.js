@@ -15,6 +15,9 @@ const {
 const {
   buildSnapshot,
   buildScopedImportPlan,
+  normalizeIdentityCompletionTargets,
+  listIdentityCompletionCandidates,
+  resolveIdentityCompletionReview,
   buildImportPlanIntentVersion,
   assertImportExecutableTargetLimit,
   normalizeRemoteImportTargets,
@@ -315,6 +318,7 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'REMOTE_IMPORT_SOURCES_INVALID',
   'REMOTE_IMPORT_BASELINES_INVALID',
   'REMOTE_IMPORT_JOBS_INVALID',
+  'IDENTITY_COMPLETION_REVIEW_INVALID',
   'ACCOUNT_TEST_REQUEST_INVALID',
   'ACCOUNT_TEST_TARGET_REVISION_REQUIRED',
   'ACCOUNT_TEST_SELECTION_INVALID',
@@ -352,6 +356,7 @@ const PUBLIC_CONFLICT_ERRORS = new Set([
   'REMOTE_IMPORT_OUTSIDE_SCOPE',
   'REMOTE_IMPORT_IDENTITY_MISMATCH',
   'REMOTE_IMPORT_IDENTITY_COMPLETION_INVALID',
+  'IDENTITY_COMPLETION_REVIEW_STALE',
   'REMOTE_IMPORT_TARGET_UNCOVERED',
   'REMOTE_IMPORT_SOURCE_CHANGED',
   'REMOTE_IMPORT_JOBS_CHANGED',
@@ -3032,6 +3037,7 @@ function observeImportJob({
   remoteSourceHashes,
   remoteSourceBindings,
   remoteTargetBaselines,
+  identityCompletionTargets,
   clientFactory,
   actor,
   db,
@@ -3085,6 +3091,7 @@ function observeImportJob({
       remoteSourceHashes,
       remoteSourceBindings,
       remoteTargetBaselines,
+      identityCompletionTargets,
       client: clientFactory ? clientFactory({ logger, logContext: { jobId: job.id, actor } }) : null,
       actor,
       db,
@@ -3200,6 +3207,19 @@ function normalizeRemotePhase3JobIds(body, remoteTargets) {
       || ids.some((id) => typeof id !== 'string' || !/^job_[a-f0-9]{24}$/.test(id))
       || new Set(ids).size !== ids.length) throw remoteImportError('REMOTE_IMPORT_JOBS_INVALID');
   return [...ids].sort();
+}
+
+function identityCompletionRequestTargets(body, selectedKeys) {
+  if (!Object.hasOwn(body, 'identityCompletionTargets')
+      && !Object.hasOwn(body, 'identityCompletionConfirmed')) return undefined;
+  if (body.identityCompletionConfirmed !== true
+      || ['remoteTargets', 'phase3JobIds', 'remoteSourceBindings', 'remoteSourceHashes',
+        'remoteTargetBaselines', 'targetDigest'].some((key) => Object.hasOwn(body, key))) {
+    const error = new Error('身份补全必须单独明确核对，不能混用普通导入、旧任务或客户端基线');
+    error.code = 'IDENTITY_COMPLETION_REVIEW_INVALID';
+    throw error;
+  }
+  return normalizeIdentityCompletionTargets(body.identityCompletionTargets, selectedKeys);
 }
 
 async function remotePhase3ImportBinding(db, jobIds, remoteTargets, selectedKeys, endpointDigest) {
@@ -3551,20 +3571,18 @@ function createServer(options = {}) {
           error.code = 'IMPORT_SELECTION_INVALID';
           throw error;
         }
-        const remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
+        const identityCompletionTargets = identityCompletionRequestTargets(body, selectedKeys);
+        let remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
         const phase3JobIds = normalizeRemotePhase3JobIds(body, remoteTargets);
         let syncClient = null;
         const getSyncClient = (clientOptions = {}) => {
           if (!syncClient) syncClient = syncClientFactory(clientOptions);
           return syncClient;
         };
-        const recoveryBinding = await remotePhase3ImportBinding(
+        let recoveryBinding = await remotePhase3ImportBinding(
           db, phase3JobIds, remoteTargets, selectedKeys,
           remoteTargets ? remotePhase3EndpointDigest(getSyncClient({ logger, logContext: { requestId, actor } })) : undefined,
         );
-        const remoteSourceHashes = recoveryBinding?.sources;
-        const remoteSourceBindings = recoveryBinding?.sourceBindings;
-        const remoteTargetBaselines = recoveryBinding?.baselines;
         const snapshot = await buildSnapshot(new URLSearchParams('withSub2api=1'), {
           includeRaw: true,
           includeInternal: true,
@@ -3580,6 +3598,14 @@ function createServer(options = {}) {
           error.code = 'SUB2API_READ_FAILED';
           throw error;
         }
+        if (identityCompletionTargets !== undefined) {
+          recoveryBinding = resolveIdentityCompletionReview(snapshot._internal.sources,
+            snapshot._internal.accounts, selectedKeys, identityCompletionTargets);
+          remoteTargets = recoveryBinding.remoteTargets;
+        }
+        const remoteSourceHashes = recoveryBinding?.sources;
+        const remoteSourceBindings = recoveryBinding?.sourceBindings;
+        const remoteTargetBaselines = recoveryBinding?.baselines;
         const plan = buildScopedImportPlan(
           snapshot._internal.sources, snapshot._internal.accounts, selectedKeys, remoteSourceBindings,
         );
@@ -3612,6 +3638,7 @@ function createServer(options = {}) {
           groupBinding,
           durationMs: performance.now() - previewStartedAt,
           counts: importPlanSummary(plan).counts,
+          identityCompletionReview: identityCompletionTargets !== undefined,
         });
         jsonResponse(response, 200, {
           readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
@@ -3621,7 +3648,12 @@ function createServer(options = {}) {
           groupBinding,
           generatedAt: snapshot.generatedAt,
           selectedKeys,
-          ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
+          ...(identityCompletionTargets !== undefined
+            ? { identityCompletionConfirmed: true, identityCompletionTargets }
+            : remoteTargets ? { remoteTargets, phase3JobIds } : {}),
+          identityCompletionCandidates: remoteTargets ? [] : listIdentityCompletionCandidates(
+            snapshot._internal.sources, snapshot._internal.accounts, selectedKeys,
+          ),
           ...importPlanSummary(plan),
         });
       } catch (error) {
@@ -3648,7 +3680,8 @@ function createServer(options = {}) {
         const selectedKeys = normalizedSelectedKeys(body.selectedKeys);
         const normalizedSnapshotVersion = String(body.snapshotVersion).toLowerCase();
         const planIntentVersion = body.planIntentVersion;
-        const remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
+        const identityCompletionTargets = identityCompletionRequestTargets(body, selectedKeys);
+        let remoteTargets = normalizeRemoteImportTargets(body.remoteTargets);
         const phase3JobIds = normalizeRemotePhase3JobIds(body, remoteTargets);
         let remoteSourceHashes;
         let remoteSourceBindings;
@@ -3658,6 +3691,8 @@ function createServer(options = {}) {
           planIntentVersion,
           selectedKeys,
           ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
+          ...(identityCompletionTargets !== undefined
+            ? { identityCompletionConfirmed: true, identityCompletionTargets } : {}),
         });
         const priorReceipt = await existingMutationReceipt(db, idempotency, actor);
         if (priorReceipt) {
@@ -3695,7 +3730,8 @@ function createServer(options = {}) {
                 remoteSourceBindings = binding.sourceBindings;
                 remoteTargetBaselines = binding.baselines;
               }
-              if (remoteTargets || selectedKeys.length > MAX_TOKEN_IMPORT_CONTEXT_TARGETS) {
+              if (remoteTargets || identityCompletionTargets !== undefined
+                  || selectedKeys.length > MAX_TOKEN_IMPORT_CONTEXT_TARGETS) {
                 const current = await buildSnapshot(
                   new URLSearchParams('withSub2api=1'),
                   {
@@ -3720,6 +3756,14 @@ function createServer(options = {}) {
                   const error = new Error('导入计划已变化，请重新检查差异');
                   error.code = 'IMPORT_PLAN_STALE';
                   throw error;
+                }
+                if (identityCompletionTargets !== undefined) {
+                  const binding = resolveIdentityCompletionReview(current._internal.sources,
+                    current._internal.accounts, selectedKeys, identityCompletionTargets);
+                  remoteTargets = binding.remoteTargets;
+                  remoteSourceHashes = binding.sources;
+                  remoteSourceBindings = binding.sourceBindings;
+                  remoteTargetBaselines = binding.baselines;
                 }
                 const currentPlan = buildScopedImportPlan(
                   current._internal.sources,
@@ -3749,7 +3793,9 @@ function createServer(options = {}) {
                     snapshotVersion: normalizedSnapshotVersion,
                     planIntentVersion,
                     selectedKeys,
-                    ...(remoteTargets ? { remoteTargets, phase3JobIds } : {}),
+                    ...(identityCompletionTargets !== undefined
+                      ? { identityCompletionConfirmed: true, identityCompletionTargets }
+                      : remoteTargets ? { remoteTargets, phase3JobIds } : {}),
                     // Keep a separately validated, non-secret display path because
                     // generic text redaction intentionally masks `token:...` values.
                     selectedSourcePaths: selectedKeys
@@ -3795,6 +3841,7 @@ function createServer(options = {}) {
               remoteSourceHashes,
               remoteSourceBindings,
               remoteTargetBaselines,
+              identityCompletionTargets,
               clientFactory: syncClientFactory,
               actor,
               db,
