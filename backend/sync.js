@@ -2801,6 +2801,10 @@ async function preflightUpdateAccount(client, item, options = {}) {
   if (!plannedCredentialStateMatches(item?._account, account)) {
     throw targetVerificationError('Sub2API 目标账号在写入前已变化', 'SUB2API_TARGET_CHANGED');
   }
+  if (typeof options.beforeUpdate === 'function') {
+    await options.beforeUpdate(account);
+    throwIfJobInterrupted(signal);
+  }
   return { account, skipReason: null };
 }
 
@@ -2912,6 +2916,7 @@ async function executeImportPlanItem({
   now = Date.now,
   remoteTargetRevision = undefined,
   remoteTargetDigest = undefined,
+  beforeUpdate = null,
 }) {
   throwIfJobInterrupted(signal);
   if (item.action === 'update') {
@@ -2919,7 +2924,7 @@ async function executeImportPlanItem({
       ? revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now))
       : null;
     throwIfJobInterrupted(signal);
-    const preflightOptions = { signal, now, remoteTargetRevision, remoteTargetDigest };
+    const preflightOptions = { signal, now, remoteTargetRevision, remoteTargetDigest, beforeUpdate };
     let preflight = await preflightUpdateAccount(client, item, preflightOptions);
     if (preflight.skipReason) {
       return { skipped: true, reason: preflight.skipReason, verification: null, result: null };
@@ -3529,6 +3534,8 @@ async function executeImport({
   client: providedClient = null,
   persistResult = null,
   persistFailure = null,
+  beforeCreate = null,
+  beforeUpdate = null,
 }) {
   const startedAt = performance.now();
   writeLog(logger, 'info', 'import.started', {
@@ -3794,6 +3801,10 @@ async function executeImport({
         };
         writeLog(logger, 'info', 'import.account_started', baseFields);
         try {
+          if (item.action === 'create' && typeof beforeCreate === 'function') {
+            await beforeCreate(item);
+            throwIfJobInterrupted(signal);
+          }
           const outcome = await executeImportPlanItem({
             client,
             item,
@@ -3802,6 +3813,7 @@ async function executeImport({
             logger,
             context: baseFields,
             sourceRoot: current._internal.sources.rootDirectory,
+            beforeUpdate,
             signal,
             remoteTargetRevision: normalizedRemoteTargets?.find((target) => (
               target.accountId === canonicalPositiveAccountId(item.accountId)
@@ -3845,6 +3857,25 @@ async function executeImport({
           }
           const result = outcome.result;
           const verification = outcome.verification;
+          if (db && typeof db.saveLink === 'function') {
+            try {
+              await db.saveLink({
+                identityKey: item.identityKey,
+                tokenPath: item.relativePath,
+                sub2apiId: verification.accountId,
+                accountName: verification.accountName || item.accountName,
+                endpointKey: require('./accountLifecycle').managementEndpointKey(
+                  client.baseUrl || process.env.SUB2API_BASE_URL,
+                ),
+                identityKeys: item.sourceIdentityKeys,
+              });
+            } catch (error) {
+              // The remote write is verified, but losing its durable identity
+              // history could permit a deleted account to be recreated later.
+              // Keep a reconciliation barrier rather than report success.
+              throw reconciliationRequiredError(error, 'account_lifecycle_persistence_failed');
+            }
+          }
           // The remote response may contain credentials or the imported
           // session. Keep only counters and identifiers in the local job DB
           // and API response.
@@ -3869,12 +3900,6 @@ async function executeImport({
                 sub2api: result,
                 verification,
               },
-            });
-            await db?.saveLink({
-              identityKey: item.identityKey,
-              tokenPath: item.relativePath,
-              sub2apiId: verification.accountId,
-              accountName: verification.accountName || item.accountName,
             });
           } catch (auditError) {
             writeLog(logger, 'error', 'import.audit_failed_after_remote_success', {

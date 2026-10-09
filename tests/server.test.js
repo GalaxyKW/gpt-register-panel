@@ -49,7 +49,10 @@ const configuredPanelToken = process.env.PANEL_ADMIN_TOKEN || '';
 const validImportPlanIntentVersion = 'sync-plan-v1.' + 'A'.repeat(43);
 
 test('static routing exposes only the declared frontend assets', () => {
-  assert.equal(path.basename(safeStaticPath('/')), 'index.html');
+  assert.equal(path.basename(safeStaticPath('/')), 'console.html');
+  assert.equal(path.basename(safeStaticPath('/index.html')), 'index.html');
+  assert.equal(path.basename(safeStaticPath('/console.js')), 'console.js');
+  assert.equal(path.basename(safeStaticPath('/console.css')), 'console.css');
   assert.equal(path.basename(safeStaticPath('/app.js')), 'app.js');
   assert.equal(path.basename(safeStaticPath('/styles.css')), 'styles.css');
   assert.equal(path.basename(safeStaticPath('/local-phase3.js')), 'local-phase3.js');
@@ -3730,7 +3733,11 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
 
     const page = await request(baseUrl, '/');
     assert.equal(page.status, 200);
-    assert.match(page.body, /账号管理/);
+    assert.match(page.body, /Register Studio/);
+    assert.match(page.body, /console\.js/);
+    const advancedPage = await request(baseUrl, '/index.html');
+    assert.equal(advancedPage.status, 200);
+    assert.match(advancedPage.body, /账号管理/);
     assert.match(page.headers['content-security-policy'], /base-uri 'none'/);
     assert.equal(page.headers['x-frame-options'], 'DENY');
     const app = await request(baseUrl, '/app.js');

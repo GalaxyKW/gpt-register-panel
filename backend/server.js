@@ -33,6 +33,7 @@ const {
   isImportPlanIntentVersion,
 } = require('./sync');
 const { Sub2ApiAdminClient } = require('./adapters/sub2apiAdmin');
+const { createConsoleService } = require('./consoleService');
 const {
   PanelDb,
   RECONCILIATION_ACK_CONFIRMATION,
@@ -113,8 +114,11 @@ const STATIC_ALLOWLIST = new Set([
   '/index.html', '/app.js', '/styles.css', '/local-phase3.js',
   '/account-test-batch.js', '/account-test-batch-ui.js',
   '/remote-phase3.js',
+  '/console.html', '/console.js', '/console.css',
 ]);
 const JSON_BODY_ENDPOINTS = new Set([
+  '/api/console/register', '/api/console/maintain', '/api/console/settings',
+  '/api/console/preflight', '/api/console/logs/cleanup', '/api/console/register/resume',
   '/api/sync/preview',
   '/api/sync/import',
   '/api/phase3',
@@ -123,6 +127,8 @@ const JSON_BODY_ENDPOINTS = new Set([
   '/api/account-tests',
 ]);
 const GET_API_ENDPOINTS = new Set([
+  '/api/console/overview', '/api/console/settings', '/api/console/logs',
+  '/api/console/logs/download', '/api/console/register/continuations',
   '/api/health',
   '/api/snapshot',
   '/api/phase3/local-accounts',
@@ -1108,6 +1114,8 @@ function reconciliationReviewPath(pathname) {
 }
 
 function allowedRequestMethod(pathname, reconciliationAck, reconciliationReview) {
+  if (pathname === '/api/console/settings') return 'GET, POST';
+  if (/^\/api\/console\/jobs\/job_[a-f0-9]{24}\/stop$/.test(pathname)) return 'POST';
   if (JSON_BODY_ENDPOINTS.has(pathname) || reconciliationAck.matched) return 'POST';
   if (GET_API_ENDPOINTS.has(pathname) || reconciliationReview.matched
       || pathParam(pathname, '/api/jobs/')) return 'GET';
@@ -1943,7 +1951,7 @@ function reconciliationAcknowledgeRequestError(body, jobId) {
 
 function safeStaticPath(urlPath) {
   let decoded;
-  try { decoded = decodeURIComponent(urlPath === '/' ? '/index.html' : urlPath); } catch { return null; }
+  try { decoded = decodeURIComponent(urlPath === '/' ? '/console.html' : urlPath); } catch { return null; }
   if (!STATIC_ALLOWLIST.has(decoded)) return null;
   const absolute = path.resolve(FRONTEND_ROOT, '.' + decoded);
   if (absolute !== FRONTEND_ROOT && !absolute.startsWith(FRONTEND_ROOT + path.sep)) return null;
@@ -3338,6 +3346,8 @@ function createServer(options = {}) {
   };
   const expiredTokenLister = options.expiredTokenLister || listExpiredTokens;
   const admissionControlPlaneLock = options.admissionControlPlaneLock || withControlPlaneLock;
+  const consoleService = createConsoleService({ db, logger, jobManager, clientFactory: syncClientFactory,
+    describeFailure: mutationFailureMetadata, ...(options.consoleOptions || {}) });
   let server;
   server = http.createServer(async (request, response) => {
     const requestId = typeof logger.requestId === 'function'
@@ -3406,6 +3416,9 @@ function createServer(options = {}) {
       );
       const requiresWrite = request.method === 'POST'
         && (reconciliationAckPath.matched
+          || (requestUrl.pathname.startsWith('/api/console/')
+            && requestUrl.pathname !== '/api/console/preflight'
+            && !/^\/api\/console\/jobs\/job_[a-f0-9]{24}\/stop$/.test(requestUrl.pathname))
           || ['/api/sync/import', '/api/phase3', '/api/phase3/local', '/api/tokens/expired/delete', '/api/account-tests'].includes(requestUrl.pathname));
       const authError = requestUrl.pathname.startsWith('/api/')
         ? authorizationError(request, requiresWrite)
@@ -3434,7 +3447,7 @@ function createServer(options = {}) {
         });
         return;
       }
-      if (allowedMethod && request.method !== allowedMethod) {
+      if (allowedMethod && !allowedMethod.split(', ').includes(request.method)) {
         writeLog(logger, 'warn', 'http.method_not_allowed', {
           requestId,
           actor,
@@ -3450,7 +3463,8 @@ function createServer(options = {}) {
         return;
       }
       if (request.method === 'POST'
-          && (JSON_BODY_ENDPOINTS.has(requestUrl.pathname) || reconciliationAckPath.matched)
+          && (JSON_BODY_ENDPOINTS.has(requestUrl.pathname) || reconciliationAckPath.matched
+            || /^\/api\/console\/jobs\/job_[a-f0-9]{24}\/stop$/.test(requestUrl.pathname))
           && !hasJsonContentType(request)) {
         writeLog(logger, 'warn', 'http.unsupported_media_type', {
           requestId,
@@ -3481,6 +3495,59 @@ function createServer(options = {}) {
         });
         return;
       }
+
+    if (requestUrl.pathname.startsWith('/api/console/')) {
+      const route = requestUrl.pathname;
+      try {
+        if (request.method === 'GET') {
+          if (route === '/api/console/overview') jsonResponse(response, 200, await consoleService.overview());
+          else if (route === '/api/console/settings') jsonResponse(response, 200, await consoleService.settings());
+          else if (route === '/api/console/logs') jsonResponse(response, 200,
+            await consoleService.queryLogs(Object.fromEntries(requestUrl.searchParams)));
+          else if (route === '/api/console/logs/download') {
+            const download = await consoleService.downloadLog(requestUrl.searchParams.get('fileId'));
+            response.writeHead(200, { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store',
+              'content-disposition': 'attachment; filename="' + download.name + '"',
+              'x-content-type-options': 'nosniff', 'content-security-policy': CONTENT_SECURITY_POLICY });
+            response.end(download.content);
+          } else if (route === '/api/console/register/continuations') jsonResponse(response, 200, await consoleService.continuations());
+          else jsonResponse(response, 404, { error: 'not_found' });
+          return;
+        }
+        if (request.method === 'POST') {
+          const body = await readJsonBody(request, 64 * 1024);
+          const invalid = requestBodyObjectError(body);
+          if (invalid) throw invalid;
+          if (route === '/api/console/preflight') {
+            if (Object.keys(body).length) throw Object.assign(new Error('连接检测不接受额外目标或参数'), { code: 'CONSOLE_REQUEST_INVALID' });
+            jsonResponse(response, 200, await consoleService.runPreflight(requestDisconnectController.signal));
+          } else if (route === '/api/console/settings') {
+            jsonResponse(response, 200, await withRequestAdmission(() => consoleService.saveSettings(body)));
+          } else if (/^\/api\/console\/jobs\/job_[a-f0-9]{24}\/stop$/.test(route)) {
+            if (Object.keys(body).length) throw Object.assign(new Error('停止操作不接受额外参数'), { code: 'CONSOLE_REQUEST_INVALID' });
+            jsonResponse(response, 202, await consoleService.stop(route.split('/')[4]));
+          } else {
+            const kind = ({ '/api/console/register': 'register', '/api/console/maintain': 'maintain',
+              '/api/console/logs/cleanup': 'log_cleanup', '/api/console/register/resume': 'resume' })[route];
+            if (!kind) { jsonResponse(response, 404, { error: 'not_found' }); return; }
+            const submitted = await withRequestAdmission(signal => consoleService.submit(kind, body,
+              { actor, idempotencyKey: requestIdempotencyKey(request), signal }));
+            sendMutationReceipt(response, submitted.receipt, submitted.replayed);
+          }
+          return;
+        }
+        jsonResponse(response, 405, { error: 'method_not_allowed' });
+      } catch (error) {
+        const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,100}$/.test(error.code) ? error.code : 'CONSOLE_REQUEST_FAILED';
+        if (/^(CONSOLE_|REGISTRATION_|ACCOUNT_LIFECYCLE_|MAINTENANCE_)/.test(code)) {
+          const status = /NOT_FOUND$/.test(code) ? 404
+            : /INVALID$/.test(code) ? 400 : /STALE|CHANGED|REQUIRED|UNKNOWN|REUSED|CONFLICT/.test(code) ? 409 : 503;
+          jsonResponse(response, status, { error: code, message: safeErrorMessage(error) });
+        } else sendPublicApiError(response, error, { fallbackCode: 'console_request_failed', fallbackMessage: '操作未完成，请查看任务日志或连接检测' });
+        writeLog(logger, 'warn', 'console.request_failed', { requestId, actor, code });
+      }
+      return;
+    }
 
     if (requestUrl.pathname === '/api/health') {
       if (request.method !== 'GET') {
@@ -4769,6 +4836,9 @@ function createServer(options = {}) {
   server.panelLogger = logger;
   server.panelDb = db;
   server.panelJobManager = jobManager;
+  server.panelConsoleService = consoleService;
+  server.once('listening', () => consoleService.start());
+  server.once('close', () => consoleService.dispose());
   return server;
 }
 
@@ -4846,6 +4916,7 @@ async function shutdownServer(server, options = {}) {
     ? Math.max(0, Math.min(12_000, Math.floor(parsedTimeout)))
     : 10_000;
   server.panelShutdownPromise = (async () => {
+    server.panelConsoleService?.dispose();
     writeLog(logger, 'info', 'server.shutdown_started', {
       signal,
       timeoutMs,

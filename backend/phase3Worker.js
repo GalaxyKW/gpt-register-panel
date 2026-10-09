@@ -2165,8 +2165,12 @@ function runCommand(command, args, options = {}) {
       });
     }
     const configuredTimeoutMs = Number(options.timeoutMs);
+    // Only the server's fixed registration launcher sets this internal flag.
+    // Ordinary Phase3 callers retain their existing two-hour hard ceiling.
+    const timeoutCeilingMs = options.registrationBatch === true
+      ? 24 * 60 * 60 * 1_000 : 2 * 60 * 60 * 1_000;
     const timeoutMs = Number.isFinite(configuredTimeoutMs) && configuredTimeoutMs > 0
-      ? Math.min(Math.max(configuredTimeoutMs, 1_000), 2 * 60 * 60 * 1_000)
+      ? Math.min(Math.max(configuredTimeoutMs, 1_000), timeoutCeilingMs)
       : 30 * 60 * 1_000;
     timer = setTimeout(() => {
       if (settled) return;
@@ -3089,6 +3093,8 @@ function runPhase3Job(args = {}) {
       }
       throwIfJobInterrupted(args.signal);
       try {
+        if (typeof args.beforeExecute === 'function') await args.beforeExecute();
+        throwIfJobInterrupted(args.signal);
         return await runPhase3JobNow(args);
       } catch (error) {
         if (typeof args.persistFailure === 'function') {
@@ -3119,6 +3125,9 @@ function runPhase3Job(args = {}) {
 }
 
 module.exports = {
+  _registrationExecution: Object.freeze({ openPinnedPhase3Root, openPinnedRegularFile,
+    closeRegularFileHandle, phase3LauncherSource, phase3Environment,
+    assertProcessTreeSafe() { if (phase3ProcessTreeUnsafe) throw phase3SupervisionError(); } }),
   PHASE3_RECONCILIATION_REASON,
   PHASE3_RECONCILIATION_SCOPE,
   PHASE3_TERMINATION_MAX_TOTAL_MS,

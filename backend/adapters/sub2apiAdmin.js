@@ -10,6 +10,7 @@ const net = require('node:net');
 const { performance } = require('node:perf_hooks');
 const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
+const { maintenanceEvidenceFromRaw } = require('../accountMaintenance');
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
@@ -20,7 +21,7 @@ const MAX_RESPONSE_BODY_BYTES = 32 * 1024 * 1024;
 const MAX_ADMIN_BASE_URL_BYTES = 4096;
 const MAX_ADMIN_REQUEST_PATH_BYTES = 4096;
 const MAX_BATCH_ACCOUNT_IDS = 1000;
-const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST']);
+const ADMIN_REQUEST_METHODS = new Set(['GET', 'POST', 'DELETE']);
 const SUB2API_EXPORT_TYPES = new Set(['', 'sub2api-data', 'sub2api-bundle']);
 const SUB2API_EXPORT_VERSIONS = new Set([0, 1]);
 const IDENTITY_CONTROL_OR_BIDI = /[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/;
@@ -468,6 +469,11 @@ function validatedAdminRequestTarget(baseUrl, baseOrigin, method, pathname) {
       || /%(?![0-9a-f]{2})/i.test(pathname)) {
     throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
   }
+  // Deletion is intentionally narrower than the generic GET/POST transport.
+  // No collection, batch, query-string or administrator endpoint is allowed.
+  if (method === 'DELETE' && !/^\/api\/v1\/admin\/accounts\/[1-9][0-9]*$/.test(pathname)) {
+    throw adminRequestTargetError('SUB2API_REQUEST_TARGET_INVALID');
+  }
   let target;
   try {
     target = new URL(baseUrl + pathname);
@@ -811,11 +817,19 @@ function safeAccount(account) {
     [account.error_message, account.errorMessage],
     4000,
   ));
+  const planAliases = scalarAliases([credentials.plan_type, credentials.chatgpt_plan_type], 64, {
+    normalize: (value) => value.toLowerCase(), rejectOuterWhitespace: true,
+  });
+  const planType = !planAliases.invalid && !planAliases.conflict
+    && ['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu'].includes(planAliases.value)
+    ? planAliases.value : '';
   return {
     id,
     name,
     platform: safeRemoteText(scalarText(account.platform, 64), 64),
     type: safeRemoteText(scalarText(account.type, 64), 64),
+    planType,
+    maintenanceEvidence: maintenanceEvidenceFromRaw(account),
     status,
     statusKnown,
     schedulable: schedulableKnown ? account.schedulable : null,
@@ -1943,6 +1957,7 @@ class Sub2ApiAdminClient {
             || (hasOwn(raw, 'id') && positiveAccountId(raw.id) !== target.id)) {
           throw currentCredentialError();
         }
+        if (target.planType && actual.planType && target.planType !== actual.planType) throw currentCredentialError(true);
         const presence = {};
         for (const kind of ['access', 'refresh', 'id']) {
           presence[kind] = actual.tokenFingerprints[kind] ? 'present' : 'absent';
@@ -1955,6 +1970,7 @@ class Sub2ApiAdminClient {
         }
         replacements.set(target.id, {
           ...target,
+          planType: actual.planType,
           tokenFingerprints: actual.tokenFingerprints,
           credentialPresence: presence,
         });
@@ -2437,6 +2453,15 @@ class Sub2ApiAdminClient {
       throw error;
     }
     return value;
+  }
+
+  async deleteAccount(id, options = {}) {
+    const accountId = requestedAccountId(id, 'SUB2API_DELETE_ID_INVALID', '删除必须指定规范账号 ID');
+    await this.request('DELETE', '/api/v1/admin/accounts/' + String(accountId), undefined,
+      { signal: options.signal, writeOperation: true });
+    // Never trust or return the arbitrary upstream success message. The
+    // maintenance worker still requires an authenticated exact-ID 404.
+    return { accountId, accepted: true };
   }
 
   async importCodexSession(payload, options = {}) {

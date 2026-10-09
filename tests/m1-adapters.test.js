@@ -2675,13 +2675,17 @@ test('Sub2API generic requests reject ambiguous targets before logging or fetch'
     throw new Error('fetch must not run');
   };
   try {
-    for (const method of ['get', 'DELETE', 'HEAD', '', new String('GET')]) {
+    for (const method of ['get', 'HEAD', '', new String('GET')]) {
       await assert.rejects(
         client.request(method, '/api/v1/admin/accounts'),
         (error) => error.code === 'SUB2API_REQUEST_METHOD_INVALID'
           && error.message === 'Sub2API 管理请求方法无效',
       );
     }
+    // DELETE is supported only for a canonical, single-account route; the
+    // collection remains forbidden before logging or sending any request.
+    await assert.rejects(client.request('DELETE', '/api/v1/admin/accounts'),
+      (error) => error.code === 'SUB2API_REQUEST_TARGET_INVALID');
     const marker = 'opaque-invalid-target-marker';
     for (const pathname of [
       '',

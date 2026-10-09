@@ -8,6 +8,11 @@ const { ensureDirectoryTree } = require('./lib/safeFs');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
 const { mutationKeyHash, normalizeIdempotencyKey } = require('./idempotency');
 const {
+  DEFAULT_CONSOLE_SETTINGS, TERMINAL_LIFECYCLE_STATES, lifecycleError,
+  validEndpointKey, normalizeLifecycleIdentityKey, normalizeLifecycleRecord,
+  normalizeConsoleSettings, lifecycleIdentityKeys,
+} = require('./accountLifecycle');
+const {
   MAX_RECONCILIATION_CONTEXT_BYTES,
   parseReconciliationContext,
   serializeReconciliationContext,
@@ -338,6 +343,71 @@ function validateDurableIdentitySchema(database) {
       '幂等回执数据库结构缺少必需的主键或唯一性保证',
     )
   ));
+  requireSingleColumnUniqueIdentity('account_lifecycle', 'lifecycle_key', lifecycleError);
+  requireSingleColumnUniqueIdentity('console_settings', 'id', lifecycleError);
+}
+
+function lifecycleRows(database, endpointKey) {
+  const rows = resultRows(database.exec(`SELECT lifecycle_key, endpoint_key, identity_key,
+      sub2api_id, account_name, state, reason_code, first_seen_at, updated_at
+    FROM account_lifecycle WHERE endpoint_key IN (${sqlString(endpointKey)}, 'legacy_unbound')
+    ORDER BY lifecycle_key LIMIT 20001`));
+  if (rows.length > 20000) throw lifecycleError('ACCOUNT_LIFECYCLE_LIMIT');
+  return rows.map((row) => {
+    if ((row.endpoint_key !== 'legacy_unbound' && !validEndpointKey(row.endpoint_key))
+        || !normalizeLifecycleIdentityKey(row.identity_key)
+        || row.lifecycle_key !== row.endpoint_key + ':' + row.identity_key
+        || !['observed', 'imported', 'delete_pending', 'deleted', 'review_required'].includes(row.state)
+        || !Number.isSafeInteger(row.sub2api_id) || row.sub2api_id <= 0
+        || typeof row.account_name !== 'string' || row.account_name.length > 256
+        || !/^[a-z0-9_]{1,64}$/.test(row.reason_code || '')
+        || !isCanonicalIsoTimestamp(row.first_seen_at) || !isCanonicalIsoTimestamp(row.updated_at)) {
+      throw lifecycleError();
+    }
+    return { endpointKey: row.endpoint_key, identityKey: row.identity_key,
+      sub2apiId: row.sub2api_id, accountName: row.account_name,
+      state: row.state, reasonCode: row.reason_code,
+      firstSeenAt: row.first_seen_at, updatedAt: row.updated_at };
+  });
+}
+
+function storeLifecycleRecord(database, record, now) {
+  // Tombstones and uncertain writes are permanent safety barriers. Observation
+  // or a late saveLink must never turn them back into eligible new accounts.
+  for (const key of record.identityKeys) {
+    const lifecycleKey = record.endpointKey + ':' + key;
+    const previous = resultRows(database.exec(`SELECT sub2api_id, state, reason_code
+      FROM account_lifecycle WHERE lifecycle_key = ${sqlString(lifecycleKey)}`))[0];
+    if (previous && (!Number.isSafeInteger(previous.sub2api_id)
+        || !['observed', 'imported', 'delete_pending', 'deleted', 'review_required'].includes(previous.state))) throw lifecycleError();
+    if (previous && TERMINAL_LIFECYCLE_STATES.has(previous.state)
+        && !(previous.state === 'delete_pending' && record.state === 'deleted'
+          && previous.sub2api_id === record.sub2apiId)) continue;
+    const collision = previous && previous.sub2api_id !== record.sub2apiId;
+    const state = collision ? 'review_required'
+      : previous?.state === 'imported' && record.state === 'observed' ? 'imported' : record.state;
+    const statement = database.prepare(`INSERT INTO account_lifecycle
+      (lifecycle_key, endpoint_key, identity_key, sub2api_id, account_name, state, reason_code, first_seen_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(lifecycle_key) DO UPDATE SET state=excluded.state,
+        reason_code=excluded.reason_code, updated_at=excluded.updated_at,
+        account_name=CASE WHEN account_lifecycle.sub2api_id=excluded.sub2api_id
+          THEN excluded.account_name ELSE account_lifecycle.account_name END`);
+    try {
+      statement.run([lifecycleKey, record.endpointKey, key, record.sub2apiId,
+        record.accountName, state, collision ? 'remote_identity_reused' : record.reasonCode, now, now]);
+    } finally { statement.free(); }
+  }
+}
+
+function storedConsoleSettings(database) {
+  const row = resultRows(database.exec('SELECT revision, settings_json FROM console_settings WHERE id = 1'))[0];
+  if (!row) return { revision: 0, settings: { ...DEFAULT_CONSOLE_SETTINGS } };
+  if (!Number.isSafeInteger(row.revision) || row.revision < 1
+      || typeof row.settings_json !== 'string' || Buffer.byteLength(row.settings_json) > 4096) throw lifecycleError('CONSOLE_SETTINGS_INVALID');
+  let settings;
+  try { settings = JSON.parse(row.settings_json); } catch { throw lifecycleError('CONSOLE_SETTINGS_INVALID'); }
+  return { revision: row.revision, settings: normalizeConsoleSettings(settings) };
 }
 
 function reconciliationError(code, message, fields = {}) {
@@ -1650,9 +1720,15 @@ function firstReconciliationBarrier(database) {
 }
 
 function firstRunningMutation(database) {
+  // A console parent coordinates durable child jobs; it never owns a remote
+  // write itself. Only the fixed coordinator types with the exact exclusive
+  // pipeline claim are exempt. Real child jobs still consume the single write
+  // slot, and reconciliation barriers are checked before this lookup.
   return resultRows(database.exec(`SELECT id, type
     FROM sync_jobs
     WHERE status = 'running'
+      AND NOT (type IN ('console_register', 'console_resume', 'console_maintain', 'console_log_cleanup')
+        AND claim_keys_json = '["console_pipeline"]')
     ORDER BY COALESCE(started_at, created_at) ASC, id ASC LIMIT 1`))[0] || null;
 }
 
@@ -2680,6 +2756,23 @@ class PanelDb {
         account_name TEXT,
         updated_at TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS account_lifecycle (
+        lifecycle_key TEXT PRIMARY KEY,
+        endpoint_key TEXT NOT NULL,
+        identity_key TEXT NOT NULL,
+        sub2api_id INTEGER NOT NULL,
+        account_name TEXT NOT NULL,
+        state TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        first_seen_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_account_lifecycle_endpoint ON account_lifecycle(endpoint_key);
+      CREATE TABLE IF NOT EXISTS console_settings (
+        id INTEGER PRIMARY KEY,
+        revision INTEGER NOT NULL,
+        settings_json TEXT NOT NULL
+      );
     `);
     const columns = resultRows(this.database.exec('PRAGMA table_info(sync_jobs)'))
       .map((row) => row.name);
@@ -2741,6 +2834,25 @@ class PanelDb {
     // schema. Without these unique identities, two queued jobs could appear to
     // own the same claim while the in-memory maps silently overwrite one owner.
     validateDurableIdentitySchema(this.database);
+    // Legacy links have no management-instance provenance. Keep their strong
+    // identities as conservative blockers instead of pretending they belong
+    // to whichever endpoint happens to be configured on this startup.
+    const legacyLinks = resultRows(this.database.exec(`SELECT identity_key, sub2api_id,
+      account_name, updated_at FROM account_links AS links WHERE NOT EXISTS (
+        SELECT 1 FROM account_lifecycle AS history WHERE history.identity_key=links.identity_key
+      ) LIMIT 20001`));
+    if (legacyLinks.length > 20000) throw lifecycleError('ACCOUNT_LIFECYCLE_LIMIT');
+    for (const link of legacyLinks) {
+      const identityKey = normalizeLifecycleIdentityKey(link.identity_key);
+      if (!identityKey || !Number.isSafeInteger(link.sub2api_id) || link.sub2api_id <= 0) continue;
+      const now = isCanonicalIsoTimestamp(link.updated_at) ? link.updated_at : new Date().toISOString();
+      const name = typeof link.account_name === 'string' && link.account_name.length <= 256 ? link.account_name : '';
+      const statement = this.database.prepare(`INSERT OR IGNORE INTO account_lifecycle
+        (lifecycle_key, endpoint_key, identity_key, sub2api_id, account_name, state, reason_code, first_seen_at, updated_at)
+        VALUES (?, 'legacy_unbound', ?, ?, ?, 'observed', 'legacy_import_history', ?, ?)`);
+      try { statement.run(['legacy_unbound:' + identityKey, identityKey, link.sub2api_id, name, now, now]); }
+      finally { statement.free(); }
+    }
   }
 
   pruneRows({ pruneMutationReceipts = true } = {}) {
@@ -4442,6 +4554,17 @@ class PanelDb {
     });
   }
 
+  async listConsoleJobReferences() {
+    // Parent workflows must not vanish behind their own hundreds of child
+    // records. Transfer only bounded references here; the console separately
+    // projects each full result into a small progress card.
+    return this.read((database) => resultRows(database.exec(`SELECT id
+      FROM sync_jobs
+      WHERE type IN ('console_register', 'console_resume', 'console_maintain', 'console_log_cleanup')
+      ORDER BY CASE WHEN status IN ('queued', 'running') THEN 0 ELSE 1 END,
+        created_at DESC, id DESC LIMIT 30`)).map(row => boundedJobListText(row.id, 128)));
+  }
+
   async listJobsPage(limit = 50) {
     const safeLimit = normalizedJobListLimit(limit);
     const rows = await this.read((database) => {
@@ -4769,6 +4892,72 @@ class PanelDb {
         now,
       ]);
       statement.free();
+      if (link.endpointKey !== undefined) {
+        const identityKeys = lifecycleIdentityKeys({ identityKeys: link.identityKeys || [link.identityKey] });
+        storeLifecycleRecord(database, normalizeLifecycleRecord({
+          endpointKey: link.endpointKey, identityKeys, sub2apiId: link.sub2apiId,
+          accountName: link.accountName || '', state: 'imported', reasonCode: 'import_verified',
+        }), now);
+      }
+    });
+  }
+
+  listAccountLifecycles(endpointKey) {
+    if (!validEndpointKey(endpointKey)) return Promise.reject(lifecycleError());
+    return this.read((database) => lifecycleRows(database, endpointKey));
+  }
+
+  getAccountLifecycle({ endpointKey, identityKey }) {
+    const key = normalizeLifecycleIdentityKey(identityKey);
+    if (!validEndpointKey(endpointKey) || !key) return Promise.reject(lifecycleError());
+    return this.read((database) => lifecycleRows(database, endpointKey)
+      .find((row) => row.endpointKey === endpointKey && row.identityKey === key) || null);
+  }
+
+  upsertAccountLifecycle(record) {
+    return this.upsertAccountLifecycles([record]);
+  }
+
+  upsertAccountLifecycles(records) {
+    let normalized;
+    try {
+      if (!Array.isArray(records) || !records.length || records.length > 10000) throw lifecycleError();
+      normalized = records.map(normalizeLifecycleRecord);
+    } catch (error) { return Promise.reject(error); }
+    return this.write((database) => {
+      database.run('BEGIN IMMEDIATE');
+      try {
+        const now = new Date().toISOString();
+        for (const record of normalized) storeLifecycleRecord(database, record, now);
+        for (const endpointKey of new Set(normalized.map((record) => record.endpointKey))) lifecycleRows(database, endpointKey);
+        database.run('COMMIT');
+      } catch (error) {
+        database.run('ROLLBACK');
+        throw error;
+      }
+      return { saved: normalized.length };
+    });
+  }
+
+  getConsoleSettings() {
+    return this.read(storedConsoleSettings);
+  }
+
+  saveConsoleSettings(settings, { expectedRevision } = {}) {
+    let normalized;
+    try {
+      normalized = normalizeConsoleSettings(settings);
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw lifecycleError('CONSOLE_SETTINGS_STALE');
+    } catch (error) { return Promise.reject(error); }
+    return this.write((database) => {
+      const current = storedConsoleSettings(database);
+      if (current.revision !== expectedRevision || current.revision >= Number.MAX_SAFE_INTEGER) throw lifecycleError('CONSOLE_SETTINGS_STALE');
+      const revision = current.revision + 1;
+      const statement = database.prepare(`INSERT INTO console_settings (id, revision, settings_json)
+        VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, settings_json=excluded.settings_json`);
+      try { statement.run([revision, JSON.stringify(normalized)]); }
+      finally { statement.free(); }
+      return { revision, settings: normalized };
     });
   }
 }
