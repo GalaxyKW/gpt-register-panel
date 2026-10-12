@@ -9,7 +9,7 @@ const { accountInMaintenanceScope, lifecycleIdentityKeys, managementEndpointKey,
 
 const BAN_CODES = new Set(['account_deactivated', 'user_deactivated', 'account_suspended', 'account_banned']);
 const AUTH_CODES = new Set(['invalid_grant', 'invalid_token', 'token_expired', 'refresh_token_expired',
-  'refresh_token_reused', 'refresh_token_revoked', 'token_revoked', 'session_expired']);
+  'refresh_token_reused', 'refresh_token_revoked', 'refresh_token_invalidated', 'token_revoked', 'session_expired']);
 const QUOTA_CODES = new Set(['insufficient_quota', 'usage_limit_reached', 'rate_limit_exceeded',
   'rate_limit_error', 'quota_exceeded', 'overloaded', 'server_overloaded']);
 
@@ -22,7 +22,12 @@ function maintenanceError(code, message = '账号维护安全核验未通过，�
 function structuredErrorCode(text) {
   if (typeof text !== 'string' || Buffer.byteLength(text) > 16384) return '';
   const trimmed = text.trim();
-  const body = trimmed.startsWith('{') ? trimmed : /\bbody:\s*(\{[\s\S]*\})\s*$/i.exec(trimmed)?.[1];
+  // These wrappers are emitted by Sub2API's OpenAI account tester and OAuth
+  // refresh service. An HTTP status or a JSON fragment mentioned in arbitrary
+  // diagnostic prose is not an account-ban verdict.
+  const body = trimmed.startsWith('{') ? trimmed
+    : /^Authentication failed \(401\):\s*(\{[\s\S]*\})$/.exec(trimmed)?.[1]
+      || /^(?:Token refresh failed \(non-retryable\):\s*)?(?:Error:\s*)?OPENAI_OAUTH_TOKEN_REFRESH_FAILED:\s*(?:token refresh failed:\s*)?status [1-5]\d{2},\s*body:\s*(\{[\s\S]*\})$/.exec(trimmed)?.[1];
   if (!body) return '';
   let value;
   try { value = JSON.parse(body); } catch { return ''; }
@@ -32,13 +37,7 @@ function structuredErrorCode(text) {
   return recognized.length === 1 ? recognized[0] : '';
 }
 
-// Raw error text only exists while parsing the management response. Return
-// finite, non-secret enums; never carry raw errors, arbitrary codes or bodies
-// into snapshots, task results, the browser, or lifecycle rows.
-function maintenanceEvidenceFromRaw(account) {
-  const messages = [account?.error_message, account?.errorMessage,
-    account?.temp_unschedulable_reason, account?.tempUnschedulableReason]
-    .filter((value) => typeof value === 'string' && Buffer.byteLength(value) <= 16384);
+function errorEvidence(messages) {
   const codes = [...new Set(messages.map(structuredErrorCode).filter(Boolean))];
   if (codes.some((code) => QUOTA_CODES.has(code)) || messages.some((message) => /(?:\b(?:429|rate[_ -]?limit|insufficient_quota|usage_limit_reached|quota[_ -]?exceeded|overload(?:ed)?)\b|额度.*(?:用完|耗尽)|限流)/i.test(message))) {
     return { category: 'quota_wait', code: 'upstream_quota_or_overload' };
@@ -51,10 +50,41 @@ function maintenanceEvidenceFromRaw(account) {
   if (messages.some((message) => message === 'openai access_token expired and refresh_token is missing')) {
     return { category: 'auth_invalid', code: 'refresh_token_missing' };
   }
-  if (messages.some((message) => /^Token refresh failed \(non-retryable\):\s*(?:Error:\s*)?(?:invalid_grant|refresh_token_reused|refresh_token_expired|refresh_token_revoked)(?:\s|:|-|$)/.test(message))) {
+  if (messages.some((message) => /^Token refresh failed \(non-retryable\):\s*(?:Error:\s*)?(?:invalid_grant|refresh_token_reused|refresh_token_expired|refresh_token_revoked|refresh_token_invalidated)(?:\s|:|-|$)/.test(message))) {
     return { category: 'auth_invalid', code: 'refresh_reauthorization_required' };
   }
   return { category: 'network_unknown', code: messages.length ? 'unclassified_upstream_error' : 'no_error_evidence' };
+}
+
+function temporaryPauseEvidence(messages) {
+  if (!messages.length) return null;
+  // The structured reason is diagnostic only. The authoritative lifetime of
+  // this pause is the account's temp_unschedulable_until, not prose or the
+  // optional until_unix inside a historical reason payload.
+  const kinds = messages.map(message => {
+    let parsed;
+    try { parsed = JSON.parse(message); } catch {}
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+        && parsed.source === 'account_scheduling_threshold'
+        && (parsed.platform === undefined || parsed.platform === 'openai')) return 'quota_threshold';
+    return errorEvidence([message]).category === 'quota_wait' ? 'quota' : 'unknown';
+  });
+  return new Set(kinds).size === 1 ? kinds[0] : 'unknown';
+}
+
+// Raw error text only exists while parsing the management response. Return
+// finite, non-secret enums; never carry raw errors, arbitrary codes or bodies
+// into snapshots, task results, the browser, or lifecycle rows. Keep temporary
+// pause reasons separate so expired cooldown metadata cannot become a lasting
+// authentication, ban or quota verdict.
+function maintenanceEvidenceFromRaw(account) {
+  const bounded = values => values.filter(value => typeof value === 'string'
+    && value.trim() && Buffer.byteLength(value) <= 16384);
+  const evidence = errorEvidence(bounded([account?.error_message, account?.errorMessage]));
+  const temporaryPause = temporaryPauseEvidence(bounded([
+    account?.temp_unschedulable_reason, account?.tempUnschedulableReason,
+  ]));
+  return temporaryPause ? { ...evidence, temporaryPause } : evidence;
 }
 
 function dateMs(value) {
@@ -81,10 +111,21 @@ function classifyAccountMaintenance(account, { nowMs = Date.now() } = {}) {
     return { classification: 'manual_disabled', reasonCode: 'administrator_lifetime_expired' };
   }
   const evidence = account?.maintenanceEvidence;
-  if (evidence?.category === 'quota_wait'
+  const temporaryUntil = dateMs(account.tempUnschedulableUntil);
+  const temporaryActive = temporaryUntil !== null && temporaryUntil > nowMs;
+  const temporaryQuota = temporaryActive && ['quota', 'quota_threshold'].includes(evidence?.temporaryPause);
+  // Preserve legacy quota reasons without a deadline, but never let an
+  // explicitly expired temporary deadline extend quota waiting indefinitely.
+  const undatedQuota = temporaryUntil === null && evidence?.temporaryPause === 'quota';
+  if (evidence?.category === 'quota_wait' || temporaryQuota || undatedQuota
       || ['rateLimitResetAt', 'overloadUntil'].some((field) => (dateMs(account[field]) || 0) > nowMs)) {
     return { classification: 'quota_wait', reasonCode: 'quota_or_cooldown',
-      retryAt: [account.rateLimitResetAt, account.overloadUntil].filter((value) => (dateMs(value) || 0) > nowMs).sort().at(-1) || null };
+      retryAt: [account.rateLimitResetAt, account.overloadUntil, ...(temporaryQuota ? [account.tempUnschedulableUntil] : [])]
+        .filter((value) => (dateMs(value) || 0) > nowMs).sort().at(-1) || null };
+  }
+  if (temporaryActive) {
+    return { classification: 'network_unknown', reasonCode: 'temporary_scheduling_pause',
+      retryAt: account.tempUnschedulableUntil };
   }
   // A healthy live account overrides stale historical auth/ban metadata.
   if (getAccountAvailability(account, nowMs).key === 'available') {

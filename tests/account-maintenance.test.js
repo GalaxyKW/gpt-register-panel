@@ -56,8 +56,21 @@ for (const [label, raw, classification] of [
   ['workspace ban is not account ban', { error_message: '{"error":{"code":"deactivated_workspace"}}' }, 'network_unknown'],
   ['organization ban is not account ban', { error_message: '{"error":{"code":"organization_deactivated"}}' }, 'network_unknown'],
   ['text mention is not structured proof', { error_message: 'Your account_deactivated code may be incorrect' }, 'network_unknown'],
+  ['real OpenAI test wrapper preserves exact ban proof', { error_message: 'Authentication failed (401): {"error":{"code":"account_deactivated"}}' }, 'confirmed_banned'],
+  ['real OpenAI test wrapper preserves invalid grant', { error_message: 'Authentication failed (401): {"error":{"code":"invalid_grant"}}' }, 'auth_invalid'],
+  ['authentication wrapper without JSON code is not ban proof', { error_message: 'Authentication failed (401): account_deactivated' }, 'network_unknown'],
+  ['authentication wrapper with status only is not ban proof', { error_message: 'Authentication failed (401): {"status":401,"message":"account is disabled"}' }, 'network_unknown'],
+  ['unrecognized 403 wrapper cannot imply account ban', { error_message: 'Authentication failed (403): {"error":{"code":"account_deactivated"}}' }, 'network_unknown'],
+  ['arbitrary quoted response is not ban proof', { error_message: 'Example body: {"error":{"code":"account_deactivated"}}' }, 'network_unknown'],
+  ['wrapped error message mention is not ban proof', { error_message: 'Authentication failed (401): {"error":{"message":"account_deactivated"}}' }, 'network_unknown'],
+  ['wrapped organization ban is not account ban', { error_message: 'Authentication failed (401): {"error":{"code":"organization_deactivated"}}' }, 'network_unknown'],
+  ['wrapped conflicting codes are not ban proof', { error_message: 'Authentication failed (401): {"error":{"code":"account_deactivated","type":"invalid_grant"}}' }, 'network_unknown'],
+  ['wrapper trailing prose invalidates structured proof', { error_message: 'Authentication failed (401): {"error":{"code":"account_deactivated"}} but retry succeeded' }, 'network_unknown'],
   ['structured invalid grant needs reauth', { error_message: '{"error":{"code":"invalid_grant"}}' }, 'auth_invalid'],
+  ['structured invalidated session needs reauth', { error_message: '{"error":{"code":"refresh_token_invalidated"}}' }, 'auth_invalid'],
   ['wrapped body refresh reused needs reauth', { error_message: 'Token refresh failed (non-retryable): OPENAI_OAUTH_TOKEN_REFRESH_FAILED: status 401, body: {"error":{"code":"refresh_token_reused"}}' }, 'auth_invalid'],
+  ['actual refresh producer invalidated session needs reauth', { error_message: 'Token refresh failed (non-retryable): OPENAI_OAUTH_TOKEN_REFRESH_FAILED: token refresh failed: status 401, body: {"error":{"code":"refresh_token_invalidated"}}' }, 'auth_invalid'],
+  ['actual refresh producer invalidated prefix needs reauth', { error_message: 'Token refresh failed (non-retryable): refresh_token_invalidated' }, 'auth_invalid'],
   ['known refresh prefix needs reauth', { error_message: 'Token refresh failed (non-retryable): invalid_grant: revoked' }, 'auth_invalid'],
   ['invalid client is provider config not account', { error_message: 'Token refresh failed (non-retryable): invalid_client' }, 'network_unknown'],
   ['inactive preserves manual intent', { status: 'inactive' }, 'manual_disabled'],
@@ -82,6 +95,74 @@ test('expired access token is refreshed only when not healthy, quota or manually
   assert.equal(classifyAccountMaintenance(safeAccount(expired), { nowMs: NOW }).classification, 'healthy');
   expired.status = 'error'; expired.error_message = 'HTTP 429';
   assert.equal(classifyAccountMaintenance(safeAccount(expired), { nowMs: NOW }).classification, 'quota_wait');
+});
+
+function thresholdReason(overrides = {}) {
+  return JSON.stringify({ source: 'account_scheduling_threshold', platform: 'openai', window: '5h',
+    threshold_percent: 90, used_percent: 92.5, until_unix: NOW / 1000 + 3600,
+    error_message: 'openai scheduling threshold reached for 5h: 92.5% used >= 90%; paused until window reset',
+    ...overrides });
+}
+
+test('live Sub2API threshold pause wins over stale authentication errors and returns its reset time', () => {
+  const value = account({ error_message: 'Authentication failed (401): {"error":{"code":"invalid_grant"}}',
+    temp_unschedulable_reason: thresholdReason(), temp_unschedulable_until: new Date(NOW + 3600000).toISOString() });
+  const item = planFor(value).items[0];
+  assert.equal(item.classification, 'quota_wait'); assert.equal(item.action, 'wait');
+  assert.equal(item.retryAt, new Date(NOW + 3600000).toISOString());
+  assert.equal(value.maintenanceEvidence.category, 'auth_invalid');
+  assert.equal(value.maintenanceEvidence.temporaryPause, 'quota_threshold');
+  // The same already-projected snapshot ages out using the current clock,
+  // without retaining quota from a historical reason string.
+  const later = classifyAccountMaintenance(value, { nowMs: NOW + 3600001 });
+  assert.equal(later.classification, 'auth_invalid');
+});
+
+test('expired threshold and quota reasons never override current healthy or invalid credentials', () => {
+  for (const reason of [thresholdReason(), 'HTTP 429 rate limit']) {
+    const overrides = { error_message: '', status: 'active', schedulable: true,
+      temp_unschedulable_reason: reason, temp_unschedulable_until: new Date(NOW - 1).toISOString() };
+    assert.equal(planFor(account(overrides)).items[0].action, 'keep');
+    const item = planFor(account({ ...overrides, status: 'error', schedulable: false,
+      error_message: '{"error":{"code":"invalid_grant"}}' })).items[0];
+    assert.equal(item.action, 'refresh'); assert.equal(item.classification, 'auth_invalid');
+  }
+});
+
+test('threshold payload cannot invent a deadline or retain a permanent quota verdict', () => {
+  const value = account({ error_message: '', status: 'active', schedulable: true,
+    temp_unschedulable_reason: thresholdReason({ until_unix: 4070908800 }) });
+  assert.equal(planFor(value).items[0].action, 'keep');
+  value.tempUnschedulableUntil = new Date(NOW - 1).toISOString();
+  value.tempUnschedulableUntilStatus = 'valid';
+  assert.equal(planFor(value).items[0].action, 'keep');
+});
+
+test('unrelated current temporary pause blocks refresh without claiming that quota is exhausted', () => {
+  for (const reason of ['upstream timeout', JSON.stringify({ source: 'custom_rule', error_message: 'system cooldown' }),
+    thresholdReason({ source: 'unrecognized_threshold' }), thresholdReason({ platform: 'anthropic' })]) {
+    const value = account({ error_message: '{"error":{"code":"invalid_grant"}}',
+      temp_unschedulable_reason: reason, temp_unschedulable_until: new Date(NOW + 3600000).toISOString() });
+    const item = planFor(value).items[0];
+    assert.equal(item.classification, 'network_unknown'); assert.equal(item.action, 'review');
+    assert.equal(item.reasonCode, 'temporary_scheduling_pause');
+    assert.equal(classifyAccountMaintenance(value, { nowMs: NOW + 3600001 }).classification, 'auth_invalid');
+  }
+});
+
+test('temporary pause code mentions cannot become persisted ban evidence after the pause ends', () => {
+  const value = account({ error_message: '', temp_unschedulable_reason: '{"error":{"code":"account_deactivated"}}',
+    temp_unschedulable_until: new Date(NOW - 1).toISOString() });
+  assert.equal(planFor(value).items[0].action, 'review');
+  assert.equal(value.maintenanceEvidence.category, 'network_unknown');
+  assert.equal(value.maintenanceEvidence.temporaryPause, 'unknown');
+});
+
+test('threshold projection contains only finite enums and chooses the longest active quota deadline', () => {
+  const value = account({ temp_unschedulable_reason: thresholdReason({ error_message: 'fixture-private-pause-text' }),
+    temp_unschedulable_until: new Date(NOW + 3600000).toISOString(), overload_until: new Date(NOW + 7200000).toISOString() });
+  assert.equal(JSON.stringify(value).includes('fixture-private-pause-text'), false);
+  assert.equal(planFor(value).items[0].retryAt, new Date(NOW + 7200000).toISOString());
 });
 
 test('raw upstream text and plan strings cannot escape finite maintenance projection', () => {
@@ -233,6 +314,33 @@ test('confirmed deletion is exact-ID, backed up, rechecked, tombstoned before DE
   assert.equal((await fixture.db.listAccountLifecycles(ENDPOINT)).every((row) => row.state === 'deleted'), true);
   await assert.rejects(deleteConfirmedBannedAccount(fixture), { code: 'MAINTENANCE_DELETE_ALREADY_RECORDED' });
 });
+
+test('exact wrapped OpenAI account-ban proof works through the guarded deletion workflow', async t => {
+  const fixture = await deletionFixture(t);
+  fixture.raw.error_message = 'Authentication failed (401): {"error":{"code":"account_deactivated"}}';
+  Object.assign(fixture.safe, safeAccount(fixture.raw));
+  fixture.target = planFor(fixture.safe).items[0];
+  assert.equal(fixture.target.action, 'delete');
+  assert.equal((await deleteConfirmedBannedAccount(fixture)).verifiedAbsent, true);
+  assert.equal(fixture.calls.filter(call => call === 'delete:47').length, 1);
+});
+
+for (const [label, overrides] of [
+  ['generic 401', { error_message: 'Authentication failed (401): invalid or expired credentials' }],
+  ['generic 403', { error_message: 'HTTP 403 forbidden account disabled' }],
+  ['quoted ban', { error_message: 'Example body: {"error":{"code":"account_deactivated"}}' }],
+  ['live threshold despite ban code', { temp_unschedulable_reason: thresholdReason(),
+    temp_unschedulable_until: new Date(NOW + 3600000).toISOString() }],
+]) {
+  test('guarded deletion cannot use ' + label + ' as account-ban authority', async t => {
+    const fixture = await deletionFixture(t);
+    Object.assign(fixture.raw, overrides); Object.assign(fixture.safe, safeAccount(fixture.raw));
+    fixture.target = { ...planFor(fixture.safe).items[0], action: 'delete' };
+    await assert.rejects(deleteConfirmedBannedAccount(fixture), { code: 'MAINTENANCE_DELETE_TARGET_CHANGED' });
+    assert.equal(fixture.calls.some(call => call.startsWith('delete:')), false);
+    assert.equal(fixture.calls.includes('backup'), false);
+  });
+}
 
 test('lost deletion response is reconciled by exact-ID 404 without retrying DELETE', async (t) => {
   const fixture = await deletionFixture(t);
