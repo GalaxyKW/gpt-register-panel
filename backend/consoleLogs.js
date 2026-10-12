@@ -10,6 +10,7 @@ const { openRootDirectory, closeDirectoryHandle } = require('./adapters/gptRegis
 const MAX_FILES = 2000, MAX_SCAN = 10000, READ_BYTES = 2 * 1024 * 1024;
 const DOWNLOAD_BYTES = 32 * 1024 * 1024, MAX_RECORD_BYTES = 64 * 1024;
 const REGISTER_HEADER = /^\[(\d{4}-\d{2}-\d{2}T[^\]\r\n]{1,40})\]\s*\[([A-Z]{1,12})\]\s?(.*)$/;
+const REGISTER_NAME = /^run-\d{8}T\d{9}Z-([1-9]\d{0,11})(?:-(job_[a-f0-9]{24}))?\.log$/;
 const READ_FLAGS = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK;
 function logError(code, message, fields) { return Object.assign(new Error(message), { code, ...fields }); }
 function roots(options = {}) {
@@ -23,7 +24,7 @@ function roots(options = {}) {
 function allowedName(root, name) {
   return root.source === 'panel'
     ? name === root.base || (name.startsWith(root.base + '.') && /^\d{1,3}$/.test(name.slice(root.base.length + 1)))
-    : /^run-\d{8}T\d{9}Z-[1-9]\d{0,11}\.log$/.test(name);
+    : REGISTER_NAME.test(name);
 }
 function privateFile(stat) {
   return stat.isFile() && !stat.isSymbolicLink() && stat.nlink === 1
@@ -81,7 +82,7 @@ function externalRegistrationActive(root) {
 function activeLog(root, name, options = {}, registerBusy) {
   if (root.source === 'panel') return name === root.base;
   if (options.registerActive === true || (registerBusy === undefined ? externalRegistrationActive(root) : registerBusy)) return true;
-  return processAlive(Number(name.match(/-(\d+)\.log$/)?.[1]));
+  return processAlive(Number(REGISTER_NAME.exec(name)?.[1]));
 }
 function listLogFiles(options = {}) {
   const files = [];
@@ -100,6 +101,7 @@ function listLogFiles(options = {}) {
         if (files.length >= MAX_FILES) throw logError('CONSOLE_LOG_LIMIT', '日志文件过多，请先归档');
         const id = crypto.createHash('sha256').update(root.source + '\0' + entry.name).digest('hex').slice(0, 32);
         files.push({ id, source: root.source, name: entry.name, bytes: stat.size, modifiedAt: stat.mtime.toISOString(),
+          jobId: root.source === 'register' ? REGISTER_NAME.exec(entry.name)?.[2] || null : null,
           active: activeLog(root, entry.name, options, registerBusy), _root: root, _rootStat: handle.stat, _stat: stat });
       }
       assertRootCurrent(root, handle);
@@ -154,7 +156,7 @@ function safeRecords(read, file) {
   return records;
 }
 function lineEntry(record, file, index) {
-  if (record.omitted || record.bytes > MAX_RECORD_BYTES) return { time: file.modifiedAt, level: 'warn', source: file.source, fileId: file.id, jobId: null, event: 'log.record_omitted', message: '[不完整、过大或无效日志记录已省略]', index };
+  if (record.omitted || record.bytes > MAX_RECORD_BYTES) return { time: file.modifiedAt, level: 'warn', source: file.source, fileId: file.id, jobId: file.jobId || null, event: 'log.record_omitted', message: '[不完整、过大或无效日志记录已省略]', index };
   if (record.json) {
     const safe = redactValue(record.json), level = String(safe.level || 'info').toLowerCase(), timestamp = safe.time || safe.timestamp || safe.ts;
     return { time: typeof timestamp === 'string' && Number.isFinite(Date.parse(timestamp)) ? timestamp : file.modifiedAt,
@@ -162,8 +164,8 @@ function lineEntry(record, file, index) {
       jobId: typeof safe.jobId === 'string' ? safe.jobId : null, event: typeof safe.event === 'string' ? safe.event : 'log',
       message: redactText(JSON.stringify(safe)), index };
   }
-  return { time: record.time, level: ['ERROR', 'WARN', 'DEBUG'].includes(record.level) ? record.level.toLowerCase() : 'info',
-    source: file.source, fileId: file.id, jobId: null, event: 'register.output', message: redactText(record.message).trimEnd(), index };
+  return { time: record.time, level: record.level === 'FATAL' ? 'error' : ['ERROR', 'WARN', 'DEBUG'].includes(record.level) ? record.level.toLowerCase() : 'info',
+    source: file.source, fileId: file.id, jobId: file.jobId || null, event: 'register.output', message: redactText(record.message).trimEnd(), index };
 }
 function queryLogs(query = {}, options = {}) {
   const files = listLogFiles(options), limit = query.limit === undefined ? 100 : Number(query.limit);
@@ -176,7 +178,26 @@ function queryLogs(query = {}, options = {}) {
   if (query.fileId && !/^[a-f0-9]{32}$/.test(query.fileId)) throw logError('CONSOLE_LOG_ID_INVALID', '日志文件编号无效');
   const q = String(query.q || '').slice(0, 200).toLowerCase(), entries = [];
   const jobIds = new Set([String(query.jobId || ''), ...(Array.isArray(options.jobIds) ? options.jobIds.filter(id => typeof id === 'string').slice(0, 4000) : [])]);
-  const selected = files.filter(f => (!source || f.source === source) && (!query.fileId || f.id === query.fileId)).slice(0, 8);
+  const candidates = files.filter(f => (!source || f.source === source) && (!query.fileId || f.id === query.fileId)
+    && (!query.jobId || f.source === 'panel' || jobIds.has(f.jobId)));
+  // Exact file binding is applied before the read cap, otherwise many newer
+  // unrelated engine logs can hide the requested task. Always retain the
+  // current panel log in a mixed query as well as the matching engine body.
+  const panelFiles = candidates.filter(f => f.source === 'panel');
+  const registerFiles = candidates.filter(f => f.source === 'register');
+  const currentPanel = panelFiles.find(f => f.name === f._root.base);
+  const ordered = query.jobId ? [] : candidates;
+  if (query.jobId) {
+    const panels = currentPanel ? [currentPanel, ...panelFiles.filter(f => f !== currentPanel)] : panelFiles;
+    // Reserve both source types: newer panel rotations must not crowd the
+    // exact engine binding out of the bounded task search either.
+    for (let i = 0; i < Math.max(registerFiles.length, panels.length) && ordered.length < 8; i++) {
+      if (registerFiles[i]) ordered.push(registerFiles[i]);
+      if (panels[i] && ordered.length < 8) ordered.push(panels[i]);
+    }
+  }
+  const selected = ordered.slice(0, 8);
+  if (currentPanel && !selected.includes(currentPanel)) selected.splice(7, 1, currentPanel);
   for (const file of selected) {
     const records = safeRecords(readLog(file), file);
     for (let i = records.length - 1; i >= 0; i -= 1) {
@@ -189,6 +210,10 @@ function queryLogs(query = {}, options = {}) {
   entries.sort((a, b) => String(b.time).localeCompare(String(a.time)) || b.index - a.index);
   return { entries: entries.slice(offset, offset + limit).map(({ index, ...entry }) => entry),
     nextCursor: offset + limit < entries.length && offset + limit <= 10000 ? String(offset + limit) : null,
+    bindingNotice: query.jobId && !files.some(f => f.source === 'register' && jobIds.has(f.jobId))
+      ? '未找到与该任务绑定的注册机日志。升级前或独立命令行日志未记录任务 ID；请清空任务筛选后按文件查看，不会按时间猜测归属。' : null,
+    searchScope: { scannedFiles: selected.length, matchingFiles: candidates.length,
+      omittedFiles: Math.max(0, candidates.length - selected.length) },
     files: files.map(publicFile), totalBytes: files.reduce((n, f) => n + f.bytes, 0), boundedSearch: true };
 }
 function downloadLog(fileId, options = {}) {

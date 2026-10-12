@@ -65,7 +65,8 @@ test('settings expose an opaque save receipt but never replay a completed reques
 });
 test('fixed descriptor launcher isolates profile, environment, argv and result channel', async t => {
   const f = fixture(t); let profile;
-  const result = await runEngineCommand({ logger, rootDirectory: f.root, arguments: ['--panel-network-preflight'], runner: async (command, args, options) => {
+  const result = await runEngineCommand({ logger, jobId: 'job_' + 'a'.repeat(24), rootDirectory: f.root, arguments: ['--panel-network-preflight'], runner: async (command, args, options) => {
+    assert.equal(options.jobId, 'job_' + 'a'.repeat(24));
     assert.equal(command, '/proc/self/fd/4'); assert.equal(options.cwd, '/proc/self/fd/5');
     assert.deepEqual(args.slice(-2), ['--', '--panel-network-preflight']);
     assert.equal(options.env.GPT_REGISTER_PANEL_RESULT_FD, '6'); assert.equal(Object.hasOwn(options.env, 'SUB2API_ADMIN_API_KEY'), false);
@@ -208,6 +209,7 @@ function continuationFixture(t, status = 'registered') {
   const f = fixture(t);
   f.account = { phone: '+15551234000', password: crypto.randomBytes(24).toString('hex'), smsActivationId: 'fixture-activation', status, email: status === 'registered' ? undefined : 'resume@example.test' };
   fs.writeFileSync(path.join(f.root, 'accounts.json'), JSON.stringify([f.account]), { mode: 0o600 });
+  if (f.account.email) fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify([{ ...f.account }]), { mode: 0o600 });
   return f;
 }
 test('continuations use opaque revisions and mask phones without exposing credentials', t => {
@@ -216,6 +218,72 @@ test('continuations use opaque revisions and mask phones without exposing creden
   assert.equal(result.items[0].phoneMasked, '***4000'); assert.equal(JSON.stringify(result).includes(f.account.password), false); assert.equal(JSON.stringify(result).includes(f.account.phone), false);
   fs.writeFileSync(path.join(f.root, 'accounts.json'), JSON.stringify([f.account, f.account]));
   assert.equal(listRegistrationContinuations({ rootDirectory: f.root }).items.every(item => !item.eligible), true);
+});
+test('historical Phase3 blocker is projected from uniquely verified username without writing either ledger', t => {
+  const f = continuationFixture(t, 'oauth_phase3_failed');
+  const historical = { ...f.account, continuationRequired: true, continuationStage: 'phase3' }; delete historical.email;
+  fs.writeFileSync(path.join(f.root, 'accounts.json'), JSON.stringify([historical]));
+  const before = ['accounts.json', 'username.json'].map(name => fs.readFileSync(path.join(f.root, name), 'utf8'));
+  const target = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
+  assert.equal(target.eligible, true); assert.equal(target.repairEmail, true); assert.equal(target.blockingRegistration, true); assert.equal(target.email, f.account.email);
+  assert.equal(JSON.stringify(target).includes(f.account.password), false);
+  assert.deepEqual(['accounts.json', 'username.json'].map(name => fs.readFileSync(path.join(f.root, name), 'utf8')), before);
+  fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify([{ ...f.account, password: 'different' }]));
+  assert.equal(listRegistrationContinuations({ rootDirectory: f.root }).items[0].eligible, false);
+});
+test('Phase2 and Phase3 continuations reject legacy terminal aliases in either local ledger before preflight', async t => {
+  const terminalVariants = [
+    ...['disabled', 'deleted', 'deactivated', 'account_disabled', 'account_deleted', 'account_deactivated']
+      .flatMap(status => [{ status }, { status: '  ' + status.toUpperCase() + ' \t' }]),
+    { phase3Disposition: 'discard' }, { phase3Disposition: '  DiScArD \t' },
+    { disabled: true }, { enabled: false }, { active: false },
+  ];
+  for (const status of ['registered', 'oauth_phase3_failed']) {
+    const f = continuationFixture(t, status), account = { ...f.account }, username = { ...f.account, email: 'resume@example.test' };
+    const accountsFile = path.join(f.root, 'accounts.json'), usernameFile = path.join(f.root, 'username.json');
+    for (const change of terminalVariants) for (const [filename, record] of [[accountsFile, account], [usernameFile, username]]) {
+      fs.writeFileSync(accountsFile, JSON.stringify([account])); fs.writeFileSync(usernameFile, JSON.stringify([username]));
+      const selected = listRegistrationContinuations({ rootDirectory: f.root }).items[0]; assert.equal(selected.eligible, true);
+      fs.writeFileSync(filename, JSON.stringify([{ ...record, ...change }]));
+      const before = [accountsFile, usernameFile].map(file => fs.readFileSync(file, 'utf8'));
+      assert.equal(listRegistrationContinuations({ rootDirectory: f.root }).items.some(item => item.eligible), false);
+      let reached = false;
+      await assert.rejects(runRegistrationResumeJob({ rootDirectory: f.root,
+        target: { selectedKey: selected.selectedKey, revision: selected.revision },
+        preflight: async () => { reached = true; }, runner: async () => { reached = true; },
+      }), { code: 'REGISTRATION_RESUME_TARGET_CHANGED' });
+      assert.equal(reached, false); assert.deepEqual([accountsFile, usernameFile].map(file => fs.readFileSync(file, 'utf8')), before);
+    }
+  }
+});
+test('Phase3 continuation binds both ledgers and rejects changed username before any preflight', async t => {
+  const f = continuationFixture(t, 'oauth_phase3_failed');
+  const target = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
+  fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify([{ ...f.account, status: 'account_disabled' }]));
+  let reached = false;
+  await assert.rejects(runRegistrationResumeJob({ rootDirectory: f.root, target: { selectedKey: target.selectedKey, revision: target.revision }, preflight: async () => { reached = true; } }), { code: 'REGISTRATION_RESUME_TARGET_CHANGED' });
+  assert.equal(reached, false);
+});
+test('Phase3 resume uses mail/OAuth-only preflight even when no SMS key is configured', async t => {
+  const f = continuationFixture(t, 'oauth_phase3_failed'); delete f.config.heroSmsApiKey;
+  fs.writeFileSync(path.join(f.root, 'config.json'), JSON.stringify(f.config));
+  const target = listRegistrationContinuations({ rootDirectory: f.root }).items[0]; let probes = 0, launches = 0;
+  await assert.rejects(runRegistrationResumeJob({ logger, rootDirectory: f.root, target: { selectedKey: target.selectedKey, revision: target.revision },
+    preflight: async options => { probes += 1; assert.equal(options.scope, 'phase3'); return { ok: true }; },
+    runner: async (_, __, options) => { launches += 1; const binding = JSON.parse(fs.readFileSync(options.extraFileDescriptors[4], 'utf8'));
+      assert.match(binding.usernameFileHash, /^[a-f0-9]{64}$/); assert.match(binding.usernameRecordHash, /^[a-f0-9]{64}$/); assert.equal(binding.usernameIndex, 0);
+      return writeEvents(options, [{ type: 'failed', code: 'FIXTURE_STOPPED_BEFORE_LOGIN' }]); },
+  }), { code: 'FIXTURE_STOPPED_BEFORE_LOGIN' });
+  assert.equal(probes, 1); assert.equal(launches, 1);
+});
+test('scoped preflight validates the exact required channels and fixed scope before spawn', async t => {
+  const f = fixture(t); let called = 0;
+  const runner = async (_, args, options) => { called += 1; assert.equal(args.includes('--preflight-scope=phase3'), true);
+    return writeEvents(options, [{ type: 'preflight_completed', result: { scope: 'phase3', channels: ['mail', 'oauth'].map(id => ({ id, ok: true, code: 'OK' })) } }]); };
+  assert.equal((await runNetworkPreflight({ logger, rootDirectory: f.root, scope: 'phase3', runner })).ok, true);
+  await assert.rejects(runNetworkPreflight({ logger, rootDirectory: f.root, scope: 'skip', runner }), { code: 'NETWORK_PREFLIGHT_SCOPE_INVALID' });
+  assert.equal(called, 1);
+  await assert.rejects(runNetworkPreflight({ logger, rootDirectory: f.root, scope: 'registration', runner: async (_, __, options) => writeEvents(options, [{ type: 'preflight_completed', result: { channels: ['mail', 'oauth'].map(id => ({ id, ok: true, code: 'OK' })) } }]) }), { code: 'NETWORK_PREFLIGHT_INVALID' });
 });
 test('continuation rejects stale complete-file bindings before any network or login', async t => {
   const f = continuationFixture(t); const { selectedKey, revision } = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
@@ -252,6 +320,10 @@ test('resume accepts a validated token only for the exact selected account bindi
   assert.equal(result.resumed, true); assert.equal(result.completedCount, 1);
 });
 const relatedEngineProtocol = path.resolve(__dirname, '../../../gpt_register/src/panelProtocol.js');
+const relatedIdentityHelper = path.resolve(__dirname, '../../../gpt_register/src/continuationIdentity.js');
+test('panel and engine enforce the exact same pure local identity mapping contract', { skip: !fs.existsSync(relatedIdentityHelper) }, () => {
+  assert.equal(fs.readFileSync(relatedIdentityHelper, 'utf8'), fs.readFileSync(path.resolve(__dirname, '../backend/lib/registrationContinuationIdentity.js'), 'utf8'));
+});
 test('real child validates private fd7 against exact ledger bytes before any resume action', { skip: !fs.existsSync(relatedEngineProtocol) }, async t => {
   const f = continuationFixture(t); const bytes = fs.readFileSync(path.join(f.root, 'accounts.json'));
   const binding = { index: 0, stage: 'phase2', fileHash: crypto.createHash('sha256').update(bytes).digest('hex'), recordHash: crypto.createHash('sha256').update(JSON.stringify(f.account)).digest('hex') };

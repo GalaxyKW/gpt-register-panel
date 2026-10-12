@@ -23,14 +23,14 @@ function harness() {
     location: { hash: '#register' }, sessionStorage: { getItem: (key) => store.get(key) ?? null, setItem: (key, value) => store.set(key, value), removeItem: (key) => store.delete(key) },
     window: { crypto: { randomUUID: () => '12345678-1234-1234-1234-123456789012' }, confirm: () => true, addEventListener() {} },
     setInterval: () => 1, setTimeout: () => 1, clearTimeout() {},
-    fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, fields: [] } } }) }; },
+    fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } }) }; },
   };
   vm.createContext(context);
-  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery };');
+  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs };');
   vm.runInContext(instrumented, context);
   const api = context.harness;
   api.state.connected = true;
-  api.state.overview = { readOnly: false, capabilities: { registrationEnabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, fields: [] } } };
+  api.state.overview = { readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } };
   return { context, api, element, store, calls };
 }
 
@@ -45,13 +45,42 @@ test('console has four real pages, advanced diagnostics, no inline script or CDN
 
 test('console describes real engine and maintenance stages in Chinese', () => {
   const { api, element } = harness();
-  for (const stage of ['checking_network', 'phase1_register', 'phase1_5_profile', 'phase2_bind_email', 'phase3_email_oauth',
+  for (const stage of ['checking_network', 'network_preflight', 'phase1_register', 'phase1_5_profile', 'phase2_bind_email', 'phase3_email_oauth',
     'planning', 'refreshing', 'updating_token', 'verifying_account', 'removing_banned', 'maintaining', 'importing_new']) {
     api.state.overview.jobs = [{ id: 'job_stage', type: 'console_register', status: 'running', stage, summary: {} }];
     api.renderJobs();
     assert.equal(element('jobs').innerHTML.includes(stage), false, 'Internal stage IDs are not user-facing instructions');
     assert.match(element('jobs').innerHTML, /[\u4e00-\u9fff]/);
   }
+  api.state.overview.jobs = [{ id: 'job_preflight', type: 'console_resume', status: 'failed', stage: 'failed', failureStage: 'network_preflight', summary: {}, error: 'synthetic connection error' }];
+  api.renderJobs(); assert.match(element('jobs').innerHTML, /失败阶段：<\/strong>连接预检/);
+});
+
+test('console failed import keeps successful registration counts visible with failure stage and recovery guidance', () => {
+  const { api, element } = harness();
+  api.state.overview.jobs = [{ id: 'job_import_fixture', type: 'console_register', status: 'failed', stage: 'failed',
+    summary: { registered: 1, imported: 0, failed: 0 }, error: '目标服务连接失败', failureStage: 'importing', nextAction: 'import_existing',
+    recoveryMessage: '注册已成功，不要重新注册；核对导入结果后处理现有 token。' }];
+  api.renderJobs();
+  const rendered = element('jobs').innerHTML;
+  assert.match(rendered, /注册成功 1 · 导入 0 · 账号步骤失败 0/);
+  assert.match(rendered, /失败阶段：<\/strong>导入 Sub2API/); assert.match(rendered, /失败原因：<\/strong>目标服务连接失败/);
+  assert.match(rendered, /注册已成功，不要重新注册/); assert.match(rendered, /class="tag bad">失败/);
+  assert.doesNotMatch(rendered, /import_existing|aria-hidden="true">✓/);
+});
+
+test('console job failure and recovery messages are escaped without hiding string summaries or bypassing holds', () => {
+  const { api, element } = harness();
+  api.state.overview.jobs = [{ id: 'job_unknown_fixture', type: 'console_register', status: 'failed', stage: 'failed',
+    summary: '部分步骤已完成', error: { message: '<script>unknown fixture</script>' }, failureStage: '<img src=x>',
+    recoveryMessage: '先核对外部结果 <script>recovery fixture</script>' }];
+  api.state.overview.reconciliation = { total: 1, returned: 1, truncated: false };
+  api.renderJobs(); api.renderControls();
+  const rendered = element('jobs').innerHTML;
+  assert.match(rendered, /部分步骤已完成/); assert.match(rendered, /失败阶段：<\/strong>执行步骤/);
+  assert.match(rendered, /&lt;script&gt;unknown fixture/); assert.match(rendered, /先核对外部结果 &lt;script&gt;/);
+  assert.doesNotMatch(rendered, /<script>|<img/);
+  assert.equal(element('start-register').disabled, true); assert.match(api.writeBlock(), /人工对账/);
 });
 
 test('console distinguishes token transport from browser access without hiding a failed subchannel', () => {
@@ -219,10 +248,101 @@ test('console resumes frozen record with persistent idempotency and displays ine
   assert.equal(calls[0].options.body, calls[1].options.body); assert.equal(calls[0].options.headers.get('Idempotency-Key'), calls[1].options.headers.get('Idempotency-Key'));
 });
 
+test('console marks verified legacy email repairs and blocking continuations without auto-submitting', () => {
+  const { api, element, calls } = harness();
+  api.state.continuations = [{ selectedKey: 'registration:accounts:0', revision: 'a'.repeat(64), stage: 'phase3',
+    email: 'synthetic@example.test', eligible: true, repairEmail: true, blockingRegistration: true }];
+  api.renderContinuations();
+  assert.match(element('continuations').innerHTML, /本地两份资料已核验，续跑时补齐历史邮箱/);
+  assert.match(element('continuations').innerHTML, /此记录阻挡新注册，优先继续/);
+  assert.doesNotMatch(element('continuations').innerHTML, /disabled/); assert.equal(calls.length, 0);
+  api.state.continuations[0].repairEmail = false; api.state.continuations[0].blockingRegistration = false;
+  api.renderContinuations(); assert.doesNotMatch(element('continuations').innerHTML, /已核验|阻挡新注册/);
+});
+
+test('console Phase3 continuation uses explicit scoped readiness without requiring SMS configuration', async () => {
+  const { api, context, element, calls } = harness();
+  api.state.overview.settings.registration = { ready: false, issues: ['缺少短信 API Key'], phase3Ready: true, phase3Issues: [] };
+  api.state.continuations = [
+    { selectedKey: 'registration:accounts:0', revision: 'a'.repeat(64), stage: 'phase3', eligible: true },
+    { selectedKey: 'registration:accounts:1', revision: 'b'.repeat(64), stage: 'phase2', eligible: true },
+  ];
+  const buttons = api.state.continuations.map((_, index) => ({ dataset: { resumeIndex: String(index) } }));
+  context.document.querySelectorAll = selector => selector === '[data-resume-index]' ? buttons : [];
+  api.renderContinuations();
+  assert.equal(buttons[0].disabled, false); assert.equal(buttons[1].disabled, true); assert.equal(element('start-register').disabled, true);
+  assert.match(element('continuation-hint-0').textContent, /无需短信配置/); assert.match(element('continuation-hint-1').textContent, /注册配置不完整/);
+  assert.equal(calls.length, 0);
+  context.fetch = async (url, options) => { calls.push({ url, options }); throw new Error('synthetic lost response'); };
+  await element('continuations').listeners.click({ target: { closest: () => buttons[0] } });
+  assert.deepEqual(JSON.parse(calls[0].options.body), { selectedKey: 'registration:accounts:0', revision: 'a'.repeat(64), autoImport: true });
+  assert.equal(calls[0].url, '/api/console/register/resume');
+});
+
+test('console Phase3 continuation never infers readiness from full registration readiness or missing issues', async () => {
+  for (const registration of [
+    { ready: true }, { ready: true, phase3Ready: false, phase3Issues: ['缺少邮箱鉴权配置'] },
+    { ready: false, phase3Ready: false, phase3Issues: ['OAuth 代理配置无效'] },
+  ]) {
+    const { api, context, element, calls } = harness();
+    api.state.overview.settings.registration = registration;
+    api.state.continuations = [{ selectedKey: 'registration:accounts:0', revision: 'a'.repeat(64), stage: 'phase3', eligible: true }];
+    const button = { dataset: { resumeIndex: '0' } };
+    context.document.querySelectorAll = selector => selector === '[data-resume-index]' ? [button] : [];
+    api.renderContinuations(); assert.equal(button.disabled, true);
+    assert.match(element('continuation-hint-0').textContent, registration.phase3Ready === false ? /Phase3 配置不完整/ : /尚未确认 Phase3 配置/);
+    if (registration.phase3Issues) assert.ok(element('continuation-hint-0').textContent.includes(registration.phase3Issues[0]));
+    await element('continuations').listeners.click({ target: { closest: () => button } }); assert.equal(calls.length, 0);
+  }
+});
+
+test('console scoped Phase3 readiness preserves all write, identity and global task guards', () => {
+  const blockers = [
+    api => { api.state.connected = false; }, api => { api.state.storageError = true; }, api => { api.state.busy = true; },
+    api => { api.state.pending = { url: '/api/console/settings' }; }, api => { api.state.networkBusy = true; },
+    api => { api.state.overview.readOnly = true; }, api => { api.state.overview.reconciliation = { total: 1, returned: 1, truncated: false }; },
+    api => { api.state.overview.activeJobs = { total: 1, returned: 1, truncated: false }; }, api => { delete api.state.overview.activeJobs; },
+    api => { api.state.overview.capabilities.comparisonAvailable = false; }, api => { api.state.overview.capabilities.phase3Enabled = false; },
+    api => { api.state.overview.capabilities.registrationEnabled = false; }, api => { api.state.continuations[0].eligible = false; },
+  ];
+  for (const block of blockers) {
+    const { api, context, element } = harness();
+    api.state.overview.settings.registration.ready = false;
+    api.state.continuations = [{ stage: 'phase3', eligible: true }];
+    const button = { dataset: { resumeIndex: '0' } };
+    context.document.querySelectorAll = selector => selector === '[data-resume-index]' ? [button] : [];
+    block(api); api.renderControls();
+    assert.equal(button.disabled, true); assert.ok(button.title); assert.ok(element('continuation-hint-0').textContent);
+  }
+});
+
 test('console log browsing and download use returned opaque file IDs not server paths', () => {
   const { api, element } = harness(); element('log-file').value = 'f'.repeat(32); element('log-source').value = 'panel';
   assert.equal(api.logQuery().get('fileId'), 'f'.repeat(32)); assert.equal(api.logQuery().get('source'), 'panel');
   assert.match(source, /state\.logFiles\.some\(\(file\) => file\.id === fileId\)/); assert.doesNotMatch(source, /download\?path=/);
+});
+
+test('console log binding gaps are shown as plain text and cleared when the next response has no notice', async () => {
+  const { api, context, element } = harness();
+  const bindingNotice = '未找到与该任务绑定的注册机日志。请清空任务筛选后按文件查看，不会按时间猜测归属。 <script>fixture</script>';
+  let report = { entries: [], files: [], nextCursor: null, bindingNotice };
+  context.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(report) });
+  await api.loadLogs();
+  assert.ok(element('log-storage').textContent.endsWith(bindingNotice)); assert.equal(element('log-storage').innerHTML, '');
+  report = { entries: [], files: [], nextCursor: null };
+  await api.loadLogs(); assert.doesNotMatch(element('log-storage').textContent, /未找到与该任务|fixture/);
+  report.bindingNotice = { message: 'wrong schema' };
+  await api.loadLogs(); assert.doesNotMatch(element('log-storage').textContent, /object Object|wrong schema/);
+});
+
+test('console reports bounded log scan coverage without claiming all matching files were read', async () => {
+  const { api, context, element } = harness();
+  let searchScope = { scannedFiles: 8, matchingFiles: 12, omittedFiles: 4 };
+  context.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify({ entries: [], files: [], nextCursor: null, searchScope }) });
+  await api.loadLogs(); assert.match(element('log-storage').textContent, /本次仅扫描 8 \/ 12 个匹配文件，较早日志请按文件查看/);
+  for (const scope of [{ scannedFiles: 8, matchingFiles: 8, omittedFiles: 0 }, { scannedFiles: 8, matchingFiles: 12, omittedFiles: 0 }, { scannedFiles: '8', matchingFiles: 12, omittedFiles: 4 }, null]) {
+    searchScope = scope; await api.loadLogs(); assert.doesNotMatch(element('log-storage').textContent, /本次仅扫描/);
+  }
 });
 
 test('console keeps policy edit revision frozen while background snapshots advance', () => {
@@ -237,6 +357,83 @@ test('console rejected settings CAS can be corrected without an unknown-write de
   context.fetch = async () => ({ ok: false, status: 409, text: async () => JSON.stringify({ error: 'CONSOLE_SETTINGS_STALE', message: 'settings changed' }) });
   await assert.rejects(api.saveSettings({ revision: 'r1', policy: { enabled: false } }), /settings changed/);
   assert.equal(api.state.pending, null);
+});
+
+test('console definite active-task settings conflict unlocks the rejected request and permits a later save', async () => {
+  const { api, context, store, calls, element } = harness();
+  const body = { revision: 'r1', policy: { enabled: false, intervalMinutes: 60 } };
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    assert.ok(store.has('registerStudio.pending.v1'));
+    return { ok: false, status: 409, text: async () => JSON.stringify({ error: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', message: '后台任务仍在执行，请先停止或等待完成后再修改设置' }) };
+  };
+  await assert.rejects(api.saveSettings(body), /后台任务仍在执行/);
+  assert.equal(api.state.pending, null); assert.equal(store.has('registerStudio.pending.v1'), false);
+  assert.equal(api.state.busy, false); assert.equal(element('settings-save').disabled, false);
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ revision: 'r2', policy: body.policy, registration: { revision: 'g1', fields: [] } }) };
+  };
+  await api.saveSettings(body);
+  assert.equal(api.state.pending, null); assert.equal(store.has('registerStudio.pending.v1'), false);
+  assert.deepEqual(calls.map((call) => call.options.method || 'GET'), ['POST', 'POST', 'GET']);
+  assert.equal(api.state.overview.settings.policy.intervalMinutes, 60);
+});
+
+test('console active-task settings rejection discards secret input without leaving a pending lock', async () => {
+  const { api, context, store } = harness();
+  const changes = { sms_key: 'SYNTHETIC_SECRET_NOT_FOR_STORAGE' };
+  context.fetch = async () => ({ ok: false, status: 409, text: async () => JSON.stringify({ code: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', message: '任务执行中' }) });
+  await assert.rejects(api.saveSettings({ revision: 'r1', registration: { revision: 'g1', changes } }), /任务执行中/);
+  assert.deepEqual(changes, {}); assert.equal(api.state.pending, null); assert.equal(store.has('registerStudio.pending.v1'), false);
+});
+
+test('console unknown settings conflicts and explicit unknown outcomes retain their original receipt', async () => {
+  for (const response of [
+    { error: 'CONSOLE_SETTINGS_OTHER_CONFLICT' },
+    { error: 'CONSOLE_SETTINGS_WRITE_UNKNOWN' },
+    { error: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', writeOutcomeUnknown: true },
+  ]) {
+    const { api, context, store, calls } = harness();
+    context.fetch = async (url, options) => { calls.push({ url, options }); return { ok: false, status: 409, text: async () => JSON.stringify({ ...response, message: '保存结果未知' }) }; };
+    await assert.rejects(api.saveSettings({ revision: 'r1', policy: { enabled: false, intervalMinutes: 60 } }), /保存结果未知/);
+    const encoded = store.get('registerStudio.pending.v1'); assert.ok(encoded); assert.ok(api.writeBlock());
+    context.fetch = async (url, options) => {
+      calls.push({ url, options });
+      return { ok: true, status: 200, text: async () => JSON.stringify({ revision: 'r1', policy: { enabled: false, intervalMinutes: 30 }, registration: { revision: 'g1', fields: [] } }) };
+    };
+    await assert.rejects(api.mutate(null, null, { replay: true }), /尚不能确认/);
+    assert.equal(store.get('registerStudio.pending.v1'), encoded); assert.deepEqual(calls.map((call) => call.options.method || 'GET'), ['POST', 'GET']);
+  }
+});
+
+test('console active-conflict exception cannot clear another operation or an accepted settings write', async () => {
+  const { api, context, store } = harness();
+  const conflict = () => ({ ok: false, status: 409, text: async () => JSON.stringify({ error: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', message: 'conflict fixture' }) });
+  context.fetch = async () => conflict();
+  await assert.rejects(api.mutate('/api/console/maintain', { importNew: true, refreshInvalid: true, deleteBanned: true }), /conflict fixture/);
+  assert.ok(api.state.pending); assert.ok(store.has('registerStudio.pending.v1'));
+  const other = harness();
+  other.context.fetch = async (url, options) => options.method === 'POST' ? { ok: true, status: 200, text: async () => '{}' } : conflict();
+  await assert.rejects(other.api.saveSettings({ revision: 'r1', policy: { enabled: false } }), /conflict fixture/);
+  assert.ok(other.api.state.pending); assert.ok(other.store.has('registerStudio.pending.v1'));
+});
+
+test('console legacy settings pending stays read-only and reload explains that it does not resolve the receipt', async () => {
+  const { api, context, store, calls, element } = harness();
+  api.persistPending({ version: 1, url: '/api/console/settings', key: 'idem_v1_' + 'e'.repeat(32), createdAt: Date.now(), body: { revision: 'r1', policy: { intervalMinutes: 60 } } });
+  const encoded = store.get('registerStudio.pending.v1');
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ revision: 'r1', policy: { intervalMinutes: 30 }, registration: { revision: 'g1', fields: [] } }) };
+  };
+  await assert.rejects(api.mutate(null, null, { replay: true }), /请求时间.*核对服务端操作日志后人工恢复/);
+  await element('settings-reload').listeners.click();
+  assert.equal(store.get('registerStudio.pending.v1'), encoded); assert.ok(api.state.pending);
+  assert.match(element('notice').textContent, /不会解除待核对记录/);
+  assert.notEqual(element('notice').className, 'notice success');
+  assert.equal(element('settings-save').disabled, true);
+  assert.deepEqual(calls.map((call) => [call.url, call.options.method || 'GET']), [['/api/console/settings', 'GET'], ['/api/console/settings', 'GET']]);
 });
 
 test('console actual update action overrides classification label when identity requires review', () => {
@@ -381,4 +578,17 @@ test('console distinguishes administrator account lifetime expiry from OAuth exp
   assert.match(element('account-rows').innerHTML, /不是 OAuth token 过期/);
   assert.match(element('account-rows').innerHTML, /不自动刷新或删除/);
   assert.match(element('account-rows').innerHTML, /<td>本次跳过<\/td>/);
+});
+
+test('console explains unclassified scheduling pauses and invalidated refresh credentials distinctly', () => {
+  const { api, element } = harness(); element('account-filter').value = 'all';
+  api.state.overview.accounts = [
+    { id: 42, classification: 'network_unknown', action: 'review', reason: 'temporary_scheduling_pause' },
+    { id: 43, classification: 'auth_invalid', action: 'refresh', reason: 'refresh_token_invalidated' },
+  ];
+  api.renderAccounts();
+  assert.match(element('account-rows').innerHTML, /不能确认是额度耗尽/);
+  assert.match(element('account-rows').innerHTML, /不自动登录或删除/);
+  assert.match(element('account-rows').innerHTML, /刷新凭据已失效，需要本地重新授权/);
+  assert.doesNotMatch(element('account-rows').innerHTML, /temporary_scheduling_pause|refresh_token_invalidated/);
 });

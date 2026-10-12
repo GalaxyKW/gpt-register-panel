@@ -98,6 +98,8 @@ function jobSummary(job) {
     summary: result.summary || {}, items: (result.items || []).slice(-100),
     itemsTotal: result.items?.length || 0, itemsTruncated: result.items?.length > 100,
     childJobIds: (result.childJobIds || []).slice(-100),
+    failureStage: result.failureStage || null, nextAction: result.nextAction || null,
+    recoveryMessage: result.recoveryMessage || null,
     createdAt: job.createdAt, finishedAt: job.finishedAt || null, error: job.error || null };
 }
 
@@ -130,7 +132,8 @@ function createConsoleService({ db, logger, jobManager,
     const saved = await db.getConsoleSettings();
     let registration;
     try { registration = readRegistrationSettings(); }
-    catch (error) { registration = { ready: false, issues: [{ code: error.code || 'REGISTRATION_CONFIG_UNAVAILABLE', message: '注册配置暂不可读，请检查服务配置与权限' }], fields: [], countries: [] }; }
+    catch (error) { registration = { ready: false, phase3Ready: false, phase3Issues: ['注册配置暂不可读，请检查服务配置与权限'],
+      issues: [{ code: error.code || 'REGISTRATION_CONFIG_UNAVAILABLE', message: '注册配置暂不可读，请检查服务配置与权限' }], fields: [], countries: [] }; }
     return { revision: saved.revision, policy: saved.settings, registration };
   }
   async function overview() {
@@ -487,24 +490,46 @@ function createConsoleService({ db, logger, jobManager,
       },
     }), false)); } catch (error) {
       const partial = error.details;
-      if (context.signal.aborted || error.requiresReconciliation || error.writeOutcomeUnknown
+      if (error.requiresReconciliation || error.writeOutcomeUnknown
           || !Number.isSafeInteger(partial?.completedCount) || partial.completedCount < 1
+          || partial.completedCount > (context.intent.count || 1)
           || !Array.isArray(partial.selectedKeys) || partial.selectedKeys.length !== partial.completedCount
           || !Array.isArray(partial.artifacts) || partial.artifacts.length !== partial.completedCount) throw error;
+      if (context.signal.aborted) {
+        // Stop forbids new work, not recording artifacts already verified by
+        // the terminated child. Do not import or rent replacements here.
+        context.result.summary.registered = partial.completedCount;
+        context.result.progress = { completed: partial.completedCount, total: context.intent.count || 1 };
+        context.result.recoveryMessage = '任务已停止，已核验的 ' + partial.completedCount
+          + ' 个本地 token 仍保留，未继续导入或租号。请先核对成果，再从账号维护处理未入库账号。';
+        throw error;
+      }
       result = partial; registrationFailure = error;
+    } finally {
+      // Drain queued progress before persisting any terminal failure, even
+      // when registration failed without producing a single artifact.
+      await progressWrites;
     }
-    await progressWrites;
-    await updateParent(context, 'importing', { progress: { completed: result.completedCount, total: context.intent.count || 1 } });
-    const imported = await importFiles(context, result.selectedKeys, null, result.artifacts);
+    // Verified local output is a completed registration, independently of
+    // the later Sub2API import. Persist it before an import read can fail.
     context.result.summary.registered = result.completedCount;
-    context.result.summary.imported = imported.succeeded || 0;
-    await verifyImportedAccounts(context, imported);
     if (registrationFailure) {
       context.result.summary.failed += 1;
       context.result.nextAction = registrationFailure.details.nextAction || 'review';
       context.result.items.push({ status: 'failed', code: registrationFailure.code || 'REGISTRATION_INCOMPLETE',
-        message: '已成功产出的账号已入库；未完成账号保留原进度，不重新租号。' });
+        message: '本批有未完成账号，保留原进度，不重新租号；已生成的 token 单独进行入库核验。' });
     }
+    await updateParent(context, 'importing', { progress: { completed: result.completedCount, total: context.intent.count || 1 } });
+    let imported;
+    try { imported = await importFiles(context, result.selectedKeys, null, result.artifacts); }
+    catch (error) {
+      context.result.recoveryMessage = '已在本地生成 ' + result.completedCount
+        + ' 个账号的 token，导入未完整确认。不要重新注册或租号；请先查看导入子任务和远端记录，结果明确后从账号维护导入未入库账号。';
+      throw error;
+    }
+    context.result.summary.imported = imported.succeeded || 0;
+    await updateParent(context, 'verifying_account');
+    await verifyImportedAccounts(context, imported);
   }
   async function maintain(context) {
     const current = await snapshot({ fresh: true, signal: context.signal });
@@ -525,7 +550,7 @@ function createConsoleService({ db, logger, jobManager,
         if (item.action === 'refresh') {
           if (!connectionsChecked) {
             await updateParent(context, 'checking_network');
-            const report = await preflight({ signal: context.signal, logger });
+            const report = await preflight({ signal: context.signal, logger, scope: 'phase3' });
             // A reauthorization only needs mail and OAuth; unavailable SMS
             // must not prevent refreshing an existing account.
             if (!['mail', 'oauth'].every(id => report.channels.some(c => c.id === id && c.ok))) {
@@ -604,7 +629,9 @@ function createConsoleService({ db, logger, jobManager,
       await updateTerminalJob(db, job.id, { status, result: context.result, finishedAt: new Date().toISOString() });
       event('info', 'console.task_completed', { jobId: job.id, type: job.type, status, summary: context.result.summary });
     }).catch(async error => {
-      context.result = { ...context.result, ...describeFailure(error), ...failureMetadata(error), stage: context.signal.aborted ? 'stopped' : 'failed' };
+      const failureStage = context.result.stage;
+      context.result = { ...context.result, ...describeFailure(error), ...failureMetadata(error), failureStage,
+        stage: context.signal.aborted ? 'stopped' : 'failed' };
       await updateTerminalJob(db, job.id, { status: context.signal.aborted ? 'interrupted' : 'failed',
         result: context.result, error: safeFailureMessage(error), finishedAt: new Date().toISOString() });
       event('error', 'console.task_failed', { jobId: job.id, code: error.code || 'CONSOLE_TASK_FAILED' });

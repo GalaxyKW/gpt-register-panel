@@ -8,6 +8,7 @@ const { readGptRegisterSources, closeDirectoryHandle } = require('./adapters/gpt
 const { PROFILE_ENV, createPhase3BrowserProfile, removePhase3BrowserProfile } = require('./lib/phase3BrowserProfile');
 const { readRegistrationSettings } = require('./registrationSettings');
 const { assertAuditLogCheckpoint } = require('./logger');
+const { resolvePhase3LocalIdentity, isLocalAccountTerminal } = require('./lib/registrationContinuationIdentity');
 const RESUME_REVISION_KEY = crypto.randomBytes(32);
 const ACCOUNT_TIMEOUT_MS = 30 * 60 * 1000;
 const BATCH_TIMEOUT_MAX_MS = 24 * 60 * 60 * 1000;
@@ -76,7 +77,7 @@ async function runEngineCommand({ rootDirectory = process.env.GPT_REGISTER_ROOT 
     try {
       result = await runner('/proc/self/fd/4', ['--preserve-symlinks', '--preserve-symlinks-main', '-e', execution.phase3LauncherSource(), '--', ...args], {
         cwd: '/proc/self/fd/5', env: { ...execution.phase3Environment(), [PROFILE_ENV]: profile.path, GPT_REGISTER_PANEL_RESULT_FD: '6', ...(resumeBinding ? { GPT_REGISTER_PANEL_RESUME_FD: '7' } : {}) },
-        extraFileDescriptors: [script.descriptor, node.descriptor, root.descriptor, resultFd, ...(resumeBinding ? [resumeFd] : [])], signal,
+        extraFileDescriptors: [script.descriptor, node.descriptor, root.descriptor, resultFd, ...(resumeBinding ? [resumeFd] : [])], signal, jobId,
         timeoutMs, registrationBatch: args.includes('--panel-register'), maxOutputBytes: 256 * 1024, terminationGraceMs: 4000,
       });
     } catch (error) {
@@ -161,17 +162,27 @@ async function runRegistrationJob({ rootDirectory = process.env.GPT_REGISTER_ROO
 }
 function continuationSnapshot(rootDirectory) {
   const handle = execution.openPinnedPhase3Root(path.resolve(rootDirectory));
-  let fd;
+  const read = filename => {
+    let fd;
+    try {
+      try { fd = fs.openSync(path.join(handle.traversalPath, filename), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
+      catch (error) { if (error.code === 'ENOENT') return { rows: [], hash: null }; throw error; }
+      const stat = fs.fstatSync(fd);
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 32 * 1024 * 1024) throw new Error();
+      const bytes = Buffer.alloc(stat.size); let offset = 0;
+      while (offset < bytes.length) { const count = fs.readSync(fd, bytes, offset, bytes.length - offset, offset); if (!count) throw new Error(); offset += count; }
+      const final = fs.fstatSync(fd), current = fs.lstatSync(path.join(handle.traversalPath, filename));
+      if (final.size !== stat.size || final.mtimeMs !== stat.mtimeMs || current.ino !== stat.ino || current.dev !== stat.dev || current.isSymbolicLink()) throw new Error();
+      const rows = JSON.parse(bytes.toString('utf8'));
+      if (!Array.isArray(rows) || rows.length > 10000 || rows.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error();
+      return { rows, hash: crypto.createHash('sha256').update(bytes).digest('hex') };
+    } finally { if (fd !== undefined) fs.closeSync(fd); }
+  };
   try {
-    try { fd = fs.openSync(path.join(handle.traversalPath, 'accounts.json'), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK); }
-    catch (error) { if (error.code === 'ENOENT') return { accounts: [], fileHash: null }; throw error; }
-    const stat = fs.fstatSync(fd);
-    if (!stat.isFile() || stat.nlink !== 1 || stat.size > 32 * 1024 * 1024) throw new Error();
-    const bytes = fs.readFileSync(fd); const accounts = JSON.parse(bytes.toString('utf8'));
-    if (!Array.isArray(accounts) || accounts.length > 10000 || accounts.some(item => !item || typeof item !== 'object' || Array.isArray(item))) throw new Error();
-    return { accounts, fileHash: crypto.createHash('sha256').update(bytes).digest('hex') };
+    const accounts = read('accounts.json'), usernames = read('username.json');
+    return { accounts: accounts.rows, fileHash: accounts.hash, usernames: usernames.rows, usernameFileHash: usernames.hash };
   } catch { throw failure('REGISTRATION_CONTINUATION_INVALID', '本地注册账本无法安全读取'); }
-  finally { if (fd !== undefined) fs.closeSync(fd); closeDirectoryHandle(handle); }
+  finally { closeDirectoryHandle(handle); }
 }
 function continuationPhone(account) {
   const raw = account?.phone;
@@ -181,20 +192,23 @@ function continuationItems(snapshot) {
   const phase2Statuses = new Set(['registered', 'oauth_phase2_failed', 'registration_sms_submission_attempted', 'registration_sms_submitted', 'registration_navigation_unconfirmed', 'registration_server_landed_pending_login']);
   const phase3Statuses = new Set(['email_bound', 'oauth_phase3_failed']);
   return snapshot.accounts.flatMap((account, index) => {
-    const status = String(account.status || 'registered');
+    const status = String(account.status || 'registered').trim().toLowerCase();
     const stage = phase3Statuses.has(status) ? 'phase3' : phase2Statuses.has(status) ? 'phase2' : null;
     if (!stage) return [];
     const phone = continuationPhone(account);
-    const email = typeof account.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email) ? account.email.toLowerCase() : '';
+    const identity = stage === 'phase3' ? resolvePhase3LocalIdentity(snapshot.accounts, snapshot.usernames, index) : null;
+    const email = identity?.ok ? identity.email : typeof account.email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(account.email) ? account.email.toLowerCase() : '';
     const samePhone = snapshot.accounts.filter(item => continuationPhone(item) === phone);
     let reason = null;
     if (!phone || typeof account.password !== 'string' || !account.password.trim() || /[\x00\r\n]/.test(account.password)) reason = '缺少有效的原手机号或登录凭据';
     else if (samePhone.length !== 1) reason = '本地手机号不唯一，需先核对原注册记录';
-    else if (stage === 'phase3' && (!email || snapshot.accounts.filter(item => String(item.email || '').toLowerCase() === email).length !== 1)) reason = '原绑定邮箱缺失或不唯一';
+    else if (isLocalAccountTerminal(account) || snapshot.usernames.some(item => continuationPhone(item) === phone && isLocalAccountTerminal(item))) reason = '本地账号已终止，不可续跑';
+    else if (stage === 'phase3' && !identity.ok) reason = ({ LOCAL_USERNAME_MISSING: '本地 username 记录缺失', LOCAL_USERNAME_AMBIGUOUS: '本地 username 手机号对应多条记录', LOCAL_PASSWORD_MISMATCH: '两份本地记录的密码不一致', LOCAL_ACTIVATION_MISMATCH: '两份本地记录的激活编号不一致', LOCAL_ACCOUNT_TERMINAL: '本地账号已终止，不可续跑', LOCAL_EMAIL_MISSING: '本地绑定邮箱缺失', LOCAL_EMAIL_AMBIGUOUS: '本地绑定邮箱不唯一', LOCAL_EMAIL_MISMATCH: '两份本地记录的邮箱不一致' })[identity.reason] || '本地身份无法唯一核验';
     else if (status.startsWith('registration_') && !account.smsActivationId) reason = '短信注册检查点缺少原激活编号';
     const selectedKey = 'registration:accounts:' + index;
-    const revision = crypto.createHmac('sha256', RESUME_REVISION_KEY).update(JSON.stringify([snapshot.fileHash, selectedKey, stage, account])).digest('hex');
-    return [{ selectedKey, revision, stage, ...(email ? { email } : {}), phoneMasked: phone ? '***' + phone.slice(-4) : '', eligible: reason === null, reason }];
+    const revision = crypto.createHmac('sha256', RESUME_REVISION_KEY).update(JSON.stringify([snapshot.fileHash, snapshot.usernameFileHash, selectedKey, stage, account])).digest('hex');
+    return [{ selectedKey, revision, stage, ...(email ? { email } : {}), phoneMasked: phone ? '***' + phone.slice(-4) : '', eligible: reason === null, reason,
+      repairEmail: identity?.ok && identity.repairEmail === true, blockingRegistration: account.continuationRequired === true }];
   });
 }
 function listRegistrationContinuations({ rootDirectory = process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register' } = {}) {
@@ -207,8 +221,11 @@ function resolveContinuation(rootDirectory, target) {
   const item = continuationItems(snapshot).find(item => item.selectedKey === target.selectedKey);
   if (!item?.eligible || !crypto.timingSafeEqual(Buffer.from(item.revision, 'hex'), Buffer.from(target.revision, 'hex'))) throw failure('REGISTRATION_RESUME_TARGET_CHANGED', '待继续账号已变化、不唯一或不再适合续跑，请刷新');
   const index = Number(target.selectedKey.split(':').at(-1));
+  const identity = item.stage === 'phase3' ? resolvePhase3LocalIdentity(snapshot.accounts, snapshot.usernames, index) : null;
   return { snapshot, item, account: snapshot.accounts[index], binding: { index, stage: item.stage, fileHash: snapshot.fileHash,
-    recordHash: crypto.createHash('sha256').update(JSON.stringify(snapshot.accounts[index])).digest('hex') } };
+    recordHash: crypto.createHash('sha256').update(JSON.stringify(snapshot.accounts[index])).digest('hex'),
+    ...(identity?.ok ? { usernameFileHash: snapshot.usernameFileHash, usernameIndex: identity.usernameIndex,
+      usernameRecordHash: crypto.createHash('sha256').update(JSON.stringify(snapshot.usernames[identity.usernameIndex])).digest('hex') } : {}) } };
 }
 async function runRegistrationResumeJob({ rootDirectory = process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register', target, signal,
   logger, jobId, actor = 'panel-admin', onProgress, preflight, runner } = {}) {
@@ -216,7 +233,7 @@ async function runRegistrationResumeJob({ rootDirectory = process.env.GPT_REGIST
   const settings = readRegistrationSettings({ rootDirectory });
   if (signal?.aborted) throw failure('JOB_INTERRUPTED', '续跑已取消');
   onProgress?.({ type: 'stage', stage: 'network_preflight' });
-  const network = await (preflight || require('./networkPreflight').runNetworkPreflight)({ rootDirectory, signal, logger, jobId, actor });
+  const network = await (preflight || require('./networkPreflight').runNetworkPreflight)({ rootDirectory, signal, logger, jobId, actor, scope: selected.item.stage === 'phase3' ? 'phase3' : 'registration' });
   if (!network.ok) throw failure('REGISTRATION_PREFLIGHT_FAILED', '网络预检未通过，未执行账号续跑', { preflight: network });
   resolveContinuation(rootDirectory, target);
   if (settings.revision !== readRegistrationSettings({ rootDirectory }).revision) throw failure('REGISTRATION_CONFIG_CHANGED', '网络预检期间注册配置已变化，未执行账号续跑');
@@ -233,7 +250,7 @@ async function runRegistrationResumeJob({ rootDirectory = process.env.GPT_REGIST
       if (latest.length !== 1 || !latest[0].email) throw failure('REGISTRATION_RESUME_OUTPUT_INVALID', '无法核验原账号续跑后的邮箱绑定');
       for (const artifact of artifacts) {
         const record = after.tokens.find(item => 'token:' + item.source + ':' + item.relativePath === artifact.selectedKey);
-        if (record?.email !== String(latest[0].email).toLowerCase()) throw failure('REGISTRATION_RESUME_OUTPUT_INVALID', '续跑产物不属于原账号的已绑定邮箱');
+        if (record?.email !== String(latest[0].email).trim().toLowerCase()) throw failure('REGISTRATION_RESUME_OUTPUT_INVALID', '续跑产物不属于原账号的已绑定邮箱');
         const originals = before.tokens.filter(item => item.email === record.email && item.parseStatus === 'ok');
         if (originals.some(item => (item.accountId && item.accountId !== record.accountId) || (item.userId && item.userId !== record.userId))) throw failure('REGISTRATION_RESUME_OUTPUT_INVALID', '续跑新 token 与该原账号既有强身份不一致');
       }

@@ -76,6 +76,55 @@ test('job filters accept internal child IDs but never user supplied expansion', 
   const result = queryLogs({ jobId: 'parent' }, { ...f.options, jobIds: ['child'] });
   assert.deepEqual(result.entries.map(entry => entry.jobId).sort(), ['child', 'parent']);
 });
+test('task-bound engine log bodies are selected before unrelated newer files and remain redacted', t => {
+  const f = fixture(t);
+  const parent = 'job_' + 'a'.repeat(24), child = 'job_' + 'b'.repeat(24), other = 'job_' + 'c'.repeat(24);
+  const name = registerName().replace('.log', '-' + child + '.log');
+  f.write('register', name, record('failure details password=fixture-private-password'), true);
+  f.write('panel', 'panel.log', jsonRecord({ jobId: parent, event: 'console.task_failed' }), true);
+  for (let i = 0; i < 12; i++) f.write('register', registerName(DEAD_PID - i - 1).replace('.log', '-' + other + '.log'), record('unrelated job'));
+  const result = queryLogs({ jobId: parent }, { ...f.options, jobIds: [child] });
+  assert.equal(result.entries.length, 2); assertSafe(result);
+  const body = result.entries.find(entry => entry.source === 'register');
+  assert.equal(body.jobId, child); assert.match(body.message, /failure details/);
+  const file = result.files.find(item => item.name === name);
+  assert.equal(file.jobId, child); assert.equal(file.active, false);
+  assertSafe(downloadLog(file.id, f.options));
+  const attemptedExpansion = queryLogs({ jobId: parent, jobIds: [child] }, f.options);
+  assert.equal(attemptedExpansion.entries.some(entry => entry.source === 'register'), false);
+});
+test('legacy engine logs remain readable but are never guessed into a task by timestamp', t => {
+  const f = fixture(t);
+  f.write('register', registerName(), record('legacy body'));
+  const result = queryLogs({ jobId: 'job_' + 'a'.repeat(24) }, f.options);
+  assert.equal(result.entries.length, 0);
+  assert.match(result.bindingNotice, /请清空任务筛选后按文件查看/);
+  assert.equal(queryLogs({ fileId: result.files[0].id }, f.options).entries[0].message, 'legacy body');
+});
+test('new panel rotations cannot hide an exactly bound engine failure body', t => {
+  const f = fixture(t), parent = 'job_' + 'a'.repeat(24), child = 'job_' + 'b'.repeat(24);
+  f.write('register', registerName().replace('.log', '-' + child + '.log'), record('task failure body'), true);
+  for (let i = 0; i < 10; i++) f.write('panel', 'panel.log' + (i ? '.' + i : ''), jsonRecord({ jobId: 'unrelated' }));
+  const result = queryLogs({ jobId: parent }, { ...f.options, jobIds: [child] });
+  assert.equal(result.entries.length, 1); assert.equal(result.entries[0].message, 'task failure body');
+  assert.equal(result.searchScope.scannedFiles, 8); assert.equal(result.searchScope.omittedFiles, 3);
+  assert.equal(result.bindingNotice, null);
+});
+test('job-bound engine filenames preserve live-PID cleanup protection', t => {
+  const f = fixture(t), jobId = 'job_' + 'd'.repeat(24);
+  const name = registerName(process.pid).replace('.log', '-' + jobId + '.log');
+  const filename = f.write('register', name, record('running'), true);
+  assert.equal(listLogFiles(f.options)[0].active, true);
+  assert.equal(cleanupLogs({ olderThanDays: 7, confirm: true }, f.options).removed, 0);
+  assert.equal(fs.existsSync(filename), true);
+});
+test('fatal engine failures are included by the error filter and remain task-bound', t => {
+  const f = fixture(t), jobId = 'job_' + 'e'.repeat(24);
+  f.write('register', registerName().replace('.log', '-' + jobId + '.log'), record('uncaught error password=fixture-private-secret', 'FATAL'));
+  const result = queryLogs({ jobId, level: 'error' }, f.options);
+  assert.equal(result.entries.length, 1); assert.equal(result.entries[0].level, 'error');
+  assert.equal(result.entries[0].jobId, jobId); assertSafe(result);
+});
 test('queries validate bounds and expose deterministic pagination', t => {
   const f = fixture(t); f.write('panel', 'panel.log', jsonRecord({ message: 'first' }) + jsonRecord({ message: 'second', level: 'error' }));
   const first = queryLogs({ limit: 1 }, f.options); assert.equal(first.nextCursor, '1');

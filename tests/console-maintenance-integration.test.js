@@ -77,6 +77,9 @@ async function fixture(t, options = {}) {
     importCodexSession: async payload => {
       if (!options.allowCreates) throw new Error('maintenance must never create replacement accounts');
       assert.equal(payload.update_existing, false);
+      if (options.importUnknown) throw Object.assign(new Error('fixture unknown write'), {
+        code: 'SUB2API_WRITE_UNKNOWN', requiresReconciliation: true, writeOutcomeUnknown: true, doNotRetry: true,
+      });
       const content = JSON.parse(payload.content);
       const id = Math.max(...remote.map(item => item.id)) + 1;
       remote.push({ id, name: payload.name, platform: 'openai', type: 'oauth', status: 'active', schedulable: true,
@@ -274,6 +277,55 @@ test('a partial registration with unconfirmed filesystem outcome never auto-impo
   const admitted = await f.request('/api/console/register', { count: 2, country: 'US', autoImport: true });
   const job = await f.waitJob(admitted.body.jobId);
   assert.equal(job.status, 'failed'); assert.equal(job.result.requiresReconciliation, true);
+  assert.deepEqual(f.writes, []);
+});
+
+for (const failurePoint of ['snapshot', 'importer']) {
+  test('verified registration remains visible when the later ' + failurePoint + ' fails', async t => {
+    let f;
+    f = await fixture(t, { allowCreates: true, consoleOptions: {
+      registrar: async () => {
+        const output = f.registrationOutput();
+        if (failurePoint === 'snapshot') f.client.listAccounts = async () => {
+          throw Object.assign(new Error('fixture transport unavailable'), { code: 'SUB2API_READ_FAILED' });
+        };
+        return output;
+      },
+      ...(failurePoint === 'importer' ? { importer: async () => {
+        throw Object.assign(new Error('fixture import unavailable'), { code: 'SUB2API_READ_FAILED' });
+      } } : {}),
+    } });
+    const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
+    assert.equal(admitted.status, 202);
+    const job = await f.waitJob(admitted.body.jobId);
+    assert.equal(job.status, 'failed');
+    assert.equal(job.result.summary.registered, 1);
+    assert.equal(job.result.summary.imported, 0);
+    assert.equal(job.result.summary.failed, 0, 'a transport failure is not a failed registration');
+    assert.equal(job.result.failureStage, 'importing');
+    assert.match(job.result.recoveryMessage, /不要重新注册或租号/);
+    assert.deepEqual(f.writes, []); assert.deepEqual(f.tested, []);
+    assert.equal(fs.existsSync(path.join(f.root, 'tokens/new-registration.json')), true);
+    const overview = await f.request('/api/console/overview');
+    const card = overview.body.jobs.find(item => item.id === job.id);
+    assert.equal(card.summary.registered, 1);
+    assert.equal(card.failureStage, 'importing');
+    assert.match(card.recoveryMessage, /不要重新注册或租号/);
+  });
+}
+
+test('unknown import outcome preserves verified local output without claiming remote success', async t => {
+  let f;
+  f = await fixture(t, { allowCreates: true, importUnknown: true, consoleOptions: {
+    registrar: async () => f.registrationOutput(),
+  } });
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.requiresReconciliation, true, job.result.code + ': ' + job.error);
+  assert.equal(job.result.summary.registered, 1); assert.equal(job.result.summary.imported, 0);
+  assert.match(job.result.recoveryMessage, /导入未完整确认/);
+  const next = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
+  assert.equal(next.status, 409);
   assert.deepEqual(f.writes, []);
 });
 

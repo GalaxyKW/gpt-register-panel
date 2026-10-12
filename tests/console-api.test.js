@@ -139,6 +139,43 @@ test('console registration completes server-side register import verify and dura
   assert.equal((await f.request('/api/console/register', { ...body, count: 2 }, key)).status, 409);
 });
 
+test('failed registration drains progress and exposes its actual failure stage without inventing failed accounts', async t => {
+  const f = await fixture(t, { registrar: async ({ onProgress }) => {
+    onProgress({ stage: 'phase3_email_oauth', completedCount: 0 });
+    throw Object.assign(new Error('existing local account needs continuation'), {
+      code: 'BATCH_PENDING_PHASE3_CONTINUATION', details: { completedCount: 0, nextAction: 'resume_account' },
+    });
+  } });
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.stage, 'failed');
+  assert.equal(job.result.failureStage, 'phase3_email_oauth');
+  assert.equal(job.result.summary.registered, 0); assert.equal(job.result.summary.failed, 0);
+  assert.equal(job.result.nextAction, 'resume_account');
+  const card = (await f.request('/api/console/overview')).body.jobs.find(item => item.id === job.id);
+  assert.equal(card.stage, 'failed'); assert.equal(card.failureStage, 'phase3_email_oauth');
+  assert.equal(card.nextAction, 'resume_account');
+  assert.equal(f.calls.import, 0);
+});
+
+test('parent task log API includes the actual bound child engine body but no unrelated run', async t => {
+  const f = await fixture(t);
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
+  const job = await f.waitJob(admitted.body.jobId);
+  const child = job.result.childJobIds[0];
+  const header = '[2020-01-01T00:00:00.000Z] [ERROR] ';
+  fs.writeFileSync(path.join(f.root, 'logs', 'run-20200101T000000000Z-2147483647-' + child + '.log'),
+    header + 'original engine error password=fixture-private-secret\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(f.root, 'logs', 'run-20200101T000000000Z-2147483646.log'),
+    header + 'unrelated legacy error\n', { mode: 0o600 });
+  const result = await f.request('/api/console/logs?jobId=' + job.id);
+  assert.equal(result.status, 200);
+  assert.equal(result.body.entries.length, 1);
+  assert.equal(result.body.entries[0].jobId, child);
+  assert.match(result.body.entries[0].message, /original engine error/);
+  assert.equal(JSON.stringify(result.body).includes('fixture-private-secret'), false);
+});
+
 test('console maintenance respects healthy quota manual-disabled and unknown accounts without invoking refresh or delete', async t => {
   const f = await fixture(t, { phase3Runner: async () => { throw new Error('must not login'); } });
   f.account(1);
@@ -205,6 +242,30 @@ test('stop cancels only the owned pipeline and repeated stop cannot launch anoth
   assert.equal((await f.waitJob(admitted.body.jobId)).status, 'interrupted');
   assert.equal((await f.request(route, {})).body.status, 'interrupted');
   assert.equal(f.calls.import, 0);
+});
+
+test('stopping after one verified registration preserves its count without starting import', async t => {
+  let f, started;
+  const executing = new Promise(resolve => { started = resolve; });
+  f = await fixture(t, { registrar: async ({ signal }) => {
+    const output = f.token(1);
+    started();
+    return new Promise((resolve, reject) => {
+      const abort = () => reject(Object.assign(new Error('stopped after verified output'), {
+        code: 'JOB_INTERRUPTED', details: { completedCount: 1, selectedKeys: [output.selectedKey],
+          artifacts: [{ selectedKey: output.selectedKey, contentHash: output.contentHash }] },
+      }));
+      signal.addEventListener('abort', abort, { once: true }); if (signal.aborted) abort();
+    });
+  } });
+  const admitted = await f.request('/api/console/register', { count: 2, country: 'US', autoImport: true });
+  await executing;
+  await f.request('/api/console/jobs/' + admitted.body.jobId + '/stop', {});
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'interrupted'); assert.equal(job.result.summary.registered, 1);
+  assert.equal(job.result.summary.imported, 0); assert.equal(f.calls.import, 0);
+  assert.match(job.result.recoveryMessage, /未继续导入或租号/);
+  assert.equal(fs.existsSync(path.join(f.root, 'tokens/account-1.json')), true);
 });
 
 test('safe partial registration imports only proven successes and reports the remaining account for explicit continuation', async t => {

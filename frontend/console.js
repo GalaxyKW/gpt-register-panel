@@ -18,7 +18,7 @@
     review: ['需要核对', 'unknown', '人工核对'], needs_review: ['需要核对', 'unknown', '人工核对'], network_unknown: ['原因待核对', 'unknown', '人工核对'], deleted: ['已删除', 'unknown', '不再导入'],
   };
   const ACTION_LABELS = { keep: '保持原样', wait: '等待恢复', refresh: '重新获取 token', delete: '删除远端记录', review: '人工核对', skip: '本次跳过', import: '首次导入' };
-  const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '管理员已关闭调度，不自动启用', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
+  const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '管理员已关闭调度，不自动启用', temporary_scheduling_pause: '账号处于临时调度暂停，但不能确认是额度耗尽；保留账号，等待核对，不自动登录或删除', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_invalidated: '刷新凭据已失效，需要本地重新授权', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
   const state = { overview: null, connected: false, pending: null, storageError: false, busy: false, refreshing: false, page: 'register', selected: new Set(), stoppingJobs: new Set(), logs: [], logFiles: [], continuations: [], nextCursor: null, logRevision: 0, token: '', settingsDirty: false, settingsRevision: null, cleanupDaysDirty: false, registrationDirty: false, registrationRevision: null, registrationFields: [], networkBusy: false, pollTimer: null };
 
   function validToken(value) { return typeof value === 'string' && /^[\x21-\x7e]{16,4096}$/.test(value); }
@@ -64,6 +64,10 @@
         error.code = body.code || body.error?.code || (typeof body.error === 'string' ? body.error : undefined);
         error.definitive = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 409 && response.status !== 429;
         if (['REGISTRATION_SETTINGS_CHANGED', 'CONSOLE_SETTINGS_STALE'].includes(error.code)) error.definitive = true;
+        // This exact settings response is emitted before any configuration write.
+        // Other conflicts (and explicit unknown outcomes below) must keep their receipt.
+        if (path === '/api/console/settings' && options.method === 'POST' && response.status === 409
+            && error.code === 'CONSOLE_SETTINGS_ACTIVE_CONFLICT') error.definitive = true;
         if (body.writeOutcomeUnknown === true || /WRITE_UNKNOWN|OUTCOME_UNKNOWN|RECONCILIATION/.test(error.code || '')) error.definitive = false;
         throw error;
       }
@@ -111,7 +115,7 @@
     const matches = expected.registration
       ? settings.registration?.lastRequestId === expected.registration.requestId
       : expected.policy && Object.entries(expected.policy).every(([key, value]) => settings.policy?.[key] === value);
-    if (!matches) throw new Error('尚不能确认本次配置已保存。不会重新发送密钥或覆盖配置，请稍后再次核对或到高级诊断检查。');
+    if (!matches) throw new Error('尚不能确认本次配置已保存。旧版遗留记录或响应丢失都可能造成此状态，不能仅凭当前配置解除保护。不会重新发送密钥或覆盖配置；请按请求时间 ' + date(pending.createdAt) + ' 核对服务端操作日志后人工恢复。重新读取配置只更新表单，不会解除这条待核对记录。');
     persistPending(null);
     if (state.overview) state.overview.settings = settings;
     state.registrationDirty = false; state.settingsDirty = false; state.registrationRevision = null;
@@ -220,6 +224,25 @@
     return accounts().filter((account) => (filter === 'all' || groups[filter]?.includes(account.classification)) && (!query || [account.name, account.email, account.id].join(' ').toLowerCase().includes(query)));
   }
   function selectable(account) { return Number.isSafeInteger(account.id) && account.id > 0; }
+  function continuationIssue(item) {
+    const blocked = writeBlock();
+    if (blocked) return blocked;
+    const capabilities = state.overview?.capabilities || {};
+    if (capabilities.comparisonAvailable === false) return '账号快照不完整，请先检测 Sub2API 连接。';
+    if (!capabilities.registrationEnabled) return '账号续跑功能未启用，请检查服务端配置。';
+    if (!capabilities.phase3Enabled) return '本地 Phase3 未启用，请检查服务端配置。';
+    if (state.networkBusy) return '网络预检正在执行，请等待检测完成后再继续。';
+    if (item?.eligible !== true) return item?.reason || '该记录尚未通过身份核验，不能继续。';
+    const registration = state.overview?.settings?.registration;
+    if (item.stage === 'phase3') {
+      if (registration?.phase3Ready === true) return '';
+      if (registration?.phase3Ready !== false) return '服务端尚未确认 Phase3 配置状态，请刷新后重试。';
+      const issues = Array.isArray(registration.phase3Issues) ? registration.phase3Issues.filter((issue) => typeof issue === 'string').join('；') : '';
+      return 'Phase3 配置不完整：' + (issues || '请到设置与检测补齐邮箱和 OAuth 配置') + '。';
+    }
+    if (item.stage !== 'phase2') return '续跑阶段无法确认，请刷新后重新选择。';
+    return registration?.ready === true ? '' : '注册配置不完整，请到设置与检测查看原因。';
+  }
   function renderControls() {
     const blocked = writeBlock();
     const capabilities = state.overview?.capabilities || {};
@@ -243,7 +266,12 @@
     $('pending-banner').hidden = !state.pending && !state.storageError;
     $('mode-label').textContent = !state.connected ? '服务未连接' : state.overview?.readOnly ? '只读模式' : state.overview?.settings?.policy?.enabled ? '自动巡检开启' : '手动控制';
     document.querySelectorAll('[data-stop-job]').forEach((button) => { button.disabled = state.stoppingJobs.has(button.dataset.stopJob); });
-    document.querySelectorAll('[data-resume-index]').forEach((button) => { button.disabled = Boolean(registrationIssue || !state.continuations[Number(button.dataset.resumeIndex)]?.eligible); });
+    document.querySelectorAll('[data-resume-index]').forEach((button) => {
+      const index = Number(button.dataset.resumeIndex), item = state.continuations[index], issue = continuationIssue(item);
+      button.disabled = Boolean(issue); button.title = issue;
+      const hint = $('continuation-hint-' + index);
+      if (hint) hint.textContent = issue || (item.stage === 'phase3' ? '无需短信配置；启动前仅检测邮箱和 OAuth 通道，不重新租号。' : '沿用现有账号继续；启动前检查完整注册配置，不重新租号。');
+    });
     renderTaskSafety();
   }
   function renderMetrics() {
@@ -280,22 +308,33 @@
       const label = /resume/.test(job.type) ? '继续已有账号' : /register/.test(job.type) ? '注册任务' : /maintain|maintenance/.test(job.type) ? '账号维护' : /log_cleanup/.test(job.type) ? '日志清理' : '后台任务';
       const tone = running ? 'neutral' : ['succeeded', 'completed'].includes(job.status) ? 'good' : job.status === 'failed' ? 'bad' : 'unknown';
       const progress = job.progress && Number.isFinite(job.progress.completed) && Number.isFinite(job.progress.total) ? ' · ' + job.progress.completed + ' / ' + job.progress.total : '';
-      const summaryLabels = { registered: '注册成功', imported: '导入', refreshed: '刷新', deleted: '删除', skipped: '跳过', failed: '失败', removed: '清理文件' };
+      const summaryLabels = { registered: '注册成功', imported: '导入', refreshed: '刷新', deleted: '删除', skipped: '跳过', failed: '账号步骤失败', removed: '清理文件' };
       const counts = job.summary && typeof job.summary === 'object' ? Object.entries(summaryLabels).filter(([key]) => Number.isFinite(job.summary[key])).map(([key, label]) => label + ' ' + job.summary[key]).join(' · ') : '';
-      const stages = { queued: '等待调度', starting: '准备执行', planning: '核对账号与维护范围', checking_network: '检查网络通道', preflight: '连接预检',
+      const stages = { queued: '等待调度', starting: '准备执行', planning: '核对账号与维护范围', checking_network: '检查网络通道', preflight: '连接预检', network_preflight: '连接预检',
         registering: '正在注册', init: '初始化注册流程', phase1_register: '手机号注册与短信验证', phase1_register_recovery: '恢复已有手机号注册',
         phase1_5_profile: '完成账号个人资料', phase2_bind_email: '绑定邮箱', phase2_resume: '继续邮箱绑定', phase3_email_oauth: '邮箱验证并获取 token',
         importing: '导入 Sub2API', importing_new: '导入从未加入的账号', maintenance: '正在维护', maintaining: '继续处理账号',
         refreshing: '本地重新授权', updating_token: '核验身份并回写原账号', verifying_account: '测试账号及恢复调度', removing_banned: '复核并删除确认封禁的记录',
         completed: '处理完成', stopped: '已停止', failed: '执行失败' };
-      const description = typeof job.summary === 'string' ? job.summary : typeof job.error === 'string' ? job.error : job.error?.message || [stages[job.stage] || job.stage, counts].filter(Boolean).join(' · ') || '等待任务报告';
-      return '<div class="job-row"><span class="job-symbol" aria-hidden="true">' + (running ? '↻' : '✓') + '</span><div><p class="job-title">' + label + escape(progress) + '</p><p class="job-detail">' + escape(description) + '</p><p class="job-detail">' + escape(job.id) + '</p></div><div class="job-status">' + tag(STATUS_LABELS[job.status] || '未知', tone) + '<span class="job-date">' + date(job.createdAt) + '</span></div><div class="job-actions"><button type="button" class="text-button" data-job-logs="' + escape(job.id) + '">日志</button>' + (running ? '<button type="button" class="text-button" data-stop-job="' + escape(job.id) + '">停止</button>' : '') + '</div></div>';
+      const description = typeof job.summary === 'string' ? job.summary : [stages[job.stage] || job.stage, counts].filter(Boolean).join(' · ') || '等待任务报告';
+      const errorMessage = typeof job.error === 'string' ? job.error : typeof job.error?.message === 'string' ? job.error.message : '';
+      const failureStage = typeof job.failureStage === 'string' && job.failureStage ? stages[job.failureStage] || '执行步骤' : '';
+      const recovery = typeof job.recoveryMessage === 'string' ? job.recoveryMessage : '';
+      const details = (failureStage ? '<p class="job-detail"><strong>失败阶段：</strong>' + escape(failureStage) + '</p>' : '')
+        + (errorMessage ? '<p class="job-detail"><strong>失败原因：</strong>' + escape(errorMessage) + '</p>' : '')
+        + (recovery ? '<p class="job-detail"><strong>后续处理：</strong>' + escape(recovery) + '</p>' : '');
+      const symbol = running ? '↻' : ['succeeded', 'completed'].includes(job.status) ? '✓' : ['failed', 'partial'].includes(job.status) ? '!' : '—';
+      return '<div class="job-row"><span class="job-symbol" aria-hidden="true">' + symbol + '</span><div><p class="job-title">' + label + escape(progress) + '</p><p class="job-detail">' + escape(description) + '</p>' + details + '<p class="job-detail">' + escape(job.id) + '</p></div><div class="job-status">' + tag(STATUS_LABELS[job.status] || '未知', tone) + '<span class="job-date">' + date(job.createdAt) + '</span></div><div class="job-actions"><button type="button" class="text-button" data-job-logs="' + escape(job.id) + '">日志</button>' + (running ? '<button type="button" class="text-button" data-stop-job="' + escape(job.id) + '">停止</button>' : '') + '</div></div>';
     }).join('') : '<div class="empty-state">还没有任务。<br>开始一次注册，或到账号维护检查现有账号。</div>';
   }
   function renderContinuations() {
     $('continuations-card').hidden = state.continuations.length === 0;
     const stages = { phase2: '继续绑定邮箱', phase3: '继续获取 token', registered: '继续绑定邮箱', email_bound: '继续获取 token' };
-    $('continuations').innerHTML = state.continuations.map((item, index) => '<div class="continuation-row"><div><strong>' + escape(item.email || item.phoneMasked || '已有账号记录') + '</strong><p>' + escape(stages[item.stage] || item.stage || '继续注册流程') + (item.reason ? ' · ' + escape(item.reason) : '') + '</p></div><button class="button secondary" type="button" data-resume-index="' + index + '"' + (!item.eligible ? ' disabled' : '') + '>继续此账号 →</button></div>').join('');
+    $('continuations').innerHTML = state.continuations.map((item, index) => {
+      const notes = [item.blockingRegistration === true ? '此记录阻挡新注册，优先继续' : '', item.repairEmail === true ? '本地两份资料已核验，续跑时补齐历史邮箱' : ''].filter(Boolean).join(' · ');
+      const issue = continuationIssue(item);
+      return '<div class="continuation-row"><div><strong>' + escape(item.email || item.phoneMasked || '已有账号记录') + '</strong><p>' + escape(stages[item.stage] || item.stage || '继续注册流程') + (item.reason ? ' · ' + escape(item.reason) : '') + '</p>' + (notes ? '<p>' + escape(notes) + '</p>' : '') + '<p id="continuation-hint-' + index + '">' + escape(issue) + '</p></div><button class="button secondary" type="button" data-resume-index="' + index + '"' + (issue ? ' disabled' : '') + '>继续此账号 →</button></div>';
+    }).join('');
     renderControls();
   }
   async function loadContinuations() {
@@ -338,7 +377,7 @@
     const operators = registration.operators || registration.options?.operators || [];
     $('register-operator-options').innerHTML = (Array.isArray(operators) ? operators : []).map((item) => '<option value="' + escape(typeof item === 'object' ? item.id ?? item.value ?? item.code : item) + '">' + escape(typeof item === 'object' ? item.name ?? item.label ?? '' : item) + '</option>').join('');
     const capabilities = state.overview.capabilities || {};
-    const values = [['注册引擎', capabilities.registrationEnabled ? '已启用' : '未启用'], ['本地重新授权', capabilities.phase3Enabled ? '已启用' : '未启用'], ['Sub2API 管理连接', capabilities.sub2apiConfigured ? '已配置' : '未配置'], ['注册配置', registration.ready === true ? '检查通过' : registration.ready === false ? '需要补充' : '未检测']];
+    const values = [['注册引擎', capabilities.registrationEnabled ? '已启用' : '未启用'], ['本地重新授权', capabilities.phase3Enabled ? '已启用' : '未启用'], ['Sub2API 管理连接', capabilities.sub2apiConfigured ? '已配置' : '未配置'], ['新注册配置', registration.ready === true ? '检查通过' : registration.ready === false ? '需要补充' : '未检测'], ['Phase3 续跑配置', registration.phase3Ready === true ? '检查通过（不要求短信）' : registration.phase3Ready === false ? '需要补充' : '未检测']];
     $('environment-list').innerHTML = values.map(([key, value]) => '<div><dt>' + key + '</dt><dd>' + value + '</dd></div>').join('');
     if (Array.isArray(registration.issues) && registration.issues.length) $('environment-list').innerHTML += '<div><dt>待处理</dt><dd>' + registration.issues.map((issue) => escape(typeof issue === 'string' ? issue : issue.message || issue.code)).join('<br>') + '</dd></div>';
     if (!state.registrationDirty && state.registrationRevision !== registration.revision) {
@@ -401,7 +440,12 @@
       state.logFiles = Array.isArray(result.files) ? result.files : [];
       const fileId = $('log-file').value;
       fillSelect('log-file', state.logFiles.map((file) => ({ value: file.id, label: file.name + ' · ' + Math.ceil(file.bytes / 1024) + ' KB · ' + date(file.modifiedAt) + (file.active ? ' · 写入中' : '') })), fileId);
-      $('log-storage').textContent = '日志文件 ' + state.logFiles.length + ' 个' + (Number.isFinite(result.totalBytes) ? ' · 合计 ' + (result.totalBytes / 1024 / 1024).toFixed(1) + ' MB' : '') + '。未选文件下载当前已加载记录；选定文件下载完整脱敏内容（上限 32 MB）。';
+      const scope = result.searchScope;
+      const partialScan = scope && Number.isSafeInteger(scope.scannedFiles) && scope.scannedFiles >= 0
+        && Number.isSafeInteger(scope.matchingFiles) && scope.matchingFiles > scope.scannedFiles
+        && Number.isSafeInteger(scope.omittedFiles) && scope.omittedFiles === scope.matchingFiles - scope.scannedFiles;
+      $('log-storage').textContent = '日志文件 ' + state.logFiles.length + ' 个' + (Number.isFinite(result.totalBytes) ? ' · 合计 ' + (result.totalBytes / 1024 / 1024).toFixed(1) + ' MB' : '') + '。未选文件下载当前已加载记录；选定文件下载完整脱敏内容（上限 32 MB）。' + (typeof result.bindingNotice === 'string' ? ' ' + result.bindingNotice : '')
+        + (partialScan ? ' 本次仅扫描 ' + scope.scannedFiles + ' / ' + scope.matchingFiles + ' 个匹配文件，较早日志请按文件查看。' : '');
       state.nextCursor = typeof result.nextCursor === 'string' ? result.nextCursor : null;
       renderLogs();
     } catch (error) { notice(errorText(error), 'error'); } finally { if (revision === state.logRevision) $('logs-more').disabled = false; }
@@ -450,7 +494,7 @@
   $('select-all').addEventListener('change', () => { for (const account of filteredAccounts().filter(selectable)) { if ($('select-all').checked) state.selected.add(account.id); else state.selected.delete(account.id); } renderAccounts(); });
   $('account-rows').addEventListener('change', (event) => { const id = Number(event.target.dataset.accountId); if (!Number.isSafeInteger(id) || id <= 0) return; if (event.target.checked) state.selected.add(id); else state.selected.delete(id); renderAccounts(); });
   $('jobs').addEventListener('click', (event) => { const stop = event.target.closest('[data-stop-job]'); const logs = event.target.closest('[data-job-logs]'); if (logs) { $('log-job').value = logs.dataset.jobLogs; location.hash = 'logs'; if (state.page === 'logs') loadLogs(); } if (stop) report(async () => { if (window.confirm('停止这一个后台任务？\n已完成的注册或导入不会回滚，其他任务不受影响。')) await stopJob(stop.dataset.stopJob); }); });
-  $('continuations').addEventListener('click', (event) => { const button = event.target.closest('[data-resume-index]'); if (!button) return; report(async () => { const item = state.continuations[Number(button.dataset.resumeIndex)]; if (!item?.eligible) throw new Error(item?.reason || '该记录不能继续'); if (!window.confirm('继续 ' + (item.email || item.phoneMasked || '所选本地账号') + '？\n从已有记录继续绑定邮箱 / 获取 token，不重新租号。可能发送验证码；成功后自动导入。')) return; await mutate('/api/console/register/resume', { selectedKey: item.selectedKey, revision: item.revision, autoImport: true }); }); });
+  $('continuations').addEventListener('click', (event) => { const button = event.target.closest('[data-resume-index]'); if (!button) return; report(async () => { const item = state.continuations[Number(button.dataset.resumeIndex)], issue = continuationIssue(item); if (issue) throw new Error(issue); if (!window.confirm('继续 ' + (item.email || item.phoneMasked || '所选本地账号') + '？\n从已有记录继续绑定邮箱 / 获取 token，不重新租号。可能发送验证码；成功后自动导入。')) return; await mutate('/api/console/register/resume', { selectedKey: item.selectedKey, revision: item.revision, autoImport: true }); }); });
   for (const id of ['log-source', 'log-level', 'log-job', 'log-file']) $(id).addEventListener('change', () => loadLogs());
   $('log-query').addEventListener('search', () => loadLogs()); $('log-query').addEventListener('keydown', (event) => { if (event.key === 'Enter') loadLogs(); });
   $('logs-refresh').addEventListener('click', () => loadLogs()); $('logs-more').addEventListener('click', () => loadLogs(true));
@@ -485,7 +529,8 @@
     const settings = await request('/api/console/settings');
     if (!state.overview) throw new Error('工作台尚未完成首次同步。');
     state.overview.settings = settings; state.settingsDirty = false; state.registrationDirty = false; state.registrationRevision = null; renderSettings();
-    notice('已重新读取服务端配置。', 'success');
+    if (state.pending?.url === '/api/console/settings') notice('已重新读取服务端配置，但上次保存结果仍待核对。请使用“核对本次请求”；若仍无法确认，请按原请求时间核对服务端操作日志。重新读取不会解除待核对记录。');
+    else notice('已重新读取服务端配置。', 'success');
   }));
   $('registration-settings-form').addEventListener('submit', (event) => { event.preventDefault(); report(async () => {
     const changes = {};

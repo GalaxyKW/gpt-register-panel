@@ -2092,7 +2092,12 @@ function runCommand(command, args, options = {}) {
     }
     const childEnvironment = { [PHASE3_SUPERVISION_ENV_NAME]: supervisionId };
     for (const [name, value] of Object.entries(options.env || process.env)) {
-      if (name !== PHASE3_SUPERVISION_ENV_NAME) childEnvironment[name] = value;
+      if (name !== PHASE3_SUPERVISION_ENV_NAME && name !== 'GPT_REGISTER_PANEL_JOB_ID') childEnvironment[name] = value;
+    }
+    // Only the internal task identity may associate an engine log with a
+    // panel job; never inherit an unrelated caller's environment binding.
+    if (typeof options.jobId === 'string' && /^job_[a-f0-9]{24}$/.test(options.jobId)) {
+      childEnvironment.GPT_REGISTER_PANEL_JOB_ID = options.jobId;
     }
     try {
       child = spawn(command, args, {
@@ -2405,6 +2410,7 @@ async function runPhase3JobNow({
       };
       browserProfile = createPhase3BrowserProfile();
       const commandOptions = {
+        jobId,
         cwd: pinnedRootPath,
         env: { ...phase3Environment(), [PROFILE_ENV]: browserProfile.path },
         timeoutMs: process.env.PANEL_PHASE3_TIMEOUT_MS,

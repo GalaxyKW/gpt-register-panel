@@ -87,10 +87,16 @@ function safeView(configuration, rootDirectory) {
       : { value: publicValue(key, spec), ...(spec[1] === 'enum' ? { options: spec[2] } : {}), ...(spec[1] === 'integer' ? { min: spec[2], max: spec[3] } : {}) }) }));
   const issues = [];
   if (!raw.heroSmsApiKey) issues.push('缺少短信 API Key');
-  if (!raw.mailBaseUrl || !(raw.mailDomain || raw.mailDomains?.length)) issues.push('缺少邮箱地址或域名');
-  if (!raw.mailAdminToken && !raw.mailAdminPassword) issues.push('缺少邮箱鉴权配置');
+  const phase3Issues = [];
+  if (!raw.mailBaseUrl || !(raw.mailDomain || raw.mailDomains?.length)) phase3Issues.push('缺少邮箱地址或域名');
+  if (!raw.mailAdminToken && !raw.mailAdminPassword) phase3Issues.push('缺少邮箱鉴权配置');
+  // OAuth uses the fixed engine route, not an SMS key or country catalog.
+  // This is configuration readiness only; scoped live mail/OAuth preflight
+  // still validates transport, authentication and browser launch before login.
+  issues.push(...phase3Issues);
   if (!countries.length) issues.push('无法读取注册国家清单');
-  return { revision, fields, countries, ready: issues.length === 0, issues, storage: FILE,
+  return { revision, fields, countries, ready: issues.length === 0, issues,
+    phase3Ready: phase3Issues.length === 0, phase3Issues, storage: FILE,
     lastRequestId: /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(configuration.overlay.panelSettingsWriteId || '') ? configuration.overlay.panelSettingsWriteId : null };
 }
 function readRegistrationSettings({ rootDirectory = process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register' } = {}) {
