@@ -137,6 +137,26 @@ test('Sub2API error terminals are definite failures without returning remote tex
   assert.equal(JSON.stringify(logs).includes(opaqueDetail), false);
 });
 
+test('Sub2API test failures preserve safe network and upstream categories, not response secrets', async () => {
+  const logs = [];
+  const client = clientWithLogs(logs);
+  for (const [error, category, status] of [
+    ['Request failed: Post "https://synthetic-private-endpoint/": context deadline exceeded', 'network', null],
+    ['API returned 502: synthetic-private-response', 'upstream', 502],
+    ['API returned 404: {"error":{"code":"model_not_found","message":"synthetic-private-message"}}', 'model_unavailable', 404],
+  ]) {
+    const result = await withFetch(async () => response('data: ' + JSON.stringify({ type: 'error', error }) + '\n\n'),
+      () => client.testAccount(8, { modelId: 'gpt-5.6-luna' }));
+    assert.equal(result.success, false);
+    assert.equal(result.failureCategory, category);
+    assert.equal(result.upstreamStatus, status);
+    assert.equal(JSON.stringify(result).includes('synthetic-private'), false);
+    assert.equal(logs.at(-1).fields.failureCategory, category);
+    assert.equal(logs.at(-1).fields.upstreamStatus, status);
+  }
+  assert.equal(JSON.stringify(logs).includes('synthetic-private'), false);
+});
+
 test('Sub2API contradictory, malformed, and incomplete SSE outcomes remain unknown', async () => {
   const logs = [];
   const client = clientWithLogs(logs);

@@ -1214,6 +1214,19 @@ function identityCompletionTarget(value) {
     targetRevision: value.targetRevision, sourceContentHash: value.sourceContentHash };
 }
 
+// Presentation only: these rows still require explicit identity review and
+// remain blocked by the ordinary import action's conflict checks.
+function pendingIdentityCompletionCandidate(plan, item) {
+  if (effectivePlanAction(item) !== 'conflict' || item?.conflictingVersions === true
+      || item?.selectedSourceSuperseded === true || !Array.isArray(plan?.identityCompletionCandidates)) return null;
+  const matches = plan.identityCompletionCandidates.filter((candidate) => (
+    candidate?.selectedKey === identityCompletionSourceKey(item)
+  ));
+  const candidate = matches[0];
+  return matches.length === 1 && candidate.identityCompletion === 'account_id'
+    && identityCompletionTarget(candidate) ? candidate : null;
+}
+
 function identityCompletionSelection(plan = state.plan) {
   const selectedKeys = plan?.selectedKeys;
   const candidates = plan?.identityCompletionCandidates;
@@ -1906,7 +1919,7 @@ function renderPlan(plan) {
     return;
   }
   const counts = items.reduce((result, item) => {
-    const action = effectivePlanAction(item);
+    const action = pendingIdentityCompletionCandidate(plan, item) ? 'identityCompletion' : effectivePlanAction(item);
     const previous = Object.prototype.hasOwnProperty.call(result, action) ? result[action] : 0;
     result[action] = previous + 1;
     return result;
@@ -1916,6 +1929,7 @@ function renderPlan(plan) {
   )).length;
   elements.planSummary.textContent = '新增 ' + (counts.create || 0) + ' · 更新 ' + (counts.update || 0)
     + ' · 跳过 ' + (counts.skip || 0) + ' · 冲突 ' + (counts.conflict || 0)
+    + (counts.identityCompletion ? ' · 待核对补全身份 ' + counts.identityCompletion : '')
     + (supersededSelectionCount ? ' · 旧副本改用最新 ' + supersededSelectionCount : '');
   elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12)
     + ' · 选择 ' + state.plan.selectedKeys.length
@@ -1924,10 +1938,7 @@ function renderPlan(plan) {
   elements.planRows.innerHTML = items.map((item) => {
     const action = effectivePlanAction(item);
     const reason = effectivePlanReason(item);
-    const candidates = Array.isArray(plan.identityCompletionCandidates)
-      ? plan.identityCompletionCandidates.filter((candidate) => candidate?.selectedKey === identityCompletionSourceKey(item)
-        && candidate.identityCompletion === 'account_id' && identityCompletionTarget(candidate)) : [];
-    const candidate = candidates.length === 1 ? candidates[0] : null;
+    const candidate = pendingIdentityCompletionCandidate(plan, item);
     const completionNote = plan.identityCompletionConfirmed === true && item.identityCompletion === 'account_id'
       ? (action === 'update' ? '同 User ID 核验一致，仅补缺失 Account ID 并更新 token；保留原 ID #' + item.accountId
         : '跳过：本次不补 Account ID、不更新 token；保留原 ID #' + item.accountId) : '';
@@ -1949,7 +1960,7 @@ function renderPlan(plan) {
         + escapeHtml(actualPath) + '</small>'
       : '';
     return '<tr>'
-    + '<td><span class="badge ' + (action === 'conflict' ? 'badge-danger' : action === 'skip' ? 'badge-neutral' : action === 'update' ? 'badge-warning' : 'badge-success') + '">' + escapeHtml(actionLabel(action)) + '</span></td>'
+    + '<td><span class="badge ' + (candidate ? 'badge-warning' : action === 'conflict' ? 'badge-danger' : action === 'skip' ? 'badge-neutral' : action === 'update' ? 'badge-warning' : 'badge-success') + '">' + escapeHtml(candidate ? '待补全身份' : actionLabel(action)) + '</span></td>'
     + '<td>' + escapeHtml(candidate ? '#' + candidate.accountId + ' ' + candidate.accountName
       : item.accountName || '-') + '</td>'
     + '<td>' + escapeHtml(item.email || '-') + '</td>'

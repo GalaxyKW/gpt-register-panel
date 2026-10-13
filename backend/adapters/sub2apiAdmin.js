@@ -11,6 +11,7 @@ const { performance } = require('node:perf_hooks');
 const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 const { maintenanceEvidenceFromRaw } = require('../accountMaintenance');
+const { classifyAccountTestFailure } = require('../lib/accountTestFailure');
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
@@ -2269,7 +2270,8 @@ class Sub2ApiAdminClient {
       throw markAccountTestReconciliation(error, 'model_mismatch', { testSuccess: true });
     }
     if (parsedSse.terminal.kind === 'failure') {
-      const detail = 'Sub2API 返回失败测试结果';
+      const diagnostic = classifyAccountTestFailure(completed);
+      const detail = diagnostic.message;
       writeLog(this.logger, 'warn', 'sub2api.account_test_unsuccessful', {
         ...this.logContext,
         accountId,
@@ -2277,11 +2279,15 @@ class Sub2ApiAdminClient {
         statusCode: response.status,
         durationMs: monotonicElapsedMilliseconds(startedAt),
         error: detail,
+        failureCategory: diagnostic.failureCategory,
+        upstreamStatus: diagnostic.upstreamStatus,
       });
       return {
         success: false,
         model: completedModel,
         message: detail,
+        failureCategory: diagnostic.failureCategory,
+        upstreamStatus: diagnostic.upstreamStatus,
         durationMs: monotonicElapsedMilliseconds(startedAt),
       };
     }

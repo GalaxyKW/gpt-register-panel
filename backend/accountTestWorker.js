@@ -14,6 +14,7 @@ const { normalizeIdentityValue } = require('./lib/token');
 const { assertAuditLogCheckpoint, safeFailureMessage } = require('./logger');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
+const { normalizeAccountTestFailure } = require('./lib/accountTestFailure');
 
 let submissionQueue = Promise.resolve();
 
@@ -636,6 +637,8 @@ async function auditResult(db, logger, result, actor, jobId, modelId) {
         status: result.status,
         code: result.code || null,
         message: result.message || null,
+        failureCategory: result.failureCategory || null,
+        upstreamStatus: result.upstreamStatus || null,
         durationMs: result.durationMs || 0,
         attempted: result.attempted !== false,
         interruptionReason: result.interruptionReason || null,
@@ -1000,6 +1003,7 @@ async function runAccountTestJobNow({
             { testSuccess: false },
           );
         }
+        const diagnostic = normalizeAccountTestFailure(test);
         const result = {
           accountId: id,
           accountName: account.name || null,
@@ -1008,7 +1012,10 @@ async function runAccountTestJobNow({
           // Keep the worker boundary defensive even though the production
           // adapter currently emits a fixed failure message. Injected clients
           // and future adapters must not be able to persist or log credentials.
-          message: safeErrorMessage(test.message || '常规请求失败'),
+          message: diagnostic.failureCategory === 'unknown'
+            ? safeErrorMessage(test.message || '常规请求失败') : diagnostic.message,
+          failureCategory: diagnostic.failureCategory,
+          upstreamStatus: diagnostic.upstreamStatus,
           testSuccess: false,
           statusBefore,
           enabled: afterFailure.schedulable === true,
@@ -1027,6 +1034,8 @@ async function runAccountTestJobNow({
           code: result.code,
           durationMs: result.durationMs,
           error: result.message,
+          failureCategory: result.failureCategory,
+          upstreamStatus: result.upstreamStatus,
         });
         continue;
       }

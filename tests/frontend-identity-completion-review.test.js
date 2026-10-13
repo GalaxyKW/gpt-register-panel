@@ -75,6 +75,35 @@ test('identity completion explicitly reviews every original ID before producing 
   assert.equal(context.identityCompletionPlanProblem(context.state.plan), '');
 });
 
+test('reviewable missing identity is labeled separately without changing its blocked import action', () => {
+  const { context } = harness();
+  const plan = ordinaryPlan();
+  assert.deepEqual(clone(context.pendingIdentityCompletionCandidate(plan, plan.items[0])), candidate);
+  assert.equal(plan.items[0].action, 'conflict');
+  for (const alter of [
+    value => { value.items[0].action = 'update'; },
+    value => { value.items[0].conflictingVersions = true; },
+    value => { value.items[0].selectedSourceSuperseded = true; },
+    value => { value.identityCompletionCandidates.push(clone(candidate)); },
+    value => { value.identityCompletionCandidates[0].targetRevision = 'invalid'; },
+    value => { value.identityCompletionCandidates[0].identityCompletion = 'user_id'; },
+    value => { value.identityCompletionCandidates[0].selectedKey = 'token:tokens:tokens/other.json'; },
+  ]) {
+    const invalid = ordinaryPlan(); alter(invalid);
+    assert.equal(context.pendingIdentityCompletionCandidate(invalid, invalid.items[0]), null);
+  }
+  Object.assign(context, { effectivePlanReason: item => item.reason, finiteNumber: Number,
+    importGroupBindingLabel: () => '', updateImportButtonState() {},
+    actionLabel: action => action, actionReasonLabel: reason => reason, formatFingerprint: () => '-' });
+  Object.assign(context.elements, { planPanel: {}, planSummary: {}, planVersion: {}, planRows: {}, importButton: {} });
+  vm.runInContext(section('function renderPlan(', 'function applyFilters('), context);
+  context.renderPlan(plan);
+  assert.match(context.elements.planSummary.textContent, /冲突 0 · 待核对补全身份 1/);
+  assert.match(context.elements.planRows.innerHTML, /badge-warning[^]*待补全身份/);
+  assert.equal(context.state.plan.items[0].action, 'conflict');
+  assert.match(context.elements.identityCompletionReviewHint.textContent, /Account ID/);
+});
+
 test('identity completion never silently drops a mixed or duplicate selection', async () => {
   for (const modify of [
     (ctx) => { ctx.state.selected.add('token:tokens:tokens/other.json'); ctx.state.plan.selectedKeys.push('token:tokens:tokens/other.json'); },

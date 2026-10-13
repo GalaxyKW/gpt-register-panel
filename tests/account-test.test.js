@@ -789,6 +789,37 @@ test('known failed test messages are redacted again at the worker boundary', asy
   assert.equal(JSON.stringify({ outcome, logRecords }).includes('worker-boundary-marker'), false);
 });
 
+test('worker persists safe test diagnostics without changing an account or copying untrusted metadata', async () => {
+  const account = oauthTestAccount(115, 'active', true);
+  const logRecords = [];
+  const audits = [];
+  const db = fakeWorkerDb();
+  db.audit = async value => { audits.push(value); };
+  let writes = 0;
+  const outcome = await runAccountTestJobNow({
+    accountIds: [account.id], targetBaselines: targetBaselines(account), db,
+    jobId: 'test-safe-network-diagnostics',
+    logger: { checkpoint() { return true; }, info(event, fields) { logRecords.push({ event, fields }); },
+      warn(event, fields) { logRecords.push({ event, fields }); }, error(event, fields) { logRecords.push({ event, fields }); } },
+    client: {
+      async listAccounts() { return [{ ...account }]; }, async getAccount() { return { ...account }; },
+      async testAccount() { return { success: false, failureCategory: 'network', upstreamStatus: 502,
+        message: 'synthetic-private-freeform-detail', extra: 'synthetic-private-extra' }; },
+      async setSchedulable() { writes++; }, async clearAccountError() { writes++; },
+    },
+  });
+  const result = outcome.results[0];
+  assert.equal(result.code, 'upstream_test_failed');
+  assert.equal(result.failureCategory, 'network');
+  assert.equal(result.upstreamStatus, 502);
+  assert.match(result.message, /不代表 token 未导入/);
+  assert.equal(result.statusAfter, 'active');
+  assert.equal(result.enabled, true);
+  assert.equal(writes, 0);
+  assert.ok(audits.some(row => row.details.failureCategory === 'network' && row.details.upstreamStatus === 502));
+  assert.equal(JSON.stringify({ outcome, logRecords, audits }).includes('synthetic-private'), false);
+});
+
 test('worker error redaction fails closed for hostile error accessors and coercion', () => {
   const hostile = Object.create(null);
   let coercionCalls = 0;
