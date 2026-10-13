@@ -129,6 +129,7 @@ const JSON_BODY_ENDPOINTS = new Set([
 const GET_API_ENDPOINTS = new Set([
   '/api/console/overview', '/api/console/settings', '/api/console/logs',
   '/api/console/logs/download', '/api/console/register/continuations',
+  '/api/console/local-tokens',
   '/api/health',
   '/api/snapshot',
   '/api/phase3/local-accounts',
@@ -3501,6 +3502,7 @@ function createServer(options = {}) {
       try {
         if (request.method === 'GET') {
           if (route === '/api/console/overview') jsonResponse(response, 200, await consoleService.overview());
+          else if (route === '/api/console/local-tokens') jsonResponse(response, 200, await consoleService.localTokens());
           else if (route === '/api/console/settings') jsonResponse(response, 200, await consoleService.settings());
           else if (route === '/api/console/logs') jsonResponse(response, 200,
             await consoleService.queryLogs(Object.fromEntries(requestUrl.searchParams)));

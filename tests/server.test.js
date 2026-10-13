@@ -3733,7 +3733,7 @@ test('serves a read-only health endpoint and safe source snapshot', async () => 
 
     const page = await request(baseUrl, '/');
     assert.equal(page.status, 200);
-    assert.match(page.body, /Register Studio/);
+    assert.match(page.body, /<title>账号工作台<\/title>/);
     assert.match(page.body, /console\.js/);
     const advancedPage = await request(baseUrl, '/index.html');
     assert.equal(advancedPage.status, 200);

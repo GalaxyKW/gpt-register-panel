@@ -26,7 +26,7 @@ function harness() {
     fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } }) }; },
   };
   vm.createContext(context);
-  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs };');
+  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected };');
   vm.runInContext(instrumented, context);
   const api = context.harness;
   api.state.connected = true;
@@ -166,7 +166,8 @@ test('console escapes job and network messages and never fabricates network succ
   const { api, element } = harness();
   api.state.overview.jobs = [{ id: 'job_1', type: 'register', status: 'failed', error: '<script>bad</script>' }]; api.renderJobs();
   assert.doesNotMatch(element('jobs').innerHTML, /<script>/);
-  api.renderNetwork(null); assert.match(element('network-channels').innerHTML, /启动任务前/); assert.doesNotMatch(element('network-channels').innerHTML, /已连通/);
+  api.renderNetwork(null); assert.equal((element('network-channels').innerHTML.match(/未检测/g) || []).length, 4); assert.doesNotMatch(element('network-channels').innerHTML, /已连通/);
+  assert.match(element('network-updated').textContent, /启动任务前按所需通道预检/);
   api.renderNetwork({ channels: [{ id: 'sms', name: '短信', ok: false, message: '<img src=x>' }] });
   assert.match(element('network-channels').innerHTML, /需检查/); assert.doesNotMatch(element('network-channels').innerHTML, /<img/);
 });
@@ -322,6 +323,42 @@ test('console log browsing and download use returned opaque file IDs not server 
   assert.match(source, /state\.logFiles\.some\(\(file\) => file\.id === fileId\)/); assert.doesNotMatch(source, /download\?path=/);
 });
 
+test('console direct logs entry and reconnection load logs without resetting pagination on ordinary polls', async () => {
+  const { api, context, calls } = harness();
+  const overview = structuredClone(api.state.overview);
+  api.state.connected = false; api.state.page = 'logs';
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    const body = url === '/api/console/overview' ? overview : url.includes('/continuations') ? { items: [] }
+      : { entries: [{ message: 'synthetic log' }], files: [], nextCursor: 'fixture-cursor' };
+    return { ok: true, status: 200, text: async () => JSON.stringify(body) };
+  };
+  await api.refresh();
+  assert.equal(calls.filter(call => call.url.startsWith('/api/console/logs?')).length, 1);
+  assert.equal(api.state.logs.length, 1); assert.equal(api.state.nextCursor, 'fixture-cursor');
+  await api.refresh();
+  assert.equal(calls.filter(call => call.url.startsWith('/api/console/logs?')).length, 1);
+  api.state.connected = false; await api.refresh();
+  assert.equal(calls.filter(call => call.url.startsWith('/api/console/logs?')).length, 2);
+  assert.ok(calls.every(call => call.options.method === undefined));
+});
+
+test('console task log shortcut clears previous file and search filters instead of hiding the chosen task', async () => {
+  const { api, context, calls, element } = harness();
+  api.state.page = 'logs'; api.state.nextCursor = 'old-file-cursor';
+  for (const [id, value] of [['log-source', 'panel'], ['log-level', 'error'], ['log-file', 'old-file'], ['log-query', 'old-message']]) element(id).value = value;
+  const jobId = 'job_' + 'a'.repeat(24);
+  context.fetch = async (url, options) => {
+    calls.push({ url, options });
+    return { ok: true, status: 200, text: async () => JSON.stringify({ entries: [], files: [], nextCursor: null }) };
+  };
+  element('jobs').listeners.click({ target: { closest: selector => selector === '[data-job-logs]' ? { dataset: { jobLogs: jobId } } : null } });
+  const query = new URL(calls[0].url, 'http://localhost').searchParams;
+  assert.equal(query.get('jobId'), jobId);
+  for (const key of ['fileId', 'source', 'level', 'q', 'cursor']) assert.equal(query.has(key), false, key);
+  assert.equal(api.state.nextCursor, null);
+});
+
 test('console log binding gaps are shown as plain text and cleared when the next response has no notice', async () => {
   const { api, context, element } = harness();
   const bindingNotice = '未找到与该任务绑定的注册机日志。请清空任务筛选后按文件查看，不会按时间猜测归属。 <script>fixture</script>';
@@ -439,7 +476,8 @@ test('console legacy settings pending stays read-only and reload explains that i
 test('console actual update action overrides classification label when identity requires review', () => {
   const { api, element } = harness(); element('account-filter').value = 'all';
   api.state.overview.accounts = [{ id: 42, classification: 'expired', action: 'review', reason: 'strong_identity_ambiguous' }];
-  api.renderAccounts(); assert.match(element('account-rows').innerHTML, /<td>人工核对<\/td>/); assert.match(element('account-rows').innerHTML, /强身份缺失或匹配不唯一/);
+  api.renderAccounts(); assert.match(element('account-rows').innerHTML, /<td>人工核对<\/td>/);
+  api.openAccountDetail(0); assert.match(element('account-detail').innerHTML, /强身份缺失或匹配不唯一/);
 });
 
 test('console permission failure during uncertain receipt recovery cannot discard original key', async () => {
@@ -574,9 +612,10 @@ test('console distinguishes administrator account lifetime expiry from OAuth exp
   const { api, element } = harness(); element('account-filter').value = 'all';
   api.state.overview.accounts = [{ id: 42, classification: 'manual_disabled', action: 'skip', reason: 'administrator_lifetime_expired' }];
   api.renderAccounts();
-  assert.match(element('account-rows').innerHTML, /管理员设定的账号有效期已到期/);
-  assert.match(element('account-rows').innerHTML, /不是 OAuth token 过期/);
-  assert.match(element('account-rows').innerHTML, /不自动刷新或删除/);
+  api.openAccountDetail(0);
+  assert.match(element('account-detail').innerHTML, /管理员设定的账号有效期已到期/);
+  assert.match(element('account-detail').innerHTML, /不是 OAuth token 过期/);
+  assert.match(element('account-detail').innerHTML, /不自动刷新或删除/);
   assert.match(element('account-rows').innerHTML, /<td>本次跳过<\/td>/);
 });
 
@@ -587,8 +626,141 @@ test('console explains unclassified scheduling pauses and invalidated refresh cr
     { id: 43, classification: 'auth_invalid', action: 'refresh', reason: 'refresh_token_invalidated' },
   ];
   api.renderAccounts();
-  assert.match(element('account-rows').innerHTML, /不能确认是额度耗尽/);
-  assert.match(element('account-rows').innerHTML, /不自动登录或删除/);
-  assert.match(element('account-rows').innerHTML, /刷新凭据已失效，需要本地重新授权/);
+  api.openAccountDetail(0);
+  assert.match(element('account-detail').innerHTML, /不能确认是额度耗尽/);
+  assert.match(element('account-detail').innerHTML, /不自动登录或删除/);
+  api.openAccountDetail(1);
+  assert.match(element('account-detail').innerHTML, /刷新凭据已失效，需要本地重新授权/);
   assert.doesNotMatch(element('account-rows').innerHTML, /temporary_scheduling_pause|refresh_token_invalidated/);
+});
+
+const uiJobId = 'job_' + 'c'.repeat(24);
+function localFixture(overrides = {}) {
+  return { selectedKey: 'token:synthetic', accountId: 160, accountName: 'free00047', eligible: true, action: 'update',
+    targetRevision: 'target-version-1', executionRevision: 'signed-plan-1', sourceContentHash: 'source-version-1',
+    sourceLabel: 'tokens/synthetic.json', matchedBy: 'user_id', identityCompletion: 'account_id',
+    reason: '相同 User ID，可补全 Account ID 并回写原账号', identitySummary: { sourceUserId: 'user-a…', targetUserId: 'user-a…' }, ...overrides };
+}
+function mockConsole(h, { localItems = [localFixture()], job = { id: uiJobId, type: 'console_maintain', status: 'queued', result: {} }, postError = null } = {}) {
+  h.context.fetch = async (url, options = {}) => {
+    h.calls.push({ url, options });
+    if (options.method === 'POST' && postError) throw postError;
+    const body = options.method === 'POST' ? { jobId: uiJobId, status: 'queued' }
+      : url === '/api/console/overview' ? h.api.state.overview
+        : url === '/api/console/local-tokens' ? { items: localItems }
+          : url === '/api/console/register/continuations' ? { items: [] } : job;
+    return { ok: true, status: options.method === 'POST' ? 202 : 200, text: async () => JSON.stringify(body) };
+  };
+}
+
+test('console main workspace has native results, account detail and no primary advanced-page dependency', () => {
+  for (const id of ['task-dialog', 'account-dialog', 'local-token-list', 'local-token-update', 'test-selected', 'import-new', 'account-jobs']) assert.match(html, new RegExp('id="' + id + '"'));
+  assert.equal((html.match(/href="\/index.html"/g) || []).length, 1);
+  assert.doesNotMatch(html.slice(0, html.indexOf('id="page-settings"')), /href="\/index.html"/);
+});
+
+test('console local-token preview explicitly separates identity completion from creation and escaping', async () => {
+  const h = harness(); mockConsole(h, { localItems: [localFixture(), localFixture({ selectedKey: 'new', action: 'create', eligible: false, accountId: null, reason: '<script>unsafe</script>' })] });
+  await h.api.loadLocalTokens();
+  assert.match(h.element('local-token-list').innerHTML, /补全远端 Account ID/);
+  assert.match(h.element('local-token-list').innerHTML, /回写目标 #160/);
+  assert.match(h.element('local-token-list').innerHTML, /data-local-token-index="1" disabled/);
+  assert.match(h.element('local-token-list').innerHTML, /&lt;script&gt;/);
+  assert.doesNotMatch(h.element('local-token-list').innerHTML, /<script>/);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('console local-token update freezes exact source target and signed execution version in durable receipt', async () => {
+  const h = harness(); mockConsole(h); await h.api.loadLocalTokens(); h.api.state.localSelected.add('token:synthetic');
+  let confirmed = ''; h.context.window.confirm = text => { confirmed = text; return true; };
+  await h.api.updateLocalTokens();
+  const writes = h.calls.filter(call => call.options.method === 'POST'); assert.equal(writes.length, 1);
+  assert.deepEqual(JSON.parse(writes[0].options.body), { accountIds: [160], importNew: false, refreshInvalid: false, deleteBanned: false,
+    localTokenTargets: [{ selectedKey: 'token:synthetic', accountId: 160, targetRevision: 'target-version-1', sourceContentHash: 'source-version-1', executionRevision: 'signed-plan-1' }] });
+  assert.match(confirmed, /#160 free00047/); assert.match(confirmed, /不新增账号、不重新登录、不租号/);
+  assert.equal(h.element('task-dialog').open, true); assert.equal(h.api.state.pending, null);
+});
+
+test('console local-token update never silently accepts changed source target or signed execution version', async () => {
+  for (const field of ['sourceContentHash', 'targetRevision', 'executionRevision', 'accountId']) {
+    const h = harness(); mockConsole(h); await h.api.loadLocalTokens(); h.api.state.localSelected.add('token:synthetic');
+    mockConsole(h, { localItems: [localFixture({ [field]: field === 'accountId' ? 174 : 'changed' })] });
+    await assert.rejects(h.api.updateLocalTokens(), /预览已更新/);
+    assert.equal(h.api.state.localSelected.size, 0); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  }
+});
+
+test('console local-token duplicate targets and missing execution proof remain ineligible', async () => {
+  const h = harness(); mockConsole(h, { localItems: [localFixture(), localFixture({ selectedKey: 'second' })] }); await h.api.loadLocalTokens();
+  for (const key of ['token:synthetic', 'second']) h.api.state.localSelected.add(key);
+  await assert.rejects(h.api.updateLocalTokens(), /不同原账号/); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  assert.equal(h.api.localTarget(localFixture({ executionRevision: '' })), null);
+  assert.equal(h.api.localTarget(localFixture({ eligible: false })), null);
+});
+
+test('console local-token unknown result keeps original receipt and blocks all new workflow writes', async () => {
+  const h = harness(); mockConsole(h); await h.api.loadLocalTokens(); h.api.state.localSelected.add('token:synthetic');
+  mockConsole(h, { postError: new Error('response lost') }); await assert.rejects(h.api.updateLocalTokens(), /response lost/);
+  const pending = JSON.parse(h.store.get('registerStudio.pending.v1'));
+  assert.equal(pending.body.localTokenTargets[0].accountId, 160); assert.equal(pending.body.localTokenTargets[0].executionRevision, 'signed-plan-1');
+  assert.equal(h.element('local-token-update').disabled, true); assert.equal(h.element('test-selected').disabled, true); assert.equal(h.element('import-new').disabled, true);
+  await assert.rejects(h.api.testSelected(), /上一条请求/); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 1);
+});
+
+test('console only-test uses fresh target revisions and never refreshes imports or deletes', async () => {
+  const h = harness(); h.api.state.overview.accounts = [{ id: 160, targetRevision: 'fresh-target', executionRevision: 'fresh-execution' }];
+  h.api.state.selected.add(160); h.api.state.refreshing = true; h.element('test-model').value = 'gpt-5.6-luna'; mockConsole(h);
+  await h.api.testSelected();
+  assert.equal(h.calls[0].url, '/api/console/overview', 'must independently read even if polling is already in flight');
+  const writes = h.calls.filter(call => call.options.method === 'POST'); assert.equal(writes.length, 1);
+  assert.deepEqual(JSON.parse(writes[0].options.body), { accountIds: [160], importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true,
+    accountTargets: [{ accountId: 160, targetRevision: 'fresh-target', executionRevision: 'fresh-execution' }], modelId: 'gpt-5.6-luna' });
+});
+
+test('console only-test refuses absent identity revisions and global holds while reads stay available', async () => {
+  for (const account of [{ id: 160 }, { id: 160, targetRevision: 'target' }]) {
+    const h = harness(); h.api.state.overview.accounts = [account]; h.api.state.selected.add(160); mockConsole(h);
+    await assert.rejects(h.api.testSelected(), /无法确认/); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  }
+  const h = harness(); h.api.state.overview.reconciliation = { total: 1, returned: 1, truncated: false }; mockConsole(h);
+  await assert.rejects(h.api.testSelected(), /人工对账/); await h.api.loadLocalTokens(); assert.ok(h.api.state.localTokensLoaded);
+});
+
+test('console task detail preserves successful writes when only-test fails and renders safe failure category', async () => {
+  const h = harness(); mockConsole(h, { job: { id: uiJobId, type: 'console_maintain', status: 'partial', result: {
+    stage: 'completed', summary: { tokensGenerated: 1, tokensUpdated: 1, tested: 1, verified: 0, testFailed: 1 },
+    items: [{ accountId: 160, accountName: 'free00047', phases: { tokenGenerated: true, tokenUpdated: true, tested: true, verified: false }, failureCategory: 'model_unavailable', upstreamStatus: 403, message: '测试未通过，不代表导入失败' }],
+  } } });
+  await h.api.openTaskDetail(uiJobId);
+  const text = h.element('task-detail').innerHTML;
+  assert.match(text, /回写原账号<\/span><strong>1/); assert.match(text, /测试通过<\/span><strong>0/);
+  assert.match(text, /模型不可用 · HTTP 403/); assert.match(text, /不代表导入失败/); assert.match(text, /data-select-result-account="160"/);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('console task detail bounds child reads and never trusts unrelated children or raw payloads', async () => {
+  const h = harness(); const childIds = Array.from({ length: 15 }, (_, index) => 'job_' + (index + 1).toString(16).padStart(24, '0'));
+  h.context.fetch = async (url, options = {}) => { h.calls.push({ url, options }); const id = url.split('/').at(-1); return { ok: true, status: 200,
+    text: async () => JSON.stringify(id === uiJobId ? { id, result: { childJobIds: ['../outside', ...childIds] } } : { id, payload: { parentJobId: 'job_' + 'f'.repeat(24), secret: 'NEVER_RENDER_PAYLOAD' }, error: 'UNRELATED_ERROR' }) }; };
+  await h.api.openTaskDetail(uiJobId);
+  assert.equal(h.calls.length, 13); assert.ok(h.calls.every(call => /^\/api\/jobs\/job_[a-f0-9]{24}$/.test(call.url)));
+  assert.match(h.element('task-detail').innerHTML, /无法核实关联/); assert.doesNotMatch(h.element('task-detail').innerHTML, /NEVER_RENDER_PAYLOAD|UNRELATED_ERROR/);
+});
+
+test('console known acceptance is not changed to unknown if task detail GET fails', async () => {
+  const h = harness(); mockConsole(h); const fetch = h.context.fetch;
+  h.context.fetch = async (url, options) => { if (url.startsWith('/api/jobs/')) throw new Error('detail unavailable'); return fetch(url, options); };
+  const result = await h.api.mutate('/api/console/maintain', { importNew: true, refreshInvalid: false, deleteBanned: false });
+  assert.equal(result.jobId, uiJobId); assert.equal(h.api.state.pending, null); assert.equal(h.store.has('registerStudio.pending.v1'), false);
+  assert.match(h.element('task-detail').innerHTML, /已接受的任务仍在服务器运行/); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 1);
+});
+
+test('console task detail matches running parent projection and does not mistake attempts for confirmed tests', async () => {
+  const h = harness(); mockConsole(h, { job: { id: uiJobId, type: 'console_maintain', status: 'queued', result: {
+    startedAt: new Date().toISOString(), stage: 'verifying_account', summary: { tokensUpdated: 1, tested: 1, verified: 0 },
+  } } });
+  await h.api.openTaskDetail(uiJobId);
+  assert.match(h.element('task-detail').innerHTML, /进行中/); assert.doesNotMatch(h.element('task-detail').innerHTML, /排队中/);
+  assert.match(h.element('task-detail').innerHTML, /已提交测试<\/span><strong>1/);
+  assert.match(h.element('task-detail').innerHTML, /测试通过<\/span><strong>0/);
 });

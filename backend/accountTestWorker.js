@@ -744,6 +744,7 @@ async function runAccountTestJobNow({
   jobTimeoutMs: requestedJobTimeoutMs = null,
   signal: externalSignal = null,
   persistResult = null,
+  beforeTestAccount = null,
 }) {
   throwIfJobInterrupted(externalSignal);
   accountIds = normalizeAccountTestJobAccountIds(accountIds);
@@ -914,6 +915,15 @@ async function runAccountTestJobNow({
       schedulableBefore = current.schedulable;
       const shouldRecover = accountStatus(account) === 'error';
 
+      // Internal-only policy hook for the unified console. Check the final
+      // fresh account, not its earlier list/preview snapshot. Never accept
+      // this callback from an HTTP request or persist it in a task payload.
+      if (beforeTestAccount !== null) {
+        if (typeof beforeTestAccount !== 'function') {
+          throw Object.assign(new Error('账号测试策略检查不可用，未发送测试'), { code: 'ACCOUNT_TEST_POLICY_INVALID' });
+        }
+        await beforeTestAccount(current);
+      }
       assertAuditLogCheckpoint(logger, 'account_test.test_mutation_checkpoint', {
         jobId,
         actor,
@@ -1501,7 +1511,8 @@ async function runAccountTestJobNow({
         accountId: id,
         accountName: account?.name || null,
         status: 'failed',
-        code: ['ACCOUNT_TEST_SUBMITTED_STATE_CHANGED', 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED']
+        code: ['ACCOUNT_TEST_SUBMITTED_STATE_CHANGED', 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED',
+          'CONSOLE_TEST_TARGET_CHANGED', 'ACCOUNT_TEST_POLICY_INVALID']
           .includes(error?.code)
           ? error.code
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),

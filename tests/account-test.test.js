@@ -139,6 +139,43 @@ function targetBaselines(...accounts) {
   return accounts.map((account) => accountTestTargetBaseline(account));
 }
 
+test('internal console policy rechecks final account evidence before any test or scheduler mutation', async () => {
+  for (const category of ['quota_wait', 'confirmed_banned']) {
+    const listed = oauthTestAccount(47, 'error', false, { planType: 'free', maintenanceEvidence: { category: 'network_unknown' } });
+    const current = { ...listed, maintenanceEvidence: { category } };
+    // This evidence change deliberately does not change the legacy baseline.
+    assert.deepEqual(accountTestTargetBaseline(listed), accountTestTargetBaseline(current));
+    const calls = [];
+    const result = await runAccountTestJobNow({ accountIds: [47], targetBaselines: targetBaselines(listed),
+      client: {
+        async listAccounts() { calls.push('list'); return [listed]; },
+        async getAccount() { calls.push('get'); return current; },
+        async testAccount() { calls.push('test'); return { success: true }; },
+        async setSchedulable() { calls.push('schedule'); },
+      },
+      async beforeTestAccount(account) {
+        calls.push('policy');
+        assert.equal(account.maintenanceEvidence.category, category);
+        throw Object.assign(new Error('账号维护状态已变化，未发送测试'), { code: 'CONSOLE_TEST_TARGET_CHANGED' });
+      },
+    });
+    assert.deepEqual(calls, ['list', 'get', 'policy', 'get']);
+    assert.equal(result.attemptedCount, 0);
+    assert.equal(result.results[0].code, 'CONSOLE_TEST_TARGET_CHANGED');
+    assert.equal(result.results[0].attempted, false);
+  }
+});
+
+test('internal console policy cannot be a non-callable value', async () => {
+  const account = oauthTestAccount(47, 'active', true);
+  let tested = false;
+  const result = await runAccountTestJobNow({ accountIds: [47], targetBaselines: targetBaselines(account),
+    beforeTestAccount: 'allow', client: { async listAccounts() { return [account]; },
+      async getAccount() { return account; }, async testAccount() { tested = true; return { success: true }; } } });
+  assert.equal(tested, false);
+  assert.equal(result.results[0].code, 'ACCOUNT_TEST_POLICY_INVALID');
+});
+
 test('account test aborts promptly while waiting for the control-plane lock', async () => {
   let markEntered;
   let releaseBlocker;

@@ -103,7 +103,11 @@ async function fixture(t, options = {}) {
   async function request(route, body, key = crypto.randomUUID()) {
     const response = await fetch('http://127.0.0.1:' + server.address().port + route, {
       ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
-      headers: { 'x-panel-token': admin, 'content-type': 'application/json', 'idempotency-key': key },
+      // Fixture jobs are polled directly through SQLite and may leave HTTP
+      // idle beyond Node 18's 5s keep-alive timeout. Do not reuse an undici
+      // socket whose server-side FIN is still queued under full-suite load.
+      // Each request still occurs exactly once: no retry masks mutations.
+      headers: { 'x-panel-token': admin, 'content-type': 'application/json', 'idempotency-key': key, connection: 'close' },
       signal: AbortSignal.timeout(15000),
     });
     const value = await response.json();
@@ -121,6 +125,18 @@ async function fixture(t, options = {}) {
   return { db, root, client, remote, writes, tested, calls, token, account, request, waitJob, server };
 }
 
+test('console API fixture uses one fresh connection per request without idle-socket retries', async t => {
+  const f = await fixture(t);
+  const sockets = new Set(); const connections = [];
+  f.server.on('request', request => { sockets.add(request.socket); connections.push(request.headers.connection); });
+  for (let i = 0; i < 3; i += 1) {
+    f.server.closeIdleConnections();
+    assert.equal((await f.request('/api/health')).status, 200);
+  }
+  assert.deepEqual(connections, ['close', 'close', 'close']);
+  assert.equal(sockets.size, 3, 'fixture must not share an idle socket across business steps');
+});
+
 test('console registration completes server-side register import verify and durable replay without browser continuation', async t => {
   const f = await fixture(t);
   const body = { count: 1, country: 'US', operator: '', autoImport: true };
@@ -132,11 +148,257 @@ test('console registration completes server-side register import verify and dura
   assert.deepEqual(f.tested, [1]);
   assert.equal(job.result.childJobIds.length, 3);
   assert.equal(job.result.summary.imported, 1);
+  assert.equal(job.result.summary.tokensGenerated, 1); assert.equal(job.result.summary.verified, 1);
   const replay = await f.request('/api/console/register', body, key);
   assert.equal(replay.body.jobId, admission.body.jobId);
   assert.equal(replay.headers.get('idempotency-replayed'), 'true');
   assert.equal(f.calls.registration, 1);
   assert.equal((await f.request('/api/console/register', { ...body, count: 2 }, key)).status, 409);
+});
+
+function existingTokenBody(rows) {
+  return { accountIds: rows.map(row => row.accountId), importNew: false, refreshInvalid: false, deleteBanned: false,
+    localTokenTargets: rows.map(({ selectedKey, accountId, targetRevision, sourceContentHash, executionRevision }) => (
+      { selectedKey, accountId, targetRevision, sourceContentHash, executionRevision }
+    )) };
+}
+function testOnlyBody(rows, modelId) {
+  return { accountIds: rows.map(row => row.id), importNew: false, refreshInvalid: false, deleteBanned: false,
+    testOnly: true, accountTargets: rows.map(({ id, targetRevision, executionRevision }) => (
+      { accountId: id, targetRevision, executionRevision }
+    )), ...(modelId ? { modelId } : {}) };
+}
+function invalidRemote(f, id, { missingAccount = false, ...changes } = {}) {
+  const account = f.account(id, { status: 'error', schedulable: false,
+    error_message: JSON.stringify({ error: { code: 'invalid_grant' } }), ...changes });
+  if (missingAccount) delete account.credentials.chatgpt_account_id;
+  return account;
+}
+
+test('main console explicitly completes three user-only identities and updates original IDs without Phase3 or creation', async t => {
+  const f = await fixture(t, { importer: require('../backend/sync').executeImport });
+  for (const id of [160, 174, 187]) { f.token(id); invalidRemote(f, id, { missingAccount: true }); }
+  const preview = await f.request('/api/console/local-tokens');
+  assert.equal(preview.status, 200);
+  const rows = preview.body.items;
+  assert.equal(rows.length, 3);
+  assert.equal(rows.every(row => row.eligible && row.identityCompletion === 'account_id' && row.matchedBy === 'user_id'), true);
+  assert.equal(rows.every(row => row.identitySummary.targetAccountId === null && row.executionRevision), true);
+  const body = existingTokenBody(rows); const key = crypto.randomUUID();
+  const admitted = await f.request('/api/console/maintain', body, key);
+  assert.equal(admitted.status, 202);
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'succeeded', job.error || JSON.stringify(job.result.items));
+  assert.deepEqual(f.writes, [160, 174, 187].map(id => ({ action: 'update', id })));
+  assert.deepEqual(f.tested, [160, 174, 187]);
+  assert.equal(job.result.summary.tokensUpdated, 3); assert.equal(job.result.summary.verified, 3);
+  assert.equal(job.result.summary.tokensGenerated, 0); assert.equal(f.calls.registration, 0); assert.equal(f.calls.preflight, 0);
+  assert.equal(f.remote.every(account => account.credentials.chatgpt_account_id === 'account-' + account.id), true);
+  assert.equal(fs.readdirSync(path.join(f.root, 'backups')).length >= 3, true);
+  const children = await Promise.all(job.result.childJobIds.map(id => f.db.getJob(id)));
+  assert.deepEqual(children.map(child => child.type), ['token_import', 'account_test', 'token_import', 'account_test', 'token_import', 'account_test']);
+  const replay = await f.request('/api/console/maintain', body, key);
+  assert.equal(replay.body.jobId, job.id); assert.equal(f.writes.length, 3);
+});
+
+test('main console updates fully matched existing token and keeps written outcome when model testing fails', async t => {
+  const f = await fixture(t, { importer: require('../backend/sync').executeImport,
+    tester: async ({ accountIds, db, jobId, persistResult, client }) => withControlPlaneLock(async () => {
+      await db.startMutationJob(jobId);
+      assert.equal(client.logContext.jobId, jobId);
+      assert.match(client.logContext.parentJobId, /^job_[a-f0-9]{24}$/);
+      const result = { requested: 1, succeeded: 0, failed: 1,
+        results: [{ accountId: accountIds[0], status: 'failed', failureCategory: 'model_unavailable', upstreamStatus: 404 }] };
+      await persistResult(result); return result;
+    }) });
+  f.token(47); invalidRemote(f, 47);
+  const rows = (await f.request('/api/console/local-tokens')).body.items;
+  assert.equal(rows[0].eligible, true); assert.equal(rows[0].identityCompletion, null);
+  const accepted = await f.request('/api/console/maintain', existingTokenBody(rows));
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'partial'); assert.equal(job.result.summary.tokensUpdated, 1);
+  assert.equal(job.result.summary.tested, 1); assert.equal(job.result.summary.verified, 0); assert.equal(job.result.summary.testFailed, 1);
+  assert.deepEqual(job.result.items[0].phases, { tokenGenerated: false, tokenUpdated: true, tested: true, verified: false });
+  assert.equal(job.result.items[0].failureCategory, 'model_unavailable'); assert.equal(job.result.items[0].upstreamStatus, 404);
+  assert.match(job.result.items[0].message, /已回写原账号/); assert.match(job.result.items[0].message, /模型/);
+  assert.deepEqual(f.writes, [{ action: 'update', id: 47 }]);
+});
+
+for (const kind of ['source', 'remote', 'endpoint', 'signature', 'duplicate_identity']) {
+  test('frozen main-console token review rejects ' + kind + ' changes before any write', async t => {
+    const f = await fixture(t, { importer: require('../backend/sync').executeImport });
+    f.token(47); const raw = invalidRemote(f, 47, { missingAccount: true });
+    const body = existingTokenBody((await f.request('/api/console/local-tokens')).body.items);
+    if (kind === 'source') f.token(47);
+    if (kind === 'remote') raw.credentials.refresh_token = crypto.randomBytes(24).toString('hex');
+    if (kind === 'endpoint') f.client.baseUrl = 'http://127.0.0.1:10';
+    if (kind === 'signature') body.localTokenTargets[0].executionRevision = 'console-execution-v1.' + 'a'.repeat(43);
+    if (kind === 'duplicate_identity') f.account(48, { credentials: { ...raw.credentials } });
+    const response = await f.request('/api/console/maintain', body);
+    assert.equal(response.status, 202);
+    const job = await f.waitJob(response.body.jobId);
+    assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_LOCAL_REVIEW_CHANGED');
+    assert.deepEqual(f.writes, []); assert.deepEqual(f.tested, []); assert.equal(f.calls.preflight, 0);
+  });
+}
+
+test('main-console token review explains healthy quota and manually disabled skips without enabling writes', async t => {
+  const f = await fixture(t);
+  f.token(1); f.account(1);
+  f.token(2); invalidRemote(f, 2, { error_message: JSON.stringify({ error: { code: 'insufficient_quota' } }) });
+  f.token(3); invalidRemote(f, 3, { status: 'disabled' });
+  f.token(4); // New-account import stays a separate explicit action.
+  const rows = (await f.request('/api/console/local-tokens')).body.items;
+  assert.equal(rows.every(row => !row.eligible && !row.executionRevision), true);
+  for (const id of [1, 2, 3]) assert.equal(rows.find(row => row.accountId === id).action, 'skip');
+  assert.match(rows.find(row => row.accountId === 1).reason, /当前可用/);
+  assert.match(rows.find(row => row.accountId === 2).reason, /额度/);
+  assert.match(rows.find(row => row.accountId === 3).reason, /手动停用/);
+  assert.equal(rows.find(row => row.accountId === null).action, 'create');
+});
+
+test('test-only is version-bound, model-selectable and never imports logs in or touches unselected accounts', async t => {
+  let receivedModel;
+  const f = await fixture(t, { tester: async ({ accountIds, modelId, db, jobId, persistResult }) => withControlPlaneLock(async () => {
+    await db.startMutationJob(jobId); receivedModel = modelId;
+    const result = { requested: 1, succeeded: 1, failed: 0, results: [{ accountId: accountIds[0], status: 'succeeded' }] };
+    await persistResult(result); return result;
+  }) });
+  f.account(1); f.account(2);
+  const rows = (await f.request('/api/console/overview')).body.accounts.filter(row => row.id === 1);
+  const accepted = await f.request('/api/console/maintain', testOnlyBody(rows, '5.6-luna'));
+  assert.equal(accepted.status, 202);
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'succeeded'); assert.equal(receivedModel, 'gpt-5.6-luna');
+  assert.equal(job.result.summary.verified, 1); assert.equal(job.result.summary.tokensUpdated, 0);
+  assert.deepEqual(f.writes, []); assert.equal(f.calls.registration, 0); assert.equal(f.calls.import, 0); assert.equal(f.calls.preflight, 0);
+  const children = await Promise.all(job.result.childJobIds.map(id => f.db.getJob(id)));
+  assert.deepEqual(children.map(child => child.type), ['account_test']); assert.deepEqual(children[0].payload.accountIds, [1]);
+});
+
+for (const kind of ['remote', 'endpoint', 'evidence', 'plan']) {
+  test('test-only rejects changed ' + kind + ' and cannot restore scheduling on a different target', async t => {
+    const f = await fixture(t); const raw = f.account(1);
+    const rows = (await f.request('/api/console/overview')).body.accounts.filter(row => row.id === 1);
+    if (kind === 'remote') raw.schedulable = false;
+    if (kind === 'endpoint') f.client.baseUrl = 'http://127.0.0.1:10';
+    if (kind === 'evidence') raw.error_message = JSON.stringify({ error: { code: 'insufficient_quota' } });
+    if (kind === 'plan') raw.credentials.plan_type = 'plus';
+    const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+    const job = await f.waitJob(accepted.body.jobId);
+    assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_TEST_TARGET_CHANGED');
+    assert.deepEqual(f.tested, []); assert.deepEqual(f.writes, []);
+  });
+}
+
+test('main console rejects mixed workflows duplicate targets and unreviewed test requests', async t => {
+  const f = await fixture(t); f.token(47); invalidRemote(f, 47);
+  const body = existingTokenBody((await f.request('/api/console/local-tokens')).body.items);
+  for (const invalid of [{ ...body, refreshInvalid: true }, { ...body, importNew: true },
+    { ...body, testOnly: true }, { ...body, accountIds: [47, 48] },
+    { ...body, localTokenTargets: [...body.localTokenTargets, ...body.localTokenTargets] },
+    { accountIds: [47], importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true },
+    { ...body, localTokenTargets: body.localTokenTargets.map(({ executionRevision, ...target }) => target) }]) {
+    assert.equal((await f.request('/api/console/maintain', invalid)).status, 400);
+  }
+  assert.deepEqual(await f.db.listJobs(), []); assert.deepEqual(f.writes, []);
+});
+
+for (const point of ['verification_read', 'worker_dispatch']) {
+  test('test-only refuses evidence-only quota change at ' + point, async t => {
+    const f = await fixture(t, { tester: require('../backend/accountTestWorker').runAccountTestJob });
+    const raw = invalidRemote(f, 1);
+    const rows = (await f.request('/api/console/overview')).body.accounts;
+    const originalRead = f.client.getAccount;
+    let reads = 0; let calls = 0;
+    f.client.getAccount = async id => {
+      reads += 1;
+      if (reads === (point === 'verification_read' ? 1 : 2)) raw.error_message = JSON.stringify({ error: { code: 'insufficient_quota' } });
+      return originalRead(id);
+    };
+    f.client.testAccount = async () => { calls += 1; throw new Error('must not call upstream'); };
+    const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+    const job = await f.waitJob(accepted.body.jobId);
+    assert.equal(job.status, 'partial'); assert.equal(calls, 0); assert.deepEqual(f.writes, []);
+    if (point === 'verification_read') assert.equal(job.result.items[0].code, 'CONSOLE_TEST_TARGET_CHANGED');
+    else {
+      const child = await f.db.getJob(job.result.childJobIds[0]);
+      assert.equal(child.result.results[0].code, 'CONSOLE_TEST_TARGET_CHANGED');
+      assert.equal(child.result.results[0].attempted, false);
+      assert.equal(job.result.items[0].code, 'CONSOLE_TEST_TARGET_CHANGED');
+      assert.equal(job.result.items[0].phases.tested, false);
+      assert.equal(job.result.summary.tested, 0); assert.equal(job.result.summary.testFailed, 0);
+    }
+  });
+}
+
+test('test-only preserves manually disabled quota-wait and confirmed-ban accounts without calls', async t => {
+  const f = await fixture(t);
+  invalidRemote(f, 1, { status: 'disabled' });
+  invalidRemote(f, 2, { error_message: JSON.stringify({ error: { code: 'insufficient_quota' } }) });
+  invalidRemote(f, 3, { error_message: JSON.stringify({ error: { code: 'account_deactivated' } }) });
+  const rows = (await f.request('/api/console/overview')).body.accounts;
+  const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'succeeded'); assert.equal(job.result.summary.skipped, 3);
+  assert.equal(job.result.summary.tested, 0); assert.deepEqual(f.tested, []); assert.deepEqual(f.writes, []);
+  assert.deepEqual(job.result.childJobIds, []);
+});
+
+test('test-only projects only safe diagnostic categories and status values', async t => {
+  const f = await fixture(t, { tester: async ({ accountIds, db, jobId, persistResult }) => withControlPlaneLock(async () => {
+    await db.startMutationJob(jobId);
+    const result = { requested: 1, succeeded: 0, failed: 1,
+      results: [{ accountId: accountIds[0], status: 'failed', failureCategory: 'untrusted-upstream-text', upstreamStatus: '403' }] };
+    await persistResult(result); return result;
+  }) });
+  f.account(1);
+  const rows = (await f.request('/api/console/overview')).body.accounts;
+  const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'partial'); assert.equal(job.result.items[0].failureCategory, 'unknown');
+  assert.equal(job.result.items[0].upstreamStatus, null);
+  assert.equal(JSON.stringify(job.result.items).includes('untrusted-upstream-text'), false);
+  assert.doesNotMatch(job.result.items[0].message, /已回写/);
+});
+
+test('controlled registration persists paired SMS caps and binds them to the original idempotency receipt', async t => {
+  const seen = [];
+  const f = await fixture(t, { registrar: async ({ options }) => {
+    seen.push(structuredClone(options));
+    throw Object.assign(new Error('synthetic stop before any external action'), { code: 'FIXTURE_CONTROLLED_STOP' });
+  } });
+  const body = { count: 1, country: 'US', operator: '', autoImport: true, smsMaxPriceUsd: '0.5000', smsMaxAcquisitions: 1 };
+  const key = crypto.randomUUID();
+  const admitted = await f.request('/api/console/register', body, key);
+  assert.equal(admitted.status, 202);
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.deepEqual(job.payload, body);
+  assert.deepEqual(seen, [{ count: 1, country: 'US', operator: '', smsMaxPriceUsd: '0.5000', smsMaxAcquisitions: 1 }]);
+  const child = await f.db.getJob(job.result.childJobIds[0]); assert.deepEqual(child.payload, { ...body, parentJobId: job.id });
+  const replay = await f.request('/api/console/register', body, key);
+  assert.equal(replay.status, 202); assert.equal(replay.body.jobId, job.id); assert.equal(replay.headers.get('idempotency-replayed'), 'true');
+  const changed = await f.request('/api/console/register', { ...body, smsMaxPriceUsd: '0.4' }, key);
+  assert.equal(changed.status, 409); assert.equal(changed.body.error, 'IDEMPOTENCY_KEY_REUSED');
+  const unbounded = await f.request('/api/console/register', { count: 1, country: 'US', operator: '', autoImport: true }, key);
+  assert.equal(unbounded.status, 409); assert.equal(unbounded.body.error, 'IDEMPOTENCY_KEY_REUSED');
+  assert.equal(seen.length, 1); assert.equal(f.calls.import, 0); assert.deepEqual(f.writes, []);
+});
+
+test('register API rejects incomplete, malformed or multi-account SMS caps before creating tasks', async t => {
+  const f = await fixture(t);
+  const base = { count: 1, country: 'US', autoImport: true };
+  const invalid = [
+    { smsMaxPriceUsd: '0.5' }, { smsMaxAcquisitions: 1 },
+    { smsMaxPriceUsd: '0.5', smsMaxAcquisitions: '1' }, { smsMaxPriceUsd: '0.5', smsMaxAcquisitions: 2 },
+    { smsMaxPriceUsd: '0.5', smsMaxAcquisitions: 1, count: 2 },
+    ...['0', '1.0001', '0.00001', '1e-1', ' 0.5', '0.5\n', 0.5, null].map(smsMaxPriceUsd => ({ smsMaxPriceUsd, smsMaxAcquisitions: 1 })),
+  ];
+  for (const changes of invalid) {
+    const response = await f.request('/api/console/register', { ...base, ...changes });
+    assert.equal(response.status, 400); assert.equal(response.body.error, 'REGISTRATION_OPTIONS_INVALID');
+  }
+  assert.equal(f.calls.registration, 0); assert.equal(f.calls.import, 0); assert.deepEqual(await f.db.listJobs(), []);
 });
 
 test('failed registration drains progress and exposes its actual failure stage without inventing failed accounts', async t => {

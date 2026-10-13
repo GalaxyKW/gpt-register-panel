@@ -6,6 +6,9 @@
   "main": "backend/index.js",
   "scripts": {
     "test": "node --require ./tests/test-isolation.js --test tests/*.test.js",
+    "test:syntax": "node scripts/check-syntax.js",
+    "test:browser": "node tests/browser-console.cjs",
+    "verify": "npm run test:syntax && npm test && npm run test:browser && npm audit --omit=dev --audit-level=high && git diff --check",
     "snapshot": "node backend/cli/snapshot.js",
     "snapshot:sub2api": "node backend/cli/snapshot.js --with-sub2api",
     "start": "node backend/server.js"

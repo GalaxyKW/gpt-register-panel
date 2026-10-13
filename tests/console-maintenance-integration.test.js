@@ -209,6 +209,9 @@ test('failed test after credential update does not enable scheduling or report a
   const f = await fixture(t, { testFails: true });
   const job = await f.maintain();
   assert.equal(job.status, 'partial'); assert.equal(job.result.summary.refreshed, 0);
+  assert.equal(job.result.summary.tokensGenerated, 1); assert.equal(job.result.summary.tokensUpdated, 1);
+  assert.equal(job.result.summary.tested, 1); assert.equal(job.result.summary.verified, 0);
+  assert.deepEqual(job.result.items[0].phases, { tokenGenerated: true, tokenUpdated: true, tested: true, verified: false });
   assert.deepEqual(f.writes, [{ action: 'update', id: 47 }]);
   assert.equal(f.raw.status, 'error'); assert.equal(f.raw.schedulable, false);
 });

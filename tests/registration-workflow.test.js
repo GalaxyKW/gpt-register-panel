@@ -32,6 +32,62 @@ test('registration request accepts only bounded explicit arguments', () => {
   assert.deepEqual(normalizeRegistrationOptions({ count: 1, country: 'US' }), { count: 1, country: 'US', operator: '' });
   for (const options of [{ count: 0, country: 'US' }, { count: 101, country: 'US' }, { count: 1, country: 'XX;id' }, { count: 1, country: 'US', operator: 'a b' }, { count: 1, country: 'US', shell: 'anything' }]) assert.throws(() => normalizeRegistrationOptions(options), { code: 'REGISTRATION_OPTIONS_INVALID' });
 });
+test('controlled single registration accepts paired decimal SMS caps without changing legacy requests', () => {
+  const base = { count: 1, country: 'US', operator: '' };
+  assert.deepEqual(normalizeRegistrationOptions(base), base);
+  for (const smsMaxPriceUsd of ['0.0001', '0.5', '0.5000', '0.9999', '1', '1.0000']) {
+    const options = { ...base, smsMaxPriceUsd, smsMaxAcquisitions: 1 };
+    assert.deepEqual(normalizeRegistrationOptions(options), options);
+  }
+});
+test('controlled registration rejects incomplete caps, non-decimals, over-limit amounts and batches', () => {
+  const base = { count: 1, country: 'US', smsMaxPriceUsd: '0.5', smsMaxAcquisitions: 1 };
+  const invalid = [
+    { count: 1, country: 'US', smsMaxPriceUsd: '0.5' }, { count: 1, country: 'US', smsMaxAcquisitions: 1 },
+    { ...base, count: 2 }, { ...base, smsMaxPriceUsd: undefined }, { ...base, smsMaxAcquisitions: undefined },
+    ...[0, 2, '1', 1.5, true, null].map(smsMaxAcquisitions => ({ ...base, smsMaxAcquisitions })),
+    ...['', '0', '0.0000', '-0.1', '+0.1', '.5', '00.5', '1.', '1.0001', '2', '0.00001', '1e-1',
+      ' 0.5', '0.5 ', '0.5\n', '0.5\r\n', '0.5\t', '0.5;id', 'Infinity', 'NaN', 0.5, null, true, {}]
+      .map(smsMaxPriceUsd => ({ ...base, smsMaxPriceUsd })),
+  ];
+  for (const options of invalid) assert.throws(() => normalizeRegistrationOptions(options), { code: 'REGISTRATION_OPTIONS_INVALID' });
+});
+test('controlled SMS caps reach the fixed engine argv exactly once; legacy argv stays unchanged', async t => {
+  const f = fixture(t);
+  for (const caps of [{}, { smsMaxPriceUsd: '0.5000', smsMaxAcquisitions: 1 }]) {
+    let launches = 0;
+    await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root,
+      options: { count: 1, country: 'US', operator: 'fixture_operator', ...caps }, preflight: async () => ({ ok: true }),
+      runner: async (_, args, options) => {
+        launches += 1;
+        const expected = ['1', '--panel-register', '--country=US', '--operator=fixture_operator',
+          ...(caps.smsMaxPriceUsd ? ['--sms-max-price-usd=0.5000', '--sms-max-acquisitions=1'] : [])];
+        assert.deepEqual(args.slice(args.indexOf('--') + 1), expected);
+        return writeEvents(options, [{ type: 'failed', code: 'FIXTURE_CONTROLLED_STOP' }]);
+      } }), { code: 'FIXTURE_CONTROLLED_STOP' });
+    assert.equal(launches, 1);
+  }
+});
+test('invalid controlled registration does not run preflight or launch any engine', async t => {
+  const f = fixture(t); let calls = 0;
+  await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root,
+    options: { count: 2, country: 'US', smsMaxPriceUsd: '0.5', smsMaxAcquisitions: 1 },
+    preflight: async () => { calls += 1; }, runner: async () => { calls += 1; } }), { code: 'REGISTRATION_OPTIONS_INVALID' });
+  assert.equal(calls, 0);
+});
+test('real supervised child receives both controlled SMS flags without shell interpretation', async t => {
+  const f = fixture(t);
+  fs.writeFileSync(path.join(f.root, 'index.js'), [
+    "const fs = require('node:fs');",
+    "const prices = process.argv.filter(arg => arg.startsWith('--sms-max-price-usd='));",
+    "const counts = process.argv.filter(arg => arg.startsWith('--sms-max-acquisitions='));",
+    "if (prices.length !== 1 || prices[0] !== '--sms-max-price-usd=0.5000' || counts.length !== 1 || counts[0] !== '--sms-max-acquisitions=1') throw new Error('wrong controlled argv');",
+    "fs.writeFileSync(6, JSON.stringify({version:1, sequence:1, type:'failed', code:'FIXTURE_CONTROLLED_ARGV_VERIFIED'}) + '\\n');",
+  ].join('\n'), { mode: 0o600 });
+  await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root,
+    options: { count: 1, country: 'US', smsMaxPriceUsd: '0.5000', smsMaxAcquisitions: 1 },
+    preflight: async () => ({ ok: true }) }), { code: 'FIXTURE_CONTROLLED_ARGV_VERIFIED' });
+});
 test('settings never echo secrets and atomically overlay only explicitly saved fields', t => {
   const f = fixture(t); const original = fs.readFileSync(path.join(f.root, 'config.json'), 'utf8');
   const view = readRegistrationSettings({ rootDirectory: f.root });

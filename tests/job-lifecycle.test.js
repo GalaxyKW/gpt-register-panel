@@ -1,4 +1,5 @@
 const assert = require('node:assert/strict');
+const { spawnSync } = require('node:child_process');
 const { EventEmitter } = require('node:events');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -10,7 +11,6 @@ require('./test-isolation');
 
 const { PanelDb } = require('../backend/db');
 const { Sub2ApiAdminClient } = require('../backend/adapters/sub2apiAdmin');
-const { runCommand } = require('../backend/phase3Worker');
 const {
   accountTestTargetBaseline,
   runAccountTestJobNow,
@@ -609,28 +609,121 @@ test('HTTP shutdown cancels a queued import admission before job creation', asyn
   }
 });
 
-test('Phase3 command abort terminates the child and reports an interrupted job', async () => {
+// Run deliberate event-loop stalls in a disposable supervisor, never in the
+// main test worker. The unsafe-tree latch must also remain isolated when the
+// hard-deadline regression intentionally triggers fail-closed behavior.
+async function phase3AbortDeadlineFixture(finalWaitMs) {
+  require('./tests/test-isolation');
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+  const { runCommand } = require('./backend/phase3Worker');
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'panel-abort-deadline-'));
+  const readyPath = path.join(directory, 'ready');
   const controller = new AbortController();
-  const startedAt = Date.now();
   const running = runCommand(process.execPath, ['-e', [
     "process.on('SIGTERM', () => {});",
+    "const fs = require('node:fs');",
+    "fs.writeFileSync(process.argv[1] + '.tmp', String(process.pid));",
+    "fs.renameSync(process.argv[1] + '.tmp', process.argv[1]);",
     'setInterval(() => {}, 1000);',
-  ].join('\n')], {
-    cwd: os.tmpdir(),
+  ].join('\n'), readyPath], {
+    cwd: directory,
     env: { PATH: process.env.PATH || '' },
     timeoutMs: 10_000,
     terminationGraceMs: 100,
-    terminationHardDeadlineMs: 100,
+    // Omitted means the production default (1000 ms). Only the fail-closed
+    // case intentionally shrinks it to the old test's unrealistic 100 ms.
+    ...(finalWaitMs === null ? {} : { terminationHardDeadlineMs: finalWaitMs }),
     maxOutputBytes: 4096,
     signal: controller.signal,
+  }).then(() => ({ unexpectedSuccess: true }), (error) => ({
+    code: error.code,
+    causeCode: error.causeCode || null,
+    details: error.details,
+  }));
+  const pause = () => new Promise((resolve) => setTimeout(resolve, 10));
+  const exists = (pid) => {
+    try { process.kill(pid, 0); return true; } catch (error) {
+      if (error.code === 'ESRCH') return false;
+      throw error;
+    }
+  };
+  try {
+    const readyDeadline = performance.now() + 5000;
+    while (!fs.existsSync(readyPath)) {
+      if (performance.now() >= readyDeadline) throw new Error('abort fixture never became ready');
+      await pause();
+    }
+    const pid = Number(fs.readFileSync(readyPath, 'utf8'));
+    if (!Number.isSafeInteger(pid) || pid <= 1) throw new Error('invalid fixture pid');
+    const startedAt = performance.now();
+    controller.abort();
+    // Reproduce the scheduling delay seen under the concurrent full suite.
+    // SIGTERM is known to be ignored: the child wrote its readiness marker
+    // only after installing the handler, unlike the former 50 ms race.
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+    const result = await running;
+    const elapsedMs = performance.now() - startedAt;
+    // An unconfirmed outcome is not success, but its last SIGKILL must still
+    // be reaped before this isolated supervisor leaves any test processes.
+    const reapedDeadline = performance.now() + 2000;
+    while (exists(pid) && performance.now() < reapedDeadline) await pause();
+    return {
+      ...result,
+      elapsedMs,
+      childRemaining: exists(pid),
+      groupRemaining: process.platform !== 'win32' && exists(-pid),
+    };
+  } finally {
+    controller.abort();
+    await running;
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+}
+
+function runPhase3AbortDeadlineFixture(finalWaitMs) {
+  const source = `(${phase3AbortDeadlineFixture.toString()})(${JSON.stringify(finalWaitMs)})
+    .then((result) => process.stdout.write(JSON.stringify(result)))
+    .catch((error) => { process.stderr.write(String(error.stack || error)); process.exitCode = 1; });`;
+  const result = spawnSync(process.execPath, ['-e', source], {
+    cwd: path.resolve(__dirname, '..'),
+    env: { PATH: process.env.PATH || '', PANEL_LOG_CONSOLE: '0' },
+    encoding: 'utf8',
+    timeout: 15_000,
+    maxBuffer: 64 * 1024,
   });
-  setTimeout(() => controller.abort(), 50);
-  await assert.rejects(
-    running,
-    (error) => error.code === 'JOB_INTERRUPTED'
-      && ['SIGTERM', 'SIGKILL'].includes(error.details?.signal),
-  );
-  assert.equal(Date.now() - startedAt < 2000, true);
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.signal, null, result.stderr);
+  return JSON.parse(result.stdout);
+}
+
+test('Phase3 command abort terminates the child and reports an interrupted job', () => {
+  const outcome = runPhase3AbortDeadlineFixture(null);
+  assert.equal(outcome.code, 'JOB_INTERRUPTED');
+  assert.equal(outcome.details.signal, 'SIGKILL');
+  assert.equal(outcome.details.observedSignal, 'SIGKILL');
+  assert.equal(outcome.details.requestedSignal, 'SIGKILL');
+  assert.equal(outcome.details.terminationConfirmed, true);
+  assert.equal(outcome.details.processScanComplete, true);
+  assert.equal(outcome.details.remainingDescendantCount, 0);
+  assert.equal(outcome.details.rootProcessRemaining, false);
+  assert.equal(outcome.childRemaining, false);
+  assert.equal(outcome.groupRemaining, false);
+  assert.equal(outcome.elapsedMs < 5000, true);
+});
+
+test('Phase3 command abort fails closed when scheduling exceeds the hard confirmation deadline', () => {
+  const outcome = runPhase3AbortDeadlineFixture(100);
+  assert.equal(outcome.code, 'PHASE3_TERMINATION_UNCONFIRMED');
+  assert.equal(outcome.causeCode, 'JOB_INTERRUPTED');
+  assert.equal(outcome.details.requestedSignal, 'SIGKILL');
+  assert.equal(outcome.details.observedSignal, null);
+  assert.equal(outcome.details.terminationConfirmed, false);
+  assert.equal(outcome.details.forcedClose, true);
+  assert.equal(outcome.childRemaining, false);
+  assert.equal(outcome.groupRemaining, false);
+  assert.equal(outcome.elapsedMs < 5000, true);
 });
 
 test('PanelDb terminal transitions cannot overwrite an earlier shutdown interruption', async () => {

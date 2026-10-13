@@ -16,12 +16,23 @@ const BATCH_TIMEOUT_MAX_MS = 24 * 60 * 60 * 1000;
 function failure(code, message, details) { return Object.assign(new Error(message), { code, ...(details ? { details } : {}) }); }
 function normalizeRegistrationOptions(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)
-      || Object.keys(options).some(key => !['count', 'country', 'operator'].includes(key))) throw failure('REGISTRATION_OPTIONS_INVALID', '注册参数包含不允许的字段');
+      || Object.keys(options).some(key => !['count', 'country', 'operator', 'smsMaxPriceUsd', 'smsMaxAcquisitions'].includes(key))) throw failure('REGISTRATION_OPTIONS_INVALID', '注册参数包含不允许的字段');
   const { count, country, operator = '' } = options;
   if (!Number.isSafeInteger(count) || count < 1 || count > 100
       || typeof country !== 'string' || !/^[A-Z]{2}$/.test(country)
       || typeof operator !== 'string' || !/^[A-Za-z0-9_-]{0,64}$/.test(operator)) throw failure('REGISTRATION_OPTIONS_INVALID', '数量、国家或运营商格式无效');
-  return { count, country, operator };
+  const hasPrice = Object.hasOwn(options, 'smsMaxPriceUsd');
+  const hasAcquisitions = Object.hasOwn(options, 'smsMaxAcquisitions');
+  if (hasPrice || hasAcquisitions) {
+    const price = options.smsMaxPriceUsd;
+    if (!hasPrice || !hasAcquisitions || count !== 1 || options.smsMaxAcquisitions !== 1
+        || typeof price !== 'string' || price.trim() !== price
+        || !/^(?:0|1)(?:\.[0-9]{1,4})?$/.test(price) || Number(price) <= 0 || Number(price) > 1) {
+      throw failure('REGISTRATION_OPTIONS_INVALID', '受控验证必须同时指定大于 0 且不超过 1 USD 的单价字符串（最多四位小数）及最多租号 1 次，且只能注册 1 个账号');
+    }
+  }
+  // These are bounds on this one execution, not a renewable total-spend budget.
+  return { count, country, operator, ...(hasPrice ? { smsMaxPriceUsd: options.smsMaxPriceUsd, smsMaxAcquisitions: 1 } : {}) };
 }
 function readProtocol(fd, partial = false) {
   const stat = fs.fstatSync(fd);
@@ -137,7 +148,8 @@ async function runRegistrationJob({ rootDirectory = process.env.GPT_REGISTER_ROO
   if (!network.ok) throw failure('REGISTRATION_PREFLIGHT_FAILED', '网络预检未通过，未申请号码或启动注册', { preflight: network });
   if (readRegistrationSettings({ rootDirectory }).revision !== settings.revision) throw failure('REGISTRATION_CONFIG_CHANGED', '网络预检期间注册配置已变化，未申请号码，请重新开始');
   const before = readGptRegisterSources({ rootDirectory, strictCompleteSnapshot: true });
-  const output = await runEngineCommand({ rootDirectory, arguments: [String(normalized.count), '--panel-register', '--country=' + normalized.country, '--operator=' + normalized.operator],
+  const output = await runEngineCommand({ rootDirectory, arguments: [String(normalized.count), '--panel-register', '--country=' + normalized.country, '--operator=' + normalized.operator,
+    ...(Object.hasOwn(normalized, 'smsMaxPriceUsd') ? ['--sms-max-price-usd=' + normalized.smsMaxPriceUsd, '--sms-max-acquisitions=1'] : [])],
     signal, logger, jobId, actor, onProgress, runner, timeoutMs: Math.min(BATCH_TIMEOUT_MAX_MS, normalized.count * ACCOUNT_TIMEOUT_MS) });
   let artifacts;
   try {
