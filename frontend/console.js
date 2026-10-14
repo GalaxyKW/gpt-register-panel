@@ -3,6 +3,7 @@
 (() => {
   const $ = (id) => document.getElementById(id);
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
+  const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#icon-' + escape(name) + '"/></svg>';
   const PENDING_STORE = 'registerStudio.pending.v1';
   const MAX_REPLAY_AGE = 20 * 60 * 60 * 1000;
   const PAGE_TITLES = { register: '注册任务', accounts: '账号管理', logs: '运行日志', settings: '设置与连接' };
@@ -27,7 +28,8 @@
   const ACTION_LABELS = { keep: '保持原样', wait: '等待恢复', refresh: '重新获取 token', delete: '删除远端记录', review: '人工核对', skip: '本次跳过', import: '首次导入' };
   const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '管理员已关闭调度，不自动启用', temporary_scheduling_pause: '账号处于临时调度暂停，但不能确认是额度耗尽；保留账号，等待核对，不自动登录或删除', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_invalidated: '刷新凭据已失效，需要本地重新授权', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
   const state = { overview: null, connected: false, pending: null, storageError: false, busy: false, refreshing: false, page: 'register', selected: new Set(), stoppingJobs: new Set(), logs: [], logFiles: [], continuations: [], nextCursor: null, logRevision: 0, token: '', settingsDirty: false, settingsRevision: null, cleanupDaysDirty: false, registrationDirty: false, registrationRevision: null, registrationFields: [], networkBusy: false, pollTimer: null,
-    taskDetail: null, taskDetailRevision: 0, localTokens: [], localSelected: new Set(), localTokensBusy: false, localTokensLoaded: false, localTokensRevision: 0 };
+    taskDetail: null, taskDetailRevision: 0, localTokens: [], localSelected: new Set(), localTokensBusy: false, localTokensLoaded: false, localTokensRevision: 0,
+    proxyList: null, proxyLoading: false, proxyLoadAttempted: false, proxyListError: '', proxyDirty: false, proxyRevision: null, proxySettingsRevision: null };
 
   function validToken(value) { return typeof value === 'string' && /^[\x21-\x7e]{16,4096}$/.test(value); }
   function notice(message, tone = '') { $('notice').textContent = message; $('notice').className = 'notice ' + tone; $('notice').hidden = !message; }
@@ -76,6 +78,8 @@
         // Other conflicts (and explicit unknown outcomes below) must keep their receipt.
         if (path === '/api/console/settings' && options.method === 'POST' && response.status === 409
             && error.code === 'CONSOLE_SETTINGS_ACTIVE_CONFLICT') error.definitive = true;
+        if (path === '/api/console/settings' && options.method === 'POST' && response.status === 409
+            && ['CONSOLE_IMPORT_PROXY_SETTINGS_STALE', 'CONSOLE_IMPORT_PROXY_SETTINGS_INVALID', 'CONSOLE_IMPORT_PROXY_CHANGED', 'CONSOLE_IMPORT_PROXY_CHECK_FAILED'].includes(error.code)) error.definitive = true;
         if (body.writeOutcomeUnknown === true || /WRITE_UNKNOWN|OUTCOME_UNKNOWN|RECONCILIATION/.test(error.code || '')) error.definitive = false;
         throw error;
       }
@@ -120,20 +124,23 @@
   async function reconcileSettings(pending) {
     const settings = await request('/api/console/settings');
     const expected = pending.body;
-    const matches = expected.registration
+    const matches = expected.importProxy ? settings.importProxy?.lastRequestId === expected.importProxy.requestId : expected.registration
       ? settings.registration?.lastRequestId === expected.registration.requestId
       : expected.policy && Object.entries(expected.policy).every(([key, value]) => settings.policy?.[key] === value);
     if (!matches) throw new Error('尚不能确认本次配置已保存。旧版遗留记录或响应丢失都可能造成此状态，不能仅凭当前配置解除保护。不会重新发送密钥或覆盖配置；请按请求时间 ' + date(pending.createdAt) + ' 核对服务端操作日志后人工恢复。重新读取配置只更新表单，不会解除这条待核对记录。');
     persistPending(null);
     if (state.overview) state.overview.settings = settings;
-    state.registrationDirty = false; state.settingsDirty = false; state.registrationRevision = null;
-    renderSettings(); notice('已确认本次配置保存成功。密钥没有被重复提交。', 'success');
+    if (expected.importProxy) { state.proxyDirty = false; state.proxyList = null; state.proxyLoadAttempted = false; }
+    else { state.registrationDirty = false; state.settingsDirty = false; state.registrationRevision = null; }
+    renderSettings(); notice(expected.importProxy ? '已确认默认导入代理保存成功。仅影响新增账号。' : '已确认本次配置保存成功。密钥没有被重复提交。', 'success');
     return settings;
   }
   async function saveSettings(body) {
     if (writeBlock()) throw new Error(writeBlock());
     if (body.registration) body.registration.requestId = settingsRequestId();
-    const safeBody = body.registration ? { revision: body.revision, registration: { revision: body.registration.revision, requestId: body.registration.requestId, changedKeys: Object.keys(body.registration.changes) } } : body;
+    if (body.importProxy) body.importProxy.requestId = settingsRequestId();
+    const safeBody = body.importProxy ? { confirm: true, importProxy: { revision: body.importProxy.revision, proxyId: body.importProxy.proxyId, requestId: body.importProxy.requestId } }
+      : body.registration ? { revision: body.revision, registration: { revision: body.registration.revision, requestId: body.registration.requestId, changedKeys: Object.keys(body.registration.changes) } } : body;
     const pending = { version: 1, url: '/api/console/settings', body: safeBody, key: mutationKey(), createdAt: Date.now() };
     persistPending(pending); state.busy = true; renderControls();
     let writeAccepted = false;
@@ -253,20 +260,85 @@
     if (item.stage !== 'phase2') return '续跑阶段无法确认，请刷新后重新选择。';
     return registration?.ready === true ? '' : '注册配置不完整，请到设置与检测查看原因。';
   }
+  function proxySettingValid(value) {
+    return value && Number.isSafeInteger(value.revision) && value.revision >= 0
+      && (value.proxyId === null || Number.isSafeInteger(value.proxyId) && value.proxyId > 0)
+      && value.configured === (value.proxyId !== null) && typeof value.endpointMatches === 'boolean';
+  }
+  function proxySaveIssue() {
+    const blocked = writeBlock(); if (blocked) return blocked;
+    if (state.proxyLoading) return '正在读取代理节点，请稍候。';
+    if (state.proxyListError) return state.proxyListError;
+    if (!state.proxyList || !Number.isSafeInteger(state.proxyRevision)) return '请先刷新节点列表，再选择默认代理。';
+    const value = $('import-proxy-select').value;
+    if (value === 'none') return '';
+    const selected = state.proxyList.items.find((item) => String(item.id) === value);
+    if (!selected) return '所选节点不在最新清单中，请重新选择；不会自动改为直连。';
+    if (selected.eligible !== true || typeof selected.revision !== 'string' || !selected.revision) return selected.reason || '所选节点不可用于新增账号，请重新选择。';
+    return '';
+  }
+  function defaultProxyIssue() {
+    const setting = state.overview?.settings?.importProxy;
+    if (!proxySettingValid(setting)) return '';
+    if (setting.proxyId !== null && !setting.endpointMatches) return '默认代理属于另一 Sub2API 实例，请在设置中重新选择；不会自动直连。';
+    if (setting.proxyId !== null && state.proxyList && !state.proxyListError) {
+      const selected = state.proxyList.items.find((item) => item.id === setting.proxyId);
+      if (!selected || selected.eligible !== true) return '默认代理已不可用，请在设置中重新选择；不会自动直连。';
+    }
+    return '';
+  }
+  function renderProxySetting() {
+    const setting = state.overview?.settings?.importProxy;
+    if (!proxySettingValid(setting)) { $('register-import-proxy').textContent = '默认导入代理：设置尚未确认'; return; }
+    if (!state.proxyDirty) state.proxySettingsRevision = setting.revision;
+    const selected = state.proxyList?.items?.find((item) => item.id === setting.proxyId);
+    $('register-import-proxy').textContent = !setting.configured ? '新账号导入：未指定代理，沿用 Sub2API 网络配置'
+      : defaultProxyIssue() || '新账号导入代理：' + (selected?.name || '节点 #' + setting.proxyId) + ' · 已有账号保持原代理';
+  }
+  async function loadProxies() {
+    if (state.proxyLoading || !state.connected) return;
+    state.proxyLoading = true; state.proxyLoadAttempted = true; state.proxyListError = ''; renderControls();
+    const previous = state.proxyDirty ? $('import-proxy-select').value : null;
+    try {
+      const result = await request('/api/console/proxies');
+      if (!Number.isSafeInteger(result.revision) || result.revision < 0 || !Array.isArray(result.items)
+          || result.items.some((item) => !Number.isSafeInteger(item.id) || item.id <= 0 || typeof item.name !== 'string' || typeof item.eligible !== 'boolean')
+          || new Set(result.items.map((item) => item.id)).size !== result.items.length
+          || !(result.selectedProxyId === null || Number.isSafeInteger(result.selectedProxyId) && result.selectedProxyId > 0)) throw new Error('代理节点清单不完整，未允许保存。');
+      state.proxyList = result; state.proxyRevision = result.revision;
+      const value = previous ?? (result.selectedProxyId === null ? 'none' : String(result.selectedProxyId));
+      const missing = value !== 'none' && !result.items.some((item) => String(item.id) === value);
+      $('import-proxy-select').innerHTML = '<option value="none">未指定（沿用 Sub2API 网络配置）</option>'
+        + (missing ? '<option value="' + escape(value) + '" disabled>所选节点 #' + escape(value) + ' 已不可用，请重新选择</option>' : '')
+        + result.items.map((item) => '<option value="' + item.id + '"' + (item.eligible ? '' : ' disabled') + '>' + escape(item.name + ' · #' + item.id + (item.protocol ? ' · ' + item.protocol : '') + (!item.eligible ? ' · ' + (item.reason || '不可用') : '')) + '</option>').join('');
+      $('import-proxy-select').value = value;
+      renderProxySetting();
+    } catch (error) { state.proxyListError = '代理列表读取失败：' + errorText(error) + ' 请刷新后重试，当前默认设置未改变。'; }
+    finally { state.proxyLoading = false; renderControls(); }
+  }
+  async function saveImportProxy() {
+    const issue = proxySaveIssue(); if (issue) throw new Error(issue);
+    const value = $('import-proxy-select').value;
+    const selected = value === 'none' ? null : state.proxyList.items.find((item) => String(item.id) === value);
+    if (!window.confirm(selected ? '将新增账号的默认导入代理设为 ' + selected.name + '（#' + selected.id + '）？\n仅影响新增账号；已有账号回写 token 保留原代理，注册机网络通道不变。'
+      : '确定不为新增账号指定代理？\n新增账号沿用 Sub2API 网络配置。已有账号的代理与注册机网络配置不变。')) return;
+    await saveSettings({ confirm: true, importProxy: { revision: state.proxyRevision, proxyId: selected?.id ?? null, ...(selected ? { proxyRevision: selected.revision } : {}) } });
+    await loadProxies();
+  }
   function renderControls() {
     const blocked = writeBlock();
     const capabilities = state.overview?.capabilities || {};
     const comparisonIssue = capabilities.comparisonAvailable === false ? '账号快照不完整，请先检测 Sub2API 连接。' : '';
-    const registrationIssue = blocked || comparisonIssue || (state.networkBusy ? '网络预检正在执行，通常需要数十秒；完成后即可启动注册。' : '') || (!capabilities.registrationEnabled ? '注册功能未启用，请检查服务端配置。' : '') || (state.overview?.settings?.registration?.ready === false ? '注册配置不完整，请到设置与检测查看原因。' : '');
+    const registrationIssue = blocked || comparisonIssue || defaultProxyIssue() || (state.networkBusy ? '网络预检正在执行，通常需要数十秒；完成后即可启动注册。' : '') || (!capabilities.registrationEnabled ? '注册功能未启用，请检查服务端配置。' : '') || (state.overview?.settings?.registration?.ready === false ? '注册配置不完整，请到设置与检测查看原因。' : '');
     $('start-register').disabled = Boolean(registrationIssue);
     $('register-hint').textContent = registrationIssue || '将按现有接码与邮箱配置执行；成功后自动首次导入。';
-    $('maintain-all').disabled = Boolean(blocked || comparisonIssue || !capabilities.sub2apiConfigured);
+    $('maintain-all').disabled = Boolean(blocked || comparisonIssue || defaultProxyIssue() || !capabilities.sub2apiConfigured);
     $('maintain-selected').disabled = Boolean(blocked || comparisonIssue || !capabilities.sub2apiConfigured || state.selected.size === 0);
     $('selected-count').textContent = state.selected.size;
     $('maintain-hint').textContent = blocked || comparisonIssue || (!capabilities.sub2apiConfigured ? '尚未配置 Sub2API 管理连接。' : '一键维护检查全池并导入新账号；维护所选只处理选中的远端 ID，不导入范围外的账号。');
     const accountIssue = blocked || comparisonIssue || (!capabilities.sub2apiConfigured ? '尚未配置 Sub2API 管理连接。' : '');
-    $('import-new').disabled = Boolean(accountIssue);
-    $('import-new').title = accountIssue;
+    $('import-new').disabled = Boolean(accountIssue || defaultProxyIssue());
+    $('import-new').title = accountIssue || defaultProxyIssue();
     $('test-selected').disabled = Boolean(accountIssue || !state.selected.size || state.selected.size > 100);
     $('test-selected-hint').textContent = accountIssue || (state.selected.size > 100 ? '单次最多测试 100 个账号，请缩小选择范围。' : state.selected.size ? '仅测试所选 ' + state.selected.size + ' 个远端账号；不会重新注册或获取 token。' : '先选择远端账号；不会重新注册或获取 token。');
     $('local-token-refresh').disabled = !state.connected || state.localTokensBusy;
@@ -278,8 +350,15 @@
     $('logs-cleanup').disabled = Boolean(blocked);
     $('check-network').disabled = state.networkBusy || !state.connected;
     $('settings-check-network').disabled = state.networkBusy || !state.connected;
-    $('check-network').textContent = state.networkBusy ? '检测中…' : '重新检测 ↗';
-    $('settings-check-network').textContent = state.networkBusy ? '检测中…' : '检测连接 ↗';
+    $('check-network').textContent = state.networkBusy ? '检测中…' : '检测连接';
+    $('settings-check-network').textContent = state.networkBusy ? '检测中…' : '检测连接';
+    const proxyIssue = proxySaveIssue();
+    $('import-proxy-refresh').disabled = state.proxyLoading || !state.connected;
+    $('import-proxy-refresh').textContent = state.proxyLoading ? '读取中…' : '刷新节点';
+    $('import-proxy-select').disabled = state.proxyLoading || !state.proxyList || Boolean(blocked);
+    $('import-proxy-save').disabled = Boolean(proxyIssue);
+    $('import-proxy-save').title = proxyIssue;
+    $('import-proxy-hint').textContent = proxyIssue || '保存后仅影响新增账号；已有账号的代理保持不变。';
     $('resolve-pending').disabled = state.busy || !state.connected || state.storageError;
     $('pending-banner').hidden = !state.pending && !state.storageError;
     $('mode-label').textContent = !state.connected ? '服务未连接' : state.overview?.readOnly ? '只读模式' : state.overview?.settings?.policy?.enabled ? '自动巡检开启' : '手动控制';
@@ -342,7 +421,7 @@
       const details = (failureStage ? '<p class="job-detail"><strong>失败阶段：</strong>' + escape(failureStage) + '</p>' : '')
         + (errorMessage ? '<p class="job-detail"><strong>失败原因：</strong>' + escape(errorMessage) + '</p>' : '')
         + (recovery ? '<p class="job-detail"><strong>后续处理：</strong>' + escape(recovery) + '</p>' : '');
-      const symbol = running ? '↻' : ['succeeded', 'completed'].includes(job.status) ? '✓' : ['failed', 'partial'].includes(job.status) ? '!' : '—';
+      const symbol = icon(running ? 'refresh' : ['succeeded', 'completed'].includes(job.status) ? 'check' : ['failed', 'partial'].includes(job.status) ? 'alert' : 'minus');
       return '<div class="job-row"><span class="job-symbol" aria-hidden="true">' + symbol + '</span><div><p class="job-title">' + label + escape(progress) + '</p><p class="job-detail">' + escape(description) + '</p>' + details + '</div><div class="job-status">' + tag(STATUS_LABELS[job.status] || '未知', tone) + '<span class="job-date">' + date(job.createdAt) + '</span></div><div class="job-actions"><button type="button" class="text-button" data-job-detail="' + escape(job.id) + '">详情</button><button type="button" class="text-button" data-job-logs="' + escape(job.id) + '">日志</button>' + (running ? '<button type="button" class="text-button" data-stop-job="' + escape(job.id) + '">停止</button>' : '') + '</div></div>';
     }).join('') : '<div class="empty-state">还没有任务。<br>开始一次注册，或到账号维护检查现有账号。</div>';
     $('account-jobs').innerHTML = $('jobs').innerHTML;
@@ -494,7 +573,7 @@
   }
   function renderNetwork(network = state.overview?.network) {
     const channels = Array.isArray(network?.channels) ? network.channels : [];
-    const icons = { sms: '▤', email: '✉', mail: '✉', oauth: '↗', login: '↗', sub2api: '⇄' };
+    const icons = { sms: icon('phone'), email: icon('mail'), mail: icon('mail'), oauth: icon('arrow'), login: icon('arrow'), sub2api: icon('network') };
     const names = { sms: '短信接码通道', mail: '邮箱 API 通道', email: '邮箱 API 通道', oauth: '登录 / OAuth 通道', login: '登录 / OAuth 通道', sub2api: 'Sub2API · 目标服务' };
     const subchecks = channel => !Array.isArray(channel.checks) ? '' : channel.checks.slice(0, 4).map(check => '<p>'
       + escape(({ node_oauth: 'token 接口出口', browser: '浏览器登录' })[check.id] || '子通道') + '：'
@@ -516,6 +595,7 @@
   function renderSettings() {
     const settings = state.overview?.settings;
     if (!settings) return;
+    renderProxySetting();
     if (!state.settingsDirty) {
       state.settingsRevision = settings.revision;
       $('automatic-maintenance').checked = settings.policy?.enabled === true;
@@ -564,6 +644,7 @@
       renderMetrics(); renderAccounts(); renderJobs(); renderNetwork(); renderSettings(); renderControls();
       if (overview.warning) notice(overview.warning);
       await loadContinuations();
+      if (state.page === 'settings' && !state.proxyLoadAttempted) await loadProxies();
       if ($('task-dialog').open && state.taskDetail?.job?.id) await openTaskDetail(state.taskDetail.job.id, { quiet: true });
       // Direct links and page reloads reach showPage before authentication and
       // the first snapshot. Load logs after connecting, but leave pagination
@@ -616,6 +697,7 @@
     $('breadcrumb-title').textContent = PAGE_TITLES[state.page];
     document.title = PAGE_TITLES[state.page] + ' · 账号工作台';
     if (state.page === 'logs' && state.connected) loadLogs();
+    if (state.page === 'settings' && state.connected && !state.proxyLoadAttempted) loadProxies();
   }
   async function preflight() {
     if (state.networkBusy) return;
@@ -701,6 +783,9 @@
   $('logs-cleanup').addEventListener('click', () => report(async () => { const days = Number($('cleanup-days').value); if (!Number.isSafeInteger(days) || days < 1 || days > 365) throw new Error('保留天数须为 1–365 的整数。'); if (!window.confirm('清理 ' + days + ' 天以前的已结束任务日志？\n此操作不可恢复，不删除 token、账号或活动日志。')) return; await mutate('/api/console/logs/cleanup', { olderThanDays: days, confirm: true }); await loadLogs(); }));
   $('cleanup-days').addEventListener('input', () => { state.cleanupDaysDirty = true; });
   $('settings-form').addEventListener('input', () => { state.settingsDirty = true; });
+  $('import-proxy-refresh').addEventListener('click', loadProxies);
+  $('import-proxy-select').addEventListener('change', () => { state.proxyDirty = true; renderControls(); });
+  $('import-proxy-form').addEventListener('submit', (event) => { event.preventDefault(); report(saveImportProxy); });
   $('settings-form').addEventListener('submit', (event) => { event.preventDefault(); report(async () => {
     const enabled = $('automatic-maintenance').checked; const interval = Number($('maintenance-interval').value); const days = Number($('log-retention').value);
     if (!Number.isSafeInteger(interval) || interval < 5 || interval > 1440 || !Number.isSafeInteger(days) || days < 1 || days > 365) throw new Error('巡检间隔须为 5–1440 分钟，日志保留须为 1–365 天。');
@@ -710,10 +795,12 @@
   }); });
   $('registration-settings-form').addEventListener('input', () => { state.registrationDirty = true; });
   $('settings-reload').addEventListener('click', () => report(async () => {
-    if ((state.settingsDirty || state.registrationDirty) && !window.confirm('重新读取配置会放弃未保存的修改，并清空新输入的密钥，是否继续？')) return;
+    if ((state.settingsDirty || state.registrationDirty || state.proxyDirty) && !window.confirm('重新读取配置会放弃未保存的修改，并清空新输入的密钥，是否继续？')) return;
     const settings = await request('/api/console/settings');
     if (!state.overview) throw new Error('工作台尚未完成首次同步。');
-    state.overview.settings = settings; state.settingsDirty = false; state.registrationDirty = false; state.registrationRevision = null; renderSettings();
+    state.overview.settings = settings; state.settingsDirty = false; state.registrationDirty = false; state.registrationRevision = null;
+    state.proxyDirty = false; state.proxyList = null; state.proxyLoadAttempted = false; renderSettings();
+    if (state.page === 'settings') await loadProxies();
     if (state.pending?.url === '/api/console/settings') notice('已重新读取服务端配置，但上次保存结果仍待核对。请使用“核对本次请求”；若仍无法确认，请按原请求时间核对服务端操作日志。重新读取不会解除待核对记录。');
     else notice('已重新读取服务端配置。', 'success');
   }));

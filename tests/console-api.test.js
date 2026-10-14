@@ -137,6 +137,136 @@ test('console API fixture uses one fresh connection per request without idle-soc
   assert.equal(sockets.size, 3, 'fixture must not share an idle socket across business steps');
 });
 
+function proxyFixture(f) {
+  const node = { id: 2, name: 'fixture route', protocol: 'http', status: 'active', expiresAt: null,
+    fallbackMode: 'none', backupProxyId: null, revision: 'proxy-v1.' + 'a'.repeat(43) };
+  f.client.listProxies = async () => [{ ...node, host: 'fixture-private-host', password: 'fixture-private-password' }];
+  f.client.getProxy = async id => { assert.equal(id, 2); return { ...node }; };
+  async function save(overrides = {}) {
+    const settings = (await f.request('/api/console/settings')).body.importProxy;
+    return f.request('/api/console/settings', { confirm: true, importProxy: { revision: settings.revision,
+      proxyId: 2, proxyRevision: node.revision, requestId: crypto.randomUUID(), ...overrides } });
+  }
+  return { node, save };
+}
+
+test('console default proxy API projects safe metadata and saves independent CAS receipt', async t => {
+  const f = await fixture(t); const p = proxyFixture(f);
+  const list = await f.request('/api/console/proxies');
+  assert.equal(list.status, 200); assert.equal(list.body.items[0].eligible, true);
+  assert.deepEqual(Object.keys(list.body.items[0]).sort(), ['eligible', 'id', 'name', 'protocol', 'reason', 'revision', 'status']);
+  assert.equal(JSON.stringify(list.body).includes('fixture-private'), false);
+  const requestId = crypto.randomUUID(); const saved = await p.save({ requestId });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.body.importProxy, { revision: 1, proxyId: 2, configured: true, endpointMatches: true, lastRequestId: requestId });
+  assert.equal((await f.request('/api/console/settings')).body.importProxy.lastRequestId, requestId);
+  const replay = await p.save({ requestId });
+  assert.equal(replay.status, 409); assert.equal(replay.body.error, 'CONSOLE_IMPORT_PROXY_SETTINGS_STALE');
+  const policy = saved.body.policy;
+  assert.equal((await f.request('/api/console/settings', { revision: saved.body.revision, policy })).status, 200);
+  assert.deepEqual((await f.request('/api/console/settings')).body.importProxy, saved.body.importProxy);
+  const otherDb = new PanelDb(path.join(f.root, 'panel.sqlite3'));
+  assert.equal((await otherDb.getImportProxySettings()).settings.proxyId, 2);
+});
+
+test('console default proxy rejects stale, expired, unconfirmed or malformed selections without settings writes', async t => {
+  const f = await fixture(t); const p = proxyFixture(f);
+  assert.equal((await p.save({ proxyRevision: 'proxy-v1.' + 'b'.repeat(43) })).status, 409);
+  p.node.expiresAt = '2000-01-01T00:00:00Z'; p.node.fallbackMode = 'direct';
+  assert.equal((await f.request('/api/console/proxies')).body.items[0].eligible, false);
+  assert.equal((await p.save()).status, 409);
+  p.node.expiresAt = null;
+  assert.equal((await p.save({ proxyId: '2' })).status, 400);
+  assert.equal((await p.save({ requestId: 'bad' })).status, 400);
+  assert.equal((await p.save({ requestId: [crypto.randomUUID()] })).status, 400);
+  assert.equal((await f.request('/api/console/settings', { importProxy: { revision: 0, proxyId: null, requestId: crypto.randomUUID() } })).status, 400);
+  assert.equal((await f.db.getImportProxySettings()).revision, 0);
+});
+
+test('console stale instance never becomes implicit direct and explicit clear needs no node read', async t => {
+  const f = await fixture(t); const p = proxyFixture(f); await p.save();
+  f.client.baseUrl = 'http://127.0.0.1:10';
+  assert.equal((await f.request('/api/console/settings')).body.importProxy.endpointMatches, false);
+  f.client.getProxy = async () => { throw new Error('must not query node when clearing'); };
+  const saved = await p.save({ proxyId: null, proxyRevision: undefined });
+  assert.equal(saved.status, 200); assert.equal(saved.body.importProxy.configured, false);
+  assert.equal(saved.body.importProxy.endpointMatches, true);
+});
+
+test('default proxy read failure before save is definitive while post-write response failure retains a receipt', async t => {
+  const f = await fixture(t); const p = proxyFixture(f);
+  f.client.getProxy = async () => { throw Object.assign(new Error('fixture-private-upstream-body'), { upstreamStatus: 404 }); };
+  const failed = await p.save();
+  assert.equal(failed.status, 409);
+  assert.equal(failed.body.error, 'CONSOLE_IMPORT_PROXY_CHECK_FAILED');
+  assert.match(failed.body.message, /未写入/); assert.equal(failed.body.message.includes('fixture-private'), false);
+  assert.equal((await f.db.getImportProxySettings()).revision, 0);
+  f.client.getProxy = async () => ({ ...p.node });
+  const requestId = crypto.randomUUID(); const persist = f.db.saveImportProxySettings.bind(f.db);
+  f.db.saveImportProxySettings = async (...args) => { await persist(...args); throw new Error('fixture-response-unavailable-after-persist'); };
+  const uncertain = await p.save({ requestId });
+  assert.notEqual(uncertain.body.error, 'CONSOLE_IMPORT_PROXY_CHECK_FAILED');
+  assert.equal((await f.request('/api/console/settings')).body.importProxy.lastRequestId, requestId);
+});
+
+test('invalid default stops registration before engine and paid actions', async t => {
+  const f = await fixture(t); const p = proxyFixture(f); await p.save(); p.node.status = 'disabled';
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', operator: '', autoImport: true });
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_IMPORT_PROXY_UNAVAILABLE');
+  assert.equal(f.calls.registration, 0); assert.equal(f.calls.preflight, 0); assert.equal(f.calls.import, 0);
+});
+
+test('default proxy feature does not broaden the auto-import-only registration API contract', async t => {
+  const f = await fixture(t); const p = proxyFixture(f); await p.save(); p.node.status = 'disabled';
+  f.client.getProxy = async () => { throw new Error('must not inspect a destination unused by token-only generation'); };
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', operator: '', autoImport: false });
+  assert.equal(admitted.status, 400); assert.equal(admitted.body.error, 'CONSOLE_REQUEST_INVALID');
+  assert.equal(f.calls.registration, 0); assert.equal(f.calls.import, 0);
+  assert.equal(f.remote.length, 0); assert.equal(f.tested.length, 0);
+});
+
+test('registration freezes an unconfigured default across generation and never adopts a later proxy', async t => {
+  let f;
+  f = await fixture(t, { registrar: async ({ beforeExecute }) => {
+    await beforeExecute();
+    const output = f.token(1);
+    await f.db.saveImportProxySettings({ proxyId: 2, endpointDigest: require('../backend/importProxy').endpointDigest(f.client),
+      lastRequestId: crypto.randomUUID() }, { expectedRevision: 0 });
+    return { requestedCount: 1, completedCount: 1, selectedKeys: [output.selectedKey],
+      artifacts: [{ selectedKey: output.selectedKey, contentHash: output.contentHash, identityKeys: ['account:account-1', 'user:user-1'] }] };
+  } });
+  proxyFixture(f);
+  const admitted = await f.request('/api/console/register', { count: 1, country: 'US', operator: '', autoImport: true });
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_IMPORT_PROXY_CHANGED');
+  assert.equal(f.calls.import, 0); assert.equal(f.remote.length, 0);
+  assert.equal(fs.existsSync(path.join(f.root, 'tokens/account-1.json')), true);
+});
+
+test('advanced preview and main-console import share the saved create-only default proxy', async t => {
+  const f = await fixture(t, { importer: require('../backend/sync').executeImport }); const p = proxyFixture(f); await p.save();
+  const source = f.token(1); let payload;
+  f.client.importCodexSession = async body => {
+    payload = body; f.account(1, { credentials: JSON.parse(body.content), proxy_id: body.proxy_id, name: body.name, group_ids: body.group_ids });
+    return { total: 1, created: 1, updated: 0, skipped: 0, failed: 0, items: [{ index: 1, account_id: 1, action: 'created' }] };
+  };
+  const preview = await f.request('/api/sync/preview', { selectedKeys: [source.selectedKey] });
+  assert.equal(preview.status, 200); assert.deepEqual(preview.body.importProxy, { proxyId: 2, appliesTo: 'create' });
+  const firstVersion = preview.body.planIntentVersion;
+  p.node.revision = 'proxy-v1.' + 'b'.repeat(43);
+  const changed = await f.request('/api/sync/preview', { selectedKeys: [source.selectedKey] });
+  assert.notEqual(changed.body.planIntentVersion, firstVersion);
+  p.node.status = 'expired';
+  const expired = await f.request('/api/sync/preview', { selectedKeys: [source.selectedKey] });
+  assert.equal(expired.status, 409); assert.equal(expired.body.error, 'CONSOLE_IMPORT_PROXY_UNAVAILABLE');
+  p.node.status = 'active';
+  const admitted = await f.request('/api/console/maintain', { importNew: true, refreshInvalid: false, deleteBanned: false });
+  const job = await f.waitJob(admitted.body.jobId);
+  assert.equal(job.status, 'succeeded', job.error || JSON.stringify(job.result));
+  assert.equal(payload.proxy_id, 2); assert.equal(f.remote[0].proxy_id, 2); assert.equal(job.result.summary.imported, 1);
+});
+
 test('console registration completes server-side register import verify and durable replay without browser continuation', async t => {
   const f = await fixture(t);
   const body = { count: 1, country: 'US', operator: '', autoImport: true };

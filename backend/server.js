@@ -130,6 +130,7 @@ const GET_API_ENDPOINTS = new Set([
   '/api/console/overview', '/api/console/settings', '/api/console/logs',
   '/api/console/logs/download', '/api/console/register/continuations',
   '/api/console/local-tokens',
+  '/api/console/proxies',
   '/api/health',
   '/api/snapshot',
   '/api/phase3/local-accounts',
@@ -346,6 +347,9 @@ const PUBLIC_BAD_REQUEST_ERRORS = new Set([
   'JOB_RECONCILIATION_CONTEXT_DIGEST_INVALID',
 ]);
 const PUBLIC_CONFLICT_ERRORS = new Set([
+  'CONSOLE_IMPORT_PROXY_CHANGED',
+  'CONSOLE_IMPORT_PROXY_ENDPOINT_CHANGED',
+  'CONSOLE_IMPORT_PROXY_UNAVAILABLE',
   'IDEMPOTENCY_KEY_REUSED',
   'IMPORT_PLAN_STALE',
   'IMPORT_RECONCILIATION_TARGET_LIMIT',
@@ -433,6 +437,9 @@ const PUBLIC_SERVICE_ERRORS = new Set([
   'SUB2API_GROUP_CONFIG_INVALID',
 ]);
 const PUBLIC_ERROR_MESSAGES = Object.freeze({
+  CONSOLE_IMPORT_PROXY_CHANGED: '默认导入代理或节点配置已变化，请重新预览；未切换直连',
+  CONSOLE_IMPORT_PROXY_ENDPOINT_CHANGED: 'Sub2API 管理实例已变化，请重新保存默认导入代理',
+  CONSOLE_IMPORT_PROXY_UNAVAILABLE: '默认导入代理读取失败或已失效，未切换直连；请检查节点',
   REQUEST_BODY_TOO_LARGE: '请求体超过允许的大小上限',
   INVALID_JSON_BODY: '请求体不是有效的 JSON',
   INVALID_REQUEST_BODY: '请求体必须是 JSON 对象',
@@ -1379,6 +1386,8 @@ function tokenImportReviewTargets(job) {
       strongIdentityKeys: [...target.strongIdentityKeys],
       availability: target.availability,
       availabilityReason: target.availabilityReason,
+      ...(target.expectedProxyKnown === true
+        ? { expectedProxyKnown: true, expectedProxyId: target.expectedProxyId } : {}),
     }));
     return {
       total: targets.length,
@@ -1804,6 +1813,16 @@ function reconciliationReviewDetail(job, options = {}) {
       ...(context.createGroupBinding
         ? { createGroupBinding: context.createGroupBinding }
         : {}),
+      ...(job.type === 'token_import' ? {
+        proxyBinding: {
+          knownTargets: context.targets.filter((target) => target.expectedProxyKnown === true).length,
+          totalTargets,
+          complete: context.targets.every((target) => target.expectedProxyKnown === true),
+          message: context.targets.every((target) => target.expectedProxyKnown === true)
+            ? '代理仅表示原任务冻结的期望，不是当前已匹配结果；请逐项核对并修正远端状态后确认。'
+            : '部分目标未保留代理期望，不能推断为直连或代理已匹配；请结合原任务记录人工核对当前代理。',
+        },
+      } : {}),
     },
   };
   detail.reconciliationContextDigest = crypto.createHash('sha256')
@@ -3503,6 +3522,7 @@ function createServer(options = {}) {
         if (request.method === 'GET') {
           if (route === '/api/console/overview') jsonResponse(response, 200, await consoleService.overview());
           else if (route === '/api/console/local-tokens') jsonResponse(response, 200, await consoleService.localTokens());
+          else if (route === '/api/console/proxies') jsonResponse(response, 200, await consoleService.proxies());
           else if (route === '/api/console/settings') jsonResponse(response, 200, await consoleService.settings());
           else if (route === '/api/console/logs') jsonResponse(response, 200,
             await consoleService.queryLogs(Object.fromEntries(requestUrl.searchParams)));
@@ -3543,7 +3563,8 @@ function createServer(options = {}) {
         const code = typeof error?.code === 'string' && /^[A-Z0-9_]{1,100}$/.test(error.code) ? error.code : 'CONSOLE_REQUEST_FAILED';
         if (/^(CONSOLE_|REGISTRATION_|ACCOUNT_LIFECYCLE_|MAINTENANCE_)/.test(code)) {
           const status = /NOT_FOUND$/.test(code) ? 404
-            : /INVALID$/.test(code) ? 400 : /STALE|CHANGED|REQUIRED|UNKNOWN|REUSED|CONFLICT/.test(code) ? 409 : 503;
+            : /INVALID$/.test(code) ? 400 : /STALE|CHANGED|REQUIRED|UNKNOWN|REUSED|CONFLICT/.test(code)
+              || code === 'CONSOLE_IMPORT_PROXY_CHECK_FAILED' ? 409 : 503;
           jsonResponse(response, status, { error: code, message: safeErrorMessage(error) });
         } else sendPublicApiError(response, error, { fallbackCode: 'console_request_failed', fallbackMessage: '操作未完成，请查看任务日志或连接检测' });
         writeLog(logger, 'warn', 'console.request_failed', { requestId, actor, code });
@@ -3687,7 +3708,8 @@ function createServer(options = {}) {
         const groupBinding = await resolveImportGroupBinding(client, plan, {
           signal: requestDisconnectController.signal,
         });
-        const executionBinding = resolveImportExecutionBinding(client, plan);
+        const proxyBinding = await require('./importProxy').resolveImportProxyBinding(db, client, plan, { signal: requestDisconnectController.signal });
+        const executionBinding = resolveImportExecutionBinding(client, plan, { importProxy: proxyBinding });
         const planIntentVersion = buildImportPlanIntentVersion(
           snapshot.version,
           selectedKeys,
@@ -3712,6 +3734,7 @@ function createServer(options = {}) {
         jsonResponse(response, 200, {
           readOnly: process.env.PANEL_WRITE_ENABLED !== '1',
           snapshotId,
+          ...(plan.some(item => item.action === 'create') ? { importProxy: { proxyId: proxyBinding?.proxyId ?? null, appliesTo: 'create' } } : {}),
           version: snapshot.version,
           planIntentVersion,
           groupBinding,

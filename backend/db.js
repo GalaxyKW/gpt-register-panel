@@ -7,6 +7,7 @@ const { acquireBakeryLease, releaseBakeryLease } = require('./lib/bakeryLock');
 const { ensureDirectoryTree } = require('./lib/safeFs');
 const { currentProcessOwner, isProcessOwnerAlive } = require('./taskCoordinator');
 const { mutationKeyHash, normalizeIdempotencyKey } = require('./idempotency');
+const { DEFAULT_IMPORT_PROXY, normalizeStoredImportProxy } = require('./importProxy');
 const {
   DEFAULT_CONSOLE_SETTINGS, TERMINAL_LIFECYCLE_STATES, lifecycleError,
   validEndpointKey, normalizeLifecycleIdentityKey, normalizeLifecycleRecord,
@@ -345,6 +346,7 @@ function validateDurableIdentitySchema(database) {
   ));
   requireSingleColumnUniqueIdentity('account_lifecycle', 'lifecycle_key', lifecycleError);
   requireSingleColumnUniqueIdentity('console_settings', 'id', lifecycleError);
+  requireSingleColumnUniqueIdentity('console_import_proxy_settings', 'id', lifecycleError);
 }
 
 function lifecycleRows(database, endpointKey) {
@@ -408,6 +410,16 @@ function storedConsoleSettings(database) {
   let settings;
   try { settings = JSON.parse(row.settings_json); } catch { throw lifecycleError('CONSOLE_SETTINGS_INVALID'); }
   return { revision: row.revision, settings: normalizeConsoleSettings(settings) };
+}
+
+function storedImportProxySettings(database) {
+  const row = resultRows(database.exec('SELECT revision, settings_json FROM console_import_proxy_settings WHERE id = 1'))[0];
+  if (!row) return { revision: 0, settings: { ...DEFAULT_IMPORT_PROXY } };
+  if (!Number.isSafeInteger(row.revision) || row.revision < 1 || typeof row.settings_json !== 'string'
+      || Buffer.byteLength(row.settings_json) > 1024) throw lifecycleError('CONSOLE_IMPORT_PROXY_SETTINGS_INVALID');
+  let settings;
+  try { settings = JSON.parse(row.settings_json); } catch { throw lifecycleError('CONSOLE_IMPORT_PROXY_SETTINGS_INVALID'); }
+  return { revision: row.revision, settings: normalizeStoredImportProxy(settings) };
 }
 
 function reconciliationError(code, message, fields = {}) {
@@ -2773,6 +2785,11 @@ class PanelDb {
         revision INTEGER NOT NULL,
         settings_json TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS console_import_proxy_settings (
+        id INTEGER PRIMARY KEY,
+        revision INTEGER NOT NULL,
+        settings_json TEXT NOT NULL
+      );
     `);
     const columns = resultRows(this.database.exec('PRAGMA table_info(sync_jobs)'))
       .map((row) => row.name);
@@ -4941,6 +4958,26 @@ class PanelDb {
 
   getConsoleSettings() {
     return this.read(storedConsoleSettings);
+  }
+
+  getImportProxySettings() { return this.read(storedImportProxySettings); }
+
+  saveImportProxySettings(settings, { expectedRevision } = {}) {
+    let normalized;
+    try {
+      normalized = normalizeStoredImportProxy(settings);
+      if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0 || normalized.lastRequestId === null) throw lifecycleError('CONSOLE_IMPORT_PROXY_SETTINGS_INVALID');
+    } catch (error) { return Promise.reject(error); }
+    return this.write(database => {
+      const current = storedImportProxySettings(database);
+      if (current.revision !== expectedRevision || current.revision >= Number.MAX_SAFE_INTEGER
+          || current.settings.lastRequestId === normalized.lastRequestId) throw lifecycleError('CONSOLE_IMPORT_PROXY_SETTINGS_STALE');
+      const revision = current.revision + 1;
+      const statement = database.prepare(`INSERT INTO console_import_proxy_settings (id, revision, settings_json)
+        VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET revision=excluded.revision, settings_json=excluded.settings_json`);
+      try { statement.run([revision, JSON.stringify(normalized)]); } finally { statement.free(); }
+      return { revision, settings: normalized };
+    });
   }
 
   saveConsoleSettings(settings, { expectedRevision } = {}) {

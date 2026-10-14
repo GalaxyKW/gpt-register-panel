@@ -1934,7 +1934,12 @@ function renderPlan(plan) {
   elements.planVersion.textContent = '快照 ' + String(plan.version || '').slice(0, 12)
     + ' · 选择 ' + state.plan.selectedKeys.length
     + (plan.identityCompletionConfirmed === true ? ' · 已核对原 ID 身份补全' : '')
-    + (importGroupBindingLabel(plan) ? ' · ' + importGroupBindingLabel(plan) : '');
+    + (importGroupBindingLabel(plan) ? ' · ' + importGroupBindingLabel(plan) : '')
+    + (counts.create ? (plan.importProxy?.appliesTo === 'create'
+      && (plan.importProxy.proxyId === null || (Number.isSafeInteger(plan.importProxy.proxyId) && plan.importProxy.proxyId > 0))
+      ? ' · 新账号代理：' + (plan.importProxy.proxyId === null ? '未指定（保留 Sub2API 网络配置）' : '#' + plan.importProxy.proxyId)
+      : ' · 新账号代理信息未提供，请刷新预览') : '')
+    + (counts.update ? ' · 更新保留原账号代理' : '');
   elements.planRows.innerHTML = items.map((item) => {
     const action = effectivePlanAction(item);
     const reason = effectivePlanReason(item);
@@ -2532,6 +2537,11 @@ function reconciliationTargetIsValid(workflow, target) {
     ? target.phone
     : null;
   if (workflow === 'token_import') {
+    const proxyKnownPresent = Object.prototype.hasOwnProperty.call(target, 'expectedProxyKnown');
+    const proxyIdPresent = Object.prototype.hasOwnProperty.call(target, 'expectedProxyId');
+    if (proxyKnownPresent !== proxyIdPresent || (proxyKnownPresent
+        && (target.expectedProxyKnown !== true || !(target.expectedProxyId === null
+          || (Number.isSafeInteger(target.expectedProxyId) && target.expectedProxyId > 0))))) return false;
     const sourceContentHashPresent = target.sourceContentHash !== undefined;
     const targetDigestPresent = target.targetDigest !== undefined;
     if (!sourcePath || !['create', 'update'].includes(target.action)
@@ -2791,6 +2801,9 @@ function reconciliationTargetContextText(detail) {
     token_cleanup: '过期 Token 清理',
   };
   const lines = ['工作流：' + workflowLabels[detail.type]];
+  if (detail.type === 'token_import') {
+    lines.push('代理信息仅是原任务冻结的期望，并非当前已匹配结果；面板不会自动确认代理绑定，请逐项人工核对。');
+  }
   if (detail.targetContext.coverage === 'conservative_all_planned_targets') {
     lines.push('重要：任务在执行中断后无法确定实际写到哪一项；以下列出本次计划内所有可能受影响目标。请使用来源内容摘要对应的文件版本和任务前备份逐项核对并修正实际状态；无法证明时不要确认。只能选择“实际状态已人工修正为期望值”。');
     const binding = detail.targetContext.createGroupBinding;
@@ -2828,6 +2841,11 @@ function reconciliationTargetContextText(detail) {
     if (target.email) fields.push('邮箱 ' + target.email);
     if (target.phone) fields.push('手机 ' + target.phone);
     if (target.action) fields.push('原动作 ' + (target.action === 'create' ? '创建' : '更新'));
+    if (detail.type === 'token_import') {
+      fields.push(target.expectedProxyKnown === true
+        ? '原任务期望代理 ' + (target.expectedProxyId === null ? '未绑定账号级代理（沿用 Sub2API 网络配置）' : '#' + target.expectedProxyId)
+        : '原任务未保留代理期望，不能推断为直连');
+    }
     if (target.baselineStatus) fields.push('提交时状态 ' + target.baselineStatus);
     if (typeof target.baselineSchedulable === 'boolean') {
       fields.push('提交时调度 ' + (target.baselineSchedulable ? '启用' : '停用'));

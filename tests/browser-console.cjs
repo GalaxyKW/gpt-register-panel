@@ -17,7 +17,9 @@ const fixtureSecret = 'SYNTHETIC_SECRET_NOT_FOR_STORAGE';
 const inventory = total => ({ total, returned: total, truncated: false });
 function makeFixture() {
   return {
-    settingsMode: 'ok', registerMode: 'ok', requests: [], receipts: new Map(), continuations: [], detailJobs: new Map(),
+    settingsMode: 'ok', registerMode: 'ok', requests: [], receipts: new Map(), confirmations: [], continuations: [], detailJobs: new Map(),
+    proxyMode: 'ok', proxyItems: [{ id: 7, name: '默认节点', protocol: 'socks5', status: 'active', revision: 'proxy7-proof', eligible: true, reason: '' },
+      { id: 9, name: '停用节点', protocol: 'http', status: 'disabled', revision: 'proxy9-proof', eligible: false, reason: '节点已停用' }],
     localTokens: [{ selectedKey: 'token:synthetic', sourceContentHash: 'source-revision', accountId: 160, accountName: 'free00047', sourceLabel: 'tokens/synthetic.json',
       action: 'update', eligible: true, reason: '相同 User ID，可补全 Account ID 并回写原账号', matchedBy: 'user_id', identityCompletion: 'account_id',
       targetRevision: 'target-revision', executionRevision: 'signed-execution', sourceFingerprint: 'new-fingerprint', targetFingerprint: 'old-fingerprint',
@@ -36,6 +38,7 @@ function makeFixture() {
         recoveryMessage: '已获取 token，不要重新注册或租号；请先核对原任务。', createdAt: '2026-10-12T02:00:00Z' }],
       network: null,
       settings: { revision: 'r1', policy: { enabled: false, intervalMinutes: 60, logsRetentionDays: 30 },
+        importProxy: { revision: 0, proxyId: null, configured: false, endpointMatches: true, lastRequestId: null },
         registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], issues: [],
           countries: [{ code: 'CL', name: '智利' }], fields: [
             { key: 'smsApiKey', label: '短信平台 API 密钥', type: 'string', secret: true, configured: true },
@@ -57,6 +60,10 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'GET') {
         if (url.pathname === '/api/console/overview') return json(fixture.overview);
         if (url.pathname === '/api/console/settings') return json(fixture.overview.settings);
+        if (url.pathname === '/api/console/proxies') {
+          if (fixture.proxyMode === 'unavailable') return json({ error: 'PROXY_LIST_UNAVAILABLE', message: '节点列表暂时不可用' }, 503);
+          return json({ revision: fixture.overview.settings.importProxy.revision, selectedProxyId: fixture.overview.settings.importProxy.proxyId, items: fixture.proxyItems });
+        }
         if (url.pathname === '/api/console/register/continuations') return json({ items: fixture.continuations });
         if (url.pathname === '/api/console/local-tokens') return json({ snapshotVersion: 'snapshot-fixture', items: fixture.localTokens });
         if (/^\/api\/jobs\/job_[a-f0-9]{24}$/.test(url.pathname)) {
@@ -80,8 +87,17 @@ const server = http.createServer(async (req, res) => {
         if (url.pathname === '/api/console/settings') {
           if (fixture.settingsMode === 'active-conflict') return json({ error: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', message: '后台任务仍在执行' }, 409);
           if (fixture.settingsMode === 'unknown') return json({ error: 'CONSOLE_SETTINGS_OTHER_CONFLICT', message: '合成场景：保存结果未知' }, 409);
+          if (entry.body.importProxy && ['stale', 'node-changed'].includes(fixture.proxyMode)) return json({ error: fixture.proxyMode === 'stale' ? 'CONSOLE_IMPORT_PROXY_SETTINGS_STALE' : 'CONSOLE_IMPORT_PROXY_CHANGED', message: '代理配置或节点已变化，请刷新后重新选择' }, 409);
           if (entry.body.policy) { fixture.overview.settings.policy = entry.body.policy; fixture.overview.settings.revision = 'r2'; }
           if (entry.body.registration) { fixture.overview.settings.registration.revision = 'g2'; fixture.overview.settings.registration.lastRequestId = entry.body.registration.requestId; }
+          if (entry.body.importProxy) {
+            const input = entry.body.importProxy;
+            assert.equal(input.revision, fixture.overview.settings.importProxy.revision);
+            assert.equal(entry.body.confirm, true);
+            if (input.proxyId !== null) assert.equal(input.proxyRevision, fixture.proxyItems.find(item => item.id === input.proxyId).revision);
+            fixture.overview.settings.importProxy = { revision: input.revision + 1, proxyId: input.proxyId, configured: input.proxyId !== null, endpointMatches: true, lastRequestId: input.requestId };
+            if (fixture.proxyMode === 'lost-response') return json({ error: 'SETTINGS_WRITE_UNKNOWN', message: '代理设置保存结果未知', writeOutcomeUnknown: true }, 503);
+          }
           return json(fixture.overview.settings);
         }
         if (url.pathname.endsWith('/stop')) {
@@ -125,6 +141,20 @@ const server = http.createServer(async (req, res) => {
 function writes(pathname) { return fixture.requests.filter(req => req.method === 'POST' && (!pathname || req.pathname === pathname)); }
 async function waitText(page, selector, text) { currentStep = selector + ': ' + text; await page.waitForFunction((s, value) => document.querySelector(s)?.textContent.includes(value), {}, selector, text); }
 async function setInput(page, selector, value) { await page.$eval(selector, (input, next) => { input.value = next; input.dispatchEvent(new Event('input', { bubbles: true })); }, value); }
+async function assertReadableText(page, selectors) {
+  const results = await page.evaluate(selectors => {
+    const rgb = value => (value.match(/[\d.]+/g) || []).map(Number);
+    const luminance = values => values.slice(0, 3).map(v => v / 255).map(v => v <= .04045 ? v / 12.92 : ((v + .055) / 1.055) ** 2.4).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+    return selectors.map(selector => {
+      const element = document.querySelector(selector); if (!element) return { selector, missing: true };
+      const foreground = luminance(rgb(getComputedStyle(element).color)); let ancestor = element, background;
+      while (ancestor) { const value = rgb(getComputedStyle(ancestor).backgroundColor); if (value.length === 3 || value[3] > .99) { background = luminance(value); break; } ancestor = ancestor.parentElement; }
+      background ??= 1;
+      return { selector, ratio: (Math.max(foreground, background) + .05) / (Math.min(foreground, background) + .05) };
+    });
+  }, selectors);
+  for (const result of results) assert.ok(!result.missing && result.ratio >= 4.5, 'text contrast below 4.5: ' + result.selector);
+}
 async function navigate(page, name) {
   await page.click('[data-page="' + name + '"]'); await page.waitForFunction(name => !document.querySelector('#page-' + name).hidden, {}, name);
   assert.deepEqual(await page.$$eval('.nav-link.active', links => links.map(link => link.dataset.page)), [name], 'navigation must have exactly one active page');
@@ -145,7 +175,7 @@ async function testCase(name, body, { authenticated = true, hash = '' } = {}) {
     return request.continue();
   });
   let acceptDialogs = true;
-  page.on('dialog', dialog => acceptDialogs ? dialog.accept() : dialog.dismiss());
+  page.on('dialog', dialog => { fixture.confirmations.push(dialog.message()); return acceptDialogs ? dialog.accept() : dialog.dismiss(); });
   if (authenticated) await page.evaluateOnNewDocument(value => sessionStorage.setItem('panelToken', value), token);
   try {
     await page.setViewport({ width: 1440, height: 1050 });
@@ -177,6 +207,7 @@ async function main() {
         await navigate(page, section);
         if (section === 'logs') await page.waitForSelector('.log-line');
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, section + ' horizontal overflow');
+        await assertReadableText(page, ['#page-' + section + ' .page-description', ...({ register: ['.metric > span', '.channel-copy p', '#jobs .job-detail'], accounts: ['.account-email', '.accounts-table th'], logs: ['.log-time'], settings: ['.proxy-description', '.environment-list dt'] })[section]]);
         if (section === 'register') {
           const text = await page.$eval('#jobs', el => el.textContent);
           assert.match(text, /注册成功 1 · 导入 0 · 账号步骤失败 0/); assert.match(text, /失败阶段：导入 Sub2API/); assert.match(text, /不要重新注册或租号/);
@@ -187,6 +218,8 @@ async function main() {
         }
       }
     }
+    await navigate(page, 'register'); await page.focus('#refresh'); await page.keyboard.press('Tab');
+    assert.equal(await page.evaluate(() => { const style = getComputedStyle(document.activeElement); return style.outlineStyle !== 'none' && parseFloat(style.outlineWidth) >= 2; }), true, 'keyboard focus must be visible');
     assert.equal(writes().length, 0);
   });
   await testCase('direct logs reload, pagination and task shortcut clear stale filters', async page => {
@@ -317,6 +350,56 @@ async function main() {
     assert.deepEqual(writes()[0].body, { accountIds: [160], importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true,
       accountTargets: [{ accountId: 160, targetRevision: 'fresh-target160', executionRevision: 'fresh-execution160' }], modelId: 'gpt-5.6-luna' });
     await page.waitForFunction(() => document.querySelector('#task-dialog').open);
+  });
+  await testCase('default import proxy requires confirmation and preserves unrelated policy edits', async (page, confirm) => {
+    await page.setViewport({ width: 390, height: 844 });
+    await navigate(page, 'settings'); await page.waitForFunction(() => !document.querySelector('#import-proxy-save').disabled);
+    assert.equal(await page.$eval('#import-proxy-select option[value="9"]', option => option.disabled), true);
+    await setInput(page, '#maintenance-interval', '95'); await page.select('#import-proxy-select', '7');
+    if (process.env.PANEL_TEST_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.PANEL_TEST_SCREENSHOT_DIR, 'mock-390-proxy-selected.png'), fullPage: true });
+    confirm(false); await page.click('#import-proxy-save'); assert.equal(writes().length, 0);
+    confirm(true); await page.click('#import-proxy-save'); await waitText(page, '#notice', '默认导入代理保存成功');
+    assert.equal(writes().length, 1); const body = writes()[0].body;
+    assert.equal(body.importProxy.proxyId, 7); assert.equal(body.importProxy.proxyRevision, 'proxy7-proof'); assert.equal(body.importProxy.revision, 0);
+    assert.match(body.importProxy.requestId, /^[a-f0-9-]{36}$/); assert.equal(body.confirm, true); assert.equal(Object.hasOwn(body, 'policy'), false);
+    assert.equal(await page.$eval('#maintenance-interval', input => input.value), '95');
+    assert.match(fixture.confirmations.at(-1), /新增账号.*默认节点（#7）/); assert.match(fixture.confirmations.at(-1), /已有账号回写 token 保留原代理，注册机网络通道不变/);
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true, 'proxy settings has no page overflow');
+    if (process.env.PANEL_TEST_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.PANEL_TEST_SCREENSHOT_DIR, 'mock-390-proxy-saved.png'), fullPage: true });
+    await navigate(page, 'register'); await waitText(page, '#register-import-proxy', '默认节点');
+    assert.equal(await page.$eval('#register-import-proxy', el => el.textContent.includes('已连通')), false);
+  });
+  await testCase('proxy definite stale conflicts release only rejected receipt; missing nodes never fall back', async page => {
+    await navigate(page, 'settings'); await page.waitForFunction(() => !document.querySelector('#import-proxy-save').disabled); await page.select('#import-proxy-select', '7');
+    for (const mode of ['stale', 'node-changed']) {
+      fixture.proxyMode = mode; const before = writes().length;
+      const response = page.waitForResponse(response => response.url() === origin + '/api/console/settings' && response.request().method() === 'POST');
+      await page.click('#import-proxy-save'); assert.equal((await response).status(), 409); await waitText(page, '#notice', '代理配置或节点已变化');
+      await page.waitForFunction(() => !document.querySelector('#import-proxy-save').disabled);
+      assert.equal(writes().length, before + 1); assert.equal(await page.evaluate(() => sessionStorage.getItem('registerStudio.pending.v1')), null);
+    }
+    fixture.proxyMode = 'ok'; fixture.overview.settings.importProxy = { revision: 2, proxyId: 81, configured: true, endpointMatches: true, lastRequestId: null };
+    await page.reload({ waitUntil: 'networkidle0' }); await waitText(page, '#import-proxy-hint', '所选节点不在最新清单');
+    assert.equal(await page.$eval('#import-proxy-select', el => el.value), '81'); assert.equal(await page.$eval('#import-proxy-save', el => el.disabled), true);
+    const count = writes().length; fixture.proxyMode = 'unavailable'; await page.click('#import-proxy-refresh'); await waitText(page, '#import-proxy-hint', '列表读取失败');
+    assert.equal(writes().length, count); assert.equal(await page.$eval('#import-proxy-select', el => el.value), '81');
+  });
+  await testCase('lost proxy save response reload recovers only own request ID without another POST', async page => {
+    await navigate(page, 'settings'); await page.waitForFunction(() => !document.querySelector('#import-proxy-save').disabled);
+    fixture.proxyMode = 'lost-response'; await page.select('#import-proxy-select', '7'); await page.click('#import-proxy-save'); await waitText(page, '#notice', '代理设置保存结果未知');
+    const raw = await page.evaluate(() => sessionStorage.getItem('registerStudio.pending.v1')); const pending = JSON.parse(raw);
+    assert.equal(pending.body.importProxy.proxyId, 7); assert.equal(Object.hasOwn(pending.body.importProxy, 'proxyRevision'), false);
+    assert.equal(writes().length, 1); await page.reload({ waitUntil: 'networkidle0' }); assert.equal(writes().length, 1);
+    await page.click('#resolve-pending'); await waitText(page, '#notice', '默认导入代理保存成功');
+    assert.equal(writes().length, 1); assert.equal(await page.evaluate(() => sessionStorage.getItem('registerStudio.pending.v1')), null);
+  });
+  await testCase('clearing import proxy is explicit null and does not claim a direct network path', async (page, confirm) => {
+    fixture.overview.settings.importProxy = { revision: 1, proxyId: 7, configured: true, endpointMatches: true, lastRequestId: null };
+    await navigate(page, 'settings'); await page.waitForFunction(() => document.querySelector('#import-proxy-select').value === '7');
+    await page.select('#import-proxy-select', 'none'); confirm(false); await page.click('#import-proxy-save'); assert.equal(writes().length, 0);
+    confirm(true); await page.click('#import-proxy-save'); await waitText(page, '#notice', '默认导入代理保存成功');
+    assert.equal(writes().length, 1); assert.equal(writes()[0].body.importProxy.proxyId, null); assert.equal(Object.hasOwn(writes()[0].body.importProxy, 'proxyRevision'), false);
+    await navigate(page, 'register'); await waitText(page, '#register-import-proxy', '沿用 Sub2API 网络配置');
   });
   assert.deepEqual(failures, []); assert.deepEqual(externalRequests, []);
   console.log(JSON.stringify({ browserAcceptance: 'passed', scenarios: completed.length, viewports: ['1440x1050', '390x844'], productionRequests: 0, externalPageRequests: 0, pageErrors: 0 }));

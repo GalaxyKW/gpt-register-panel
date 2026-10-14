@@ -489,6 +489,10 @@ test('reconciliation detail is path-bound and exposes only bounded workflow targ
     assert.deepEqual(response.json.targetContext, {
       available: true,
       coverage: 'exact_unknown_targets',
+      proxyBinding: {
+        knownTargets: 0, totalTargets: 1, complete: false,
+        message: '部分目标未保留代理期望，不能推断为直连或代理已匹配；请结合原任务记录人工核对当前代理。',
+      },
       total: 1,
       returned: 1,
       truncated: false,

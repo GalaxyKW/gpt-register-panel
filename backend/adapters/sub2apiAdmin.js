@@ -12,6 +12,7 @@ const { TextDecoder } = require('node:util');
 const { redactText } = require('../logger');
 const { maintenanceEvidenceFromRaw } = require('../accountMaintenance');
 const { classifyAccountTestFailure } = require('../lib/accountTestFailure');
+const { safeProxy, proxySchemaError, rawAccountProxyState } = require('../lib/sub2apiProxy');
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15000;
 const MAX_REQUEST_TIMEOUT_MS = 120000;
@@ -795,9 +796,11 @@ function safeAccount(account) {
     overload,
   ];
   const groupIds = normalizedAccountGroupIds(account);
+  const proxy = rawAccountProxyState(account);
   const schemaValid = scalarSchemaValid
     && !autoPauseInvalid
     && groupIds.valid
+    && proxy.proxyIdValid
     && dateFields.every((field) => field.status !== 'invalid');
   const nestedUsage = normalizeTableUsageStats(account.usage);
   const hasNestedUsageShape = account.usage && typeof account.usage === 'object'
@@ -827,6 +830,7 @@ function safeAccount(account) {
   return {
     id,
     name,
+    ...proxy,
     platform: safeRemoteText(scalarText(account.platform, 64), 64),
     type: safeRemoteText(scalarText(account.type, 64), 64),
     planType,
@@ -1980,6 +1984,22 @@ class Sub2ApiAdminClient {
       if (targets.size !== 0) throw currentCredentialError();
     }
     return accounts.map((account) => replacements.get(account.id) || account);
+  }
+
+  async listProxies(options = {}) {
+    const value = await this.request('GET', '/api/v1/admin/proxies/all', undefined, { signal: options.signal });
+    if (!Array.isArray(value) || value.length > 10000) throw proxySchemaError();
+    const rows = value.map(row => safeProxy(row, this.baseUrl));
+    if (new Set(rows.map(row => row.id)).size !== rows.length) throw proxySchemaError();
+    return rows.sort((a, b) => a.id - b.id);
+  }
+
+  async getProxy(id, options = {}) {
+    if (!Number.isSafeInteger(id) || id <= 0) throw proxySchemaError();
+    const value = await this.request('GET', '/api/v1/admin/proxies/' + id, undefined, { signal: options.signal });
+    const row = safeProxy(value, this.baseUrl);
+    if (row.id !== id) throw proxySchemaError();
+    return row;
   }
 
   async listGroups(options = {}) {

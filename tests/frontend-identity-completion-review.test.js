@@ -102,6 +102,13 @@ test('reviewable missing identity is labeled separately without changing its blo
   assert.match(context.elements.planRows.innerHTML, /badge-warning[^]*待补全身份/);
   assert.equal(context.state.plan.items[0].action, 'conflict');
   assert.match(context.elements.identityCompletionReviewHint.textContent, /Account ID/);
+  for (const proxyId of [2, null]) {
+    context.renderPlan({ ...plan, items: [{ ...plan.items[0], action: 'create', reason: 'token_only' }],
+      importProxy: { proxyId, appliesTo: 'create' } });
+    assert.match(context.elements.planVersion.textContent, proxyId === 2 ? /新账号代理：#2/ : /未指定（保留 Sub2API 网络配置）/);
+  }
+  context.renderPlan(reviewedPlan());
+  assert.match(context.elements.planVersion.textContent, /更新保留原账号代理/);
 });
 
 test('identity completion never silently drops a mixed or duplicate selection', async () => {

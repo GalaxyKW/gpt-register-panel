@@ -339,6 +339,63 @@ test('token import reconciliation context binds create groups and execution targ
   }
 });
 
+test('proxy expectations bind creates and preserved update proxies without guessing legacy direct access', () => {
+  const create = importPlanItem(41);
+  const selected = proxyId => ({ ...EXECUTION_BINDING, importProxy: { mode: 'selected', proxyId } });
+  const legacy = buildContext([create]);
+  assert.equal(Object.hasOwn(legacy.targets[0], 'expectedProxyId'), false);
+  assert.equal(Object.hasOwn(legacy.targets[0], 'expectedProxyKnown'), false);
+  const bound = buildContext([create], { executionBinding: selected(7) });
+  const changed = buildContext([create], { executionBinding: selected(8) });
+  assert.equal(bound.targets[0].expectedProxyKnown, true);
+  assert.equal(bound.targets[0].expectedProxyId, 7);
+  assert.notEqual(bound.targets[0].targetDigest, legacy.targets[0].targetDigest);
+  assert.notEqual(bound.targets[0].targetDigest, changed.targets[0].targetDigest);
+  assert.notEqual(bound.manifestDigest, changed.manifestDigest);
+  for (const proxyId of [null, 12]) {
+    const update = importPlanItem(42, { action: 'update', accountId: 42,
+      availability: 'unavailable', availabilityReason: 'sub2api_status_error',
+      _account: { proxyIdKnown: true, proxyId } });
+    const context = buildContext([update], { executionBinding: selected(99) });
+    assert.equal(context.targets[0].expectedProxyId, proxyId, 'updates preserve their own proxy instead of a new-create default');
+    assert.deepEqual(parseReconciliationContext('token_import', serializeReconciliationContext('token_import', context)), context);
+  }
+  assert.deepEqual(parseReconciliationContext('token_import', serializeReconciliationContext('token_import', legacy)), legacy);
+});
+
+test('proxy expectation fields must be complete, canonical and digest-bound', () => {
+  const context = buildContext([importPlanItem(43)], {
+    executionBinding: { ...EXECUTION_BINDING, importProxy: { mode: 'selected', proxyId: 7 } },
+  });
+  for (const changes of [{ expectedProxyId: 8 }, { expectedProxyId: '7' }, { expectedProxyId: 0 },
+    { expectedProxyId: -1 }, { expectedProxyId: Number.MAX_SAFE_INTEGER + 1 }, { expectedProxyKnown: false },
+    { expectedProxyKnown: null }, { expectedProxyId: undefined }]) {
+    const changed = structuredClone(context);
+    Object.assign(changed.targets[0], changes);
+    assert.equal(normalizeReconciliationContext('token_import', changed), null);
+  }
+  for (const field of ['expectedProxyId', 'expectedProxyKnown']) {
+    const changed = structuredClone(context); delete changed.targets[0][field];
+    assert.equal(normalizeReconciliationContext('token_import', changed), null);
+  }
+  const stripped = structuredClone(context);
+  delete stripped.targets[0].expectedProxyKnown; delete stripped.targets[0].expectedProxyId;
+  assert.equal(normalizeReconciliationContext('token_import', stripped), null, 'cannot downgrade a bound context to legacy');
+  for (const importProxy of [null, { mode: 'direct', proxyId: null }, { mode: 'selected' },
+    { mode: 'selected', proxyId: null }, { mode: 'selected', proxyId: '7' }]) {
+    assert.throws(() => buildContext([importPlanItem(43)], { executionBinding: { ...EXECUTION_BINDING, importProxy } }),
+      { code: 'JOB_RECONCILIATION_CONTEXT_INVALID' });
+  }
+  const update = importPlanItem(44, { action: 'update', accountId: 44,
+    availability: 'unavailable', availabilityReason: 'sub2api_status_error', _account: { proxyIdKnown: true } });
+  assert.throws(() => buildContext([update]), { code: 'JOB_RECONCILIATION_CONTEXT_INVALID' });
+  const hostile = structuredClone(context);
+  let called = false;
+  Object.defineProperty(hostile.targets[0], 'expectedProxyId', { enumerable: true, get() { called = true; return 7; } });
+  assert.equal(normalizeReconciliationContext('token_import', hostile), null);
+  assert.equal(called, false);
+});
+
 test('token import reconciliation context enforces canonical bounded group bindings', () => {
   const plan = [importPlanItem(15)];
   const maximumIds = Array.from({ length: 1000 }, (_, index) => index + 1);

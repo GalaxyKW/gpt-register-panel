@@ -131,6 +131,29 @@ test('token cleanup reconciliation requires a path-bound content hash', () => {
   }], 2), false);
 });
 
+test('import reconciliation displays only validated proxy expectations and marks missing legacy evidence', () => {
+  const context = {};
+  vm.runInNewContext(section('function boundedReconciliationDisplay', 'function reconciliationReviewDetailError')
+    + section('function reconciliationTargetContextText', 'async function openReconciliationDialog'), context);
+  const detail = validReviewDetail(heldJob());
+  const target = detail.targetContext.targets[0];
+  assert.equal(context.reconciliationTargetIsValid('token_import', target), true);
+  assert.match(context.reconciliationTargetContextText(detail), /原任务未保留代理期望，不能推断为直连/);
+  Object.assign(target, { expectedProxyKnown: true, expectedProxyId: 23 });
+  assert.equal(context.reconciliationTargetIsValid('token_import', target), true);
+  assert.match(context.reconciliationTargetContextText(detail), /原任务期望代理 #23/);
+  assert.match(context.reconciliationTargetContextText(detail), /并非当前已匹配结果/);
+  target.expectedProxyId = null;
+  assert.equal(context.reconciliationTargetIsValid('token_import', target), true);
+  assert.match(context.reconciliationTargetContextText(detail), /未绑定账号级代理（沿用 Sub2API 网络配置）/);
+  for (const changes of [{ expectedProxyId: '23' }, { expectedProxyId: 0 }, { expectedProxyKnown: false },
+    { expectedProxyId: undefined }, { expectedProxyKnown: undefined }]) {
+    assert.equal(context.reconciliationTargetIsValid('token_import', { ...target, ...changes }), false);
+  }
+  delete target.expectedProxyId;
+  assert.equal(context.reconciliationTargetIsValid('token_import', target), false);
+});
+
 test('frontend rejects weak reconciliation targets for every mutating workflow', () => {
   const contracts = section(
     'function boundedReconciliationDisplay',

@@ -26,7 +26,7 @@ function harness() {
     fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } }) }; },
   };
   vm.createContext(context);
-  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected };');
+  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected, loadProxies, saveImportProxy, renderProxySetting, proxySaveIssue, defaultProxyIssue };');
   vm.runInContext(instrumented, context);
   const api = context.harness;
   api.state.connected = true;
@@ -763,4 +763,125 @@ test('console task detail matches running parent projection and does not mistake
   assert.match(h.element('task-detail').innerHTML, /进行中/); assert.doesNotMatch(h.element('task-detail').innerHTML, /排队中/);
   assert.match(h.element('task-detail').innerHTML, /已提交测试<\/span><strong>1/);
   assert.match(h.element('task-detail').innerHTML, /测试通过<\/span><strong>0/);
+});
+
+function mockProxySettings(h, { proxyId = null, error = null, listError = false, receiptMismatch = false } = {}) {
+  h.api.state.overview.settings.importProxy = { revision: 1, proxyId, configured: proxyId !== null, endpointMatches: true, lastRequestId: null };
+  const items = [{ id: 7, name: '<unsafe>节点', protocol: 'socks5', eligible: true, status: 'active', revision: 'signed-node7' },
+    { id: 9, name: '停用节点', protocol: 'http', eligible: false, status: 'disabled', revision: 'signed-node9', reason: '节点已停用' }];
+  h.context.fetch = async (url, options = {}) => {
+    h.calls.push({ url, options });
+    if (url === '/api/console/proxies') {
+      if (listError) throw new Error('list unavailable');
+      return { ok: true, status: 200, text: async () => JSON.stringify({ revision: h.api.state.overview.settings.importProxy.revision, selectedProxyId: h.api.state.overview.settings.importProxy.proxyId, items }) };
+    }
+    if (options.method === 'POST') {
+      const body = JSON.parse(options.body);
+      if (error) return { ok: false, status: error.status || 409, text: async () => JSON.stringify(error) };
+      h.api.state.overview.settings.importProxy = { revision: body.importProxy.revision + 1, proxyId: body.importProxy.proxyId, configured: body.importProxy.proxyId !== null, endpointMatches: true, lastRequestId: receiptMismatch ? 'different-request' : body.importProxy.requestId };
+    }
+    return { ok: true, status: 200, text: async () => JSON.stringify(h.api.state.overview.settings) };
+  };
+  return items;
+}
+
+test('console uses local consistent SVG icons and one structured responsive stylesheet', () => {
+  assert.match(html, /id="icon-accounts"/); assert.match(html, /id="icon-shield"/);
+  assert.equal((css.match(/:root\s*\{/g) || []).length, 1);
+  assert.doesNotMatch(html, /class="section-kicker"|class="policy-strip"/);
+  for (const id of ['import-proxy-form', 'import-proxy-select', 'import-proxy-save', 'register-import-proxy']) assert.match(html, new RegExp('id="' + id + '"'));
+  assert.match(html, /已有账号回写 token 时保留其原代理/);
+});
+
+test('console proxy selection escapes node labels and never treats enabled as connectivity proof', async () => {
+  const h = harness(); mockProxySettings(h, { proxyId: 7 }); await h.api.loadProxies();
+  assert.match(h.element('import-proxy-select').innerHTML, /&lt;unsafe&gt;/); assert.doesNotMatch(h.element('import-proxy-select').innerHTML, /<unsafe>|已连通/);
+  assert.match(h.element('import-proxy-select').innerHTML, /value="9" disabled/);
+  assert.equal(h.element('import-proxy-select').value, '7'); assert.equal(h.element('import-proxy-save').disabled, false);
+  assert.match(h.element('register-import-proxy').textContent, /已有账号保持原代理/);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('console independent import proxy save sends selected node proof with request identity and explicit confirmation', async () => {
+  const h = harness(); mockProxySettings(h); await h.api.loadProxies(); h.element('import-proxy-select').value = '7';
+  let confirmation; h.context.window.confirm = value => { confirmation = value; return true; };
+  await h.api.saveImportProxy();
+  const writes = h.calls.filter(call => call.options.method === 'POST'); assert.equal(writes.length, 1);
+  const body = JSON.parse(writes[0].options.body);
+  assert.deepEqual(body, { confirm: true, importProxy: { revision: 1, proxyId: 7, proxyRevision: 'signed-node7', requestId: '12345678-1234-1234-1234-123456789012' } });
+  assert.match(confirmation, /#7/); assert.match(confirmation, /已有账号回写 token 保留原代理/); assert.match(confirmation, /注册机网络通道不变/);
+  assert.equal(h.api.state.pending, null); assert.equal(h.api.state.overview.settings.importProxy.proxyId, 7);
+});
+
+test('console clearing default proxy is explicit null with no invented direct-connection guarantee', async () => {
+  const h = harness(); mockProxySettings(h, { proxyId: 7 }); await h.api.loadProxies(); h.element('import-proxy-select').value = 'none';
+  h.context.window.confirm = () => false; await h.api.saveImportProxy(); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  let confirmation; h.context.window.confirm = value => { confirmation = value; return true; }; await h.api.saveImportProxy();
+  const body = JSON.parse(h.calls.find(call => call.options.method === 'POST').options.body);
+  assert.equal(body.importProxy.proxyId, null); assert.equal(Object.hasOwn(body.importProxy, 'proxyRevision'), false);
+  assert.match(confirmation, /沿用 Sub2API 网络配置/); assert.doesNotMatch(confirmation, /直连/);
+});
+
+test('console unknown proxy save keeps receipt without node proof and recovers only by original request ID', async () => {
+  const h = harness(); mockProxySettings(h, { error: { error: 'PROXY_WRITE_UNKNOWN', message: 'unknown', writeOutcomeUnknown: true } });
+  await h.api.loadProxies(); h.element('import-proxy-select').value = '7'; await assert.rejects(h.api.saveImportProxy(), /unknown/);
+  const pending = JSON.parse(h.store.get('registerStudio.pending.v1'));
+  assert.equal(pending.body.importProxy.proxyId, 7); assert.equal(Object.hasOwn(pending.body.importProxy, 'proxyRevision'), false);
+  await assert.rejects(h.api.reconcileSettings(pending), /不能仅凭当前配置/);
+  h.api.state.overview.settings.importProxy.proxyId = 7;
+  await assert.rejects(h.api.reconcileSettings(pending), /不能仅凭当前配置/);
+  h.api.state.overview.settings.importProxy.lastRequestId = pending.body.importProxy.requestId;
+  await h.api.reconcileSettings(pending); assert.equal(h.api.state.pending, null);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 1, 'read-only receipt recovery must not repost');
+});
+
+test('console recognized proxy prewrite rejections unlock but explicit unknown and unrecognized 409 retain safety', async () => {
+  for (const code of ['CONSOLE_IMPORT_PROXY_SETTINGS_STALE', 'CONSOLE_IMPORT_PROXY_SETTINGS_INVALID', 'CONSOLE_IMPORT_PROXY_CHANGED', 'CONSOLE_IMPORT_PROXY_CHECK_FAILED']) {
+    const h = harness(); mockProxySettings(h, { error: { error: code, message: 'rejected', status: code.endsWith('INVALID') ? 400 : 409 } }); await h.api.loadProxies(); h.element('import-proxy-select').value = '7';
+    await assert.rejects(h.api.saveImportProxy(), /rejected/); assert.equal(h.api.state.pending, null, code);
+  }
+  for (const error of [{ error: 'UNRECOGNIZED_PROXY_CONFLICT', message: 'unknown' }, { error: 'CONSOLE_IMPORT_PROXY_CHANGED', message: 'unknown', writeOutcomeUnknown: true }, { error: 'CONSOLE_IMPORT_PROXY_CHECK_FAILED', message: 'unknown', writeOutcomeUnknown: true }, { error: 'CONSOLE_IMPORT_PROXY_CHECK_FAILED', message: 'unknown', status: 503 }]) {
+    const h = harness(); mockProxySettings(h, { error }); await h.api.loadProxies(); h.element('import-proxy-select').value = '7';
+    await assert.rejects(h.api.saveImportProxy(), /unknown/); assert.ok(h.api.state.pending);
+  }
+});
+
+test('console unavailable or missing proxy never silently switches selection to no-proxy', async () => {
+  const h = harness(); mockProxySettings(h, { proxyId: 81 }); await h.api.loadProxies();
+  assert.equal(h.element('import-proxy-select').value, '81'); assert.equal(h.element('import-proxy-save').disabled, true);
+  assert.match(h.element('import-proxy-select').innerHTML, /#81 已不可用/); assert.match(h.api.defaultProxyIssue(), /不会自动直连/);
+  h.element('import-proxy-select').value = '9'; await assert.rejects(h.api.saveImportProxy(), /节点已停用/);
+  mockProxySettings(h, { proxyId: 81, listError: true }); await h.api.loadProxies();
+  assert.equal(h.element('import-proxy-save').disabled, true); assert.equal(h.element('import-proxy-select').value, '9');
+  assert.match(h.element('import-proxy-hint').textContent, /当前默认设置未改变/);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('console default proxy endpoint mismatch blocks new imports not existing-account operations', async () => {
+  const h = harness(); mockProxySettings(h, { proxyId: 7 }); h.api.state.overview.settings.importProxy.endpointMatches = false; h.api.state.selected.add(160);
+  h.api.renderProxySetting(); h.api.renderControls();
+  assert.match(h.element('register-import-proxy').textContent, /另一 Sub2API 实例/);
+  assert.equal(h.element('start-register').disabled, true); assert.equal(h.element('import-new').disabled, true); assert.equal(h.element('maintain-all').disabled, true);
+  assert.equal(h.element('maintain-selected').disabled, false); assert.equal(h.element('test-selected').disabled, false);
+});
+
+test('console proxy list reload retains explicit unsaved selection while advancing CAS proof', async () => {
+  const h = harness(); mockProxySettings(h); await h.api.loadProxies(); h.element('import-proxy-select').value = '7'; h.api.state.proxyDirty = true;
+  h.api.state.overview.settings.importProxy.revision = 2; await h.api.loadProxies();
+  assert.equal(h.element('import-proxy-select').value, '7'); assert.equal(h.api.state.proxyRevision, 2);
+});
+
+test('console saving proxy independently preserves unsaved policy and registration edits', async () => {
+  const h = harness(); mockProxySettings(h); await h.api.loadProxies();
+  h.api.state.settingsDirty = true; h.api.state.registrationDirty = true; h.element('maintenance-interval').value = '95';
+  h.element('import-proxy-select').value = '7'; await h.api.saveImportProxy();
+  assert.equal(h.api.state.settingsDirty, true); assert.equal(h.api.state.registrationDirty, true);
+  assert.equal(h.element('maintenance-interval').value, '95');
+});
+
+test('console prewrite proxy check exception never makes another endpoint or read definitive', async () => {
+  const h = harness(); h.context.fetch = async () => ({ ok: false, status: 409, text: async () => JSON.stringify({ error: 'CONSOLE_IMPORT_PROXY_CHECK_FAILED' }) });
+  for (const [url, options] of [['/api/console/register', { method: 'POST', body: '{}' }], ['/api/console/settings', {}]]) {
+    await assert.rejects(h.api.request(url, options), error => error.code === 'CONSOLE_IMPORT_PROXY_CHECK_FAILED' && error.definitive === false);
+  }
 });

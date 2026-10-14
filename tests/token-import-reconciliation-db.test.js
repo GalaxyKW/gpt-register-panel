@@ -57,7 +57,7 @@ function importPlanItem(index = 1) {
   };
 }
 
-function buildContext(plan = [importPlanItem()]) {
+function buildContext(plan = [importPlanItem()], options = {}) {
   const hasCreates = plan.some((item) => item.action === 'create');
   return buildTokenImportReconciliationContext(plan, {
     snapshotVersion: SNAPSHOT_VERSION,
@@ -66,8 +66,36 @@ function buildContext(plan = [importPlanItem()]) {
       ? { mode: 'explicit', groupIds: [7] }
       : { mode: 'not_applicable', groupIds: [] },
     executionBinding: { target: EXECUTION_TARGET },
+    ...options,
   });
 }
+
+test('durable import review exposes frozen proxy expectations without claiming live proxy verification', async () => {
+  const db = new PanelDb(databasePath('proxy-review'));
+  const job = await createTokenImportJob(db);
+  const context = buildContext([importPlanItem(17)], { executionBinding: { target: EXECUTION_TARGET,
+    importProxy: { mode: 'selected', proxyId: 23 } } });
+  await db.startMutationJob(job.id, { reconciliationContext: context });
+  await db.updateJob(job.id, { status: 'failed', result: { writeOutcomeUnknown: true }, finishedAt: new Date().toISOString() });
+  const stored = await db.getJobForReconciliation(job.id);
+  const detail = reconciliationReviewDetail(stored, { currentImportTargetFingerprint: EXECUTION_TARGET.fingerprint });
+  assert.equal(detail.targetContext.targets[0].expectedProxyKnown, true);
+  assert.equal(detail.targetContext.targets[0].expectedProxyId, 23);
+  assert.equal(detail.targetContext.proxyBinding.knownTargets, 1);
+  assert.equal(detail.targetContext.proxyBinding.complete, true);
+  assert.match(detail.targetContext.proxyBinding.message, /不是当前已匹配结果/);
+  assert.equal(Object.hasOwn(detail.targetContext.proxyBinding, 'currentMatches'), false);
+  assert.equal(stored.status, 'failed'); assert.equal(stored.reconciliationHold, true);
+
+  const legacyContext = buildContext([importPlanItem(17)]);
+  const legacyDetail = reconciliationReviewDetail({ ...stored, reconciliationContext: legacyContext },
+    { currentImportTargetFingerprint: EXECUTION_TARGET.fingerprint });
+  assert.equal(Object.hasOwn(legacyDetail.targetContext.targets[0], 'expectedProxyId'), false);
+  assert.equal(legacyDetail.targetContext.proxyBinding.knownTargets, 0);
+  assert.equal(legacyDetail.targetContext.proxyBinding.complete, false);
+  assert.match(legacyDetail.targetContext.proxyBinding.message, /不能推断为直连/);
+  assert.notEqual(legacyDetail.reconciliationContextDigest, detail.reconciliationContextDigest);
+});
 
 async function createTokenImportJob(db) {
   return db.createJob('token_import', {

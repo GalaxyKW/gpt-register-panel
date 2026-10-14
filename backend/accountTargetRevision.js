@@ -1,6 +1,7 @@
 const crypto = require('node:crypto');
 
 const { normalizeIdentityValue, parseDateValue } = require('./lib/token');
+const { accountProxyState } = require('./lib/sub2apiProxy');
 
 const REVISION_PREFIX = 'account-test-v1.';
 const REVISION_PATTERN = /^account-test-v1\.[A-Za-z0-9_-]{43}$/;
@@ -146,6 +147,7 @@ function canonicalAccountTestTarget(account) {
   const identities = canonicalStrongIdentities(account);
   const state = knownAccountState(account);
   const groupIds = canonicalGroupIds(ownValue(account, 'groupIds'));
+  const proxy = accountProxyState(account);
   const booleanEvidenceFields = [
     'schemaValid',
     'identityConflict',
@@ -172,7 +174,7 @@ function canonicalAccountTestTarget(account) {
   if (!id || platform !== 'openai' || type !== 'oauth' || !state
       || ownValue(account, 'schemaValid') === false || identities.invalid
       || invalidBooleanEvidence || conflictEvidence || invalidCredentialShape
-      || !groupIds || identities.account.length + identities.user.length === 0) return null;
+      || !groupIds || !proxy || identities.account.length + identities.user.length === 0) return null;
 
   const fingerprints = {};
   const presence = {};
@@ -231,6 +233,7 @@ function canonicalAccountTestTarget(account) {
     identities: { account: identities.account, user: identities.user },
     credentials: { fingerprints, presence },
     groupIds,
+    proxy,
     state: {
       ...state,
       schemaValid: ownValue(account, 'schemaValid') !== false,
@@ -290,6 +293,7 @@ function accountTestOwnershipDigest(account) {
       identities: target.identities,
       credentials: target.credentials,
       groupIds: target.groupIds,
+      proxy: target.proxy,
     }))
     .digest('hex');
 }

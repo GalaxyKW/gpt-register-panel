@@ -138,7 +138,7 @@ function verifyRegistrationArtifacts(events, before, after, count) {
   return outputs;
 }
 async function runRegistrationJob({ rootDirectory = process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register', options, signal,
-  logger, jobId, actor = 'panel-admin', onProgress, preflight, runner } = {}) {
+  logger, jobId, actor = 'panel-admin', onProgress, preflight, runner, beforeExecute = null } = {}) {
   const normalized = normalizeRegistrationOptions(options);
   const settings = readRegistrationSettings({ rootDirectory });
   if (!settings.ready || !settings.countries.some(item => item.code === normalized.country)) throw failure('REGISTRATION_CONFIG_INVALID', '注册配置或所选国家不完整，请先检查设置');
@@ -146,6 +146,11 @@ async function runRegistrationJob({ rootDirectory = process.env.GPT_REGISTER_ROO
   onProgress?.({ type: 'stage', stage: 'network_preflight' });
   const network = await (preflight || require('./networkPreflight').runNetworkPreflight)({ rootDirectory, signal, logger, jobId, actor });
   if (!network.ok) throw failure('REGISTRATION_PREFLIGHT_FAILED', '网络预检未通过，未申请号码或启动注册', { preflight: network });
+  if (beforeExecute !== null) {
+    if (typeof beforeExecute !== 'function') throw failure('REGISTRATION_DESTINATION_INVALID', '导入目标检查不可用，未启动注册');
+    await beforeExecute();
+  }
+  if (signal?.aborted) throw failure('JOB_INTERRUPTED', '任务已取消，未启动注册');
   if (readRegistrationSettings({ rootDirectory }).revision !== settings.revision) throw failure('REGISTRATION_CONFIG_CHANGED', '网络预检期间注册配置已变化，未申请号码，请重新开始');
   const before = readGptRegisterSources({ rootDirectory, strictCompleteSnapshot: true });
   const output = await runEngineCommand({ rootDirectory, arguments: [String(normalized.count), '--panel-register', '--country=' + normalized.country, '--operator=' + normalized.operator,
@@ -240,13 +245,18 @@ function resolveContinuation(rootDirectory, target) {
       usernameRecordHash: crypto.createHash('sha256').update(JSON.stringify(snapshot.usernames[identity.usernameIndex])).digest('hex') } : {}) } };
 }
 async function runRegistrationResumeJob({ rootDirectory = process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register', target, signal,
-  logger, jobId, actor = 'panel-admin', onProgress, preflight, runner } = {}) {
+  logger, jobId, actor = 'panel-admin', onProgress, preflight, runner, beforeExecute = null } = {}) {
   const selected = resolveContinuation(rootDirectory, target);
   const settings = readRegistrationSettings({ rootDirectory });
   if (signal?.aborted) throw failure('JOB_INTERRUPTED', '续跑已取消');
   onProgress?.({ type: 'stage', stage: 'network_preflight' });
   const network = await (preflight || require('./networkPreflight').runNetworkPreflight)({ rootDirectory, signal, logger, jobId, actor, scope: selected.item.stage === 'phase3' ? 'phase3' : 'registration' });
   if (!network.ok) throw failure('REGISTRATION_PREFLIGHT_FAILED', '网络预检未通过，未执行账号续跑', { preflight: network });
+  if (beforeExecute !== null) {
+    if (typeof beforeExecute !== 'function') throw failure('REGISTRATION_DESTINATION_INVALID', '导入目标检查不可用，未启动续跑');
+    await beforeExecute();
+  }
+  if (signal?.aborted) throw failure('JOB_INTERRUPTED', '任务已取消，未启动续跑');
   resolveContinuation(rootDirectory, target);
   if (settings.revision !== readRegistrationSettings({ rootDirectory }).revision) throw failure('REGISTRATION_CONFIG_CHANGED', '网络预检期间注册配置已变化，未执行账号续跑');
   const before = readGptRegisterSources({ rootDirectory, strictCompleteSnapshot: true });

@@ -188,6 +188,29 @@ function normalizeExecutionTarget(value) {
     : null;
 }
 
+function validExpectedProxyId(value) {
+  return value === null || (Number.isSafeInteger(value) && value > 0);
+}
+
+function expectedProxyFromPlanItem(item, options) {
+  if (ownData(item, 'action') === 'create') {
+    const binding = ownData(ownData(options, 'executionBinding'), 'importProxy');
+    // Older executions and creates without an explicitly selected proxy did
+    // not promise direct access. Do not invent a null binding for them.
+    if (binding === undefined) return {};
+    const proxyId = ownData(binding, 'proxyId');
+    if (ownData(binding, 'mode') !== 'selected' || !Number.isSafeInteger(proxyId) || proxyId <= 0) {
+      throw contextError('导入目标代理期望无效，拒绝开始写任务');
+    }
+    return { expectedProxyKnown: true, expectedProxyId: proxyId };
+  }
+  const account = ownData(item, '_account');
+  if (ownData(account, 'proxyIdKnown') !== true) return {};
+  const proxyId = ownData(account, 'proxyId');
+  if (!validExpectedProxyId(proxyId)) throw contextError('原账号代理期望无效，拒绝开始写任务');
+  return { expectedProxyKnown: true, expectedProxyId: proxyId };
+}
+
 function targetMaterial(target, bindings) {
   return {
     sourcePath: target.sourcePath,
@@ -202,6 +225,8 @@ function targetMaterial(target, bindings) {
     availabilityReason: target.availabilityReason,
     executionTarget: bindings.executionTarget,
     createGroupBinding: target.action === 'create' ? bindings.createGroupBinding : null,
+    ...(target.expectedProxyKnown === true
+      ? { expectedProxyKnown: true, expectedProxyId: target.expectedProxyId } : {}),
   };
 }
 
@@ -218,7 +243,11 @@ function normalizeTokenImportTarget(value, bindings) {
     'accountName', 'email', 'accessFingerprint', 'strongIdentityKeys',
     'availability', 'availabilityReason',
   ]);
-  if (!exactObjectKeys(value, allowed)) return null;
+  const withProxy = exactObjectKeys(value, new Set([...allowed, 'expectedProxyKnown', 'expectedProxyId']));
+  if (!withProxy && !exactObjectKeys(value, allowed)) return null;
+  const expectedProxyId = ownData(value, 'expectedProxyId');
+  if (withProxy && (ownData(value, 'expectedProxyKnown') !== true
+      || !validExpectedProxyId(expectedProxyId))) return null;
   const sourcePath = canonicalSourcePath(ownData(value, 'sourcePath'));
   const sourceContentHash = ownData(value, 'sourceContentHash');
   const action = ownData(value, 'action');
@@ -268,6 +297,7 @@ function normalizeTokenImportTarget(value, bindings) {
     strongIdentityKeys,
     availability,
     availabilityReason,
+    ...(withProxy ? { expectedProxyKnown: true, expectedProxyId } : {}),
   };
   const digest = targetDigest(normalized, bindings);
   return ownData(value, 'targetDigest') === digest
@@ -418,6 +448,7 @@ function buildTokenImportReconciliationContext(plan, options = {}) {
       strongIdentityKeys,
       availability: ownData(item, 'availability'),
       availabilityReason: ownData(item, 'availabilityReason'),
+      ...expectedProxyFromPlanItem(item, options),
     };
     rawTarget.targetDigest = targetDigest(rawTarget, bindings);
     const normalized = normalizeTokenImportTarget(rawTarget, bindings);

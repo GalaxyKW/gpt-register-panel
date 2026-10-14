@@ -173,6 +173,21 @@ test('failed preflight prevents registration process launch', async t => {
   await assert.rejects(runRegistrationJob({ rootDirectory: f.root, options: { count: 1, country: 'US' }, preflight: async () => ({ ok: false }), runner: async () => { invoked = true; } }), { code: 'REGISTRATION_PREFLIGHT_FAILED' });
   assert.equal(invoked, false);
 });
+for (const kind of ['rejected', 'invalid', 'cancelled']) {
+  test('registration destination check ' + kind + ' after preflight prevents any engine launch', async t => {
+    const f = fixture(t); const controller = new AbortController(); let launches = 0; const order = [];
+    await assert.rejects(runRegistrationJob({ rootDirectory: f.root, options: { count: 1, country: 'US' },
+      signal: controller.signal, preflight: async () => { order.push('preflight'); return { ok: true }; },
+      beforeExecute: kind === 'invalid' ? {} : async () => {
+        order.push('destination');
+        if (kind === 'cancelled') controller.abort();
+        else throw Object.assign(new Error('default proxy disabled'), { code: 'CONSOLE_IMPORT_PROXY_UNAVAILABLE' });
+      }, runner: async () => { launches++; } }), { code: kind === 'invalid' ? 'REGISTRATION_DESTINATION_INVALID'
+      : kind === 'cancelled' ? 'JOB_INTERRUPTED' : 'CONSOLE_IMPORT_PROXY_UNAVAILABLE' });
+    assert.deepEqual(order, kind === 'invalid' ? ['preflight'] : ['preflight', 'destination']);
+    assert.equal(launches, 0);
+  });
+}
 test('registration batch deadline scales with requested count but remains bounded to 24 hours', async t => {
   const f = fixture(t);
   for (const [count, expectedMinutes] of [[1, 30], [2, 60], [48, 1440], [100, 1440]]) {
@@ -268,6 +283,17 @@ function continuationFixture(t, status = 'registered') {
   if (f.account.email) fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify([{ ...f.account }]), { mode: 0o600 });
   return f;
 }
+test('resume destination invalidated during preflight prevents engine launch without changing ledgers', async t => {
+  const f = continuationFixture(t); const target = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
+  const before = fs.readFileSync(path.join(f.root, 'accounts.json')); let launches = 0; const order = [];
+  await assert.rejects(runRegistrationResumeJob({ rootDirectory: f.root,
+    target: { selectedKey: target.selectedKey, revision: target.revision },
+    preflight: async () => { order.push('preflight'); return { ok: true }; },
+    beforeExecute: async () => { order.push('destination'); throw Object.assign(new Error('proxy expired'), { code: 'CONSOLE_IMPORT_PROXY_UNAVAILABLE' }); },
+    runner: async () => { launches++; } }), { code: 'CONSOLE_IMPORT_PROXY_UNAVAILABLE' });
+  assert.deepEqual(order, ['preflight', 'destination']); assert.equal(launches, 0);
+  assert.deepEqual(fs.readFileSync(path.join(f.root, 'accounts.json')), before);
+});
 test('continuations use opaque revisions and mask phones without exposing credentials', t => {
   const f = continuationFixture(t); const result = listRegistrationContinuations({ rootDirectory: f.root });
   assert.equal(result.items.length, 1); assert.equal(result.items[0].stage, 'phase2'); assert.equal(result.items[0].eligible, true);

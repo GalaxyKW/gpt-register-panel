@@ -22,6 +22,7 @@ const { accountTestTargetBaseline, runAccountTestJob, accountTestJobStatus, norm
 const { normalizeAccountTestFailure } = require('./lib/accountTestFailure');
 const { strongIdentityContradiction } = require('./diff');
 const logs = require('./consoleLogs');
+const importProxy = require('./importProxy');
 
 const PARENT_TYPES = new Set(['console_register', 'console_resume', 'console_maintain', 'console_log_cleanup']);
 const TERMINAL = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
@@ -171,7 +172,20 @@ function createConsoleService({ db, logger, jobManager,
     try { registration = readRegistrationSettings(); }
     catch (error) { registration = { ready: false, phase3Ready: false, phase3Issues: ['注册配置暂不可读，请检查服务配置与权限'],
       issues: [{ code: error.code || 'REGISTRATION_CONFIG_UNAVAILABLE', message: '注册配置暂不可读，请检查服务配置与权限' }], fields: [], countries: [] }; }
-    return { revision: saved.revision, policy: saved.settings, registration };
+    const proxy = await importProxy.readImportProxySettings(db);
+    let endpointMatches = proxy.settings.proxyId === null;
+    try { endpointMatches ||= proxy.settings.endpointDigest === importProxy.endpointDigest(client()); } catch {}
+    return { revision: saved.revision, policy: saved.settings, registration,
+      importProxy: { revision: proxy.revision, proxyId: proxy.settings.proxyId,
+        configured: proxy.settings.proxyId !== null, endpointMatches, lastRequestId: proxy.settings.lastRequestId } };
+  }
+  async function proxies() {
+    const remoteClient = client();
+    const saved = await importProxy.readImportProxySettings(db);
+    const rows = await remoteClient.listProxies();
+    return { revision: saved.revision, selectedProxyId: saved.settings.proxyId,
+      items: rows.map(proxy => ({ id: proxy.id, name: proxy.name, protocol: proxy.protocol, status: proxy.status,
+        revision: proxy.revision, ...importProxy.proxyEligibility(proxy) })) };
   }
   async function localTokenReview(current, remoteClient, signal) {
     const accounts = requireRemote(current);
@@ -329,8 +343,8 @@ function createConsoleService({ db, logger, jobManager,
     try { return await networkPromise; } finally { networkPromise = null; }
   }
   async function saveSettings(body) {
-    if (!ordinaryObject(body) || Object.keys(body).some(k => !['revision', 'policy', 'registration', 'confirm'].includes(k))
-        || Number(Object.hasOwn(body, 'policy')) + Number(Object.hasOwn(body, 'registration')) !== 1) {
+    if (!ordinaryObject(body) || Object.keys(body).some(k => !['revision', 'policy', 'registration', 'importProxy', 'confirm'].includes(k))
+        || ['policy', 'registration', 'importProxy'].filter(key => Object.hasOwn(body, key)).length !== 1) {
       throw failure('CONSOLE_REQUEST_INVALID', '每次仅保存一组设置');
     }
     return withControlPlaneLock(async () => {
@@ -339,8 +353,38 @@ function createConsoleService({ db, logger, jobManager,
       if (inventory.activeJobs.total > 0) {
         throw failure('CONSOLE_SETTINGS_ACTIVE_CONFLICT', '后台任务仍在执行，请先停止或等待完成后再修改设置');
       }
-      assertAuditLogCheckpoint(logger, 'console.settings_save_checkpoint', { section: body.policy ? 'policy' : 'registration' });
-      if (body.policy) {
+      assertAuditLogCheckpoint(logger, 'console.settings_save_checkpoint', { section: body.policy ? 'policy' : body.importProxy ? 'importProxy' : 'registration' });
+      if (body.importProxy) {
+        const value = body.importProxy;
+        if (body.confirm !== true || !ordinaryObject(value)
+            || Object.keys(value).some(key => !['revision', 'proxyId', 'proxyRevision', 'requestId'].includes(key))
+            || !Number.isSafeInteger(value.revision) || value.revision < 0
+            || typeof value.requestId !== 'string' || !importProxy.UUID.test(value.requestId)
+            || (value.proxyId !== null && (!Number.isSafeInteger(value.proxyId) || value.proxyId < 1))
+            || (value.proxyId !== null && (typeof value.proxyRevision !== 'string' || value.proxyRevision.length > 160))) {
+          throw failure('CONSOLE_IMPORT_PROXY_SETTINGS_INVALID', '请明确选择默认导入代理并确认保存');
+        }
+        let endpoint = null;
+        if (value.proxyId !== null) {
+          let proxy;
+          // This catch covers only the read-only precondition. In particular
+          // DB persistence and the response read remain outside: failures
+          // there may represent a completed write and need receipt recovery.
+          try {
+            const remoteClient = client();
+            proxy = await remoteClient.getProxy(value.proxyId);
+            endpoint = importProxy.endpointDigest(remoteClient);
+          } catch {
+            throw failure('CONSOLE_IMPORT_PROXY_CHECK_FAILED', '保存前无法核验代理，设置未写入；请重载节点后重试');
+          }
+          const eligible = importProxy.proxyEligibility(proxy);
+          if (proxy?.id !== value.proxyId || !eligible.eligible || proxy.revision !== value.proxyRevision) {
+            throw failure('CONSOLE_IMPORT_PROXY_CHANGED', '所选代理配置已变化或不可用，请重新加载节点清单');
+          }
+        }
+        await db.saveImportProxySettings({ proxyId: value.proxyId, endpointDigest: endpoint, lastRequestId: value.requestId },
+          { expectedRevision: value.revision });
+      } else if (body.policy) {
         const old = await db.getConsoleSettings();
         if (body.policy.enabled && !old.settings.enabled && body.confirm !== true) {
           throw failure('CONSOLE_REQUEST_INVALID', '启用自动维护须明确确认后续刷新和封禁删除策略');
@@ -453,7 +497,12 @@ function createConsoleService({ db, logger, jobManager,
       if (!item || item._record?.contentHash !== artifact.contentHash) throw failure('CONSOLE_SOURCE_CHANGED', '任务产出的 token 文件已变化，未继续导入');
     }
     const groupBinding = await sync.resolveImportGroupBinding(remoteClient, plan, { signal: context.signal });
-    const executionBinding = sync.resolveImportExecutionBinding(remoteClient, plan);
+    const proxyBinding = await importProxy.resolveImportProxyBinding(db, remoteClient, plan, { signal: context.signal });
+    if (plan.some(item => item.action === 'create') && Object.hasOwn(context, 'importProxyBinding')
+        && JSON.stringify(context.importProxyBinding) !== JSON.stringify(proxyBinding)) {
+      throw failure('CONSOLE_IMPORT_PROXY_CHANGED', '任务启动后默认代理发生变化，已保留本地成果，未改为直连导入');
+    }
+    const executionBinding = sync.resolveImportExecutionBinding(remoteClient, plan, { importProxy: proxyBinding });
     const planIntentVersion = sync.buildImportPlanIntentVersion(current.version, selectedKeys, plan,
       groupBinding, executionBinding, reviewed?.remoteTargets);
     const { result } = await child(context, 'token_import', { snapshotVersion: current.version,
@@ -628,12 +677,16 @@ function createConsoleService({ db, logger, jobManager,
   async function register(context) {
     const current = await snapshot({ fresh: true, signal: context.signal, context });
     requireRemote(current);
+    if (context.intent.autoImport) context.importProxyBinding = await importProxy.resolveImportProxyBinding(db, client(context), [{ action: 'create' }], { signal: context.signal });
+    // This read happens before entering the engine: invalid destination
+    // configuration must not be discovered only after a paid registration.
     await updateParent(context, 'checking_network');
     let progressWrites = Promise.resolve();
     let completedCount = 0;
     let result; let registrationFailure = null;
     const resuming = context.job.type === 'console_resume';
     try { ({ result } = await child(context, 'registration', context.intent, ['registration'], options => (resuming ? resumer : registrar)({
+      ...(context.intent.autoImport ? { beforeExecute: () => importProxy.assertImportProxyCurrent(db, client(context), context.importProxyBinding, { signal: context.signal }) } : {}),
       ...options, ...(resuming ? { target: { selectedKey: context.intent.selectedKey, revision: context.intent.revision } }
         : { options: { count: context.intent.count, country: context.intent.country, operator: context.intent.operator,
           ...(Object.hasOwn(context.intent, 'smsMaxPriceUsd') ? { smsMaxPriceUsd: context.intent.smsMaxPriceUsd, smsMaxAcquisitions: context.intent.smsMaxAcquisitions } : {}) } }),
@@ -693,6 +746,10 @@ function createConsoleService({ db, logger, jobManager,
   async function maintain(context) {
     const current = await snapshot({ fresh: true, signal: context.signal, context });
     const accounts = requireRemote(current);
+    if (context.intent.importNew) {
+      const creates = sync.buildImportPlan(current._internal.sources, accounts).filter(item => item.action === 'create' && freeTokenForAutomaticImport(item));
+      context.importProxyBinding = await importProxy.resolveImportProxyBinding(db, client(context), creates, { signal: context.signal });
+    }
     const endpointKey = lifecycle.managementEndpointKey(client(context).baseUrl);
     await lifecycle.recordObservedAccounts(db, { endpointKey, accounts });
     const history = await db.listAccountLifecycles(endpointKey);
@@ -944,7 +1001,7 @@ function createConsoleService({ db, logger, jobManager,
     if (!timer) { timer = setInterval(() => { tick().catch(() => {}); }, 30000); timer.unref?.(); }
   }
   function dispose() { if (timer) clearInterval(timer); timer = null; }
-  return { overview, localTokens, settings, saveSettings, runPreflight, submit, stop, start, dispose,
+  return { overview, localTokens, proxies, settings, saveSettings, runPreflight, submit, stop, start, dispose,
     continuations: async () => listRegistrationContinuations(),
     queryLogs,
     downloadLog: async id => logs.downloadLog(id, await logOptions()),

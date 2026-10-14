@@ -1,4 +1,5 @@
 const crypto = require('node:crypto');
+const importProxy = require('./importProxy');
 const fs = require('node:fs');
 const path = require('node:path');
 const { performance } = require('node:perf_hooks');
@@ -590,6 +591,9 @@ function safeAccountForSnapshot(account) {
     tokenFingerprints: account.tokenFingerprints,
     credentialPresence: account.credentialPresence,
     groupIds: account.groupIds,
+    proxyIdKnown: account.proxyIdKnown === true,
+    proxyId: account.proxyIdKnown === true ? account.proxyId : null,
+    proxyIdValid: account.proxyIdValid !== false,
     usage: account.usage || null,
     usageError: safeRemoteError(
       account.usageError,
@@ -1171,6 +1175,9 @@ function importPlanTargetState(account) {
     tokenFingerprints: importPlanFingerprintState(account.tokenFingerprints),
     credentialPresence: importPlanCredentialPresence(account.credentialPresence),
     groupIds: Array.isArray(account.groupIds) ? [...account.groupIds] : [],
+    proxyIdKnown: account.proxyIdKnown === true,
+    proxyId: account.proxyIdKnown === true ? account.proxyId : null,
+    proxyIdValid: account.proxyIdValid !== false,
   };
 }
 
@@ -1374,6 +1381,7 @@ function resolveImportExecutionBinding(client, plan, options = {}) {
   return {
     target: resolveImportTargetBinding(client),
     createPolicy: resolveImportCreatePolicy(plan, options.environment),
+    ...(options.importProxy === undefined ? {} : { importProxy: importProxy.normalizeImportProxyBinding(options.importProxy) }),
   };
 }
 
@@ -1387,6 +1395,7 @@ function normalizeImportExecutionBinding(plan, binding) {
   return {
     target: normalizeImportTargetBinding(binding.target),
     createPolicy: normalizeImportCreatePolicy(plan, binding.createPolicy),
+    ...(binding.importProxy === undefined ? {} : { importProxy: importProxy.normalizeImportProxyBinding(binding.importProxy) }),
   };
 }
 
@@ -2213,6 +2222,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   }
   verifyTargetIdentity(item, account, reportedId);
   const verifiedGroupIds = verifyCreatedGroupBinding(account, expectedGroupIds);
+  verifyExpectedProxy(account, options.expectedProxyId);
   const expectedIdentity = item.sourceIdentityKeys?.length
     ? item.sourceIdentityKeys
     : item._account?.identityKeys || [item.identityKey];
@@ -2255,6 +2265,7 @@ async function verifyImportedAccount(client, item, result, logger, context = {},
   // detail GET and the final uniqueness scan must not be reported as a
   // confirmed create.
   verifyCreatedGroupBinding(identityMatches[0], expectedGroupIds);
+  verifyExpectedProxy(identityMatches[0], options.expectedProxyId);
   const expectedName = item?.accountName;
   const nameMatches = accountsMatchingFreeName(accounts, expectedName);
   if (parseCanonicalFreeName(expectedName) === null
@@ -2470,6 +2481,8 @@ function verifyTargetFingerprint(item, account) {
 
 function plannedCredentialStateMatches(plannedAccount, account) {
   if (!plannedAccount) return false;
+  if (plannedAccount.proxyIdKnown === true && (account?.proxyIdKnown !== true
+      || account.proxyIdValid === false || account.proxyId !== plannedAccount.proxyId)) return false;
   for (const field of ['access', 'refresh', 'id']) {
     const expectedFingerprint = plannedAccount.tokenFingerprints?.[field] || null;
     const actualFingerprint = account?.tokenFingerprints?.[field] || null;
@@ -2639,7 +2652,7 @@ function buildCodexSessionDocument(item) {
   };
 }
 
-function buildCodexImportIdempotencyKey(item) {
+function buildCodexImportIdempotencyKey(item, _legacyContext, proxyBinding) {
   const contentHash = String(item?._record?.contentHash || '').toLowerCase();
   const strongIdentity = [];
   for (const prefix of ['account:', 'user:']) {
@@ -2660,6 +2673,7 @@ function buildCodexImportIdempotencyKey(item) {
       : [item?.fingerprints?.access || '', item?.fingerprints?.refresh || ''],
     relativePath: String(item?.relativePath || ''),
     targetName: String(item?.accountName || ''),
+    ...(proxyBinding ? { proxyId: importProxy.normalizeImportProxyBinding(proxyBinding).proxyId } : {}),
   };
   const digest = crypto.createHash('sha256')
     .update('gpt-register-panel/create/v2\n')
@@ -2904,11 +2918,20 @@ function assertCreatedImportResult(result, knownAccountIds = new Set()) {
   return accountId;
 }
 
+function verifyExpectedProxy(account, expectedProxyId) {
+  if (expectedProxyId === undefined) return;
+  if (account?.proxyIdKnown !== true || account.proxyIdValid === false || account.proxyId !== expectedProxyId) {
+    throw targetVerificationError('写后代理绑定与计划不一致，需核对原账号；面板未自动重试或修改代理', 'SUB2API_IMPORT_PROXY_MISMATCH');
+  }
+}
+
 async function executeImportPlanItem({
   client,
   item,
   groups = [],
   createPolicy = null,
+  proxyBinding = undefined,
+  db = null,
   logger = null,
   context = {},
   sourceRoot = null,
@@ -2975,6 +2998,7 @@ async function executeImportPlanItem({
       throwIfPostWriteInterrupted(signal);
       const accountId = verifyTargetIdentity(item, account, item.accountId);
       verifyUpdatedTargetIdentity(writeItem, account);
+      verifyExpectedProxy(account, preflight.account.proxyIdKnown === true ? preflight.account.proxyId : undefined);
       const fingerprint = verifyTargetFingerprint(item, account);
       if (identityCompletionProofs.has(item)) {
         const accounts = await retryPostflightRead(() => client.listAccounts({
@@ -2985,6 +3009,7 @@ async function executeImportPlanItem({
         const finalAccount = accounts.find((entry) => entry.id === item.accountId);
         verifyTargetIdentity(item, finalAccount, item.accountId);
         verifyUpdatedTargetIdentity(writeItem, finalAccount);
+        verifyExpectedProxy(finalAccount, preflight.account.proxyIdKnown === true ? preflight.account.proxyId : undefined);
         verifyTargetFingerprint(item, finalAccount);
       }
       const verification = {
@@ -3048,6 +3073,11 @@ async function executeImportPlanItem({
     const finalKnownAccountIds = await preflightCreateAccount(client, item, { signal });
     knownAccountIds = new Set([...knownAccountIds, ...finalKnownAccountIds]);
   }
+  // Re-read settings and the exact node after backup/source/account awaits.
+  // A disabled, expired, edited or removed node must never become direct.
+  await importProxy.assertImportProxyCurrent(db, client, proxyBinding, { signal });
+  const selectedProxy = importProxy.normalizeImportProxyBinding(proxyBinding);
+  if (sourceRoot) freshRecord = revalidateSourceToken(item, sourceRoot, readCurrentTimeMilliseconds(now));
   const writeItem = freshRecord ? { ...item, _record: freshRecord, _raw: freshRecord.raw } : item;
   const payload = {
     // Only the validated Codex fields cross the adapter boundary. Unknown
@@ -3061,8 +3091,9 @@ async function executeImportPlanItem({
     update_existing: boundCreatePolicy.updateExisting,
     skip_default_group_bind: boundCreatePolicy.skipDefaultGroupBind,
     confirm_mixed_channel_risk: boundCreatePolicy.confirmMixedChannelRisk,
+    ...(selectedProxy ? { proxy_id: selectedProxy.proxyId } : {}),
   };
-  const idempotencyKey = buildCodexImportIdempotencyKey(writeItem);
+  const idempotencyKey = buildCodexImportIdempotencyKey(writeItem, undefined, selectedProxy);
   throwIfJobInterrupted(signal);
   let writeResponseReceived = false;
   let rawResult = null;
@@ -3085,14 +3116,16 @@ async function executeImportPlanItem({
     writeResponseReceived = true;
     throwIfPostWriteInterrupted(signal);
     assertCreatedImportResult(rawResult, knownAccountIds);
+    await importProxy.assertImportProxyCurrent(db, client, proxyBinding, { signal });
     const verification = await verifyImportedAccount(
       client,
       item,
       rawResult,
       logger,
       context,
-      { signal, expectedGroupIds: boundGroups },
+      { signal, expectedGroupIds: boundGroups, expectedProxyId: selectedProxy?.proxyId },
     );
+    await importProxy.assertImportProxyCurrent(db, client, proxyBinding, { signal });
     throwIfPostWriteInterrupted(signal);
     return {
       skipped: false,
@@ -3634,7 +3667,8 @@ async function executeImport({
       assertRemoteImportPlan(fullPlan, current._internal.accounts, normalizedRemoteTargets, normalizedRemoteBaselines);
       assertImportExecutableTargetLimit(fullPlan);
       const groupBinding = await resolveImportGroupBinding(client, fullPlan, { signal });
-      const executionBinding = resolveImportExecutionBinding(client, fullPlan);
+      const proxyBinding = await importProxy.resolveImportProxyBinding(db, client, fullPlan, { signal });
+      const executionBinding = resolveImportExecutionBinding(client, fullPlan, { importProxy: proxyBinding });
       throwIfJobInterrupted(signal);
       const currentPlanIntentVersion = buildImportPlanIntentVersion(
         current.version,
@@ -3810,6 +3844,8 @@ async function executeImport({
             item,
             groups,
             createPolicy: executionBinding.createPolicy,
+            proxyBinding: executionBinding.importProxy,
+            db,
             logger,
             context: baseFields,
             sourceRoot: current._internal.sources.rootDirectory,

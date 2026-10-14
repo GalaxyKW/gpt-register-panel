@@ -20,7 +20,7 @@ const {
 function revisions() {
   const secret = Buffer.alloc(32, 13);
   const account = createAccountTargetRevisionIssuer(secret).issue({
-    id: 943, platform: 'openai', type: 'oauth', status: 'error', schedulable: false,
+    id: 10404, platform: 'openai', type: 'oauth', status: 'error', schedulable: false,
     identityKeys: ['account:fixture-workspace'], tokenFingerprints: { access: 'a'.repeat(64) },
   });
   const username = {
@@ -135,7 +135,7 @@ test('logger durable JSON lines and rereads preserve revisions but redact adjace
   const marker = 'synthetic-adjacent-credential-value';
   assert.ok(logger.checkpoint('test.revision_metadata', {
     phase3TargetRevision: local, planIntentVersion: plan,
-    remoteTarget: { accountId: 943, targetRevision: account },
+    remoteTarget: { accountId: 10404, targetRevision: account },
     password: marker, access_token: marker,
   }), 'audit checkpoint must complete');
   const text = fs.readFileSync(filePath, 'utf8');
