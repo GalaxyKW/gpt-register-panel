@@ -14,6 +14,21 @@ const ACCOUNT_TIMEOUT_MS = 30 * 60 * 1000;
 const BATCH_TIMEOUT_MAX_MS = 24 * 60 * 60 * 1000;
 
 function failure(code, message, details) { return Object.assign(new Error(message), { code, ...(details ? { details } : {}) }); }
+function registrationFailureMessage(code, { resumed = false, nextAction = null } = {}) {
+  // Only exact pre-dispatch input failures may say the current form was not
+  // submitted. Do not infer this from free-form engine text or from a failed
+  // batch: earlier accounts / forms may already have completed successfully.
+  if (['CREDENTIAL_INPUT_UNCONFIRMED', 'PASSWORD_INPUT_UNCONFIRMED',
+    'CREDENTIAL_CONTEXT_CHANGED', 'CREDENTIAL_INPUT_CONTEXT_CHANGED', 'PHONE_COUNTRY_UNCONFIRMED',
+    'PHONE_INPUT_UNCONFIRMED', 'PHONE_INPUT_INVALID', 'PHONE_INPUT_FORMAT_UNCONFIRMED'].includes(code)) {
+    return '当前表单输入或页面上下文未通过确认，未继续主动提交；本次执行已停止。保留已有订单、账号检查点及已生成 token，请先核对原记录，不要重新租号';
+  }
+  if (code === 'SMS_SETTLEMENT_WAIT_EXHAUSTED') {
+    return '旧短信订单结算等待已达安全上限，本次执行已停止，未继续申请新号码。已有订单与账本保留待核对；结算未确认不代表已退款，请先核对旧订单状态，不要重新租号';
+  }
+  if (resumed) return '原账号续跑未完成，保留原检查点；未申请新号码';
+  return nextAction ? '已有账号待继续，已停止租用新号码；请从账号恢复入口续跑' : '注册未完整完成，保留已落地账号与可验证产物';
+}
 function normalizeRegistrationOptions(options = {}) {
   if (!options || typeof options !== 'object' || Array.isArray(options)
       || Object.keys(options).some(key => !['count', 'country', 'operator', 'smsMaxPriceUsd', 'smsMaxAcquisitions'].includes(key))) throw failure('REGISTRATION_OPTIONS_INVALID', '注册参数包含不允许的字段');
@@ -173,7 +188,7 @@ async function runRegistrationJob({ rootDirectory = process.env.GPT_REGISTER_ROO
     const failed = output.events.findLast(item => item.type === 'failed');
     const nextAction = ['resume_phase2', 'resume_account'].includes(failed?.nextAction) ? failed.nextAction : null;
     const code = output.commandError?.code === 'JOB_INTERRUPTED' ? 'JOB_INTERRUPTED' : /^[A-Z0-9_]{1,100}$/.test(failed?.code || '') ? failed.code : 'REGISTRATION_INCOMPLETE';
-    throw failure(code, nextAction ? '已有账号待继续，已停止租用新号码；请从账号恢复入口续跑' : '注册未完整完成，保留已落地账号与可验证产物', { ...result, nextAction });
+    throw failure(code, registrationFailureMessage(code, { nextAction }), { ...result, nextAction });
   }
   return result;
 }
@@ -282,7 +297,8 @@ async function runRegistrationResumeJob({ rootDirectory = process.env.GPT_REGIST
     resumed: true, phases: output.events.filter(item => item.type === 'stage').map(item => ({ stage: /^[a-z0-9_]{1,64}$/.test(item.stage || '') ? item.stage : 'unknown' })), processSummary: output.processSummary };
   if (output.commandError || output.events.at(-1)?.type !== 'completed' || artifacts.length !== 1) {
     const failed = output.events.findLast(item => item.type === 'failed');
-    throw failure(output.commandError?.code === 'JOB_INTERRUPTED' ? 'JOB_INTERRUPTED' : /^[A-Z0-9_]{1,100}$/.test(failed?.code || '') ? failed.code : 'REGISTRATION_RESUME_INCOMPLETE', '原账号续跑未完成，保留原检查点；未申请新号码', { ...result, nextAction: 'resume_account' });
+    const code = output.commandError?.code === 'JOB_INTERRUPTED' ? 'JOB_INTERRUPTED' : /^[A-Z0-9_]{1,100}$/.test(failed?.code || '') ? failed.code : 'REGISTRATION_RESUME_INCOMPLETE';
+    throw failure(code, registrationFailureMessage(code, { resumed: true }), { ...result, nextAction: 'resume_account' });
   }
   return result;
 }

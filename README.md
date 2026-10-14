@@ -219,11 +219,15 @@ unit 使用只读文件系统视图，只开放以下已经绑定并固定的服
 
 浏览器验收默认查找本机 Chrome 和面板/配套注册机的 `puppeteer-core` 依赖；非默认部署可以显式设置 `PANEL_TEST_CHROME_PATH` 和 `PANEL_TEST_PUPPETEER_PATH`。这两个变量只指定测试程序，不读取注册机配置。缺少浏览器或驱动时明确失败，不静默跳过。验收使用临时本机模拟 API 和虚构数据，拦截其他来源请求，不读取生产 `.env`，不注册、发送验证码、保存真实设置或操作 Sub2API。桌面与手机尺寸的页面导航，以及登录、任务恢复、失败计数、账号选择、日志筛选、停止和设置回执等交互都要检查。可用 `PANEL_TEST_SCREENSHOT_DIR` 保存合成数据截图，不应把生产账号截图上传到测试产物。
 
-配套注册机仍须在其目录单独执行 `npm test`、源码语法检查和 `npm audit --omit=dev --audit-level=high`。真实 DOM 验证见注册机的 `test/manual/email-submit-smoke.cjs`；真实 Chrome 启动及子进程回收见面板的 `tests/manual/phase3-browser-smoke.cjs`。这两项都使用隔离夹具；浏览器生命周期检查应运行于仅允许 loopback 的网络命名空间或部署沙箱，不得直接替换成真实账号登录。
+配套注册机仍须在其目录单独执行 `npm test`、源码语法检查和 `npm audit --omit=dev --audit-level=high`。真实 DOM 验证见注册机的 `test/manual/email-submit-smoke.cjs`；真实 Chrome 启动及子进程回收见面板的 `tests/manual/phase3-browser-smoke.cjs`；手机号受控组件验收见 `tests/manual/phone-input-browser-smoke.cjs`。这些配套验收不包含在面板的 `npm run verify` 中，修改注册机输入或浏览器逻辑后须另外执行。均使用隔离夹具，不得直接替换成真实账号登录。
 
 生命周期脚本会检查实际 Linux 网络命名空间必须与宿主不同，且只有启用的 loopback 接口；未隔离时以 `SMOKE_NETWORK_ISOLATION_REQUIRED` 退出。在面板项目目录、具备网络命名空间权限的 Linux 主机上可运行：
 
     sudo unshare --net -- sh -c 'ip link set lo up && exec /usr/bin/node tests/manual/phase3-browser-smoke.cjs /mnt/nvme/gpt_register'
+
+手机号脚本同样强制网络隔离，使用安装中的浏览器驱动、真实键盘事件及合成页面，不读取注册机生产配置。它复现自动恢复区号和重置光标的输入框，覆盖本地号码、带区号号码、格式化、前导零，以及输入或提交前国家、号码、页面元素和表单变化的拒绝行为。不能用直接给 `value` 赋值的 mock 代替这项验收，也不能把合成页面通过当作真实注册成功：
+
+    sudo unshare --net -- sh -c 'ip link set lo up && exec /usr/bin/node tests/manual/phone-input-browser-smoke.cjs /mnt/nvme/gpt_register'
 
 使用清空 capabilities 的临时 systemd unit 时，隔离进程可能无法读取 PID 1 的命名空间标识；可在外层用 `readlink /proc/self/ns/net` 取得非敏感基准，通过 `PANEL_SMOKE_HOST_NET_NAMESPACE` 传入。仍须设置 `PrivateNetwork=true`，脚本仍会核对实际命名空间和接口；这个变量不是允许联网的开关。
 

@@ -238,6 +238,101 @@ test('paid-account continuation is surfaced without rerunning or allocating anot
   } }), error => error.code === 'BATCH_PENDING_PHASE2_CONTINUATION' && error.details.nextAction === 'resume_phase2');
   assert.equal(calls, 1);
 });
+for (const code of ['CREDENTIAL_INPUT_UNCONFIRMED', 'PASSWORD_INPUT_UNCONFIRMED',
+  'CREDENTIAL_CONTEXT_CHANGED', 'CREDENTIAL_INPUT_CONTEXT_CHANGED', 'PHONE_COUNTRY_UNCONFIRMED',
+  'PHONE_INPUT_UNCONFIRMED', 'PHONE_INPUT_INVALID', 'PHONE_INPUT_FORMAT_UNCONFIRMED']) {
+  test('registration protocol presents ' + code + ' as current-form input failure without replay or raw engine text', async t => {
+    const f = fixture(t); let calls = 0;
+    await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root, options: { count: 1, country: 'US' },
+      preflight: async () => ({ ok: true }), runner: async (_, __, options) => {
+        calls++;
+        const result = writeEvents(options, [{ type: 'stage', stage: 'phase1_register' },
+          { type: 'failed', code, message: 'fixture-only-private-engine-message', nextAction: 'retry_new_registration' }]);
+        throw Object.assign(new Error('fixture-only-private-stderr'), { details: { ...result, code: 1 } });
+      } }), error => {
+      assert.equal(error.code, code);
+      assert.match(error.message, /当前表单输入或页面上下文未通过确认，未继续主动提交/);
+      assert.match(error.message, /已有订单、账号检查点及已生成 token/);
+      assert.match(error.message, /不要重新租号/);
+      assert.doesNotMatch(error.message, /网络|导入失败|全批未注册|fixture-only/);
+      assert.equal(error.details.nextAction, null);
+      assert.equal(error.details.completedCount, 0);
+      assert.deepEqual(error.details.phases, [{ stage: 'phase1_register' }]);
+      assert.equal(JSON.stringify(error.details).includes('fixture-only-private'), false);
+      return true;
+    });
+    assert.equal(calls, 1);
+  });
+}
+test('registration settlement safety stop preserves old-order uncertainty without claiming refund or retry', async t => {
+  const f = fixture(t); let calls = 0;
+  await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root, options: { count: 1, country: 'US' },
+    preflight: async () => ({ ok: true }), runner: async (_, __, options) => {
+      calls++;
+      return writeEvents(options, [{ type: 'failed', code: 'SMS_SETTLEMENT_WAIT_EXHAUSTED',
+        message: 'fixture-only-private-order', nextAction: 'rent_again', refundConfirmed: true }]);
+    } }), error => {
+    assert.equal(error.code, 'SMS_SETTLEMENT_WAIT_EXHAUSTED');
+    assert.match(error.message, /已有订单与账本保留待核对/);
+    assert.match(error.message, /结算未确认不代表已退款/);
+    assert.match(error.message, /未继续申请新号码/);
+    assert.match(error.message, /不要重新租号/);
+    assert.doesNotMatch(error.message, /当前表单|网络|导入失败|fixture-only/);
+    assert.equal(error.details.nextAction, null);
+    assert.equal(Object.hasOwn(error.details, 'refundConfirmed'), false);
+    return true;
+  });
+  assert.equal(calls, 1);
+});
+test('unknown phone dispatch and unrecognized codes are never presented as unsubmitted input', async t => {
+  const f = fixture(t);
+  for (const code of ['PHONE_SUBMIT_RESULT_UNKNOWN', 'OAUTH_PHONE_SUBMIT_RESULT_UNKNOWN',
+    'CREDENTIAL_INPUT_UNCONFIRMED_UNKNOWN', 'SMS_SETTLEMENT_WAIT_EXHAUSTED_UNKNOWN']) {
+    await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root, options: { count: 1, country: 'US' },
+      preflight: async () => ({ ok: true }), runner: async (_, __, options) => writeEvents(options,
+        [{ type: 'failed', code, message: '当前表单未提交，已退款，可以重新租号' }]) }), error => {
+      assert.equal(error.code, code);
+      assert.equal(error.message, '注册未完整完成，保留已落地账号与可验证产物');
+      assert.doesNotMatch(error.message, /未提交|未继续主动提交|已退款|重新租号/);
+      return true;
+    });
+  }
+});
+test('input failure after a verified batch artifact preserves that successful account and never claims whole batch unsubmitted', async t => {
+  const f = fixture(t); let calls = 0;
+  const document = { email: 'fixture-completed@example.test', chatgpt_account_id: 'fixture-completed-account',
+    chatgpt_user_id: 'fixture-completed-user', access_token: crypto.randomBytes(24).toString('hex'),
+    refresh_token: crypto.randomBytes(24).toString('hex'), expires_at: '2099-01-01T00:00:00Z', type: 'codex' };
+  await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root, options: { count: 2, country: 'US' },
+    preflight: async () => ({ ok: true }), runner: async (_, __, options) => {
+      calls++;
+      const bytes = JSON.stringify(document); fs.writeFileSync(path.join(f.root, 'tokens/completed.json'), bytes, { mode: 0o600 });
+      return writeEvents(options, [{ type: 'account_completed', completedCount: 1,
+        artifacts: [{ selectedKey: 'token:tokens:tokens/completed.json', contentHash: crypto.createHash('sha256').update(bytes).digest('hex') }] },
+      { type: 'stage', stage: 'phase1_register' }, { type: 'failed', code: 'CREDENTIAL_INPUT_UNCONFIRMED' }]);
+    } }), error => {
+    assert.equal(error.details.requestedCount, 2); assert.equal(error.details.completedCount, 1);
+    assert.deepEqual(error.details.selectedKeys, ['token:tokens:tokens/completed.json']);
+    assert.match(error.message, /当前表单输入/); assert.match(error.message, /已生成 token/);
+    assert.doesNotMatch(error.message, /全批|未注册|未生成|全部失败/);
+    assert.equal(JSON.stringify(error.details).includes(document.access_token), false);
+    return true;
+  });
+  assert.equal(calls, 1);
+  assert.equal(fs.existsSync(path.join(f.root, 'tokens/completed.json')), true);
+});
+test('interruption remains authoritative over an earlier unconfirmed-input event', async t => {
+  const f = fixture(t);
+  await assert.rejects(runRegistrationJob({ logger, rootDirectory: f.root, options: { count: 1, country: 'US' },
+    preflight: async () => ({ ok: true }), runner: async (_, __, options) => {
+      const result = writeEvents(options, [{ type: 'failed', code: 'CREDENTIAL_INPUT_UNCONFIRMED' }]);
+      throw Object.assign(new Error('fixture cancellation'), { code: 'JOB_INTERRUPTED', details: result });
+    } }), error => {
+    assert.equal(error.code, 'JOB_INTERRUPTED');
+    assert.doesNotMatch(error.message, /未继续主动提交/);
+    return true;
+  });
+});
 test('real supervised child returns fd6 protocol and cleanup confirms process exit', async t => {
   const f = fixture(t);
   fs.writeFileSync(path.join(f.root, 'index.js'), [
@@ -283,6 +378,35 @@ function continuationFixture(t, status = 'registered') {
   if (f.account.email) fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify([{ ...f.account }]), { mode: 0o600 });
   return f;
 }
+test('same-account resume projects fixed input and settlement failures without changing frozen ledgers or leasing anew', async t => {
+  const f = continuationFixture(t, 'oauth_phase3_failed');
+  const selected = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
+  const target = { selectedKey: selected.selectedKey, revision: selected.revision };
+  const before = ['accounts.json', 'username.json'].map(name => fs.readFileSync(path.join(f.root, name), 'utf8'));
+  for (const code of ['CREDENTIAL_INPUT_UNCONFIRMED', 'CREDENTIAL_INPUT_CONTEXT_CHANGED', 'PHONE_COUNTRY_UNCONFIRMED',
+    'PHONE_INPUT_FORMAT_UNCONFIRMED', 'SMS_SETTLEMENT_WAIT_EXHAUSTED', 'PHONE_SUBMIT_RESULT_UNKNOWN']) {
+    let calls = 0;
+    await assert.rejects(runRegistrationResumeJob({ logger, rootDirectory: f.root, target,
+      preflight: async () => ({ ok: true }), runner: async (_, args, options) => {
+        calls++;
+        assert.deepEqual(args.slice(-2), ['--panel-resume', '--phase3']);
+        assert.equal(args.includes('--panel-register'), false);
+        return writeEvents(options, [{ type: 'failed', code, message: 'fixture-only-private-resume', nextAction: 'rent_again' }]);
+      } }), error => {
+      assert.equal(error.code, code); assert.equal(error.details.nextAction, 'resume_account');
+      assert.equal(error.details.resumed, true); assert.equal(error.details.completedCount, 0);
+      if (code === 'SMS_SETTLEMENT_WAIT_EXHAUSTED') assert.match(error.message, /已有订单与账本保留待核对/);
+      else if (code === 'PHONE_SUBMIT_RESULT_UNKNOWN') {
+        assert.equal(error.message, '原账号续跑未完成，保留原检查点；未申请新号码');
+        assert.doesNotMatch(error.message, /未继续主动提交/);
+      } else assert.match(error.message, /当前表单输入或页面上下文未通过确认，未继续主动提交/);
+      assert.doesNotMatch(error.message, /fixture-only/);
+      return true;
+    });
+    assert.equal(calls, 1);
+    assert.deepEqual(['accounts.json', 'username.json'].map(name => fs.readFileSync(path.join(f.root, name), 'utf8')), before);
+  }
+});
 test('resume destination invalidated during preflight prevents engine launch without changing ledgers', async t => {
   const f = continuationFixture(t); const target = listRegistrationContinuations({ rootDirectory: f.root }).items[0];
   const before = fs.readFileSync(path.join(f.root, 'accounts.json')); let launches = 0; const order = [];
