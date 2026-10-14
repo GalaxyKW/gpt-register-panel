@@ -100,6 +100,7 @@ const {
   TOKEN_IMPORT_CONTEXT_COVERAGE,
   normalizeReconciliationContext,
 } = require('./reconciliationContext');
+const registrationReconciliation = require('./registrationReconciliation');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -449,6 +450,7 @@ const PUBLIC_ERROR_MESSAGES = Object.freeze({
   IDEMPOTENCY_KEY_REUSED: '该 Idempotency-Key 已用于不同请求',
   JOB_ALREADY_CLAIMED: '该操作目标已有任务排队或运行中',
   JOB_RECONCILIATION_REQUIRED: '存在需要人工核对的任务，已阻止继续写入',
+  JOB_RECONCILIATION_CONTEXT_UNAVAILABLE: '对账证据缺失、不完整、过期或实际状态已变化；请管理员重新核验原任务、外部订单和本地产物，保护未解除',
   ACCOUNT_TEST_TARGET_REVISION_STALE: '账号状态已变化，请刷新后重新选择',
   ACCOUNT_TEST_NO_ELIGIBLE_ACCOUNTS: '没有可测试的上游账号',
   ACCOUNT_TEST_BASELINE_INVALID: '无法安全确认账号测试基线，请稍后重试',
@@ -1757,6 +1759,10 @@ function reconciliationReviewDetail(job, options = {}) {
   else if (job.type === 'account_test') context = accountTestReviewTargets(job);
   else if (job.type === 'phase3') context = phase3ReviewTargets(job);
   else if (job.type === TOKEN_CLEANUP_JOB_TYPE) context = tokenCleanupReviewContext(job);
+  else if (['registration', 'console_register'].includes(job.type)) {
+    context = registrationReconciliation.registrationReviewContext(job,
+      options.registrationReviewJobs, options.registrationReviewOptions);
+  }
   if (!context || context.complete !== true || context.targets.length === 0
       || context.targets.length !== context.total) {
     const error = new Error('该任务未保留足够的安全目标信息，不能从面板确认人工对账');
@@ -1876,6 +1882,12 @@ function validateReconciliationAcknowledgeContext(
     error.code = 'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION';
     throw error;
   }
+  if (['registration', 'console_register'].includes(job.type)
+      && resolution !== 'state_manually_reconciled') {
+    const error = new Error('注册任务必须核对全部运行与订单证据，仅允许记录人工核对结论');
+    error.code = 'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION';
+    throw error;
+  }
   const actualClaims = Array.isArray(job.claimKeys) ? job.claimKeys : [];
   let expectedClaims = null;
   if (job.reconciliationScope === 'global') {
@@ -1902,6 +1914,10 @@ function validateReconciliationAcknowledgeContext(
       }
     } else if (job.type === TOKEN_CLEANUP_JOB_TYPE) {
       expectedClaims = [TOKEN_CLEANUP_CLAIM_KEY];
+    } else if (job.type === 'registration') {
+      expectedClaims = ['registration'];
+    } else if (job.type === 'console_register') {
+      expectedClaims = ['console_pipeline'];
     }
   }
   const actualSet = new Set(actualClaims);
@@ -3366,6 +3382,13 @@ function createServer(options = {}) {
   };
   const expiredTokenLister = options.expiredTokenLister || listExpiredTokens;
   const admissionControlPlaneLock = options.admissionControlPlaneLock || withControlPlaneLock;
+  const registrationReviewOptions = {
+    rootDirectory: options.registrationReviewOptions?.rootDirectory
+      || process.env.GPT_REGISTER_ROOT || '/mnt/nvme/gpt_register',
+    evidenceDirectory: options.registrationReviewOptions?.evidenceDirectory
+      || registrationReconciliation.DEFAULT_EVIDENCE_DIRECTORY,
+    processRoot: options.registrationReviewOptions?.processRoot || '/proc',
+  };
   const consoleService = createConsoleService({ db, logger, jobManager, clientFactory: syncClientFactory,
     describeFailure: mutationFailureMetadata, ...(options.consoleOptions || {}) });
   let server;
@@ -4667,12 +4690,16 @@ function createServer(options = {}) {
         });
         const acknowledgement = await withRequestAdmission(async (signal) => {
           throwIfJobInterrupted(signal);
-          return db.acknowledgeJobReconciliation(reconciliationAckPath.jobId, {
+          const originalJob = await db.getJobForReconciliation(reconciliationAckPath.jobId);
+          const registration = ['registration', 'console_register'].includes(originalJob?.type);
+          const registrationReviewJobIds = registration ? registrationReconciliation.chainIds(originalJob) : undefined;
+          const acknowledge = () => db.acknowledgeJobReconciliation(reconciliationAckPath.jobId, {
             actor,
             confirmation: body.confirmation,
             resolution: body.resolution,
             claimDigest: body.claimDigest,
             contextDigest: body.contextDigest,
+            ...(registration ? { registrationReviewJobIds } : {}),
             validateContext: (job) => {
               const reviewOptions = job.type === 'token_import'
                   && job.reconciliationContext?.executionTarget
@@ -4683,7 +4710,7 @@ function createServer(options = {}) {
                       workflow: 'reconciliation_acknowledge',
                     }),
                   }
-                : {};
+                : registration ? { registrationReviewJobs: job.registrationReviewJobs, registrationReviewOptions } : {};
               return validateReconciliationAcknowledgeContext(
                 job,
                 body.contextDigest,
@@ -4704,6 +4731,16 @@ function createServer(options = {}) {
               });
             },
           });
+          if (!registration) return acknowledge();
+          return admissionControlPlaneLock(async () => {
+            throwIfJobInterrupted(signal);
+            const policy = await db.getConsoleSettings();
+            if (policy?.settings?.enabled !== false) {
+              const error = new Error('请先关闭自动维护，再进行注册人工对账');
+              error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE'; throw error;
+            }
+            return registrationReconciliation.withRegistrationProjectLock(registrationReviewOptions.rootDirectory, acknowledge, registrationReviewOptions);
+          }, { signal });
         });
         writeLog(logger, 'warn', 'job.reconciliation_acknowledge_completed', {
           requestId,
@@ -4758,6 +4795,13 @@ function createServer(options = {}) {
           throw error;
         }
         const job = await db.getJobForReconciliation(reconciliationReviewRoute.jobId);
+        if (['registration', 'console_register'].includes(job?.type)) {
+          const policy = await db.getConsoleSettings();
+          if (policy?.settings?.enabled !== false) {
+            const error = new Error('自动维护未关闭，不能确认注册人工对账');
+            error.code = 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE'; throw error;
+          }
+        }
         const reviewOptions = job?.type === 'token_import'
             && job.reconciliationContext?.executionTarget
           ? {
@@ -4767,7 +4811,9 @@ function createServer(options = {}) {
                 workflow: 'reconciliation_detail',
               }),
             }
-          : {};
+          : ['registration', 'console_register'].includes(job?.type)
+            ? { registrationReviewJobs: await db.getRegistrationReconciliationJobs(registrationReconciliation.chainIds(job)), registrationReviewOptions }
+            : {};
         jsonResponse(response, 200, reconciliationReviewDetail(job, reviewOptions));
       } catch (error) {
         sendPublicApiError(response, error, {

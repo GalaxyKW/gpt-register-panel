@@ -26,7 +26,7 @@ function harness() {
     fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } }) }; },
   };
   vm.createContext(context);
-  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected, loadProxies, saveImportProxy, renderProxySetting, proxySaveIssue, defaultProxyIssue };');
+  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected, loadProxies, saveImportProxy, renderProxySetting, proxySaveIssue, defaultProxyIssue, openRegistrationReview, acknowledgeRegistrationReview, registrationReviewValid, registrationReviewIssue, persistRegistrationReview, registrationReviewPendingValid, dismissResolvedRegistrationReview, registrationResolvedElsewhere };');
   vm.runInContext(instrumented, context);
   const api = context.harness;
   api.state.connected = true;
@@ -516,6 +516,214 @@ test('console reconciliation holds are visible and block all new writes but not 
   assert.match(element('task-safety-message').textContent, /刷新或重新登录不会解除/);
   assert.equal(element('check-network').disabled, false); assert.equal(element('logs-refresh').disabled, false);
   assert.match(html, /id="task-safety-banner"[\s\S]*?href="\/index.html"/);
+});
+
+const reviewParentId = 'job_' + 'd'.repeat(24), reviewChildId = 'job_' + 'e'.repeat(24);
+function reviewFixture(id = reviewParentId) {
+  return { version: 1, id, type: id === reviewParentId ? 'console_register' : 'registration', status: 'failed', reconciliationHold: true, reconciliationResolved: false,
+    reconciliationClaimDigest: 'a'.repeat(64), reconciliationContextDigest: 'b'.repeat(64),
+    targetContext: { available: true, coverage: 'exact_unknown_targets', total: 1, returned: 1, truncated: false, targets: [{ kind: 'registration_manual_review',
+      parentJobId: reviewParentId, childJobId: reviewChildId, evidenceMode: 'manual_reconstructed', evidenceId: 'c'.repeat(32), evidenceDigest: 'd'.repeat(64),
+      checkedAt: new Date(Date.now() - 60000).toISOString(), expiresAt: new Date(Date.now() + 600000).toISOString(), rootFingerprint: 'e'.repeat(64), localStateDigest: 'f'.repeat(64),
+      processScan: 'stopped', originalRoot: 'manually_verified', localRecords: 'reviewed_preserved', remoteImport: 'not_reached', smsOrder: 'terminal', smsStatus: 'cancelled', smsSettlement: 'unknown' }] } };
+}
+function mockRegistrationReview(h, { detail = reviewFixture(), postError = null, loseReadback = false } = {}) {
+  const held = new Set([reviewParentId, reviewChildId]); let accepted = false;
+  h.api.state.overview.reconciliation = { total: 2, returned: 2, truncated: false };
+  const job = id => ({ id, type: id === reviewParentId ? 'console_register' : 'registration', status: 'failed', error: '合成输入失败 <script>unsafe</script>',
+    result: held.has(id) ? { reconciliationHold: true, requiresReconciliation: true } : { reconciliationHold: false, reconciliationResolved: true, reconciliationReviewedContextDigest: detail.reconciliationContextDigest } });
+  h.context.fetch = async (url, options = {}) => {
+    h.calls.push({ url, options });
+    if (url.endsWith('/acknowledge')) {
+      assert.ok(h.store.has('registerStudio.registrationReview.v1'), 'receipt is durable before POST');
+      if (postError) throw new Error(postError);
+      const body = JSON.parse(options.body); held.delete(body.jobId); accepted = true;
+      h.api.state.overview.reconciliation = { total: held.size, returned: held.size, truncated: false };
+      return { ok: true, status: 200, text: async () => JSON.stringify({ jobId: body.jobId }) };
+    }
+    if (accepted && loseReadback && url === '/api/jobs/' + detail.id) throw new Error('readback unavailable');
+    const value = url === '/api/jobs?limit=100' ? { jobs: [...held].map(job), reconciliationHolds: { total: held.size, returned: held.size, truncated: false } }
+      : url.endsWith('/reconciliation') ? detail : url.startsWith('/api/jobs/') ? job(url.split('/').at(-1))
+        : url.endsWith('/continuations') ? { items: [] } : h.api.state.overview;
+    return { ok: true, status: 200, text: async () => JSON.stringify(value) };
+  };
+  return { held, job };
+}
+
+test('registration reconciliation entry reads both parent and child and never posts on opening', async () => {
+  const h = harness(); mockRegistrationReview(h);
+  await h.api.openRegistrationReview();
+  assert.match(h.element('registration-review-content').innerHTML, /主任务/); assert.match(h.element('registration-review-content').innerHTML, /执行步骤/);
+  assert.match(h.element('registration-review-content').innerHTML, /&lt;script&gt;/); assert.doesNotMatch(h.element('registration-review-content').innerHTML, /<script>/);
+  assert.equal(h.calls.some(call => call.options.method === 'POST'), false);
+  await h.api.openRegistrationReview(reviewParentId);
+  assert.match(h.element('registration-review-content').innerHTML, /需分别确认/); assert.match(h.element('registration-review-content').innerHTML, /费用结算仍未知/);
+  assert.match(h.element('registration-review-content').innerHTML, /不代表已退款/);
+  assert.equal(h.element('registration-review-submit').disabled, true); assert.equal(h.element('start-register').disabled, true);
+});
+
+test('registration reconciliation requires explicit acknowledgement and clears only its exact durable receipt', async () => {
+  const h = harness(); const fixture = mockRegistrationReview(h); await h.api.openRegistrationReview(reviewParentId);
+  await assert.rejects(h.api.acknowledgeRegistrationReview(), /勾选/);
+  h.element('registration-review-checked').checked = true;
+  h.context.window.confirm = () => false; await h.api.acknowledgeRegistrationReview(); assert.equal(h.calls.some(call => call.options.method === 'POST'), false);
+  h.context.window.confirm = () => true; await h.api.acknowledgeRegistrationReview();
+  const posts = h.calls.filter(call => call.options.method === 'POST'); assert.equal(posts.length, 1);
+  assert.deepEqual(JSON.parse(posts[0].options.body), { jobId: reviewParentId, confirmation: '我已按强身份完成人工核对', resolution: 'state_manually_reconciled', claimDigest: 'a'.repeat(64), contextDigest: 'b'.repeat(64) });
+  assert.equal(fixture.held.has(reviewChildId), true); assert.equal(h.api.state.registrationReviewPending, null); assert.equal(h.element('start-register').disabled, true);
+  assert.equal(h.store.has('registerStudio.registrationReview.v1'), false);
+});
+
+test('registration reconciliation rejects incomplete, mismatched, expired, changed and unknown evidence', async () => {
+  const mutations = [detail => { detail.id = reviewChildId; }, detail => { detail.type = 'phase3'; }, detail => { detail.status = 'running'; },
+    detail => { detail.targetContext.truncated = true; }, detail => { detail.targetContext.returned = 0; }, detail => { detail.targetContext.targets[0].parentJobId = reviewChildId; },
+    detail => { detail.targetContext.targets[0].expiresAt = new Date(0).toISOString(); }, detail => { detail.targetContext.targets[0].checkedAt = new Date(Date.now() + 600000).toISOString(); },
+    detail => { detail.targetContext.targets[0].processScan = 'unknown'; }, detail => { detail.targetContext.targets[0].smsOrder = 'unknown'; },
+    detail => { detail.targetContext.targets[0].smsStatus = 'pending'; }, detail => { detail.targetContext.targets[0].remoteImport = 'unknown'; },
+    detail => { detail.targetContext.targets[0].rootFingerprint = 'invalid'; }, detail => { detail.reconciliationContextDigest = 'invalid'; }];
+  for (const mutate of mutations) {
+    const h = harness(), detail = reviewFixture(); mutate(detail); mockRegistrationReview(h, { detail }); await h.api.openRegistrationReview(reviewParentId);
+    h.element('registration-review-checked').checked = true;
+    await assert.rejects(h.api.acknowledgeRegistrationReview()); assert.equal(h.calls.some(call => call.options.method === 'POST'), false);
+    assert.equal(h.element('start-register').disabled, true);
+  }
+});
+
+test('registration reconciliation fails closed for incomplete inventory and missing private evidence', async () => {
+  for (const response of [{ jobs: [], reconciliationHolds: { total: 2, returned: 0, truncated: true } }, { jobs: [], reconciliationHolds: { total: 2, returned: 2, truncated: false } }]) {
+    const h = harness(); h.context.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(response) });
+    await h.api.openRegistrationReview(); assert.match(h.element('registration-review-message').textContent, /不完整|不一致/); assert.equal(h.element('registration-review-submit').disabled, true);
+  }
+  const h = harness(); h.context.fetch = async () => ({ ok: false, status: 409, text: async () => JSON.stringify({ error: 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', message: '历史注册任务缺少可验证对账证据，请管理员核验原运行及短信费用。' }) });
+  await h.api.openRegistrationReview(reviewParentId); assert.match(h.element('registration-review-message').textContent, /管理员核验/); assert.equal(h.element('registration-review-submit').disabled, true);
+});
+
+test('registration reconciliation lost response stays blocked and only explicit exact-body resubmission is possible', async () => {
+  const h = harness(); mockRegistrationReview(h, { postError: 'response lost' }); await h.api.openRegistrationReview(reviewParentId);
+  h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview();
+  const raw = h.store.get('registerStudio.registrationReview.v1'); assert.ok(raw); assert.match(h.api.writeBlock(), /回执尚未确认/);
+  await h.api.openRegistrationReview(); assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 1);
+  assert.equal(h.store.get('registerStudio.registrationReview.v1'), raw); assert.equal(h.element('registration-review-checked').checked, false);
+  assert.equal(h.element('registration-review-submit').disabled, true);
+  h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview();
+  const posts = h.calls.filter(call => call.options.method === 'POST'); assert.equal(posts.length, 2); assert.equal(posts[1].options.body, posts[0].options.body);
+  assert.equal(h.api.state.pending, null, 'ordinary business request receipts are never overwritten');
+});
+
+test('registration reconciliation lost readback resolves by exact-context GET without another POST', async () => {
+  const h = harness(); mockRegistrationReview(h, { loseReadback: true }); await h.api.openRegistrationReview(reviewParentId);
+  h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview(); assert.ok(h.api.state.registrationReviewPending);
+  const pending = h.api.state.registrationReviewPending, original = h.context.fetch;
+  h.context.fetch = async (url, options) => url === '/api/jobs/' + reviewParentId ? { ok: true, status: 200, text: async () => JSON.stringify({ id: reviewParentId,
+    result: { reconciliationResolved: true, reconciliationHold: false, reconciliationReviewedContextDigest: pending.contextDigest } }) } : original(url, options);
+  await h.api.openRegistrationReview(); assert.equal(h.api.state.registrationReviewPending, null);
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 1);
+});
+
+test('registration reconciliation cannot overwrite unknown receipt with changed evidence or clear mismatched resolution', async () => {
+  const h = harness(); mockRegistrationReview(h, { postError: 'response lost' }); await h.api.openRegistrationReview(reviewParentId);
+  h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview();
+  const pending = h.api.state.registrationReviewPending; const detail = reviewFixture(); detail.reconciliationContextDigest = 'c'.repeat(64);
+  mockRegistrationReview(h, { detail }); await h.api.openRegistrationReview(); h.element('registration-review-checked').checked = true;
+  await assert.rejects(h.api.acknowledgeRegistrationReview(), /变化后的证据/); assert.equal(h.api.state.registrationReviewPending, pending);
+  const original = h.context.fetch; h.context.fetch = async (url, options) => url === '/api/jobs/' + reviewParentId
+    ? { ok: true, status: 200, text: async () => JSON.stringify({ id: reviewParentId, result: { reconciliationResolved: true, reconciliationHold: false, reconciliationReviewedContextDigest: 'c'.repeat(64) } }) } : original(url, options);
+  await h.api.openRegistrationReview(); assert.match(h.element('registration-review-message').textContent, /回执与本次证据不一致/); assert.ok(h.api.state.registrationReviewPending);
+});
+
+test('registration reconciliation only releases rejected local receipt for exact guaranteed prewrite conflicts', async () => {
+  for (const [code, status, writeOutcomeUnknown, clears] of [
+    ['JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', 409, false, true], ['JOB_RECONCILIATION_CONTEXT_INCOMPLETE', 409, false, true],
+    ['JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH', 409, false, true], ['JOB_RECONCILIATION_TARGET_MISMATCH', 409, false, true],
+    ['JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION', 409, false, true], ['JOB_RECONCILIATION_DIGEST_MISMATCH', 409, false, true],
+    ['JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', 503, false, false], ['JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', 409, true, false],
+    ['JOB_RECONCILIATION_NOT_HELD', 409, false, false], ['JOB_RECONCILIATION_ACK_CONFLICT', 409, false, false], ['OTHER_CONFLICT', 409, false, false],
+  ]) {
+    const h = harness(); const fixture = mockRegistrationReview(h); await h.api.openRegistrationReview(reviewParentId);
+    const original = h.context.fetch; h.context.fetch = async (url, options) => url.endsWith('/acknowledge')
+      ? { ok: false, status, text: async () => JSON.stringify({ error: code, message: '合成证据冲突', writeOutcomeUnknown }) } : original(url, options);
+    h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview();
+    assert.equal(h.api.state.registrationReviewPending === null, clears, code + ':' + status + ':' + writeOutcomeUnknown);
+    assert.equal(fixture.held.size, 2); assert.equal(h.element('start-register').disabled, true);
+    assert.equal(h.api.state.registrationReview, null);
+  }
+  const h = harness(); mockRegistrationReview(h); await h.api.openRegistrationReview(reviewParentId);
+  const original = h.context.fetch;
+  h.context.fetch = async (url, options) => url === '/api/jobs/' + reviewParentId
+    ? { ok: false, status: 409, text: async () => JSON.stringify({ error: 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', message: '回执读取冲突' }) } : original(url, options);
+  h.element('registration-review-checked').checked = true; await h.api.acknowledgeRegistrationReview();
+  assert.ok(h.api.state.registrationReviewPending, 'post-acceptance GET errors never become definite prewrite rejection');
+});
+
+function elsewhereResolvedJob() {
+  return { id: reviewParentId, type: 'console_register', status: 'failed', result: { reconciliationResolved: true, reconciliationHold: false,
+    requiresReconciliation: false, futureOperationsUnblocked: true, retryAllowed: false, doNotRetry: true,
+    reconciliationResolution: 'state_manually_reconciled', reconciliationAcknowledgedBy: 'panel-admin', reconciliationClaimDigest: 'a'.repeat(64),
+    reconciliationBlockScope: 'none', reconciliationReviewedContextDigest: 'c'.repeat(64) } };
+}
+test('registration resolved by another manual review only clears local wait after fresh read and explicit confirmation', async () => {
+  const h = harness(); mockRegistrationReview(h);
+  const pending = { version: 1, jobId: reviewParentId, claimDigest: 'a'.repeat(64), contextDigest: 'b'.repeat(64), createdAt: Date.now() };
+  h.api.persistRegistrationReview(pending);
+  const original = h.context.fetch; h.context.fetch = async (url, options) => {
+    if (url === '/api/jobs/' + reviewParentId) { h.calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify(elsewhereResolvedJob()) }; }
+    return original(url, options);
+  };
+  await h.api.openRegistrationReview(); assert.equal(h.api.state.registrationReviewPending, pending);
+  assert.equal(h.element('registration-review-dismiss').hidden, false); assert.match(h.element('registration-review-content').innerHTML, /不能把旧请求标记为成功/);
+  h.context.window.confirm = () => false; await h.api.dismissResolvedRegistrationReview(); assert.equal(h.api.state.registrationReviewPending, pending);
+  h.context.window.confirm = () => true; await h.api.dismissResolvedRegistrationReview(); assert.equal(h.api.state.registrationReviewPending, null);
+  assert.equal(h.calls.filter(call => call.options?.method === 'POST').length, 0);
+  assert.equal(h.calls.filter(call => call.url === '/api/jobs/' + reviewParentId).length, 3);
+  assert.match(h.element('registration-review-content').innerHTML, /未将上次丢失响应的请求记为成功/);
+});
+
+test('registration other-resolution dismissal rejects missing terminal fields, changed receipt, and unknown reads', async () => {
+  const mutations = [job => { job.id = reviewChildId; }, job => { job.type = 'account_test'; }, job => { job.status = 'running'; },
+    ...['reconciliationResolved', 'reconciliationHold', 'requiresReconciliation', 'futureOperationsUnblocked', 'retryAllowed', 'doNotRetry',
+      'reconciliationResolution', 'reconciliationAcknowledgedBy', 'reconciliationClaimDigest', 'reconciliationBlockScope', 'reconciliationReviewedContextDigest'].map(key => job => { delete job.result[key]; }),
+    job => { job.result.reconciliationHold = true; }, job => { job.result.reconciliationReviewedContextDigest = 'invalid'; }];
+  for (const mutate of mutations) {
+    const h = harness(), pending = { version: 1, jobId: reviewParentId, claimDigest: 'a'.repeat(64), contextDigest: 'b'.repeat(64), createdAt: Date.now() };
+    h.api.persistRegistrationReview(pending); const job = elsewhereResolvedJob(); mutate(job);
+    assert.equal(h.api.registrationResolvedElsewhere(job, pending), false);
+  }
+  for (const changed of [false, true]) {
+    const h = harness(), pending = { version: 1, jobId: reviewParentId, claimDigest: 'a'.repeat(64), contextDigest: 'b'.repeat(64), createdAt: Date.now() };
+    h.api.persistRegistrationReview(pending); h.api.state.registrationReviewOtherResolution = { jobId: reviewParentId, contextDigest: 'c'.repeat(64) };
+    h.context.fetch = async () => { if (!changed) throw new Error('read unavailable'); const job = elsewhereResolvedJob(); job.result.reconciliationReviewedContextDigest = 'd'.repeat(64); return { ok: true, status: 200, text: async () => JSON.stringify(job) }; };
+    await h.api.dismissResolvedRegistrationReview(); assert.equal(h.api.state.registrationReviewPending, pending); assert.equal(h.api.state.registrationReviewOtherResolution, null);
+    assert.match(h.element('registration-review-message').textContent, /本地回执仍保留/);
+  }
+});
+
+test('registration local-wait dismissal stays busy through its fresh GET and cancelled confirmation', async () => {
+  const h = harness(), pending = { version: 1, jobId: reviewParentId, claimDigest: 'a'.repeat(64), contextDigest: 'b'.repeat(64), createdAt: Date.now() };
+  h.api.persistRegistrationReview(pending); h.api.state.registrationReviewOtherResolution = { jobId: reviewParentId, contextDigest: 'c'.repeat(64) };
+  let completeRead, readCount = 0, confirmations = 0;
+  h.context.fetch = async () => { readCount += 1; await new Promise(resolve => { completeRead = resolve; }); return { ok: true, status: 200, text: async () => JSON.stringify(elsewhereResolvedJob()) }; };
+  h.context.window.confirm = () => { confirmations += 1; return false; };
+  const first = h.api.dismissResolvedRegistrationReview();
+  assert.equal(h.api.state.registrationReviewBusy, true); assert.equal(h.element('registration-review-dismiss').disabled, true);
+  assert.equal(h.api.state.registrationReviewPending, pending); assert.equal(confirmations, 0, 'an existing receipt does not mean the click completed');
+  await assert.rejects(h.api.dismissResolvedRegistrationReview(), /尚未确认/); assert.equal(readCount, 1);
+  completeRead(); await first;
+  assert.equal(confirmations, 1); assert.equal(h.api.state.registrationReviewPending, pending);
+  assert.equal(h.api.state.registrationReviewBusy, false); assert.equal(h.element('registration-review-dismiss').disabled, false);
+});
+
+test('registration reconciliation blocks writes in read-only, active, disconnected and existing pending states', async () => {
+  for (const change of [h => { h.api.state.overview.readOnly = true; }, h => { h.api.state.overview.activeJobs = { total: 1, returned: 1, truncated: false }; }, h => { h.api.state.connected = false; }, h => { h.api.state.storageError = true; }, h => { h.api.state.pending = { version: 1 }; }]) {
+    const h = harness(); mockRegistrationReview(h); await h.api.openRegistrationReview(reviewParentId); h.element('registration-review-checked').checked = true; change(h);
+    await assert.rejects(h.api.acknowledgeRegistrationReview()); assert.equal(h.calls.some(call => call.options.method === 'POST'), false);
+  }
+});
+
+test('registration reconciliation fails before POST when its session receipt cannot be saved', async () => {
+  const h = harness(); mockRegistrationReview(h); await h.api.openRegistrationReview(reviewParentId); h.element('registration-review-checked').checked = true;
+  h.context.sessionStorage.setItem = () => { throw new Error('storage unavailable'); };
+  await assert.rejects(h.api.acknowledgeRegistrationReview(), /无法保存/); assert.equal(h.calls.some(call => call.options.method === 'POST'), false);
+  assert.equal(h.api.state.storageError, true);
 });
 
 test('console incomplete, truncated or inconsistent task inventory fails closed', () => {

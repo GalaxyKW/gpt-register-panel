@@ -5,6 +5,7 @@
   const escape = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]));
   const icon = (name) => '<svg class="icon" aria-hidden="true"><use href="#icon-' + escape(name) + '"/></svg>';
   const PENDING_STORE = 'registerStudio.pending.v1';
+  const REVIEW_STORE = 'registerStudio.registrationReview.v1';
   const MAX_REPLAY_AGE = 20 * 60 * 60 * 1000;
   const PAGE_TITLES = { register: '注册任务', accounts: '账号管理', logs: '运行日志', settings: '设置与连接' };
   const JOB_ID = /^job_[a-f0-9]{24}$/;
@@ -29,6 +30,7 @@
   const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '管理员已关闭调度，不自动启用', temporary_scheduling_pause: '账号处于临时调度暂停，但不能确认是额度耗尽；保留账号，等待核对，不自动登录或删除', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_invalidated: '刷新凭据已失效，需要本地重新授权', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
   const state = { overview: null, connected: false, pending: null, storageError: false, busy: false, refreshing: false, page: 'register', selected: new Set(), stoppingJobs: new Set(), logs: [], logFiles: [], continuations: [], nextCursor: null, logRevision: 0, token: '', settingsDirty: false, settingsRevision: null, cleanupDaysDirty: false, registrationDirty: false, registrationRevision: null, registrationFields: [], networkBusy: false, pollTimer: null,
     taskDetail: null, taskDetailRevision: 0, localTokens: [], localSelected: new Set(), localTokensBusy: false, localTokensLoaded: false, localTokensRevision: 0,
+    registrationReview: null, registrationReviewJobId: null, registrationReviewRevision: 0, registrationReviewBusy: false, registrationReviewPending: null, registrationReviewOtherResolution: null,
     proxyList: null, proxyLoading: false, proxyLoadAttempted: false, proxyListError: '', proxyDirty: false, proxyRevision: null, proxySettingsRevision: null };
 
   function validToken(value) { return typeof value === 'string' && /^[\x21-\x7e]{16,4096}$/.test(value); }
@@ -72,6 +74,7 @@
         const error = new Error(body.message || body.error?.message || (typeof body.error === 'string' ? body.error : '') || '请求失败（HTTP ' + response.status + '）');
         error.status = response.status;
         error.code = body.code || body.error?.code || (typeof body.error === 'string' ? body.error : undefined);
+        error.writeOutcomeUnknown = body.writeOutcomeUnknown === true;
         error.definitive = response.status >= 400 && response.status < 500 && response.status !== 408 && response.status !== 409 && response.status !== 429;
         if (['REGISTRATION_SETTINGS_CHANGED', 'CONSOLE_SETTINGS_STALE'].includes(error.code)) error.definitive = true;
         // This exact settings response is emitted before any configuration write.
@@ -185,6 +188,7 @@
     if (state.storageError) return '会话存储不可用，已锁定写操作。';
     if (!state.connected || !state.overview) return '尚未连接服务，不能确认后台状态。';
     if (inventoryProblem()) return inventoryProblem();
+    if (state.registrationReviewPending) return '注册人工对账回执尚未确认，请重新读取原任务核对；不会自动重发确认。';
     if (state.overview.reconciliation.total > 0) return '有 ' + state.overview.reconciliation.total + ' 个任务的外部结果尚未确认。请先查看相关任务并完成人工对账，期间禁止新写入。';
     if (state.overview.activeJobs.total > 0) return '后台仍有 ' + state.overview.activeJobs.total + ' 项活动任务，完成或停止后再提交新操作。';
     if (state.overview.readOnly) return '当前为只读模式，请在服务端启用写入后重试。';
@@ -208,14 +212,206 @@
     const problem = inventoryProblem();
     const holds = state.overview?.reconciliation?.total || 0;
     const active = state.overview?.activeJobs?.total || 0;
-    const show = Boolean(state.overview && (problem || holds || active));
+    const reviewPending = Boolean(state.registrationReviewPending);
+    const show = Boolean(state.overview && (problem || holds || active || reviewPending));
     $('task-safety-banner').hidden = !show;
     if (!show) return;
     $('task-safety-banner').className = 'task-safety-banner' + (!problem && !holds ? ' running' : '');
-    $('task-safety-title').textContent = problem ? '后台任务状态尚未核对完整' : holds ? holds + ' 个任务需要人工对账' : '后台有 ' + active + ' 项活动任务';
+    $('task-safety-title').textContent = problem ? '后台任务状态尚未核对完整' : reviewPending ? '注册人工对账回执待确认' : holds ? holds + ' 个任务需要人工对账' : '后台有 ' + active + ' 项活动任务';
     $('task-safety-message').textContent = problem ? problem + ' 查看状态、日志、连接检测和停止已知任务仍可使用。'
-      : holds ? '此前操作的外部结果尚不明确，服务端保留了安全阻挡。刷新或重新登录不会解除阻挡；请核对原账号 ID 和强身份后处理。仍可停止已知任务和查看日志。'
+      : reviewPending ? '尚未确认原任务是否已解除阻挡。重新读取只核对服务端回执，不会自动提交或启动注册。'
+      : holds ? '此前操作的外部结果尚不明确，服务端保留了安全阻挡，刷新或重新登录不会解除。同一注册流程可能包含主任务和执行步骤两条记录，不代表注册了两次。可在此核对注册任务；仍可停止已知任务和查看日志，其他类型请查看原任务详情。'
         : '任务在服务器上继续执行，暂不接受重复的新操作。点“查看相关任务”查看进度，需要终止时点击该任务的“停止”。';
+    $('show-task-list').textContent = holds || reviewPending ? '查看并核对任务' : '查看相关任务';
+  }
+  function registrationReviewPendingValid(value) {
+    return value?.version === 1 && JOB_ID.test(String(value.jobId)) && /^[a-f0-9]{64}$/.test(String(value.claimDigest))
+      && /^[a-f0-9]{64}$/.test(String(value.contextDigest)) && Number.isSafeInteger(value.createdAt) && value.createdAt > 0;
+  }
+  function persistRegistrationReview(value) {
+    const encoded = value ? JSON.stringify(value) : null;
+    try {
+      if (encoded === null) sessionStorage.removeItem(REVIEW_STORE); else sessionStorage.setItem(REVIEW_STORE, encoded);
+      if (sessionStorage.getItem(REVIEW_STORE) !== encoded) throw new Error('persistence');
+    } catch { state.storageError = true; throw new Error('无法保存人工对账回执，保持阻挡，未继续提交。'); }
+    state.registrationReviewPending = value;
+  }
+  function registrationReviewValid(detail, id) {
+    const context = detail?.targetContext, target = context?.targets?.[0];
+    const checkedAt = Date.parse(target?.checkedAt), expiresAt = Date.parse(target?.expiresAt);
+    return detail?.version === 1 && detail.id === id && ['registration', 'console_register'].includes(detail.type)
+      && ['succeeded', 'partial', 'failed', 'interrupted'].includes(detail.status)
+      && detail.reconciliationHold === true && detail.reconciliationResolved === false
+      && /^[a-f0-9]{64}$/.test(String(detail.reconciliationClaimDigest)) && /^[a-f0-9]{64}$/.test(String(detail.reconciliationContextDigest))
+      && context.available === true && context.coverage === 'exact_unknown_targets' && context.total === 1 && context.returned === 1 && context.truncated === false
+      && Array.isArray(context.targets) && context.targets.length === 1 && target.kind === 'registration_manual_review'
+      && JOB_ID.test(String(target.parentJobId)) && JOB_ID.test(String(target.childJobId)) && target.parentJobId !== target.childJobId
+      && (detail.type === 'console_register' ? target.parentJobId === id : target.childJobId === id)
+      && target.evidenceMode === 'manual_reconstructed' && /^[a-f0-9]{32}$/.test(String(target.evidenceId))
+      && ['evidenceDigest', 'rootFingerprint', 'localStateDigest'].every(key => /^[a-f0-9]{64}$/.test(String(target[key])))
+      && Number.isFinite(checkedAt) && Number.isFinite(expiresAt) && checkedAt <= Date.now() + 60000 && expiresAt > Date.now() && expiresAt > checkedAt
+      && target.processScan === 'stopped' && target.originalRoot === 'manually_verified' && target.localRecords === 'reviewed_preserved'
+      && target.remoteImport === 'not_reached' && target.smsOrder === 'terminal' && ['cancelled', 'completed', 'expired'].includes(target.smsStatus)
+      && ['unknown', 'verified'].includes(target.smsSettlement);
+  }
+  function registrationReviewIssue() {
+    if (!state.connected || !state.overview) return '尚未连接服务，保持阻挡。';
+    if (state.storageError) return '会话回执无法保存，保持阻挡。';
+    if (inventoryProblem()) return inventoryProblem();
+    if (state.overview.readOnly !== false) return '当前只读模式，只能查看证据。';
+    if (state.overview.activeJobs.total > 0) return '后台仍有活动任务，停止并核对后再确认。';
+    if (state.busy || state.registrationReviewBusy || state.pending) return '另有请求正在处理或待确认，暂不提交对账。';
+    if (!registrationReviewValid(state.registrationReview, state.registrationReviewJobId)) return '核对证据缺失、已过期或不完整，请重新读取；保持阻挡。';
+    const pending = state.registrationReviewPending;
+    if (pending && (pending.jobId !== state.registrationReview.id || pending.contextDigest !== state.registrationReview.reconciliationContextDigest
+        || pending.claimDigest !== state.registrationReview.reconciliationClaimDigest)) return '原确认回执仍待核对，不能用变化后的证据覆盖旧请求。请核对原任务。';
+    if (!$('registration-review-checked').checked) return '请先核对并勾选确认事项。';
+    return '';
+  }
+  function renderRegistrationReviewControls() {
+    const issue = registrationReviewIssue();
+    $('registration-review-submit').disabled = Boolean(issue);
+    $('registration-review-submit').title = issue;
+    $('registration-review-hint').hidden = !state.registrationReview;
+    $('registration-review-hint').textContent = issue || '仅确认当前这一条原任务；确认前服务端会再次复查证据与进程。';
+    $('registration-review-submit').textContent = state.registrationReviewBusy ? '正在核对…' : state.registrationReviewPending ? '再次确认同一原任务' : '确认核对并解除阻挡';
+    $('registration-review-refresh').disabled = state.registrationReviewBusy;
+    $('registration-review-close').disabled = state.registrationReviewBusy;
+    $('registration-review-checked').disabled = state.registrationReviewBusy || !registrationReviewValid(state.registrationReview, state.registrationReviewJobId);
+    $('registration-review-dismiss').hidden = !state.registrationReviewOtherResolution;
+    $('registration-review-dismiss').disabled = state.registrationReviewBusy || !state.connected || state.storageError;
+  }
+  function registrationResolvedElsewhere(job, pending) {
+    const result = job?.result;
+    return registrationReviewPendingValid(pending) && job?.id === pending.jobId && ['registration', 'console_register'].includes(job.type)
+      && ['succeeded', 'partial', 'failed', 'interrupted'].includes(job.status) && result?.reconciliationResolved === true
+      && result.reconciliationHold === false && result.requiresReconciliation === false && result.futureOperationsUnblocked === true
+      && result.retryAllowed === false && result.doNotRetry === true
+      && result.reconciliationResolution === 'state_manually_reconciled' && result.reconciliationAcknowledgedBy === 'panel-admin'
+      && result.reconciliationClaimDigest === pending.claimDigest && result.reconciliationBlockScope === 'none'
+      && /^[a-f0-9]{64}$/.test(String(result.reconciliationReviewedContextDigest)) && result.reconciliationReviewedContextDigest !== pending.contextDigest;
+  }
+  async function dismissResolvedRegistrationReview() {
+    const pending = state.registrationReviewPending, observed = state.registrationReviewOtherResolution;
+    if (!pending || !observed || observed.jobId !== pending.jobId || state.registrationReviewBusy || !state.connected || state.storageError) throw new Error('原任务最终核对状态尚未确认，不能结束本地等待。');
+    state.registrationReviewBusy = true; renderControls();
+    try {
+      const job = await request('/api/jobs/' + pending.jobId);
+      if (!registrationResolvedElsewhere(job, pending) || job.result.reconciliationReviewedContextDigest !== observed.contextDigest
+          || state.registrationReviewPending !== pending) throw new Error('原任务最终回执变化或不完整，保持本地阻挡，请重新读取。');
+      if (!window.confirm('原任务 ' + pending.jobId + ' 已由另一次人工核对解除阻挡。\n这不代表上次丢失响应的请求成功。仅结束当前浏览器的本地等待，不重跑、不租号、不导入，也不再次发送解除请求。')) return;
+      persistRegistrationReview(null); state.registrationReviewOtherResolution = null; state.registrationReview = null; state.registrationReviewJobId = null;
+      $('registration-review-content').innerHTML = '<p class="muted">原任务已由另一次人工核对解除阻挡，已结束本地等待。未将上次丢失响应的请求记为成功，原任务也未重跑。</p>';
+      reviewMessage('只清除了当前浏览器对旧确认的等待，没有发送解除请求；其他任务的阻挡仍保留。');
+      await refresh();
+    } catch (error) { state.registrationReviewOtherResolution = null; reviewMessage(errorText(error) + ' 本地回执仍保留，不会自动清除或重试。'); }
+    finally { state.registrationReviewBusy = false; renderControls(); }
+  }
+  function reviewMessage(message) { $('registration-review-message').textContent = message; $('registration-review-message').hidden = !message; }
+  function renderRegistrationReview(detail, job) {
+    const target = detail.targetContext.targets[0];
+    const checks = [
+      ['进程与原运行目录', '进程已停止；管理员已核验原运行目录，服务端将在确认前再次复查。'],
+      ['本地账号与产物', '已核对并保留本地记录。不会删除 token、账号或原任务，也不会把任务改为成功。'],
+      ['远端导入', '原流程未到导入步骤；此次不会导入、重跑或租号。'],
+      ['短信订单', '原订单已结束：' + ({ cancelled: '已取消', completed: '已完成', expired: '已过期' })[target.smsStatus] + '。' + (target.smsSettlement === 'verified' ? '费用记录已核对；不据此宣称退款。' : '费用结算仍未知；结束订单不代表已退款。')],
+    ];
+    $('registration-review-content').innerHTML = '<div class="detail-notice">同一注册流程的两条任务记录：主任务负责流程，执行步骤负责注册机。需分别确认；只解除当前这一条，其他阻挡仍保留。</div>'
+      + detailRows([['当前确认', detail.type === 'console_register' ? '主任务' : '注册机执行步骤'], ['主任务 ID', target.parentJobId], ['执行步骤 ID', target.childJobId], ['原任务结果', STATUS_LABELS[detail.status] || '未知'], ['证据核验时间', date(target.checkedAt)], ['证据有效期至', date(target.expiresAt)]])
+      + '<h3>原任务失败原因</h3><p class="detail-notice">' + escape(typeof job.error === 'string' ? job.error : job.error?.message || '原任务外部结果未能确认，请结合原任务日志核对。') + '</p>'
+      + '<h3>已核验事项</h3><ul class="review-checks">' + checks.map(([label, text]) => '<li>' + tag('已核对', 'good') + '<div><strong>' + escape(label) + '</strong><p>' + escape(text) + '</p></div></li>').join('') + '</ul>';
+    $('registration-review-confirmation').hidden = false;
+  }
+  async function openRegistrationReview(id = null) {
+    if (state.registrationReviewBusy) return;
+    if (id !== null && !JOB_ID.test(String(id))) throw new Error('人工对账任务 ID 无效。');
+    const revision = ++state.registrationReviewRevision;
+    state.registrationReview = null; state.registrationReviewJobId = id || state.registrationReviewPending?.jobId || null;
+    state.registrationReviewOtherResolution = null;
+    $('registration-review-checked').checked = false; $('registration-review-confirmation').hidden = true;
+    $('registration-review-content').innerHTML = '<p class="muted">正在读取任务与核对证据…</p>'; reviewMessage('');
+    if (!$('registration-review-dialog').open) $('registration-review-dialog').showModal();
+    state.registrationReviewBusy = true; renderControls();
+    try {
+      const pending = state.registrationReviewPending;
+      if (pending) {
+        const job = await request('/api/jobs/' + pending.jobId);
+        if (job?.id !== pending.jobId) throw new Error('原任务回执 ID 不一致，保持阻挡。');
+        if (job.result?.reconciliationResolved === true && job.result?.reconciliationHold === false
+            && job.result?.reconciliationReviewedContextDigest === pending.contextDigest) {
+          persistRegistrationReview(null);
+          state.registrationReviewJobId = null;
+          reviewMessage('已从原任务确认上次对账成功。原任务未重跑；将继续显示其他仍待核对的任务。');
+          await refresh();
+        } else if (registrationResolvedElsewhere(job, pending)) {
+          state.registrationReviewOtherResolution = { jobId: job.id, contextDigest: job.result.reconciliationReviewedContextDigest };
+          $('registration-review-content').innerHTML = detailRows([['原任务 ID', job.id], ['原任务结果', STATUS_LABELS[job.status] || '未知']])
+            + '<p class="detail-notice">原任务已由另一次人工核对解除阻挡，服务端明确禁止重跑。此回执不属于上次丢失响应的请求，不能把旧请求标记为成功。</p>';
+          reviewMessage('旧本地回执仍保留。可明确选择“结束本地等待”；点击后将再次只读核验，不发送解除请求。');
+          return;
+        } else if (job.result?.reconciliationResolved === true) throw new Error('原任务的已确认回执与本次证据不一致，保持本地阻挡，请管理员核对。');
+        else { state.registrationReviewJobId = pending.jobId; reviewMessage('上次确认结果仍待核对，不会自动重发。可再次读取原证据；仅在证据一致时，重新勾选后显式确认同一原任务。'); }
+      }
+      if (!state.registrationReviewJobId) {
+        const list = await request('/api/jobs?limit=100');
+        const inventory = list?.reconciliationHolds;
+        if (!Array.isArray(list.jobs) || !inventory || !Number.isSafeInteger(inventory.total) || inventory.total < 0
+            || inventory.returned !== inventory.total || inventory.truncated !== false) throw new Error('人工对账任务清单不完整，保持阻挡。');
+        const held = list.jobs.filter(job => job.result?.reconciliationHold === true && job.result?.reconciliationResolved !== true);
+        if (held.length !== inventory.total || new Set(held.map(job => job.id)).size !== held.length
+            || held.some(job => !JOB_ID.test(String(job.id)))) throw new Error('人工对账任务与清单数量不一致，保持阻挡。');
+        if (revision !== state.registrationReviewRevision) return;
+        $('registration-review-content').innerHTML = held.length ? '<p class="muted">同一注册流程可能占两条任务记录，确认一条不会自动解除另一条。请选择原任务读取证据。</p>'
+          + held.map(job => '<div class="child-job"><div><strong>' + escape(({ console_register: '注册流程主任务', registration: '注册机执行步骤' })[job.type] || '其他类型任务') + '</strong><p>' + escape(job.id) + '</p><p>' + escape(typeof job.error === 'string' ? job.error : job.error?.message || '原任务外部结果待核对') + '</p></div>'
+            + (['registration', 'console_register'].includes(job.type) ? '<button type="button" class="button secondary" data-registration-review="' + escape(job.id) + '">读取核对证据</button>' : '<a class="text-button" href="/index.html">高级诊断</a>') + '</div>').join('')
+          : '<p class="muted">当前没有待人工对账的任务。解除阻挡不会自动启动注册；需要时请另行提交新任务。</p>';
+        return;
+      }
+      const detail = await request('/api/jobs/' + state.registrationReviewJobId + '/reconciliation');
+      if (revision !== state.registrationReviewRevision) return;
+      if (!registrationReviewValid(detail, state.registrationReviewJobId)) throw new Error('注册任务核对证据缺失、过期或不完整，保持阻挡。');
+      const job = await request('/api/jobs/' + state.registrationReviewJobId);
+      if (revision !== state.registrationReviewRevision) return;
+      if (job?.id !== detail.id || job.type !== detail.type || job.status !== detail.status || job.result?.reconciliationHold !== true
+          || job.result?.reconciliationResolved === true) throw new Error('原任务状态与核对证据已经变化，保持阻挡，请重新读取。');
+      state.registrationReview = detail; renderRegistrationReview(detail, job);
+    } catch (error) {
+      if (revision !== state.registrationReviewRevision) return;
+      $('registration-review-content').innerHTML = '<p class="muted">未能取得可确认的注册对账证据。不会自动解除或重新注册。</p>';
+      reviewMessage(errorText(error));
+    } finally { state.registrationReviewBusy = false; renderControls(); }
+  }
+  async function acknowledgeRegistrationReview() {
+    const issue = registrationReviewIssue(); if (issue) throw new Error(issue);
+    const detail = state.registrationReview;
+    if (!window.confirm('仅解除原任务 ' + detail.id + ' 的阻挡？\n不会重跑、租号、导入，也不把失败改成成功；同一流程的其他任务仍需分别核对。')) return;
+    const pending = state.registrationReviewPending || { version: 1, jobId: detail.id, claimDigest: detail.reconciliationClaimDigest, contextDigest: detail.reconciliationContextDigest, createdAt: Date.now() };
+    persistRegistrationReview(pending); state.registrationReviewBusy = true; $('registration-review-checked').checked = false; renderControls();
+    let accepted = false;
+    try {
+      await request('/api/jobs/' + pending.jobId + '/reconciliation/acknowledge', { method: 'POST', expectedStatus: 200,
+        body: JSON.stringify({ jobId: pending.jobId, confirmation: '我已按强身份完成人工核对', resolution: 'state_manually_reconciled', claimDigest: pending.claimDigest, contextDigest: pending.contextDigest }) });
+      accepted = true;
+      // A successful HTTP response alone is not proof. Read the durable exact-context receipt.
+      const job = await request('/api/jobs/' + pending.jobId);
+      if (job?.id !== pending.jobId || job.result?.reconciliationResolved !== true || job.result?.reconciliationHold !== false
+          || job.result?.reconciliationReviewedContextDigest !== pending.contextDigest) throw new Error('人工对账回执无法确认，保持本地阻挡；请重新读取原任务，勿新建注册。');
+      persistRegistrationReview(null); state.registrationReview = null; state.registrationReviewJobId = null;
+      $('registration-review-content').innerHTML = '<p class="muted">已确认当前任务解除阻挡，原失败结果和产物保持不变。重新读取可查看其余任务。</p>';
+      $('registration-review-confirmation').hidden = true; reviewMessage('当前任务已核对。没有重跑、租号或导入；其他任务的阻挡不会被自动清除。'); await refresh();
+    } catch (error) {
+      state.registrationReview = null;
+      const rejectedBeforeRelease = !accepted && error.status === 409 && error.writeOutcomeUnknown !== true && [
+        'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', 'JOB_RECONCILIATION_CONTEXT_INCOMPLETE', 'JOB_RECONCILIATION_CONTEXT_DIGEST_MISMATCH',
+        'JOB_RECONCILIATION_TARGET_MISMATCH', 'JOB_RECONCILIATION_RESOLUTION_REQUIRES_MANUAL_RECONCILIATION', 'JOB_RECONCILIATION_DIGEST_MISMATCH',
+      ].includes(error.code);
+      if (rejectedBeforeRelease) {
+        // These exact server conflicts are guaranteed to occur before release.
+        // The durable server hold stays; discard only this rejected UI receipt.
+        persistRegistrationReview(null);
+        reviewMessage(errorText(error) + ' 服务端已在解除前拒绝，原阻挡保留。请重新读取并核验最新证据，再明确确认；不会自动提交。');
+      } else reviewMessage(errorText(error) + ' 未确认解除结果，保持阻挡。请重新读取原任务；不会自动重发确认。');
+    } finally { state.registrationReviewBusy = false; renderControls(); }
   }
   async function stopJob(jobId) {
     if (!/^job_[a-f0-9]{24}$/.test(String(jobId))) throw new Error('待停止任务 ID 无效。');
@@ -370,6 +566,7 @@
       if (hint) hint.textContent = issue || (item.stage === 'phase3' ? '无需短信配置；启动前仅检测邮箱和 OAuth 通道，不重新租号。' : '沿用现有账号继续；启动前检查完整注册配置，不重新租号。');
     });
     renderTaskSafety();
+    renderRegistrationReviewControls();
   }
   function renderMetrics() {
     const summary = state.overview?.summary || {};
@@ -760,7 +957,14 @@
   for (const id of ['jobs', 'account-jobs', 'task-dialog', 'account-dialog']) $(id).addEventListener('click', taskClick);
   $('task-dialog-close').addEventListener('click', closeDetails); $('account-dialog-close').addEventListener('click', closeDetails);
   $('task-dialog').addEventListener('cancel', () => { state.taskDetailRevision += 1; state.taskDetail = null; });
-  $('show-task-list').addEventListener('click', () => { location.hash = 'register'; showPage(); $('task-list').scrollIntoView?.({ block: 'start' }); });
+  $('show-task-list').addEventListener('click', () => { if (state.overview?.reconciliation?.total > 0 || state.registrationReviewPending) { report(() => openRegistrationReview()); return; } location.hash = 'register'; showPage(); $('task-list').scrollIntoView?.({ block: 'start' }); });
+  $('registration-review-content').addEventListener('click', event => { const button = event.target.closest('[data-registration-review]'); if (button) report(() => openRegistrationReview(button.dataset.registrationReview)); });
+  $('registration-review-refresh').addEventListener('click', () => report(() => openRegistrationReview(state.registrationReviewJobId)));
+  $('registration-review-checked').addEventListener('change', renderRegistrationReviewControls);
+  $('registration-review-submit').addEventListener('click', () => report(acknowledgeRegistrationReview));
+  $('registration-review-dismiss').addEventListener('click', () => report(dismissResolvedRegistrationReview));
+  $('registration-review-close').addEventListener('click', () => { if (!state.registrationReviewBusy) { state.registrationReviewRevision += 1; state.registrationReview = null; $('registration-review-dialog').close(); } });
+  $('registration-review-dialog').addEventListener('cancel', event => { if (state.registrationReviewBusy) event.preventDefault(); else { state.registrationReviewRevision += 1; state.registrationReview = null; } });
   $('continuations').addEventListener('click', (event) => { const button = event.target.closest('[data-resume-index]'); if (!button) return; report(async () => { const item = state.continuations[Number(button.dataset.resumeIndex)], issue = continuationIssue(item); if (issue) throw new Error(issue); if (!window.confirm('继续 ' + (item.email || item.phoneMasked || '所选本地账号') + '？\n从已有记录继续绑定邮箱 / 获取 token，不重新租号。可能发送验证码；成功后自动导入。')) return; await mutate('/api/console/register/resume', { selectedKey: item.selectedKey, revision: item.revision, autoImport: true }); }); });
   for (const id of ['log-source', 'log-level', 'log-job', 'log-file']) $(id).addEventListener('change', () => loadLogs());
   $('log-query').addEventListener('search', () => loadLogs()); $('log-query').addEventListener('keydown', (event) => { if (event.key === 'Enter') loadLogs(); });
@@ -822,6 +1026,7 @@
   document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(); });
   try { const token = sessionStorage.getItem('panelToken'); if (validToken(token)) state.token = token; else if (token) sessionStorage.removeItem('panelToken'); } catch { /* Authentication can still work in memory. */ }
   try { const raw = sessionStorage.getItem(PENDING_STORE); if (raw !== null) { const pending = JSON.parse(raw); if (!pendingValid(pending)) throw new Error('invalid pending'); state.pending = pending; } } catch { state.storageError = true; notice('操作恢复记录无法读取。为防止重复执行，写操作已锁定，请到高级诊断核对。', 'error'); }
+  try { const raw = sessionStorage.getItem(REVIEW_STORE); if (raw !== null) { const pending = JSON.parse(raw); if (!registrationReviewPendingValid(pending)) throw new Error('invalid review'); state.registrationReviewPending = pending; } } catch { state.storageError = true; notice('人工对账回执无法读取，保持操作阻挡。请管理员核对原任务，勿重新注册。', 'error'); }
   showPage(); renderControls(); refresh();
   state.pollTimer = setInterval(() => { if (!document.hidden && !$('auth-dialog').open) refresh(); }, 6000);
 })();

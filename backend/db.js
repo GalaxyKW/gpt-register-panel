@@ -54,6 +54,33 @@ const AUDIT_LIST_TEXT_BYTES = Object.freeze({
 });
 const MAX_JOB_CLAIM_KEYS = 1000;
 const MAX_JOB_CLAIM_KEY_BYTES = 512;
+function registrationReconciliationJobs(database, ids) {
+  if (!Array.isArray(ids) || ids.length !== 2 || new Set(ids).size !== 2
+      || ids.some(id => !/^job_[a-f0-9]{24}$/.test(id))) throw reconciliationGuardUnavailable();
+  const active = resultRows(database.exec("SELECT COUNT(*) AS count FROM sync_jobs WHERE status IS NULL OR status NOT IN ('succeeded','partial','failed','interrupted')"))[0]?.count;
+  if (active !== 0) throw reconciliationError('JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', '仍有活动任务，不能确认注册对账');
+  return ids.map(id => {
+    const row = resultRows(database.exec(`SELECT
+      CASE WHEN typeof(id)='text' AND length(CAST(id AS BLOB)) <= ${MAX_JOB_ID_BYTES} THEN id ELSE NULL END AS id,
+      CASE WHEN typeof(type)='text' AND length(CAST(type AS BLOB)) <= ${MAX_JOB_TYPE_BYTES} THEN type ELSE NULL END AS type,
+      CASE WHEN typeof(status)='text' AND length(CAST(status AS BLOB)) <= ${MAX_JOB_STATUS_BYTES} THEN status ELSE NULL END AS status,
+      CASE WHEN typeof(claim_keys_json)='text' AND length(CAST(claim_keys_json AS BLOB)) <= 1024 THEN claim_keys_json ELSE NULL END AS claim_keys_json,
+      CASE WHEN typeof(reconciliation_hold)='integer' AND reconciliation_hold IN (0,1) THEN reconciliation_hold ELSE NULL END AS reconciliation_hold,
+      CASE WHEN typeof(reconciliation_scope)='text' AND length(CAST(reconciliation_scope AS BLOB)) <= 6 THEN reconciliation_scope ELSE NULL END AS reconciliation_scope,
+      CASE WHEN typeof(reconciliation_claim_digest)='text' AND length(CAST(reconciliation_claim_digest AS BLOB)) = 64 THEN reconciliation_claim_digest ELSE NULL END AS reconciliation_claim_digest,
+      CASE WHEN typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB)) <= ${MAX_JOB_PAYLOAD_BYTES} THEN payload_json ELSE NULL END AS payload_json,
+      CASE WHEN typeof(result_json)='text' AND length(CAST(result_json AS BLOB)) <= ${MAX_JOB_RESULT_BYTES} THEN result_json ELSE NULL END AS result_json
+      FROM sync_jobs WHERE id = ${sqlString(id)} LIMIT 1`))[0];
+    if (!row || row.id !== id || !['registration', 'console_register'].includes(row.type)
+        || !['failed', 'interrupted'].includes(row.status) || ![0, 1].includes(row.reconciliation_hold)
+        || typeof row.payload_json !== 'string' || typeof row.result_json !== 'string'
+        || typeof row.claim_keys_json !== 'string' || row.claim_keys_json.length > 1024) throw reconciliationGuardUnavailable();
+    return { id: row.id, type: row.type, status: row.status,
+      payload: redactValue(parseStoredReviewPayload(row)), result: redactValue(parseStoredResult(row)),
+      claimKeys: parseStoredClaimKeys(row), reconciliationScope: row.reconciliation_scope,
+      reconciliationClaimDigest: row.reconciliation_claim_digest, reconciliationHold: row.reconciliation_hold === 1 };
+  });
+}
 // A single UTF-8 byte may expand to a six-byte JSON escape (for example NUL).
 // Include quotes, commas and brackets so every list accepted by
 // normalizeClaimKeys() has a corresponding bounded on-disk representation.
@@ -3793,6 +3820,9 @@ class PanelDb {
             claimKeys: [...claimKeys],
             reconciliationScope: job.reconciliation_scope,
             reconciliationClaimDigest: currentDigest,
+            ...(['registration', 'console_register'].includes(job.type)
+              ? { registrationReviewJobs: registrationReconciliationJobs(database, acknowledgement.registrationReviewJobIds) }
+              : {}),
           });
         } catch (error) {
           if (['JOB_RECONCILIATION_CONTEXT_UNAVAILABLE',
@@ -4569,6 +4599,10 @@ class PanelDb {
         reconciliationHold: row.reconciliation_hold === 1,
       };
     });
+  }
+
+  async getRegistrationReconciliationJobs(ids) {
+    return this.read(database => registrationReconciliationJobs(database, ids));
   }
 
   async listConsoleJobReferences() {

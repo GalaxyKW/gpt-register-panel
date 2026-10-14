@@ -12,12 +12,14 @@ const repository = path.resolve(__dirname, '..');
 const token = 'synthetic-admin-token-only';
 const jobId = 'job_' + 'a'.repeat(24);
 const failedId = 'job_' + 'b'.repeat(24);
+const reviewParentId = 'job_' + 'd'.repeat(24), reviewChildId = 'job_' + 'e'.repeat(24);
 const fileId = 'f'.repeat(32);
 const fixtureSecret = 'SYNTHETIC_SECRET_NOT_FOR_STORAGE';
 const inventory = total => ({ total, returned: total, truncated: false });
 function makeFixture() {
   return {
     settingsMode: 'ok', registerMode: 'ok', requests: [], receipts: new Map(), confirmations: [], continuations: [], detailJobs: new Map(),
+    reviewMode: 'ok', reviewJobs: new Map(), reviewEvidence: new Map(), reviewReadDelayMs: 0,
     proxyMode: 'ok', proxyItems: [{ id: 7, name: '默认节点', protocol: 'socks5', status: 'active', revision: 'proxy7-proof', eligible: true, reason: '' },
       { id: 9, name: '停用节点', protocol: 'http', status: 'disabled', revision: 'proxy9-proof', eligible: false, reason: '节点已停用' }],
     localTokens: [{ selectedKey: 'token:synthetic', sourceContentHash: 'source-revision', accountId: 160, accountName: 'free00047', sourceLabel: 'tokens/synthetic.json',
@@ -58,6 +60,14 @@ const server = http.createServer(async (req, res) => {
       fixture.requests.push(entry);
       if (req.headers['x-panel-token'] !== token) return json({ error: 'unauthorized' }, 401);
       if (req.method === 'GET') {
+        if (url.pathname === '/api/jobs') return json({ jobs: [...fixture.reviewJobs.values()].filter(job => job.result?.reconciliationHold), reconciliationHolds: fixture.overview.reconciliation });
+        const reviewMatch = /^\/api\/jobs\/(job_[a-f0-9]{24})\/reconciliation$/.exec(url.pathname);
+        if (reviewMatch) {
+          if (fixture.reviewMode === 'missing') return json({ error: 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', message: '历史注册任务缺少可验证对账证据，请管理员先核验原运行、短信订单/费用及本地产物；不会自动解除。' }, 409);
+          const detail = fixture.reviewEvidence.get(reviewMatch[1]);
+          if (!detail) return json({ error: 'JOB_RECONCILIATION_NOT_FOUND', message: '待核对任务不存在' }, 404);
+          return json(detail);
+        }
         if (url.pathname === '/api/console/overview') return json(fixture.overview);
         if (url.pathname === '/api/console/settings') return json(fixture.overview.settings);
         if (url.pathname === '/api/console/proxies') {
@@ -68,7 +78,8 @@ const server = http.createServer(async (req, res) => {
         if (url.pathname === '/api/console/local-tokens') return json({ snapshotVersion: 'snapshot-fixture', items: fixture.localTokens });
         if (/^\/api\/jobs\/job_[a-f0-9]{24}$/.test(url.pathname)) {
           const id = url.pathname.split('/').at(-1);
-          return json(fixture.detailJobs.get(id) || fixture.overview.jobs.find(job => job.id === id) || { id, type: 'console_maintain', status: 'queued', result: { stage: 'queued', summary: {} } });
+          if (fixture.reviewReadDelayMs && fixture.reviewJobs.has(id)) await new Promise(resolve => setTimeout(resolve, fixture.reviewReadDelayMs));
+          return json(fixture.reviewJobs.get(id) || fixture.detailJobs.get(id) || fixture.overview.jobs.find(job => job.id === id) || { id, type: 'console_maintain', status: 'queued', result: { stage: 'queued', summary: {} } });
         }
         if (url.pathname === '/api/console/logs') return json({
           entries: [{ time: '2026-10-12T02:00:00Z', level: 'info', source: 'register', event: 'fixture', message: url.searchParams.has('cursor') ? '更早的合成日志' : '最新的合成日志' }],
@@ -84,6 +95,18 @@ const server = http.createServer(async (req, res) => {
       if (req.method === 'POST') {
         let raw = ''; for await (const chunk of req) { raw += chunk; if (raw.length > 65536) throw new Error('mock request too large'); }
         entry.body = JSON.parse(raw || '{}');
+        const reviewAck = /^\/api\/jobs\/(job_[a-f0-9]{24})\/reconciliation\/acknowledge$/.exec(url.pathname);
+        if (reviewAck) {
+          const job = fixture.reviewJobs.get(reviewAck[1]), proof = fixture.reviewEvidence.get(reviewAck[1]);
+          assert.equal(entry.body.jobId, job.id); assert.equal(entry.body.claimDigest, proof.reconciliationClaimDigest); assert.equal(entry.body.contextDigest, proof.reconciliationContextDigest);
+          assert.equal(entry.body.resolution, 'state_manually_reconciled'); assert.equal(entry.body.confirmation, '我已按强身份完成人工核对');
+          if (fixture.reviewMode === 'changed') return json({ error: 'JOB_RECONCILIATION_CONTEXT_UNAVAILABLE', message: '核对证据已经变化，保持阻挡' }, 409);
+          if (fixture.reviewMode === 'lost-before-acceptance') return json({ error: 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED', message: '合成确认传输结果未知', writeOutcomeUnknown: true }, 503);
+          job.result = { ...job.result, reconciliationHold: false, reconciliationResolved: true, reconciliationReviewedContextDigest: entry.body.contextDigest };
+          fixture.overview.reconciliation = inventory([...fixture.reviewJobs.values()].filter(item => item.result.reconciliationHold).length);
+          if (fixture.reviewMode === 'lost-response') return json({ error: 'JOB_RECONCILIATION_ACKNOWLEDGE_FAILED', message: '合成确认响应丢失', writeOutcomeUnknown: true }, 503);
+          return json({ jobId: job.id, resolution: entry.body.resolution });
+        }
         if (url.pathname === '/api/console/settings') {
           if (fixture.settingsMode === 'active-conflict') return json({ error: 'CONSOLE_SETTINGS_ACTIVE_CONFLICT', message: '后台任务仍在执行' }, 409);
           if (fixture.settingsMode === 'unknown') return json({ error: 'CONSOLE_SETTINGS_OTHER_CONFLICT', message: '合成场景：保存结果未知' }, 409);
@@ -140,6 +163,13 @@ const server = http.createServer(async (req, res) => {
 });
 function writes(pathname) { return fixture.requests.filter(req => req.method === 'POST' && (!pathname || req.pathname === pathname)); }
 async function waitText(page, selector, text) { currentStep = selector + ': ' + text; await page.waitForFunction((s, value) => document.querySelector(s)?.textContent.includes(value), {}, selector, text); }
+async function waitInteractive(page, selector) {
+  currentStep = selector + ': visible and enabled';
+  await page.waitForFunction(value => {
+    const element = document.querySelector(value);
+    return element?.isConnected && !element.hidden && !element.disabled && element.getClientRects().length > 0;
+  }, {}, selector);
+}
 async function setInput(page, selector, value) { await page.$eval(selector, (input, next) => { input.value = next; input.dispatchEvent(new Event('input', { bubbles: true })); }, value); }
 async function assertReadableText(page, selectors) {
   const results = await page.evaluate(selectors => {
@@ -160,6 +190,23 @@ async function navigate(page, name) {
   assert.deepEqual(await page.$$eval('.nav-link.active', links => links.map(link => link.dataset.page)), [name], 'navigation must have exactly one active page');
 }
 async function closeTaskDetail(page) { await page.waitForFunction(() => document.querySelector('#task-dialog').open); await page.click('#task-dialog-close'); }
+function prepareRegistrationReview() {
+  for (const id of [reviewParentId, reviewChildId]) {
+    const type = id === reviewParentId ? 'console_register' : 'registration';
+    fixture.reviewJobs.set(id, { id, type, status: 'failed', error: '合成手机号输入未确认，进程终止结果待核对', result: { reconciliationHold: true, requiresReconciliation: true } });
+    fixture.reviewEvidence.set(id, { version: 1, id, type, status: 'failed', reconciliationHold: true, reconciliationResolved: false,
+      reconciliationClaimDigest: 'a'.repeat(64), reconciliationContextDigest: 'b'.repeat(64),
+      targetContext: { available: true, coverage: 'exact_unknown_targets', total: 1, returned: 1, truncated: false, targets: [{ kind: 'registration_manual_review',
+        parentJobId: reviewParentId, childJobId: reviewChildId, evidenceMode: 'manual_reconstructed', evidenceId: 'c'.repeat(32), evidenceDigest: 'd'.repeat(64),
+        checkedAt: new Date(Date.now() - 60000).toISOString(), expiresAt: new Date(Date.now() + 600000).toISOString(), rootFingerprint: 'e'.repeat(64), localStateDigest: 'f'.repeat(64),
+        processScan: 'stopped', originalRoot: 'manually_verified', localRecords: 'reviewed_preserved', remoteImport: 'not_reached', smsOrder: 'terminal', smsStatus: 'cancelled', smsSettlement: 'unknown' }] } });
+  }
+  fixture.overview.reconciliation = inventory(2);
+}
+async function openRegistrationEvidence(page, id = reviewParentId) {
+  await page.click('#show-task-list'); await page.waitForSelector('[data-registration-review="' + id + '"]');
+  await page.click('[data-registration-review="' + id + '"]');
+}
 async function refresh(page) {
   const response = page.waitForResponse(response => response.url() === origin + '/api/console/register/continuations');
   await page.click('#refresh'); await response;
@@ -279,6 +326,81 @@ async function main() {
     const registration = writes('/api/console/register'); assert.equal(registration.length, 2);
     assert.equal(registration[0].key, registration[1].key); assert.deepEqual(registration[0].body, registration[1].body); assert.equal(fixture.receipts.size, 1);
     assert.equal(await page.evaluate(() => sessionStorage.getItem('registerStudio.pending.v1')), null);
+  });
+  await testCase('registration reconciliation parent-child proof is readable on desktop/mobile and requires two explicit confirmations', async (page, confirm) => {
+    prepareRegistrationReview(); await refresh(page); await openRegistrationEvidence(page);
+    await waitText(page, '#registration-review-content', '费用结算仍未知'); assert.equal(writes().length, 0);
+    for (const width of [1440, 390]) {
+      await page.setViewport({ width, height: width === 390 ? 844 : 1050 });
+      assert.equal(await page.$eval('#registration-review-dialog', element => element.scrollWidth <= element.clientWidth + 1), true, 'review dialog horizontal overflow');
+      await assertReadableText(page, ['#registration-review-dialog .detail-notice', '#registration-review-dialog .detail-list dt', '#registration-review-dialog .review-checks p']);
+      if (process.env.PANEL_TEST_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.PANEL_TEST_SCREENSHOT_DIR, 'mock-' + width + '-registration-review.png'), fullPage: true });
+    }
+    assert.equal(await page.$eval('#registration-review-submit', el => el.disabled), true);
+    await page.click('#registration-review-checked'); confirm(false); await page.click('#registration-review-submit'); assert.equal(writes().length, 0);
+    confirm(true); await page.click('#registration-review-submit'); await waitText(page, '#registration-review-message', '当前任务已核对');
+    assert.equal(writes().length, 1); assert.equal(fixture.reviewJobs.get(reviewChildId).result.reconciliationHold, true);
+    assert.equal(await page.$eval('#start-register', el => el.disabled), true);
+    await page.click('#registration-review-refresh'); await page.waitForSelector('[data-registration-review="' + reviewChildId + '"]');
+    await page.click('[data-registration-review="' + reviewChildId + '"]'); await waitText(page, '#registration-review-content', '注册机执行步骤');
+    await page.click('#registration-review-checked'); await page.click('#registration-review-submit'); await waitText(page, '#registration-review-message', '当前任务已核对');
+    assert.equal(writes().length, 2); assert.equal(fixture.reviewJobs.get(reviewParentId).status, 'failed'); assert.equal(fixture.reviewJobs.get(reviewChildId).status, 'failed');
+    assert.equal(writes('/api/console/register').length, 0);
+  });
+  await testCase('registration review missing expired and unknown evidence never enables confirmation', async page => {
+    prepareRegistrationReview(); fixture.reviewMode = 'missing'; await refresh(page); await openRegistrationEvidence(page);
+    await waitText(page, '#registration-review-message', '管理员先核验'); assert.equal(await page.$eval('#registration-review-submit', el => el.disabled), true);
+    fixture.reviewMode = 'ok'; fixture.reviewEvidence.get(reviewParentId).targetContext.targets[0].expiresAt = '2000-01-01T00:00:00Z';
+    await page.click('#registration-review-refresh'); await waitText(page, '#registration-review-message', '过期'); assert.equal(await page.$eval('#registration-review-submit', el => el.disabled), true);
+    fixture.reviewEvidence.get(reviewParentId).targetContext.targets[0].expiresAt = new Date(Date.now() + 600000).toISOString();
+    fixture.reviewEvidence.get(reviewParentId).targetContext.targets[0].processScan = 'unknown';
+    await page.click('#registration-review-refresh'); await waitText(page, '#registration-review-message', '不完整'); assert.equal(writes().length, 0);
+  });
+  await testCase('registration acknowledgement response loss survives reload and recovers by exact receipt GET only', async page => {
+    prepareRegistrationReview(); fixture.reviewMode = 'lost-response'; await refresh(page); await openRegistrationEvidence(page);
+    await waitText(page, '#registration-review-content', '已核验事项'); await page.click('#registration-review-checked'); await page.click('#registration-review-submit');
+    await waitText(page, '#registration-review-message', '未确认解除结果');
+    assert.ok(await page.evaluate(() => sessionStorage.getItem('registerStudio.registrationReview.v1')));
+    await page.reload({ waitUntil: 'networkidle0' }); await waitText(page, '#task-safety-title', '回执待确认'); assert.equal(writes().length, 1);
+    await page.click('#show-task-list'); await waitText(page, '#registration-review-message', '已从原任务确认上次对账成功');
+    assert.equal(writes().length, 1); assert.equal(await page.evaluate(() => sessionStorage.getItem('registerStudio.registrationReview.v1')), null);
+    assert.equal(fixture.overview.reconciliation.total, 1); assert.equal(await page.$eval('#start-register', el => el.disabled), true);
+  });
+  await testCase('registration acknowledgement changed server evidence keeps both holds without automatic retry', async page => {
+    prepareRegistrationReview(); fixture.reviewMode = 'changed'; await refresh(page); await openRegistrationEvidence(page);
+    await waitText(page, '#registration-review-content', '已核验事项'); await page.click('#registration-review-checked'); await page.click('#registration-review-submit');
+    await waitText(page, '#registration-review-message', '证据已经变化'); assert.equal(fixture.overview.reconciliation.total, 2);
+    await page.reload({ waitUntil: 'networkidle0' }); assert.equal(writes().length, 1); assert.equal(await page.$eval('#start-register', el => el.disabled), true);
+  });
+  await testCase('registration resolved by another review clears only local wait after explicit fresh-GET confirmation', async (page, confirm) => {
+    prepareRegistrationReview(); fixture.reviewMode = 'lost-before-acceptance'; await refresh(page); await openRegistrationEvidence(page);
+    await waitText(page, '#registration-review-content', '已核验事项'); await page.click('#registration-review-checked'); await page.click('#registration-review-submit');
+    await waitText(page, '#registration-review-message', '未确认解除结果'); assert.equal(fixture.overview.reconciliation.total, 2);
+    fixture.reviewJobs.get(reviewParentId).result = { reconciliationHold: false, reconciliationResolved: true, requiresReconciliation: false,
+      futureOperationsUnblocked: true, retryAllowed: false, doNotRetry: true, reconciliationResolution: 'state_manually_reconciled',
+      reconciliationAcknowledgedBy: 'panel-admin', reconciliationClaimDigest: 'a'.repeat(64), reconciliationBlockScope: 'none', reconciliationReviewedContextDigest: 'c'.repeat(64) };
+    fixture.overview.reconciliation = inventory(1);
+    // This action re-reads the receipt before opening its native confirmation.
+    // A delayed GET must not let the next test click change the first dialog's
+    // answer. Wait for the cancelled action to finish, not merely for the old
+    // receipt to exist (it also exists while that GET is still in flight).
+    fixture.reviewReadDelayMs = 200;
+    await page.reload({ waitUntil: 'networkidle0' }); await page.click('#show-task-list'); await waitText(page, '#registration-review-content', '已由另一次人工核对');
+    assert.ok(await page.evaluate(() => sessionStorage.getItem('registerStudio.registrationReview.v1'))); assert.equal(writes().length, 1);
+    await waitInteractive(page, '#registration-review-dismiss');
+    const confirmationsBeforeCancel = fixture.confirmations.length;
+    confirm(false); currentStep = 'cancel local-wait dismissal after fresh GET'; await page.click('#registration-review-dismiss');
+    await waitInteractive(page, '#registration-review-dismiss');
+    assert.equal(fixture.confirmations.length, confirmationsBeforeCancel + 1, 'the first confirmation was actually shown and dismissed');
+    assert.ok(await page.evaluate(() => sessionStorage.getItem('registerStudio.registrationReview.v1')));
+    assert.equal(writes().length, 1);
+    confirm(true); currentStep = 'accept local-wait dismissal after cancelled action has finished'; await page.click('#registration-review-dismiss');
+    await waitText(page, '#registration-review-message', '只清除了当前浏览器');
+    assert.equal(fixture.confirmations.length, confirmationsBeforeCancel + 2, 'the accepted action has its own explicit confirmation');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('registerStudio.registrationReview.v1')), null);
+    assert.equal(writes().length, 1, 'dismissing an already-final receipt must never POST');
+    assert.equal(fixture.overview.reconciliation.total, 1); assert.equal(fixture.reviewJobs.get(reviewParentId).status, 'failed');
+    assert.equal(await page.$eval('#start-register', el => el.disabled), true, 'other hold remains');
   });
   await testCase('settings definite rejection unlocks; secrets and unknown results never replay', async page => {
     await navigate(page, 'settings'); fixture.settingsMode = 'active-conflict'; await setInput(page, '#maintenance-interval', '75'); await page.click('#settings-save');
