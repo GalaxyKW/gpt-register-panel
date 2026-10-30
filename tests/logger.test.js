@@ -1112,7 +1112,10 @@ test('fatal stderr formatting preserves a bounded stack without exposing credent
     "const { safeErrorText } = require('./backend/logger');",
     "const error = new Error('Authorization: Basic ZmFrZTpmYWtl');",
     "error.code = 'FAKE_START_FAILURE';",
-    "error.stack += '\\ncredentialPayload=fake-stderr-credential';",
+    // Node 22 exposes even an assigned native Error.stack through an accessor.
+    // The logger intentionally reads only data properties, never arbitrary
+    // getters. Make this test's supported stack representation explicit.
+    "Object.defineProperty(error, 'stack', { value: 'Error: Authorization: Basic ZmFrZTpmYWtl\\n    at syntheticStartup (fixture.js:1:1)\\ncredentialPayload=fake-stderr-credential', configurable: true });",
     "process.stderr.write(safeErrorText(error, 512) + '\\n');",
   ].join('\n');
   const child = spawnSync(process.execPath, ['-e', script], {
@@ -1122,7 +1125,36 @@ test('fatal stderr formatting preserves a bounded stack without exposing credent
   assert.equal(child.status, 0, child.stderr);
   assert.match(child.stderr, /code=FAKE_START_FAILURE/);
   assert.match(child.stderr, /Error:/);
+  assert.match(child.stderr, /at syntheticStartup \(fixture\.js:1:1\)/);
   assert.equal(child.stderr.includes('ZmFrZTpmYWtl'), false);
   assert.equal(child.stderr.includes('fake-stderr-credential'), false);
   assert.ok(child.stderr.length <= 513);
+});
+
+test('fatal stderr formatting never evaluates a stack accessor and falls back to safe data fields', () => {
+  const error = new Error('Authorization: Basic ZmFrZTpmYWtl');
+  error.code = 'FAKE_START_FAILURE';
+  let calls = 0;
+  Object.defineProperty(error, 'stack', {
+    configurable: true,
+    get() { calls += 1; throw new Error('fake-stack-getter-secret'); },
+  });
+  assert.equal(safeErrorText(error, 512), 'code=FAKE_START_FAILURE\nAuthorization: [redacted]');
+  assert.equal(calls, 0);
+
+  // Validate the native runtime representation too, without asking V8 to
+  // materialize its stack or triggering Error.prepareStackTrace. On Node 22
+  // this is the exact accessor fallback used by executable startup failures.
+  const native = new Error('Authorization: Basic ZmFrZTpmYWtl');
+  native.code = 'FAKE_NATIVE_FAILURE';
+  const descriptor = Object.getOwnPropertyDescriptor(native, 'stack');
+  const formatted = safeErrorText(native, 512);
+  assert.match(formatted, /code=FAKE_NATIVE_FAILURE/);
+  assert.equal(formatted.includes('ZmFrZTpmYWtl'), false);
+  if (descriptor && !Object.hasOwn(descriptor, 'value')) {
+    assert.equal(formatted, 'code=FAKE_NATIVE_FAILURE\nAuthorization: [redacted]');
+  } else {
+    assert.match(formatted, /Error:/);
+  }
+  assert.ok(formatted.length <= 512);
 });

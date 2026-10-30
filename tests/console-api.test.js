@@ -239,7 +239,7 @@ test('registration freezes an unconfigured default across generation and never a
   proxyFixture(f);
   const admitted = await f.request('/api/console/register', { count: 1, country: 'US', operator: '', autoImport: true });
   const job = await f.waitJob(admitted.body.jobId);
-  assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_IMPORT_PROXY_CHANGED');
+  assert.equal(job.status, 'partial'); assert.equal(job.result.code, 'CONSOLE_IMPORT_PROXY_CHANGED');
   assert.equal(f.calls.import, 0); assert.equal(f.remote.length, 0);
   assert.equal(fs.existsSync(path.join(f.root, 'tokens/account-1.json')), true);
 });
@@ -449,7 +449,7 @@ for (const point of ['verification_read', 'worker_dispatch']) {
     f.client.testAccount = async () => { calls += 1; throw new Error('must not call upstream'); };
     const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
     const job = await f.waitJob(accepted.body.jobId);
-    assert.equal(job.status, 'partial'); assert.equal(calls, 0); assert.deepEqual(f.writes, []);
+    assert.equal(job.status, 'failed'); assert.equal(calls, 0); assert.deepEqual(f.writes, []);
     if (point === 'verification_read') assert.equal(job.result.items[0].code, 'CONSOLE_TEST_TARGET_CHANGED');
     else {
       const child = await f.db.getJob(job.result.childJobIds[0]);
@@ -486,10 +486,29 @@ test('test-only projects only safe diagnostic categories and status values', asy
   const rows = (await f.request('/api/console/overview')).body.accounts;
   const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
   const job = await f.waitJob(accepted.body.jobId);
-  assert.equal(job.status, 'partial'); assert.equal(job.result.items[0].failureCategory, 'unknown');
+  assert.equal(job.status, 'failed'); assert.equal(job.result.items[0].failureCategory, 'unknown');
   assert.equal(job.result.items[0].upstreamStatus, null);
   assert.equal(JSON.stringify(job.result.items).includes('untrusted-upstream-text'), false);
   assert.doesNotMatch(job.result.items[0].message, /已回写/);
+});
+
+test('test-only continues ordinary account failures and reports partial only after a verified success', async t => {
+  const tested = [];
+  const f = await fixture(t, { tester: async ({ accountIds, db, jobId, persistResult }) => withControlPlaneLock(async () => {
+    await db.startMutationJob(jobId); tested.push(...accountIds);
+    const success = accountIds[0] === 2;
+    const result = { requested: 1, succeeded: success ? 1 : 0, failed: success ? 0 : 1,
+      results: [{ accountId: accountIds[0], status: success ? 'succeeded' : 'failed', failureCategory: 'model_unavailable' }] };
+    await persistResult(result); return result;
+  }) });
+  f.account(1); f.account(2);
+  const rows = (await f.request('/api/console/overview')).body.accounts;
+  const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'partial'); assert.deepEqual(tested, [1, 2]);
+  assert.equal(job.result.summary.tested, 2); assert.equal(job.result.summary.verified, 1);
+  assert.equal(job.result.summary.failed, 1); assert.equal(job.result.summary.tokensUpdated, 0);
+  assert.deepEqual(job.result.items.map(item => item.status), ['failed', 'verified']);
 });
 
 test('controlled registration persists paired SMS caps and binds them to the original idempotency receipt', async t => {
@@ -586,6 +605,98 @@ test('console maintenance respects healthy quota manual-disabled and unknown acc
   assert.equal(overview.status, 200);
   assert.equal(overview.body.summary.quotaWait, 1);
   assert.equal(overview.body.summary.healthy, 1);
+});
+
+test('44 refresh targets share one real Node-symlink preflight failure without inventing account failures', async t => {
+  let preflights = 0; let spawned = 0;
+  const { runNetworkPreflight } = require('../backend/networkPreflight');
+  const f = await fixture(t, { preflight: async options => {
+    preflights += 1;
+    return runNetworkPreflight({ ...options, runner: async () => { spawned += 1; throw new Error('must not spawn'); } });
+  } });
+  fs.writeFileSync(path.join(f.root, 'index.js'), '// synthetic entry point', { mode: 0o600 });
+  const nodeAlias = path.join(f.root, 'node-alias'); fs.symlinkSync(process.execPath, nodeAlias);
+  process.env.GPT_REGISTER_NODE_PATH = nodeAlias;
+  for (let id = 1; id <= 44; id++) invalidRemote(f, id);
+  const response = await f.request('/api/console/maintain', { accountIds: [], importNew: false, refreshInvalid: true, deleteBanned: true });
+  assert.equal(response.status, 202);
+  const job = await f.waitJob(response.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'PHASE3_PATH_INVALID');
+  assert.equal(job.result.failureStage, 'checking_network'); assert.equal(job.result.summary.failed, 0);
+  assert.equal(job.result.summary.tokensGenerated, 0); assert.equal(job.result.summary.tokensUpdated, 0);
+  assert.deepEqual(job.result.progress, { completed: 0, total: 44 });
+  assert.deepEqual(job.result.items, []); assert.deepEqual(job.result.childJobIds, []);
+  assert.match(job.result.recoveryMessage, /尚未启动任何账号刷新/);
+  assert.equal(preflights, 1); assert.equal(spawned, 0); assert.equal(f.calls.import, 0);
+  assert.deepEqual(f.writes, []); assert.deepEqual(f.tested, []);
+  assert.equal((await f.db.listJobs()).length, 1); assert.equal(await f.db.countActiveJobs(), 0);
+});
+
+for (const kind of ['path_permissions', 'invalid_protocol', 'channels_unavailable', 'failed_process_with_ok_channels', 'unknown_result']) {
+  test('shared refresh preflight ' + kind + ' stops the batch once and preserves safety', async t => {
+    let preflights = 0;
+    const codes = { path_permissions: 'PHASE3_PATH_PERMISSIONS_INVALID', invalid_protocol: 'NETWORK_PREFLIGHT_INVALID',
+      channels_unavailable: 'CONSOLE_NETWORK_UNAVAILABLE', failed_process_with_ok_channels: 'CONSOLE_NETWORK_UNAVAILABLE',
+      unknown_result: 'REGISTRATION_TERMINATION_UNCONFIRMED' };
+    const f = await fixture(t, { preflight: async () => {
+      preflights += 1;
+      if (kind === 'channels_unavailable') return { ok: false, channels: ['mail', 'oauth'].map(id => ({ id, ok: false, code: 'FIXTURE_NETWORK_FAILED' })) };
+      if (kind === 'failed_process_with_ok_channels') return { ok: false, channels: ['mail', 'oauth'].map(id => ({ id, ok: true, code: 'OK' })) };
+      throw Object.assign(new Error('synthetic preflight failure'), { code: codes[kind],
+        ...(kind === 'unknown_result' ? { requiresReconciliation: true, writeOutcomeUnknown: true, doNotRetry: true } : {}) });
+    } });
+    invalidRemote(f, 1); invalidRemote(f, 2);
+    const response = await f.request('/api/console/maintain', { accountIds: [1, 2], importNew: false, refreshInvalid: true, deleteBanned: false });
+    const job = await f.waitJob(response.body.jobId);
+    assert.equal(job.status, 'failed'); assert.equal(job.result.code, codes[kind]);
+    assert.equal(job.result.failureStage, 'checking_network'); assert.equal(job.result.summary.failed, 0);
+    assert.deepEqual(job.result.items, []); assert.deepEqual(job.result.childJobIds, []);
+    assert.equal(preflights, 1); assert.equal(f.calls.import, 0); assert.deepEqual(f.writes, []);
+    if (kind === 'unknown_result') {
+      assert.equal(job.result.reconciliationHold, true); assert.equal(job.result.requiresReconciliation, true);
+      assert.equal((await f.request('/api/console/maintain', { accountIds: [1], importNew: false, refreshInvalid: true, deleteBanned: false })).status, 409);
+      assert.equal(preflights, 1);
+    }
+  });
+}
+
+test('channel detection preserves a safe execution error code without claiming a network probe ran', async t => {
+  const f = await fixture(t, { preflight: async () => { throw Object.assign(new Error('fixture-sensitive-path-and-detail'), { code: 'PHASE3_PATH_INVALID' }); } });
+  const response = await f.request('/api/console/preflight', {});
+  assert.equal(response.status, 200); assert.equal(response.body.ok, false);
+  for (const id of ['sms', 'mail', 'oauth']) {
+    const channel = response.body.channels.find(item => item.id === id);
+    assert.equal(channel.ok, false); assert.equal(channel.code, 'PHASE3_PATH_INVALID');
+    assert.match(channel.message, /尚未进行该通道网络检测/);
+  }
+  assert.equal(JSON.stringify(response.body).includes('fixture-sensitive-path-and-detail'), false);
+  assert.equal(f.calls.registration, 0); assert.equal(f.calls.import, 0);
+});
+
+test('ordinary per-account mapping failures continue after one shared preflight but never count skips as success', async t => {
+  const f = await fixture(t);
+  invalidRemote(f, 1); invalidRemote(f, 2); f.account(3);
+  const response = await f.request('/api/console/maintain', { accountIds: [], importNew: false, refreshInvalid: true, deleteBanned: false });
+  const job = await f.waitJob(response.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.stage, 'failed');
+  assert.equal(job.result.summary.failed, 2); assert.equal(job.result.summary.skipped, 1);
+  assert.deepEqual(job.result.items.map(item => item.status), ['failed', 'failed', 'skipped']);
+  assert.equal(job.result.items.filter(item => item.code === 'CONSOLE_LOGIN_MAPPING_REQUIRED').length, 2);
+  assert.equal(f.calls.preflight, 1); assert.equal(f.calls.import, 0); assert.deepEqual(job.result.childJobIds, []);
+});
+
+test('refresh preflight is not required for unselected invalid accounts or import-only maintenance', async t => {
+  let preflights = 0;
+  const f = await fixture(t, { preflight: async () => { preflights += 1; throw new Error('must not preflight'); } });
+  invalidRemote(f, 1); f.account(2);
+  for (const body of [
+    { accountIds: [2], importNew: false, refreshInvalid: true, deleteBanned: false },
+    { accountIds: [], importNew: true, refreshInvalid: false, deleteBanned: false },
+  ]) {
+    const response = await f.request('/api/console/maintain', body); assert.equal(response.status, 202);
+    const job = await f.waitJob(response.body.jobId); assert.equal(job.status, 'succeeded');
+  }
+  assert.equal(preflights, 0); assert.deepEqual(f.writes, []);
 });
 
 test('observed or deleted accounts cannot reenter automatic import after disappearing from Sub2API', async t => {

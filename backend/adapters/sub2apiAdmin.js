@@ -1540,6 +1540,12 @@ class Sub2ApiAdminClient {
       throw new Error('SUB2API_BASE_URL is required');
     }
     try {
+      // URL decodes host escapes and exposes an empty search/hash for a bare
+      // '?' or '#'. Reject those ambiguous inputs before canonicalization,
+      // while allowing percent-encoded characters in an ordinary path.
+      const rawAuthority = /^https?:[/\\]*([^/\\?#]*)/i.exec(this.baseUrl)?.[1] || '';
+      if (rawAuthority.includes('%')) throw new Error('encoded authority is not allowed');
+      if (/[?#]/.test(this.baseUrl)) throw new Error('query and fragment are not allowed');
       const parsedBaseUrl = new URL(this.baseUrl);
       if (!['http:', 'https:'].includes(parsedBaseUrl.protocol)) throw new Error('unsupported protocol');
       if (!parsedBaseUrl.hostname) throw new Error('hostname is required');

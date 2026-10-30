@@ -192,6 +192,53 @@ test('real maintenance chain reauthorizes once, updates original ID and restores
   assert.equal((await f.db.listAccountLifecycles(managementEndpointKey(f.client.baseUrl))).filter(row => row.state === 'imported').length, 2);
 });
 
+for (const kind of ['before_first_login', 'after_one_refresh', 'unknown_after_one_refresh']) {
+  test('shared runtime failure ' + kind + ' stops remaining accounts and preserves proven outcomes', async t => {
+    let calls = 0;
+    const f = await fixture(t, { consoleOptions: { phase3Runner: async options => {
+      calls += 1;
+      if (kind !== 'before_first_login' && calls === 1) return runPhase3Job(options);
+      throw Object.assign(new Error('synthetic shared runtime failure'), {
+        code: kind === 'unknown_after_one_refresh' ? 'PHASE3_TERMINATION_UNCONFIRMED' : 'PHASE3_PATH_INVALID',
+        ...(kind === 'unknown_after_one_refresh' ? { requiresReconciliation: true, writeOutcomeUnknown: true, doNotRetry: true } : {}),
+      });
+    } } });
+    const records = JSON.parse(fs.readFileSync(path.join(f.root, 'username.json'), 'utf8'));
+    for (const id of [48, 49]) {
+      const credentials = { ...f.original, email: 'remaining-' + id + '@example.test',
+        chatgpt_account_id: 'remaining-account-' + id, chatgpt_user_id: 'remaining-user-' + id,
+        access_token: crypto.randomBytes(24).toString('hex'), refresh_token: crypto.randomBytes(24).toString('hex') };
+      f.remote.push({ ...structuredClone(f.raw), id, name: 'free000' + id, credentials });
+      fs.writeFileSync(path.join(f.root, 'tokens', 'remaining-' + id + '.json'), JSON.stringify(credentials), { mode: 0o600 });
+      records.push({ ...records[0], email: credentials.email });
+    }
+    fs.writeFileSync(path.join(f.root, 'username.json'), JSON.stringify(records), { mode: 0o600 });
+    const beforeThird = fs.readFileSync(path.join(f.root, 'tokens/remaining-49.json'), 'utf8');
+    const job = await f.maintain({ accountIds: [47, 48, 49] });
+    assert.equal(job.status, kind === 'after_one_refresh' ? 'partial' : 'failed');
+    assert.equal(calls, kind === 'before_first_login' ? 1 : 2);
+    assert.equal(f.counters.preflight, 1);
+    assert.equal(job.result.summary.refreshed, kind === 'before_first_login' ? 0 : 1);
+    assert.equal(job.result.summary.tokensGenerated, kind === 'before_first_login' ? 0 : 1);
+    assert.equal(job.result.summary.tokensUpdated, kind === 'before_first_login' ? 0 : 1);
+    assert.equal(job.result.summary.verified, kind === 'before_first_login' ? 0 : 1);
+    assert.equal(fs.readFileSync(path.join(f.root, 'tokens/remaining-49.json'), 'utf8'), beforeThird);
+    assert.equal(f.writes.every(write => write.id === 47), true);
+    if (kind === 'unknown_after_one_refresh') {
+      assert.equal(job.result.requiresReconciliation, true); assert.equal(job.result.reconciliationHold, true);
+      const next = await f.request('/api/console/maintain', { accountIds: [49], importNew: false, refreshInvalid: true, deleteBanned: false });
+      assert.equal(next.status, 409); assert.equal(calls, 2);
+    } else {
+      assert.equal(job.result.summary.failed, 0, 'a shared environment failure is not a per-account login failure');
+      assert.equal(job.result.items.length, kind === 'before_first_login' ? 0 : 1);
+      assert.equal(job.result.code, 'PHASE3_PATH_INVALID');
+      assert.match(job.result.recoveryMessage, /共享执行器不可用/);
+      assert.equal(job.result.requiresReconciliation === true, false);
+    }
+    assert.equal(await f.db.countActiveJobs(), 0);
+  });
+}
+
 for (const change of ['quotaBeforeRefresh', 'quotaAtExecution', 'quotaDuringBackup']) {
   test('late quota change prevents automatic writes: ' + change, async t => {
     const f = await fixture(t, { [change]: true });
@@ -229,7 +276,7 @@ test('real Phase3 terminal disposition plus prior strong local binding authorize
 test('a ban while logging into an email-only local candidate cannot authorize remote deletion', async t => {
   const f = await fixture(t, { ban: true, noLocalToken: true });
   const job = await f.maintain();
-  assert.equal(job.status, 'partial'); assert.equal(job.result.summary.deleted, 0);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.summary.deleted, 0);
   assert.deepEqual(f.writes, []); assert.equal(f.remote.length, 2);
   assert.equal(await f.db.countActiveJobs(), 0);
 });
@@ -301,7 +348,7 @@ for (const failurePoint of ['snapshot', 'importer']) {
     const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
     assert.equal(admitted.status, 202);
     const job = await f.waitJob(admitted.body.jobId);
-    assert.equal(job.status, 'failed');
+    assert.equal(job.status, 'partial');
     assert.equal(job.result.summary.registered, 1);
     assert.equal(job.result.summary.imported, 0);
     assert.equal(job.result.summary.failed, 0, 'a transport failure is not a failed registration');
@@ -362,7 +409,7 @@ for (const planType of ['plus', undefined]) {
     const admitted = await f.request('/api/console/register', { count: 1, country: 'US', autoImport: true });
     assert.equal(admitted.status, 202);
     const job = await f.waitJob(admitted.body.jobId);
-    assert.equal(job.status, 'failed'); assert.equal(job.result.code, 'CONSOLE_TOKEN_PLAN_INVALID');
+    assert.equal(job.status, 'partial'); assert.equal(job.result.code, 'CONSOLE_TOKEN_PLAN_INVALID');
     assert.deepEqual(f.writes, []); assert.deepEqual(f.tested, []);
     assert.equal(f.remote.length, 2);
   });

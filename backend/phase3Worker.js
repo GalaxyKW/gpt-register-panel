@@ -625,11 +625,13 @@ function assertTrustedPhase3Object(stat, label, options = {}) {
   if (!trustedOwner || (stat.mode & 0o022) !== 0) {
     const error = new Error(label + ' 的所有者或写权限不安全');
     error.code = 'PHASE3_PATH_PERMISSIONS_INVALID';
+    error.pathReason = 'unsafe_permissions';
     throw error;
   }
   if (options.executable === true && (stat.mode & 0o111) === 0) {
     const error = new Error(label + ' 不可执行');
     error.code = 'PHASE3_PATH_INVALID';
+    error.pathReason = 'not_executable';
     throw error;
   }
 }
@@ -639,6 +641,7 @@ function openPinnedRegularFile(filePath, label, options = {}) {
     try { assertDirectoryTree(path.dirname(filePath), label + ' 父目录'); } catch (error) {
       const wrapped = new Error(label + ' 父目录不存在、不可读取或包含符号链接');
       wrapped.code = 'PHASE3_PATH_INVALID';
+      wrapped.pathReason = 'unsafe_parent';
       wrapped.cause = error;
       throw wrapped;
     }
@@ -647,14 +650,16 @@ function openPinnedRegularFile(filePath, label, options = {}) {
   try {
     const initial = fs.lstatSync(filePath);
     if (initial.isSymbolicLink() || !initial.isFile()) {
-      throw new Error(label + ' 必须是非符号链接普通文件');
+      throw Object.assign(new Error(label + ' 必须是非符号链接普通文件'), {
+        pathReason: initial.isSymbolicLink() ? 'symlink' : 'not_regular_file',
+      });
     }
     descriptor = fs.openSync(filePath, READ_ONLY_NOFOLLOW);
     const opened = fs.fstatSync(descriptor);
     const latest = fs.lstatSync(filePath);
     if (!opened.isFile() || latest.isSymbolicLink() || !latest.isFile()
         || !sameFileIdentity(initial, opened) || !sameFileIdentity(opened, latest)) {
-      throw new Error(label + ' 在打开期间发生变化');
+      throw Object.assign(new Error(label + ' 在打开期间发生变化'), { pathReason: 'changed' });
     }
     assertTrustedPhase3Object(opened, label, options);
     return { descriptor, stat: opened };
@@ -665,6 +670,8 @@ function openPinnedRegularFile(filePath, label, options = {}) {
     if (['PHASE3_PATH_INVALID', 'PHASE3_PATH_PERMISSIONS_INVALID'].includes(error?.code)) throw error;
     const wrapped = new Error(label + ' 不存在、不可读取、已变化或不安全');
     wrapped.code = 'PHASE3_PATH_INVALID';
+    wrapped.pathReason = ['symlink', 'not_regular_file', 'changed'].includes(error?.pathReason)
+      ? error.pathReason : error?.code === 'ENOENT' ? 'missing' : 'unreadable';
     wrapped.cause = error;
     throw wrapped;
   }

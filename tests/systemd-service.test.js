@@ -137,6 +137,7 @@ test('systemd unit executes only pinned sources and refuses a missing or read-on
   const preflight = values(unit, 'Service', 'ExecStartPre');
   assert.ok(preflight.includes('/usr/bin/test -r /etc/gpt-register-panel/panel.env'));
   assert.ok(preflight.includes('/usr/bin/test -x /usr/bin/node'));
+  assert.equal(preflight.at(-1), '/usr/bin/node /run/gpt-register-panel/code/backend/cli/check-phase3-runtime.js');
   const nodeChecks = preflight.filter((command) => command.startsWith('/usr/bin/node -e '));
   const sourceBindingCheck = nodeChecks.find((command) => (
     command.includes('invalid source binding pairs')

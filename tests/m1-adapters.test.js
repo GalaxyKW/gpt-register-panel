@@ -2553,6 +2553,64 @@ test('Sub2API base URL rejects query strings and fragments', () => {
   );
 });
 
+test('Sub2API base URL rejects encoded authorities and empty delimiters before any fetch', () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+  global.fetch = () => {
+    calls += 1;
+    throw new Error('unexpected fetch');
+  };
+  try {
+    for (const baseUrl of [
+      'http://%31%32%37.0.0.1:8080',
+      'https://%65xample.test/private-marker',
+      'http://local%68ost:8080',
+      'http:/%31%32%37.0.0.1:8080',
+      'http:\\\\%31%32%37.0.0.1:8080',
+      'http://127.0.0.1:8080?',
+      'http://127.0.0.1:8080/#',
+      'https://example.test/private-marker?#',
+      'https://synthetic-user:synthetic-password@%65xample.test',
+    ]) {
+      assert.throws(
+        () => new Sub2ApiAdminClient({ baseUrl, apiKey: 'test-key', allowInsecureHttp: true }),
+        (error) => error.message === 'SUB2API_BASE_URL 必须是无查询参数、片段或内嵌凭据的 http(s) 地址'
+          && error.cause === undefined,
+      );
+    }
+    assert.equal(calls, 0);
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
+test('Sub2API base URL preserves IPv4, IPv6 and encoded path request routing', async () => {
+  const originalFetch = global.fetch;
+  const calls = [];
+  global.fetch = async (url) => {
+    calls.push(url);
+    return new Response(JSON.stringify({ code: 0, data: { id: 1 } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    });
+  };
+  const bases = [
+    'http://127.12.34.56:8080',
+    'http://[::1]:8080',
+    'https://example.test/panel',
+    'https://example.test/panel%20space/%3F%23%25',
+  ];
+  try {
+    for (const baseUrl of bases) {
+      const client = new Sub2ApiAdminClient({ baseUrl, apiKey: 'test-key' });
+      assert.deepEqual(await client.request('GET', '/api/v1/admin/accounts/1'), { id: 1 });
+    }
+    assert.deepEqual(calls, bases.map((baseUrl) => baseUrl + '/api/v1/admin/accounts/1'));
+  } finally {
+    global.fetch = originalFetch;
+  }
+});
+
 test('Sub2API permits plaintext HTTP only for loopback unless explicitly overridden', () => {
   const previous = process.env.SUB2API_ALLOW_INSECURE_HTTP;
   delete process.env.SUB2API_ALLOW_INSECURE_HTTP;
@@ -2574,7 +2632,6 @@ test('Sub2API permits plaintext HTTP only for loopback unless explicitly overrid
     for (const baseUrl of [
       'http://localhost:8080',
       'http://LOCALHOST:8080',
-      'http://local%68ost:8080',
       'http://192.0.2.10:8080',
       'http://evil.example:8080',
       'http://[::ffff:127.0.0.1]:8080',

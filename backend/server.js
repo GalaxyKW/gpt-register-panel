@@ -101,6 +101,7 @@ const {
   normalizeReconciliationContext,
 } = require('./reconciliationContext');
 const registrationReconciliation = require('./registrationReconciliation');
+const { checkPhase3Runtime } = require('./phase3RuntimeCheck');
 
 const FRONTEND_ROOT = path.resolve(__dirname, '..', 'frontend');
 const CONTENT_TYPES = {
@@ -4920,6 +4921,7 @@ async function startServer(options = {}) {
   let server;
   try {
     validateListenConfiguration(host);
+    checkPhase3Runtime();
     server = createServer(options);
   } catch (error) {
     throw error;

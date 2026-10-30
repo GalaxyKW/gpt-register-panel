@@ -26,9 +26,20 @@ const importProxy = require('./importProxy');
 
 const PARENT_TYPES = new Set(['console_register', 'console_resume', 'console_maintain', 'console_log_cleanup']);
 const TERMINAL = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
+const SHARED_EXECUTION_ERRORS = new Set([
+  'PHASE3_PATH_INVALID', 'PHASE3_PATH_PERMISSIONS_INVALID', 'PHASE3_PATH_PIN_UNAVAILABLE',
+  'PHASE3_ROOT_INVALID', 'PHASE3_DESCRIPTOR_INVALID', 'PHASE3_CLOCK_INVALID',
+  'PHASE3_SUPERVISION_UNSAFE', 'PHASE3_DISABLED', 'PHASE3_BROWSER_PROFILE_PARENT_UNSAFE',
+]);
 const EXECUTION_REVISION = /^console-execution-v1\.[A-Za-z0-9_-]{43}$/;
 function failure(code, message) { return Object.assign(new Error(message), { code }); }
 function ordinaryObject(value) { return value && typeof value === 'object' && !Array.isArray(value); }
+function hasCompletedOutcome(summary) {
+  // Skips and submitted tests are not successes. A verified local token or
+  // remote write remains a real outcome even when a later step fails.
+  return ['registered', 'imported', 'refreshed', 'deleted', 'tokensGenerated', 'tokensUpdated', 'verified']
+    .some(key => Number.isSafeInteger(summary?.[key]) && summary[key] > 0);
+}
 function strongIdentityOverlaps(left, right) {
   return left.some(key => /^(account|user):/.test(key) && right.includes(key));
 }
@@ -330,7 +341,12 @@ function createConsoleService({ db, logger, jobManager,
     networkPromise = (async () => {
       let report;
       try { report = await preflight({ signal, logger }); }
-      catch (error) { report = { ok: false, checkedAt: new Date().toISOString(), channels: ['sms', 'mail', 'oauth'].map(id => ({ id, ok: false, code: 'CONFIG_UNAVAILABLE', message: '注册配置或检测执行器不可用' })) }; }
+      catch (error) {
+        const executionUnavailable = SHARED_EXECUTION_ERRORS.has(error?.code);
+        report = { ok: false, checkedAt: new Date().toISOString(), channels: ['sms', 'mail', 'oauth'].map(id => ({ id, ok: false,
+          code: executionUnavailable ? error.code : 'CONFIG_UNAVAILABLE',
+          message: executionUnavailable ? '注册执行器配置或安全检查未通过，尚未进行该通道网络检测' : '注册配置或检测执行器不可用' })) };
+      }
       const started = Date.now(); let destination;
       try {
         await client().listAccounts({ pageSize: 200, requireTotal: true, requirePaginationMetadata: true, signal });
@@ -820,7 +836,23 @@ function createConsoleService({ db, logger, jobManager,
     }
     const items = plan.items.filter(item => !selected.length || selected.includes(item.accountId));
     await updateParent(context, 'planning', { progress: { completed: 0, total: items.length } });
-    let connectionsChecked = false;
+    if (items.some(item => item.action === 'refresh')) {
+      // The execution environment and channels are shared by this batch. A
+      // missing Node binary is not a failed login for every selected account.
+      await updateParent(context, 'checking_network');
+      try {
+        const report = await preflight({ signal: context.signal, logger, scope: 'phase3' });
+        // Reauthorization only needs mail/OAuth; an unavailable SMS channel
+        // must not prevent refreshing an existing account.
+        if (report?.ok !== true || !Array.isArray(report.channels)
+            || !['mail', 'oauth'].every(id => report.channels.some(c => c.id === id && c.ok === true))) {
+          throw failure('CONSOLE_NETWORK_UNAVAILABLE', '邮箱或登录通道不通，已停止本轮刷新');
+        }
+      } catch (error) {
+        context.result.recoveryMessage = '刷新前置检查未通过，尚未启动任何账号刷新。请先修复执行器配置或通道检测，再明确提交新任务；不会自动重试。';
+        throw error;
+      }
+    }
     for (const item of items) {
       throwIfJobInterrupted(context.signal);
       let status = 'skipped'; let errorCode = null; let message = item.reasonCode;
@@ -828,16 +860,6 @@ function createConsoleService({ db, logger, jobManager,
       let diagnostic = {};
       try {
         if (item.action === 'refresh') {
-          if (!connectionsChecked) {
-            await updateParent(context, 'checking_network');
-            const report = await preflight({ signal: context.signal, logger, scope: 'phase3' });
-            // A reauthorization only needs mail and OAuth; unavailable SMS
-            // must not prevent refreshing an existing account.
-            if (!['mail', 'oauth'].every(id => report.channels.some(c => c.id === id && c.ok))) {
-              throw failure('CONSOLE_NETWORK_UNAVAILABLE', '邮箱或登录通道不通，已停止本轮刷新');
-            }
-            connectionsChecked = true;
-          }
           await updateParent(context, 'refreshing');
           try { await refreshAccount(context, accounts.find(a => a.id === item.accountId), phases); }
           catch (error) {
@@ -856,6 +878,10 @@ function createConsoleService({ db, logger, jobManager,
           context.result.summary.deleted += 1; status = 'deleted';
         } else context.result.summary.skipped += 1;
       } catch (error) {
+        if (SHARED_EXECUTION_ERRORS.has(error?.code)) {
+          context.result.recoveryMessage = '共享执行器不可用，已停止剩余维护步骤；已有成果仍保留。请修复执行环境后重新核对未处理账号，不会自动重试。';
+          throw error;
+        }
         status = 'failed'; errorCode = error.code || 'CONSOLE_STEP_FAILED'; message = safeFailureMessage(error);
         diagnostic = error.consoleTestFailure || {};
         context.result.summary.failed += 1;
@@ -907,15 +933,19 @@ function createConsoleService({ db, logger, jobManager,
         }, false);
         context.result.summary = result.result;
       }
-      const status = context.result.summary.failed > 0 ? 'partial' : 'succeeded';
-      context.result.stage = 'completed';
+      const status = context.result.summary.failed > 0
+        ? (hasCompletedOutcome(context.result.summary) ? 'partial' : 'failed') : 'succeeded';
+      if (status === 'failed') context.result.failureStage = context.result.stage;
+      context.result.stage = status === 'failed' ? 'failed' : 'completed';
       await updateTerminalJob(db, job.id, { status, result: context.result, finishedAt: new Date().toISOString() });
       event('info', 'console.task_completed', { jobId: job.id, type: job.type, status, summary: context.result.summary });
     }).catch(async error => {
       const failureStage = context.result.stage;
       context.result = { ...context.result, ...describeFailure(error), ...failureMetadata(error), failureStage,
         stage: context.signal.aborted ? 'stopped' : 'failed' };
-      await updateTerminalJob(db, job.id, { status: context.signal.aborted ? 'interrupted' : 'failed',
+      const status = context.signal.aborted ? 'interrupted'
+        : !error.requiresReconciliation && !error.writeOutcomeUnknown && hasCompletedOutcome(context.result.summary) ? 'partial' : 'failed';
+      await updateTerminalJob(db, job.id, { status,
         result: context.result, error: safeFailureMessage(error), finishedAt: new Date().toISOString() });
       event('error', 'console.task_failed', { jobId: job.id, code: error.code || 'CONSOLE_TASK_FAILED' });
     }).finally(() => { active.delete(job.id); snapshotCache = null; });

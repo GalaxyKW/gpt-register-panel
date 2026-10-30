@@ -27,7 +27,7 @@ function successfulJob(id, ids) {
       requiresReconciliation: false, executionStarted: true, executionComplete: true, stopReason: null,
       results: ids.map((accountId) => ({ accountId, status: 'succeeded', testSuccess: true, code: 'account_test_succeeded' })) } };
 }
-function harness(rows, overrides = {}) {
+function harness(rows, overrides = {}, { loadHelper = true } = {}) {
   const nodes = {};
   const events = {};
   const requests = [];
@@ -98,7 +98,7 @@ function harness(rows, overrides = {}) {
     ...overrides,
   };
   vm.createContext(context);
-  vm.runInContext(helper + '\n' + source, context);
+  vm.runInContext((loadHelper ? helper + '\n' : '') + source, context);
   return { context, nodes, events, requests, submissions, jobs, notices,
     run: (code) => vm.runInContext(code, context), recoveries: () => recoveries };
 }
@@ -141,8 +141,21 @@ test('batch UI keeps the 1000 selection ceiling and rejects duplicate IDs or all
   assert.match(run('accountTestBatchSelection(rows).problem'), /只保留其中一行/);
   context.rows = Array.from({ length: 1001 }, (_, index) => row(index + 1));
   assert.match(run('accountTestBatchSelection(rows).problem'), /最多核对 1000/);
-  delete context.PanelAccountTestBatch;
+  // Contextified globals are not guaranteed to disappear when the outer
+  // sandbox property is deleted (notably on Node 22). Remove the browser
+  // global inside its own realm and verify the state the UI actually sees.
+  run('delete globalThis.PanelAccountTestBatch');
+  assert.equal(run('typeof PanelAccountTestBatch'), 'undefined');
   assert.match(run('accountTestBatchActionProblem()'), /组件未加载/);
+});
+
+test('batch UI refuses submission when the helper script was never loaded', async () => {
+  const { run, nodes, submissions, requests } = harness([row(1)], {}, { loadHelper: false });
+  assert.equal(run('typeof PanelAccountTestBatch'), 'undefined');
+  assert.match(run('accountTestBatchActionProblem()'), /组件未加载/);
+  await run('openAccountTestBatchDialog()');
+  assert.equal(nodes['#accountTestBatchDialog'].open, false);
+  assert.deepEqual(submissions, []); assert.deepEqual(requests, []);
 });
 
 test('batch UI validates unchanged selection and model before using an earlier confirmation', async () => {
