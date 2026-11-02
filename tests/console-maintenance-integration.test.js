@@ -72,6 +72,7 @@ async function fixture(t, options = {}) {
     applyOAuthCredentials: async (id, payload) => {
       writes.push({ action: 'update', id }); assert.equal(id, 47);
       raw.credentials = { ...raw.credentials, ...payload.credentials };
+      raw.status = 'active'; raw.error_message = ''; raw.updated_at = new Date().toISOString();
       return safeAccount(raw);
     },
     importCodexSession: async payload => {
@@ -91,7 +92,10 @@ async function fixture(t, options = {}) {
     },
     testAccount: async (id, args) => {
       tested.push({ id, model: args.modelId }); if (!options.allowCreates) assert.equal(id, 47);
-      if (options.testFails) return { success: false };
+      if (options.testFails) {
+        if (options.updateOnTestFailure) raw.updated_at = new Date().toISOString();
+        return { success: false };
+      }
       const target = remote.find(item => item.id === id); target.status = 'active'; target.error_message = '';
       return { success: true };
     },
@@ -192,6 +196,75 @@ test('real maintenance chain reauthorizes once, updates original ID and restores
   assert.equal((await f.db.listAccountLifecycles(managementEndpointKey(f.client.baseUrl))).filter(row => row.state === 'imported').length, 2);
 });
 
+test('legacy writeback remains recoverable after 35 newer no-op parents and continues without another Phase3', async t => {
+  const options = { testFails: true };
+  const f = await fixture(t, options), original = await f.maintain();
+  // Reproduce the persisted pre-fix shape: the import succeeded, but policy
+  // rejected testing before a test child existed. Credentials stay untouched.
+  const old = structuredClone(original.result);
+  delete old.writebackRecoveries; old.summary.tested = 0; old.summary.testFailed = 0;
+  old.items[0].code = 'CONSOLE_TEST_TARGET_CHANGED'; old.items[0].phases.tested = false;
+  old.childJobIds = (await Promise.all(old.childJobIds.map(id => f.db.getJob(id))))
+    .filter(job => job.type !== 'account_test').map(job => job.id);
+  // A fixture-only historical row; the production update API deliberately
+  // forbids rewriting terminal history.
+  await f.db.write(database => database.run('UPDATE sync_jobs SET result_json = ? WHERE id = ?', [JSON.stringify(old), original.id]));
+  for (let i = 0; i < 35; i++) {
+    const job = await f.db.createJob('console_maintain', {}, 'local');
+    await f.db.updateJob(job.id, { status: 'succeeded', result: { summary: { skipped: 1 }, items: [] }, finishedAt: new Date().toISOString() });
+  }
+  const overview = (await f.request('/api/console/overview')).body;
+  assert.equal(overview.summary.pendingVerification, 1);
+  assert.equal(overview.accounts.find(row => row.id === 47).classification, 'pending_verification');
+  assert.equal(overview.accounts.find(row => row.id === 47).requiresExplicitTestSelection, true);
+  const unrequested = await f.maintain({ refreshInvalid: false, deleteBanned: false });
+  assert.equal(unrequested.result.stage, 'no_changes'); assert.equal(unrequested.result.summary.tested, 0);
+  options.testFails = false;
+  const automatic = await f.maintain();
+  assert.equal(automatic.result.stage, 'no_changes'); assert.equal(automatic.result.summary.tested, 0);
+  assert.equal(automatic.result.items[0].reasonCode, 'writeback_pending_explicit_test');
+  const selected = overview.accounts.find(row => row.id === 47);
+  f.raw.group_ids = [3]; // Real Sub2API group-only edits may preserve updated_at.
+  const testIntent = account => ({ accountIds: [47], importNew: false, refreshInvalid: false, deleteBanned: false,
+    testOnly: true, accountTargets: [{ accountId: 47, targetRevision: account.targetRevision, executionRevision: account.executionRevision }] });
+  const stale = await f.request('/api/console/maintain', testIntent(selected));
+  assert.equal(stale.status, 202);
+  assert.equal((await f.waitJob(stale.body.jobId)).result.code, 'CONSOLE_TEST_TARGET_CHANGED');
+  assert.equal(f.tested.length, 1); assert.equal(f.raw.schedulable, false);
+  const current = (await f.request('/api/console/overview')).body.accounts.find(row => row.id === 47);
+  const accepted = await f.request('/api/console/maintain', testIntent(current));
+  assert.equal(accepted.status, 202);
+  const after = await f.waitJob(accepted.body.jobId);
+  assert.equal(after.status, 'succeeded', after.error || after.result?.items?.[0]?.message);
+  assert.equal(after.result.summary.verified, 1); assert.equal(after.result.summary.tokensGenerated, 0);
+  assert.equal(after.result.summary.tokensUpdated, 0); assert.equal(f.counters.phase3, 1);
+  assert.equal(f.raw.schedulable, true);
+  assert.deepEqual(f.writes.map(row => row.action), ['update', 'scheduler']);
+});
+
+test('known failed test can be retried after its own version change without reauthorizing or bypassing a later manual change', async t => {
+  const options = { testFails: true, updateOnTestFailure: true };
+  const f = await fixture(t, options), original = await f.maintain();
+  assert.equal(original.result.summary.tokensUpdated, 1); assert.equal(original.result.summary.testFailed, 1);
+  const overview = (await f.request('/api/console/overview')).body;
+  const account = overview.accounts.find(row => row.id === 47);
+  assert.equal(account.classification, 'pending_verification');
+  options.testFails = false;
+  const accepted = await f.request('/api/console/maintain', { accountIds: [47], importNew: false, refreshInvalid: false, deleteBanned: false,
+    testOnly: true, accountTargets: [{ accountId: 47, targetRevision: account.targetRevision, executionRevision: account.executionRevision }] });
+  assert.equal(accepted.status, 202);
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'succeeded', job.error || job.result.items[0].message);
+  assert.equal(job.result.summary.verified, 1); assert.equal(f.counters.phase3, 1);
+  assert.equal(f.raw.schedulable, true);
+  // A subsequent manual pause changes the remote version and never reuses
+  // either the original writeback or failed-test permission.
+  f.raw.schedulable = false; f.raw.updated_at = new Date(Date.now() + 1000).toISOString();
+  const manual = await f.maintain();
+  assert.equal(manual.result.stage, 'no_changes'); assert.equal(manual.result.summary.skipped, 1);
+  assert.equal(f.raw.schedulable, false); assert.equal(f.tested.length, 2);
+});
+
 for (const kind of ['before_first_login', 'after_one_refresh', 'unknown_after_one_refresh']) {
   test('shared runtime failure ' + kind + ' stops remaining accounts and preserves proven outcomes', async t => {
     let calls = 0;
@@ -260,7 +333,7 @@ test('failed test after credential update does not enable scheduling or report a
   assert.equal(job.result.summary.tested, 1); assert.equal(job.result.summary.verified, 0);
   assert.deepEqual(job.result.items[0].phases, { tokenGenerated: true, tokenUpdated: true, tested: true, verified: false });
   assert.deepEqual(f.writes, [{ action: 'update', id: 47 }]);
-  assert.equal(f.raw.status, 'error'); assert.equal(f.raw.schedulable, false);
+  assert.equal(f.raw.status, 'active'); assert.equal(f.raw.schedulable, false);
 });
 
 test('real Phase3 terminal disposition plus prior strong local binding authorizes only the original remote deletion', async t => {

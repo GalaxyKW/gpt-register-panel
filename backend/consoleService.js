@@ -23,6 +23,7 @@ const { normalizeAccountTestFailure } = require('./lib/accountTestFailure');
 const { strongIdentityContradiction } = require('./diff');
 const logs = require('./consoleLogs');
 const importProxy = require('./importProxy');
+const writebackRecovery = require('./writebackRecovery');
 
 const PARENT_TYPES = new Set(['console_register', 'console_resume', 'console_maintain', 'console_log_cleanup']);
 const TERMINAL = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
@@ -177,6 +178,27 @@ function createConsoleService({ db, logger, jobManager,
     if (!sync.confirmedSub2ApiRead(value)) throw failure('SUB2API_READ_FAILED', 'Sub2API 尚未连接，未启动账号操作');
     return value._internal.accounts;
   }
+  async function addPendingVerifications(plan, accounts, remoteClient) {
+    const proofs = await writebackRecovery.findPendingWritebackRecoveries({ db, accounts, client: remoteClient });
+    for (const item of plan.items) {
+      if (item.action === 'skip' && item.reasonCode === 'administrator_unscheduled' && proofs.has(item.accountId)) {
+        item.classification = 'pending_verification'; item.action = 'verify'; item.reasonCode = 'writeback_pending_verification';
+        item.requiresExplicitTestSelection = proofs.get(item.accountId).requiresExplicitTestSelection === true;
+      }
+    }
+    return proofs;
+  }
+  function skipMessage(reason) {
+    return ({ administrator_unscheduled: '调度当前关闭，未发现本面板待恢复的回写记录；保留当前设置',
+      administrator_disabled: '账号已停用，保留当前设置', administrator_lifetime_expired: '账号使用期限已到，保留期限设置',
+      quota_or_cooldown: '额度或冷却尚未恢复，本次等待，不重新登录', outside_free_oauth_scope: '不属于 Free OAuth 维护范围，本次跳过',
+      account_deactivated: '上游已明确停用账号，本次不发送测试', user_deactivated: '上游已明确停用账号，本次不发送测试',
+      account_suspended: '上游已明确暂停账号，本次不发送测试', account_banned: '上游已明确封禁账号，本次不发送测试',
+      strong_identity_ambiguous: '账号身份存在重复，未发送测试', lifecycle_requires_reconciliation: '该账号有尚未结束的记录变更，本次未测试',
+      writeback_pending_explicit_test: 'token 已回写，待单独测试；不会重新登录',
+      account_available: '账号当前可用，无需处理', disabled_by_policy: '本次未选择此维护动作' })[reason]
+      || '当前状态不适用所选操作，本次跳过';
+  }
   async function settings() {
     const saved = await db.getConsoleSettings();
     let registration;
@@ -293,11 +315,13 @@ function createConsoleService({ db, logger, jobManager,
     const remote = current?._internal?.accounts || [];
     const plan = endpointKey ? maintenance.buildMaintenancePlan({ accounts: remote, lifecycles: history,
       endpointKey, policy: configuration.policy }) : { items: [] };
+    if (endpointKey) await addPendingVerifications(plan, remote, client());
     const accounts = plan.items.map(item => {
       const account = remote.find(a => a.id === item.accountId);
       return { id: item.accountId, name: item.accountName, email: account?.email || '', status: account?.status || 'unknown',
         targetRevision: item.targetRevision, executionRevision: item.targetRevision ? testExecutionRevision(account, client()) : null,
         classification: item.classification, action: item.action, reason: item.reasonCode,
+        requiresExplicitTestSelection: item.requiresExplicitTestSelection === true,
         retryAt: item.retryAt || null, usage: account?.usage || null,
         lastProcessedAt: history.find(row => row.sub2apiId === item.accountId)?.updatedAt || null };
     });
@@ -331,6 +355,7 @@ function createConsoleService({ db, logger, jobManager,
         comparisonAvailable: !warning },
       summary: { total: remote.length, healthy: count('healthy'), quotaWait: count('quota_wait'),
         refreshNeeded: count('auth_invalid') + count('expired'), banned: count('confirmed_banned'),
+        pendingVerification: count('pending_verification'),
         needsReview: accounts.filter(a => a.action === 'review').length, neverImported },
       accounts, jobs, settings: configuration, network, warning,
       reconciliation: inventory.reconciliationHolds, activeJobs: inventory.activeJobs,
@@ -521,7 +546,7 @@ function createConsoleService({ db, logger, jobManager,
     const executionBinding = sync.resolveImportExecutionBinding(remoteClient, plan, { importProxy: proxyBinding });
     const planIntentVersion = sync.buildImportPlanIntentVersion(current.version, selectedKeys, plan,
       groupBinding, executionBinding, reviewed?.remoteTargets);
-    const { result } = await child(context, 'token_import', { snapshotVersion: current.version,
+    const { result, jobId: importJobId } = await child(context, 'token_import', { snapshotVersion: current.version,
       planIntentVersion, selectedSourcePaths: plan.map(item => item.relativePath) }, ['token_import'], options => importer({
       ...options, client: Object.assign(remoteClient, { logContext: { jobId: options.jobId, parentJobId: context.job.id } }), snapshotVersion: current.version, planIntentVersion, selectedKeys,
       ...(reviewed ? { remoteTargets: reviewed.remoteTargets, remoteSourceHashes: reviewed.sources,
@@ -543,16 +568,29 @@ function createConsoleService({ db, logger, jobManager,
         message: '本批有 ' + result.failed + ' 个导入失败；已验证成功的账号继续测试，失败项不会自动重交。' });
     }
     snapshotCache = null;
-    return result;
+    return { ...result, consoleImportJobId: importJobId, consoleImportEndpointDigest: remotePhase3EndpointDigest(remoteClient) };
   }
 
-  async function verifyAccount(context, id, { expectedTarget = null, phases = {} } = {}) {
+  async function verifyAccount(context, id, { expectedTarget = null, phases = {}, recoveryProof = null,
+    writebackOrigin = null, importJobId = null, importEndpointDigest = null } = {}) {
     const remoteClient = client(context);
     const account = await remoteClient.getAccount(id, { signal: context.signal });
+    if (writebackOrigin && importJobId) {
+      recoveryProof = await writebackRecovery.resolveImmediateWritebackRecovery({ db,
+        parent: { ...context.job, result: context.result }, origin: writebackOrigin, account, client: remoteClient, importJobId, importEndpointDigest });
+      if (recoveryProof) {
+        context.result.writebackRecoveries ||= [];
+        context.result.writebackRecoveries.push(recoveryProof);
+        await updateParent(context, 'verifying_account');
+      }
+    }
+    const canRecover = current => recoveryProof !== null
+      && writebackRecovery.matchesWritebackProof(recoveryProof, current, remoteClient);
     const assertTestPolicy = current => {
       if (!current || current.id !== id || maintenanceVersion(account) !== maintenanceVersion(current)
           || !lifecycle.accountInMaintenanceScope(current)
-          || ['manual_disabled', 'quota_wait', 'confirmed_banned'].includes(maintenance.classifyAccountMaintenance(current).classification)) {
+          || (['manual_disabled', 'quota_wait', 'confirmed_banned'].includes(maintenance.classifyAccountMaintenance(current).classification)
+            && !canRecover(current))) {
         throw failure('CONSOLE_TEST_TARGET_CHANGED', '账号维护状态已变化，未测试或改变调度');
       }
     };
@@ -566,18 +604,31 @@ function createConsoleService({ db, logger, jobManager,
     const modelId = context.intent.modelId ?? context.policy.testModel;
     phases.tested = true;
     context.result.summary.tested += 1;
-    const { result } = await child(context, 'account_test', { accountIds: [id], modelId },
+    const { result, jobId: testJobId } = await child(context, 'account_test', { accountIds: [id], modelId },
       ['account:' + id], options => tester({ ...options, accountIds: [id], targetBaselines: [baseline],
         modelId, client: Object.assign(remoteClient, { logContext: { jobId: options.jobId, parentJobId: context.job.id } }),
+        ...(recoveryProof ? { authorizeSchedulingRecovery: canRecover } : {}),
         beforeTestAccount: assertTestPolicy }));
     if (accountTestJobStatus(result) !== 'succeeded') {
       const outcome = result.results?.find(item => item.accountId === id);
+      if (recoveryProof && outcome?.recoveryObservation && outcome.testSuccess === false
+          && !result.requiresReconciliation && !result.writeOutcomeUnknown) {
+        const current = await remoteClient.getAccount(id, { signal: context.signal });
+        if (writebackRecovery.pendingState(current)
+            && outcome.recoveryObservation.targetDigest === accountTestTargetDigest(current)
+            && outcome.recoveryObservation.updatedAt === current.updatedAt) {
+          const renewed = { ...recoveryProof, targetDigest: accountTestTargetDigest(current), updatedAt: current.updatedAt,
+            failedTestJobId: testJobId };
+          context.result.writebackRecoveries = [...(context.result.writebackRecoveries || []).filter(p => p.accountId !== id), renewed];
+          await updateParent(context, 'verifying_account');
+        }
+      }
       if (outcome?.attempted === false) {
         phases.tested = false;
         context.result.summary.tested -= 1;
-        if (outcome.code === 'CONSOLE_TEST_TARGET_CHANGED') {
-          throw failure('CONSOLE_TEST_TARGET_CHANGED', '账号维护状态已变化，未发送测试或改变调度');
-        }
+        const code = ['CONSOLE_TEST_TARGET_CHANGED', 'ACCOUNT_TEST_RECOVERY_NOT_AUTHORIZED',
+          'ACCOUNT_TEST_RECOVERY_NOT_ALLOWED'].includes(outcome.code) ? outcome.code : 'CONSOLE_TEST_NOT_STARTED';
+        throw failure(code, '测试前账号状态已变化，本次未发送测试或改变调度');
       }
       const detail = normalizeAccountTestFailure(outcome);
       context.result.summary.testFailed += 1;
@@ -677,7 +728,8 @@ function createConsoleService({ db, logger, jobManager,
     phases.tokenUpdated = imported.succeeded > 0;
     context.result.summary.tokensUpdated += imported.succeeded || 0;
     await updateParent(context, 'verifying_account');
-    await verifyAccount(context, account.id, { phases });
+    await verifyAccount(context, account.id, { phases, writebackOrigin: account, importJobId: imported.consoleImportJobId,
+      importEndpointDigest: imported.consoleImportEndpointDigest });
   }
 
   async function deleteAccount(context, item, phase3JobId = null) {
@@ -770,6 +822,15 @@ function createConsoleService({ db, logger, jobManager,
     await lifecycle.recordObservedAccounts(db, { endpointKey, accounts });
     const history = await db.listAccountLifecycles(endpointKey);
     const plan = maintenance.buildMaintenancePlan({ accounts, lifecycles: history, endpointKey, policy: context.intent });
+    const recoveries = await addPendingVerifications(plan, accounts, client(context));
+    if (!context.intent.testOnly) {
+      for (const item of plan.items) if (item.action === 'verify' && item.requiresExplicitTestSelection) {
+        item.action = 'skip'; item.reasonCode = 'writeback_pending_explicit_test';
+      }
+    }
+    if (!context.intent.refreshInvalid && !context.intent.testOnly) {
+      for (const item of plan.items) if (item.action === 'verify') { item.action = 'skip'; item.reasonCode = 'disabled_by_policy'; }
+    }
     const selected = context.intent.accountIds;
     if (selected.some(id => !accounts.some(a => a.id === id))) throw failure('CONSOLE_TARGET_CHANGED', '所选账号清单已变化，请刷新');
     if (context.intent.localTokenTargets || context.intent.testOnly) {
@@ -788,6 +849,22 @@ function createConsoleService({ db, logger, jobManager,
           throw failure('CONSOLE_TEST_TARGET_CHANGED', '所选账号或目标服务已变化，请重新选择测试目标');
         }
       }
+      // The whole explicit selection has passed both current revisions. Legacy
+      // imports can now bind the current group/proxy policy durably; merely
+      // reading the overview or running automatic maintenance cannot do this.
+      if (context.intent.testOnly) {
+        for (const target of targets) {
+          const candidate = recoveries.get(target.accountId);
+          const decision = plan.items.find(item => item.accountId === target.accountId);
+          if (candidate?.requiresExplicitTestSelection !== true || decision?.classification !== 'pending_verification'
+              || decision.action !== 'verify') continue;
+          const { requiresExplicitTestSelection, ...proof } = candidate;
+          proof.selectedTestParentId = context.job.id;
+          recoveries.set(target.accountId, proof);
+          context.result.writebackRecoveries ||= [];
+          context.result.writebackRecoveries.push(proof);
+        }
+      }
       await updateParent(context, 'planning', { progress: { completed: 0, total: targets.length } });
       for (const target of targets) {
         throwIfJobInterrupted(context.signal);
@@ -801,7 +878,7 @@ function createConsoleService({ db, logger, jobManager,
               || ['strong_identity_ambiguous', 'lifecycle_requires_reconciliation'].includes(decision?.reasonCode))) {
             context.result.summary.skipped += 1;
             item = { ...item, status: 'skipped', code: decision?.reasonCode,
-              message: '账号处于手动停用、额度等待或需核对状态，未测试或改变调度' };
+              reasonCode: decision?.reasonCode, message: skipMessage(decision?.reasonCode) };
           } else {
             if (context.intent.localTokenTargets) {
               await updateParent(context, 'updating_token');
@@ -812,11 +889,12 @@ function createConsoleService({ db, logger, jobManager,
               // Persist the independently verified write before a later test
               // can fail. A network/model failure must not erase this outcome.
               await updateParent(context, 'verifying_account');
-              await verifyAccount(context, account.id, { phases });
+              await verifyAccount(context, account.id, { phases, writebackOrigin: account, importJobId: imported.consoleImportJobId,
+                importEndpointDigest: imported.consoleImportEndpointDigest });
               item.message = '已有 token 已回写原 ID 并验证成功，未重新登录或新增账号';
             } else {
               await updateParent(context, 'verifying_account');
-              await verifyAccount(context, account.id, { expectedTarget: target, phases });
+              await verifyAccount(context, account.id, { expectedTarget: target, phases, recoveryProof: recoveries.get(account.id) || null });
               item.message = '账号测试成功，未获取或导入 token';
             }
           }
@@ -859,7 +937,11 @@ function createConsoleService({ db, logger, jobManager,
       const phases = { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false };
       let diagnostic = {};
       try {
-        if (item.action === 'refresh') {
+        if (item.action === 'verify') {
+          await updateParent(context, 'verifying_account');
+          await verifyAccount(context, item.accountId, { phases, recoveryProof: recoveries.get(item.accountId) || null });
+          status = 'verified'; message = '此前 token 已回写，本次测试通过并恢复调度，未重新登录';
+        } else if (item.action === 'refresh') {
           await updateParent(context, 'refreshing');
           try { await refreshAccount(context, accounts.find(a => a.id === item.accountId), phases); }
           catch (error) {
@@ -876,7 +958,7 @@ function createConsoleService({ db, logger, jobManager,
           await updateParent(context, 'removing_banned');
           await deleteAccount(context, item);
           context.result.summary.deleted += 1; status = 'deleted';
-        } else context.result.summary.skipped += 1;
+        } else { context.result.summary.skipped += 1; message = skipMessage(item.reasonCode); }
       } catch (error) {
         if (SHARED_EXECUTION_ERRORS.has(error?.code)) {
           context.result.recoveryMessage = '共享执行器不可用，已停止剩余维护步骤；已有成果仍保留。请修复执行环境后重新核对未处理账号，不会自动重试。';
@@ -888,7 +970,7 @@ function createConsoleService({ db, logger, jobManager,
         if (context.signal.aborted || error.requiresReconciliation || error.writeOutcomeUnknown
             || error.code === 'CONSOLE_NETWORK_UNAVAILABLE') throw error;
       }
-      context.result.items.push({ accountId: item.accountId, accountName: item.accountName, status, code: errorCode,
+      context.result.items.push({ accountId: item.accountId, accountName: item.accountName, status, code: errorCode, reasonCode: item.reasonCode,
         phases, ...diagnostic, message });
       await updateParent(context, 'maintaining', { progress: { completed: context.result.items.length, total: items.length } });
     }
@@ -936,7 +1018,10 @@ function createConsoleService({ db, logger, jobManager,
       const status = context.result.summary.failed > 0
         ? (hasCompletedOutcome(context.result.summary) ? 'partial' : 'failed') : 'succeeded';
       if (status === 'failed') context.result.failureStage = context.result.stage;
-      context.result.stage = status === 'failed' ? 'failed' : 'completed';
+      const noChanges = job.type === 'console_maintain' && status === 'succeeded'
+        && !hasCompletedOutcome(context.result.summary);
+      context.result.stage = status === 'failed' ? 'failed' : noChanges ? 'no_changes' : 'completed';
+      if (noChanges) context.result.outcome = 'no_changes';
       await updateTerminalJob(db, job.id, { status, result: context.result, finishedAt: new Date().toISOString() });
       event('info', 'console.task_completed', { jobId: job.id, type: job.type, status, summary: context.result.summary });
     }).catch(async error => {

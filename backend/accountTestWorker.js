@@ -10,7 +10,7 @@ const {
   matchesAccountTestTargetRevision,
 } = require('./accountTargetRevision');
 const { accountKeys, hasStrongIdentity, identitiesStronglyCompatible } = require('./diff');
-const { normalizeIdentityValue } = require('./lib/token');
+const { normalizeIdentityValue, parseDateValue } = require('./lib/token');
 const { assertAuditLogCheckpoint, safeFailureMessage } = require('./logger');
 const { withControlPlaneLock } = require('./taskCoordinator');
 const { throwIfJobInterrupted } = require('./jobLifecycle');
@@ -745,6 +745,7 @@ async function runAccountTestJobNow({
   signal: externalSignal = null,
   persistResult = null,
   beforeTestAccount = null,
+  authorizeSchedulingRecovery = null,
 }) {
   throwIfJobInterrupted(externalSignal);
   accountIds = normalizeAccountTestJobAccountIds(accountIds);
@@ -913,7 +914,7 @@ async function runAccountTestJobNow({
       account = current;
       statusBefore = current.status || statusBefore;
       schedulableBefore = current.schedulable;
-      const shouldRecover = accountStatus(account) === 'error';
+      let recoveryAfterWriteback = false;
 
       // Internal-only policy hook for the unified console. Check the final
       // fresh account, not its earlier list/preview snapshot. Never accept
@@ -924,6 +925,39 @@ async function runAccountTestJobNow({
         }
         await beforeTestAccount(current);
       }
+      // OAuth credential writeback can clear Sub2API's error status while
+      // leaving its scheduler disabled. Only an internal caller that proves
+      // this completed writeback may restore that active/disabled account;
+      // an ordinary test must continue to preserve its scheduler setting.
+      if (authorizeSchedulingRecovery !== null) {
+        if (typeof authorizeSchedulingRecovery !== 'function') {
+          throw Object.assign(new Error('账号调度恢复授权不可用，未发送测试'), { code: 'ACCOUNT_TEST_POLICY_INVALID' });
+        }
+        if (accountStatus(account) === 'active' && schedulableBefore === false) {
+          if (await authorizeSchedulingRecovery(account) !== true) {
+            throw Object.assign(new Error('本次 token 回写的恢复依据已失效，未发送测试或修改调度'), {
+              code: 'ACCOUNT_TEST_RECOVERY_NOT_AUTHORIZED',
+            });
+          }
+          // The proof lookup may await durable history. Re-read the actual
+          // account afterwards so a concurrent change cannot inherit it.
+          const authorizedAccount = await client.getAccount(id, { signal });
+          assertAccountTestSubmittedBaseline(submittedBaseline, authorizedAccount);
+          if (beforeTestAccount !== null) await beforeTestAccount(authorizedAccount);
+          const availabilityIfRecovered = getAccountAvailability({
+            ...authorizedAccount, schedulable: true, schedulableKnown: true,
+          });
+          if (availabilityIfRecovered.key !== 'available'
+              || ['quota_wait', 'confirmed_banned'].includes(authorizedAccount.maintenanceEvidence?.category)) {
+            throw Object.assign(new Error('账号仍有额度、停用或期限限制，未发送恢复测试'), {
+              code: 'ACCOUNT_TEST_RECOVERY_NOT_ALLOWED',
+            });
+          }
+          account = authorizedAccount;
+          recoveryAfterWriteback = true;
+        }
+      }
+      const shouldRecover = accountStatus(account) === 'error' || recoveryAfterWriteback;
       assertAuditLogCheckpoint(logger, 'account_test.test_mutation_checkpoint', {
         jobId,
         actor,
@@ -1014,6 +1048,18 @@ async function runAccountTestJobNow({
           );
         }
         const diagnostic = normalizeAccountTestFailure(test);
+        // A known failed probe can update Sub2API's change marker while
+        // leaving the verified writeback and disabled scheduler intact.
+        // Return only a bound observation for the console's existing proof;
+        // this is not a new recovery permission for arbitrary tests.
+        const observedDigest = recoveryAfterWriteback
+          && accountStatus(afterFailure) === 'active' && afterFailure.schedulable === false
+          && test.requiresReconciliation !== true && test.writeOutcomeUnknown !== true
+          && test.testOutcomeUnknown !== true
+          && typeof afterFailure.updatedAt === 'string'
+          && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(afterFailure.updatedAt)
+          && parseDateValue(afterFailure.updatedAt)
+          ? accountTestTargetDigest(afterFailure) : null;
         const result = {
           accountId: id,
           accountName: account.name || null,
@@ -1032,6 +1078,9 @@ async function runAccountTestJobNow({
           enabledKnown: true,
           statusAfter: afterFailure.status || null,
           statusAfterKnown: true,
+          ...(observedDigest ? { recoveryObservation: {
+            targetDigest: observedDigest, updatedAt: afterFailure.updatedAt,
+          } } : {}),
           durationMs: elapsedMilliseconds(itemStartedAt),
         };
         results.push(result);
@@ -1050,8 +1099,8 @@ async function runAccountTestJobNow({
         continue;
       }
       // Sub2API's test endpoint already clears recoverable runtime state. The
-      // panel only changes schedulable for accounts that started in error;
-      // healthy or intentionally disabled accounts must keep their setting.
+      // panel changes schedulable only for an original error or a proven
+      // completed token writeback; other accounts keep their setting.
       if (!shouldRecover) {
         const after = await client.getAccount(id, { signal });
         const targetUnchanged = sameAccountOwnership(account, after);
@@ -1199,7 +1248,9 @@ async function runAccountTestJobNow({
         schedulable: true,
         schedulableKnown: true,
       });
-      if (availabilityIfEnabled.key !== 'available') {
+      if (availabilityIfEnabled.key !== 'available'
+          || (recoveryAfterWriteback
+            && ['quota_wait', 'confirmed_banned'].includes(afterTest.maintenanceEvidence?.category))) {
         const result = {
           accountId: id,
           accountName: afterTest.name || account.name || null,
@@ -1512,7 +1563,8 @@ async function runAccountTestJobNow({
         accountName: account?.name || null,
         status: 'failed',
         code: ['ACCOUNT_TEST_SUBMITTED_STATE_CHANGED', 'ACCOUNT_TEST_SUBMITTED_TARGET_CHANGED',
-          'CONSOLE_TEST_TARGET_CHANGED', 'ACCOUNT_TEST_POLICY_INVALID']
+          'CONSOLE_TEST_TARGET_CHANGED', 'ACCOUNT_TEST_POLICY_INVALID',
+          'ACCOUNT_TEST_RECOVERY_NOT_AUTHORIZED', 'ACCOUNT_TEST_RECOVERY_NOT_ALLOWED']
           .includes(error?.code)
           ? error.code
           : (recoveryAttempted ? 'account_recovery_failed' : 'account_test_failed'),

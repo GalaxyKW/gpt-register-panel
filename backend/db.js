@@ -4616,6 +4616,17 @@ class PanelDb {
         created_at DESC, id DESC LIMIT 30`)).map(row => boundedJobListText(row.id, 128)));
   }
 
+  async listWritebackRecoveryJobReferences() {
+    // Recovery is retained workflow state, not the UI's most recent 30 cards.
+    // Transfer only references, and avoid scanning ordinary no-op parents.
+    return this.read(database => resultRows(database.exec(`SELECT id FROM sync_jobs
+      WHERE type = 'console_maintain' AND typeof(result_json) = 'text'
+        AND (instr(result_json, '"writebackRecoveries"') > 0
+          OR instr(result_json, '"CONSOLE_TEST_TARGET_CHANGED"') > 0)
+      ORDER BY created_at DESC, id DESC LIMIT ${HARD_MAX_JOBS}`))
+      .map(row => boundedJobListText(row.id, 128)));
+  }
+
   async listJobsPage(limit = 50) {
     const safeLimit = normalizedJobListLimit(limit);
     const rows = await this.read((database) => {

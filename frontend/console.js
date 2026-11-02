@@ -14,7 +14,7 @@
     phase1_5_profile: '完成账号个人资料', phase2_bind_email: '绑定邮箱', phase2_resume: '继续邮箱绑定', phase3_email_oauth: '邮箱验证并获取 token',
     importing: '导入 Sub2API', importing_new: '导入从未加入的账号', maintenance: '正在维护', maintaining: '继续处理账号',
     refreshing: '本地重新授权', updating_token: '核验身份并回写原账号', verifying_account: '测试账号及恢复调度', removing_banned: '复核并删除确认封禁的记录',
-    completed: '处理完成', stopped: '已停止', failed: '执行失败' };
+    completed: '处理完成', no_changes: '本次未执行账号操作', stopped: '已停止', failed: '执行失败' };
   const ACTIVE = new Set(['queued', 'pending', 'running', 'stopping', 'cancel_requested']);
   const STATUS_LABELS = { queued: '排队中', pending: '等待中', running: '进行中', stopping: '正在停止', cancel_requested: '正在停止', succeeded: '已完成', completed: '已完成', failed: '失败', cancelled: '已停止', canceled: '已停止', interrupted: '需核对', partial: '部分完成' };
   const CLASSIFICATION = {
@@ -22,12 +22,13 @@
     new: ['从未导入', 'neutral', '首次导入'], never_imported: ['从未导入', 'neutral', '首次导入'],
     refresh: ['需要授权', 'warn', '重新获取 token'], refresh_needed: ['需要授权', 'warn', '重新获取 token'],
     invalid: ['认证失效', 'warn', '重新获取 token'], auth_invalid: ['认证失效', 'warn', '重新获取 token'], expired: ['已过期', 'warn', '重新获取 token'],
+    pending_verification: ['已回写，待测试', 'warn', '测试并恢复调度'],
     quota: ['额度耗尽', 'neutral', '等待恢复'], quota_wait: ['额度 / 冷却中', 'neutral', '等待恢复'], rate_limited: ['限流冷却', 'neutral', '等待恢复'],
-    banned: ['确认封禁', 'bad', '删除远端记录'], confirmed_banned: ['确认封禁', 'bad', '删除远端记录'], disabled: ['手动停用', 'unknown', '保留停用'], manual_disabled: ['手动停用', 'unknown', '保留停用'],
+    banned: ['确认封禁', 'bad', '删除远端记录'], confirmed_banned: ['确认封禁', 'bad', '删除远端记录'], disabled: ['调度关闭', 'unknown', '保留当前设置'], manual_disabled: ['调度关闭', 'unknown', '保留当前设置'],
     review: ['需要核对', 'unknown', '人工核对'], needs_review: ['需要核对', 'unknown', '人工核对'], network_unknown: ['原因待核对', 'unknown', '人工核对'], deleted: ['已删除', 'unknown', '不再导入'],
   };
-  const ACTION_LABELS = { keep: '保持原样', wait: '等待恢复', refresh: '重新获取 token', delete: '删除远端记录', review: '人工核对', skip: '本次跳过', import: '首次导入' };
-  const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '管理员已关闭调度，不自动启用', temporary_scheduling_pause: '账号处于临时调度暂停，但不能确认是额度耗尽；保留账号，等待核对，不自动登录或删除', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_invalidated: '刷新凭据已失效，需要本地重新授权', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
+  const ACTION_LABELS = { keep: '保持原样', wait: '等待恢复', refresh: '重新获取 token', verify: '测试并恢复调度', delete: '删除远端记录', review: '人工核对', skip: '本次跳过', import: '首次导入' };
+  const REASONS = { account_available: '账号可用，不更新现有 token', quota_or_cooldown: '额度耗尽或限流冷却，等待恢复', credential_expired_unavailable: '凭据已过期且账号不可用，需要重新授权', administrator_disabled: '管理员已停用账号，不自动启用', administrator_lifetime_expired: '管理员设定的账号有效期已到期，不是 OAuth token 过期；保留停用，不自动刷新或删除', administrator_unscheduled: '调度当前关闭，且没有可自动恢复的回写记录；保留现有设置', writeback_pending_verification: '新 token 已回写到原账号，继续测试；通过后自动恢复调度，无需重新登录', temporary_scheduling_pause: '账号处于临时调度暂停，但不能确认是额度耗尽；保留账号，等待核对，不自动登录或删除', failure_requires_diagnosis: '目前不能确认失败原因，保留账号并等待核对', account_schema_unknown: '账号信息不完整或身份存在冲突', account_status_unknown: '远端状态未知', strong_identity_ambiguous: '强身份缺失或匹配不唯一，需要人工核对', lifecycle_requires_reconciliation: '导入或删除履历需要核对', outside_free_oauth_scope: '不属于 Free OAuth 账号，不自动处理', disabled_by_policy: '此动作已被维护策略关闭', never_imported: '未发现历史导入记录，可首次导入', confirmed_ban_deleted: '已确认封禁并删除远端记录，不会再次导入', invalid_grant: '重新授权凭据已失效', invalid_token: 'token 无效', token_expired: 'token 已过期', refresh_token_expired: '刷新凭据已过期', refresh_token_invalidated: '刷新凭据已失效，需要本地重新授权', refresh_token_reused: '刷新凭据已经使用，需重新登录', refresh_token_revoked: '刷新凭据被撤销', refresh_token_missing: '缺少刷新凭据，需重新登录', refresh_reauthorization_required: '无法直接续期，需要本地重新授权', account_deactivated: '上游明确确认账号已停用', user_deactivated: '上游明确确认用户已停用', account_suspended: '上游明确确认账号被暂停', account_banned: '上游明确确认账号被封禁' };
   const state = { overview: null, connected: false, pending: null, storageError: false, busy: false, refreshing: false, page: 'register', selected: new Set(), stoppingJobs: new Set(), logs: [], logFiles: [], continuations: [], nextCursor: null, logRevision: 0, token: '', settingsDirty: false, settingsRevision: null, cleanupDaysDirty: false, registrationDirty: false, registrationRevision: null, registrationFields: [], networkBusy: false, pollTimer: null,
     taskDetail: null, taskDetailRevision: 0, localTokens: [], localSelected: new Set(), localTokensBusy: false, localTokensLoaded: false, localTokensRevision: 0,
     registrationReview: null, registrationReviewJobId: null, registrationReviewRevision: 0, registrationReviewBusy: false, registrationReviewPending: null, registrationReviewOtherResolution: null,
@@ -433,7 +434,7 @@
   function filteredAccounts() {
     const query = $('account-search').value.toLowerCase();
     const filter = $('account-filter').value;
-    const groups = { healthy: ['healthy', 'active'], new: ['new', 'never_imported'], refresh: ['refresh', 'refresh_needed', 'invalid', 'auth_invalid', 'expired'], quota: ['quota', 'quota_wait', 'rate_limited'], banned: ['banned', 'confirmed_banned'], review: ['review', 'needs_review', 'network_unknown', 'disabled', 'manual_disabled'] };
+    const groups = { healthy: ['healthy', 'active'], new: ['new', 'never_imported'], refresh: ['refresh', 'refresh_needed', 'invalid', 'auth_invalid', 'expired'], verify: ['pending_verification'], quota: ['quota', 'quota_wait', 'rate_limited'], banned: ['banned', 'confirmed_banned'], review: ['review', 'needs_review', 'network_unknown', 'disabled', 'manual_disabled'] };
     return accounts().filter((account) => (filter === 'all' || groups[filter]?.includes(account.classification)) && (!query || [account.name, account.email, account.id].join(' ').toLowerCase().includes(query)));
   }
   function selectable(account) { return Number.isSafeInteger(account.id) && account.id > 0; }
@@ -572,7 +573,7 @@
     const summary = state.overview?.summary || {};
     $('metric-total').textContent = number(summary.total);
     $('metric-healthy').textContent = number(summary.healthy);
-    $('metric-attention').textContent = number(summary.refreshNeeded !== undefined && summary.needsReview !== undefined && summary.banned !== undefined ? summary.refreshNeeded + summary.needsReview + summary.banned : undefined);
+    $('metric-attention').textContent = number(summary.refreshNeeded !== undefined && summary.needsReview !== undefined && summary.banned !== undefined ? summary.refreshNeeded + summary.needsReview + summary.banned + (Number.isFinite(summary.pendingVerification) ? summary.pendingVerification : 0) : undefined);
     $('metric-new').textContent = number(summary.neverImported);
   }
   function renderAccounts() {
@@ -594,32 +595,75 @@
     $('account-count').textContent = '显示 ' + rows.length + ' / ' + all.length + ' 个账号 · 已选 ' + state.selected.size;
     renderControls();
   }
+  function taskPresentation(job) {
+    const summary = job.summary && typeof job.summary === 'object' ? job.summary : {};
+    const noActivity = ['registered', 'imported', 'refreshed', 'deleted', 'tokensGenerated', 'tokensUpdated', 'tested', 'verified', 'testFailed']
+      .every(key => summary[key] === 0);
+    const noChanges = /maintain/.test(job.type) && ['succeeded', 'completed'].includes(job.status)
+      && (summary.skipped > 0 || job.stage === 'no_changes') && summary.failed === 0 && noActivity;
+    const allSkipped = noChanges && summary.skipped > 0;
+    const running = ACTIVE.has(job.status);
+    return { noChanges, allSkipped, running,
+      label: allSkipped ? '全部跳过' : noChanges ? '未执行' : STATUS_LABELS[job.status] || '未知',
+      tone: noChanges || running ? 'neutral' : ['succeeded', 'completed'].includes(job.status) ? 'good' : job.status === 'failed' ? 'bad' : 'unknown',
+      stage: noChanges ? '本次未执行账号操作' : STAGES[job.stage] || job.stage || '等待任务报告' };
+  }
+  function taskCounters(job, detail = false) {
+    const summary = job.summary && typeof job.summary === 'object' ? job.summary : {};
+    const rows = [['registered', '注册成功'], ['tokensGenerated', '生成 token'], ['imported', detail ? '首次导入' : '导入'],
+      ['tokensUpdated', detail ? '回写原账号' : '回写'], ['tested', '已提交测试'], ['verified', '测试通过'], ['testFailed', '测试未通过'],
+      ['deleted', detail ? '删除记录' : '删除'], ['skipped', detail ? '跳过账号' : '跳过'],
+      ['failed', /maintain/.test(job.type) ? '未完成流程' : '账号步骤失败'], ['removed', '清理文件']];
+    if (summary.tokensUpdated === undefined) rows.push(['refreshed', '刷新完成']);
+    // Keep a zero when it describes an attempted chain, not eight empty
+    // counters for a task which never performed an account operation.
+    return rows.filter(([key]) => Number.isFinite(summary[key]) && (summary[key] > 0
+      || key === 'imported' && summary.registered > 0
+      || key === 'tokensUpdated' && summary.tokensGenerated > 0
+      || ['verified', 'testFailed'].includes(key) && summary.tested > 0))
+      .map(([key, label]) => [label, summary[key]]);
+  }
+  function taskResultNote(job) {
+    const presentation = taskPresentation(job);
+    if (presentation.noChanges) return '本次未执行账号操作。' + (presentation.allSkipped ? '跳过原因见逐账号结果。' : '没有符合当前维护条件的账号。');
+    const summary = job.summary || {};
+    const items = Array.isArray(job.items) ? job.items : [];
+    const pending = items.filter(item => item.status === 'failed' && item.phases?.tokenUpdated === true && item.phases?.tested === false).length;
+    const notGenerated = items.filter(item => item.status === 'failed' && item.phases?.tokenGenerated === false && item.phases?.tokenUpdated === false).length;
+    if (pending && pending + notGenerated === summary.failed) {
+      return pending + ' 个已回写，待测试' + (notGenerated ? '；' + notGenerated + ' 个未生成 token' : '') + '。已回写的账号无需重新获取 token。';
+    }
+    if (summary.tokensUpdated > 0 && summary.tested === 0) {
+      return summary.tokensUpdated + ' 个账号的 token 已回写，测试尚未开始；无需重新获取 token。';
+    }
+    return '';
+  }
   function renderJobs() {
     const jobs = Array.isArray(state.overview?.jobs) ? state.overview.jobs : [];
     $('job-count').textContent = jobs.filter((job) => ACTIVE.has(job.status)).length + ' 个进行中';
     $('jobs').innerHTML = jobs.length ? jobs.slice(0, 20).map((job) => {
-      const running = ACTIVE.has(job.status);
+      const presentation = taskPresentation(job), running = presentation.running;
       const label = /resume/.test(job.type) ? '继续已有账号' : /register/.test(job.type) ? '注册任务' : /maintain|maintenance/.test(job.type) ? '账号维护' : /log_cleanup/.test(job.type) ? '日志清理' : '后台任务';
-      const tone = running ? 'neutral' : ['succeeded', 'completed'].includes(job.status) ? 'good' : job.status === 'failed' ? 'bad' : 'unknown';
+      const tone = presentation.tone;
       const progress = job.progress && Number.isFinite(job.progress.completed) && Number.isFinite(job.progress.total) ? ' · ' + job.progress.completed + ' / ' + job.progress.total : '';
-      const summaryLabels = { registered: '注册成功', imported: '导入', tokensGenerated: '生成 token', tokensUpdated: '回写', tested: '已提交测试', verified: '测试通过', testFailed: '测试未通过', deleted: '删除', skipped: '跳过', failed: '账号步骤失败', removed: '清理文件' };
-      if (job.summary?.tokensUpdated === undefined) summaryLabels.refreshed = '刷新完成';
-      const counts = job.summary && typeof job.summary === 'object' ? Object.entries(summaryLabels).filter(([key]) => Number.isFinite(job.summary[key])).map(([key, label]) => label + ' ' + job.summary[key]).join(' · ') : '';
+      const counts = taskCounters(job).map(([label, value]) => label + ' ' + value).join(' · ');
       const stages = { queued: '等待调度', starting: '准备执行', planning: '核对账号与维护范围', checking_network: '检查网络通道', preflight: '连接预检', network_preflight: '连接预检',
         registering: '正在注册', init: '初始化注册流程', phase1_register: '手机号注册与短信验证', phase1_register_recovery: '恢复已有手机号注册',
         phase1_5_profile: '完成账号个人资料', phase2_bind_email: '绑定邮箱', phase2_resume: '继续邮箱绑定', phase3_email_oauth: '邮箱验证并获取 token',
         importing: '导入 Sub2API', importing_new: '导入从未加入的账号', maintenance: '正在维护', maintaining: '继续处理账号',
         refreshing: '本地重新授权', updating_token: '核验身份并回写原账号', verifying_account: '测试账号及恢复调度', removing_banned: '复核并删除确认封禁的记录',
         completed: '处理完成', stopped: '已停止', failed: '执行失败' };
-      const description = typeof job.summary === 'string' ? job.summary : [stages[job.stage] || job.stage, counts].filter(Boolean).join(' · ') || '等待任务报告';
+      const description = typeof job.summary === 'string' ? job.summary : [presentation.stage, counts].filter(Boolean).join(' · ');
       const errorMessage = typeof job.error === 'string' ? job.error : typeof job.error?.message === 'string' ? job.error.message : '';
       const failureStage = typeof job.failureStage === 'string' && job.failureStage ? stages[job.failureStage] || '执行步骤' : '';
       const recovery = typeof job.recoveryMessage === 'string' ? job.recoveryMessage : '';
-      const details = (failureStage ? '<p class="job-detail"><strong>失败阶段：</strong>' + escape(failureStage) + '</p>' : '')
+      const resultNote = taskResultNote(job);
+      const details = (resultNote ? '<p class="job-detail">' + escape(resultNote) + '</p>' : '')
+        + (failureStage ? '<p class="job-detail"><strong>失败阶段：</strong>' + escape(failureStage) + '</p>' : '')
         + (errorMessage ? '<p class="job-detail"><strong>失败原因：</strong>' + escape(errorMessage) + '</p>' : '')
         + (recovery ? '<p class="job-detail"><strong>后续处理：</strong>' + escape(recovery) + '</p>' : '');
-      const symbol = icon(running ? 'refresh' : ['succeeded', 'completed'].includes(job.status) ? 'check' : ['failed', 'partial'].includes(job.status) ? 'alert' : 'minus');
-      return '<div class="job-row"><span class="job-symbol" aria-hidden="true">' + symbol + '</span><div><p class="job-title">' + label + escape(progress) + '</p><p class="job-detail">' + escape(description) + '</p>' + details + '</div><div class="job-status">' + tag(STATUS_LABELS[job.status] || '未知', tone) + '<span class="job-date">' + date(job.createdAt) + '</span></div><div class="job-actions"><button type="button" class="text-button" data-job-detail="' + escape(job.id) + '">详情</button><button type="button" class="text-button" data-job-logs="' + escape(job.id) + '">日志</button>' + (running ? '<button type="button" class="text-button" data-stop-job="' + escape(job.id) + '">停止</button>' : '') + '</div></div>';
+      const symbol = icon(running ? 'refresh' : presentation.noChanges ? 'minus' : ['succeeded', 'completed'].includes(job.status) ? 'check' : ['failed', 'partial'].includes(job.status) ? 'alert' : 'minus');
+      return '<div class="job-row"><span class="job-symbol" aria-hidden="true">' + symbol + '</span><div><p class="job-title">' + label + escape(progress) + '</p><p class="job-detail">' + escape(description) + '</p>' + details + '</div><div class="job-status">' + tag(presentation.label, tone) + '<span class="job-date">' + date(job.createdAt) + '</span></div><div class="job-actions"><button type="button" class="text-button" data-job-detail="' + escape(job.id) + '">详情</button><button type="button" class="text-button" data-job-logs="' + escape(job.id) + '">日志</button>' + (running ? '<button type="button" class="text-button" data-stop-job="' + escape(job.id) + '">停止</button>' : '') + '</div></div>';
     }).join('') : '<div class="empty-state">还没有任务。<br>开始一次注册，或到账号维护检查现有账号。</div>';
     $('account-jobs').innerHTML = $('jobs').innerHTML;
   }
@@ -634,23 +678,46 @@
     const categories = { network: '连接 / 代理问题', model_unavailable: '模型不可用', quota: '额度不足', rate_limited: '请求限流', authentication: '认证失败', account_status: '账号状态异常', upstream: '上游服务异常', unknown: '原因尚未确定' };
     return [categories[item.failureCategory], Number.isSafeInteger(item.upstreamStatus) && item.upstreamStatus >= 400 && item.upstreamStatus <= 599 ? 'HTTP ' + item.upstreamStatus : '', typeof item.message === 'string' ? item.message : ''].filter(Boolean).join(' · ');
   }
+  function renderTaskAccount(item) {
+    const phases = item.phases || {};
+    const skipped = item.status === 'skipped';
+    const pending = phases.tokenUpdated === true && phases.tested === false;
+    const generatedOnly = phases.tokenGenerated === true && phases.tokenUpdated === false;
+    const successfulSteps = [['tokenGenerated', '已生成 token'], ['tokenUpdated', '已回写原账号'], ['tested', '已提交测试'], ['verified', '测试通过']]
+      .filter(([key]) => phases[key] === true).map(([, label]) => label).join(' · ');
+    const label = skipped ? '已跳过' : phases.verified === true ? '测试通过' : pending ? '已回写，待测试'
+      : generatedOnly ? '已生成，未回写' : item.status === 'failed' ? '本次失败' : '处理结果';
+    const reasonCode = [item.reasonCode, item.code, item.message].find(code => typeof code === 'string' && Object.hasOwn(REASONS, code));
+    let reason = reasonCode ? REASONS[reasonCode] : failureDescription(item) || item.reason || '';
+    if (skipped && reasonCode === 'administrator_unscheduled') reason = '当时检测到调度关闭，本次未执行测试或修改调度。';
+    if (skipped && /手动停用.*额度等待.*需核对/.test(reason)) reason = '本次未执行测试或修改调度；旧任务未记录具体跳过原因。';
+    if (pending && item.code === 'CONSOLE_TEST_TARGET_CHANGED') reason = '测试前账号状态检查未通过，本次没有发送测试；已回写的 token 保留。';
+    const currentPending = skipped && accounts().some(account => account.id === item.accountId && account.classification === 'pending_verification');
+    const followup = pending ? '无需重新获取 token。再次维护会检查已回写结果，继续测试及恢复调度。'
+      : currentPending ? '当前已识别为待测试恢复；再次维护可继续使用已回写的 token。' : '';
+    const canSelectTest = !skipped && !generatedOnly && Number.isSafeInteger(item.accountId) && item.accountId > 0
+      && (phases.tokenUpdated === true || phases.tested === true);
+    return '<div class="task-account-result"><div class="task-account-heading"><strong>' + escape(item.accountName || (Number.isSafeInteger(item.accountId) ? '远端 #' + item.accountId : '本地账号')) + '</strong>'
+      + tag(label, skipped ? 'neutral' : phases.verified === true ? 'good' : 'warn') + '</div>'
+      + '<p>' + escape(skipped ? '本次未执行账号操作' : successfulSteps || (phases.tokenGenerated === false ? '未生成新 token' : '尚无已完成步骤')) + '</p>'
+      + (reason ? '<p>' + escape(reason) + '</p>' : '') + (followup ? '<p>' + escape(followup) + '</p>' : '')
+      + (canSelectTest ? '<button type="button" class="text-button" data-select-result-account="' + item.accountId + '">选中此账号，继续测试</button>' : '') + '</div>';
+  }
   function renderTaskDetail() {
     const detail = state.taskDetail;
     if (!detail) return;
-    const job = taskProjection(detail.job), summary = job.summary;
+    const job = taskProjection(detail.job);
     $('task-dialog-title').textContent = /resume/.test(job.type) ? '已有账号续跑详情' : /register/.test(job.type) ? '注册任务详情' : /maintain/.test(job.type) ? '账号处理详情' : '任务详情';
     $('task-dialog-subtitle').textContent = job.id + ' · ' + date(job.createdAt);
     const error = typeof job.error === 'string' ? job.error : job.error?.message;
-    const counters = [['注册成功', summary.registered], ['生成 token', summary.tokensGenerated], ['首次导入', summary.imported], ['回写原账号', summary.tokensUpdated], ['已提交测试', summary.tested], ['测试通过', summary.verified], ['测试未通过', summary.testFailed], ['删除记录', summary.deleted]].filter(([, value]) => Number.isFinite(value));
-    const status = STATUS_LABELS[job.status] || '未知';
+    const counters = taskCounters(job, true);
+    const presentation = taskPresentation(job), resultNote = taskResultNote(job);
     const items = Array.isArray(job.items) ? job.items.slice(-100) : [];
-    $('task-detail').innerHTML = '<div class="detail-status">' + tag(status, ACTIVE.has(job.status) ? 'neutral' : ['completed', 'succeeded'].includes(job.status) ? 'good' : 'warn') + '<span>' + escape(STAGES[job.stage] || '执行状态待核对') + '</span></div>'
-      + (counters.length ? '<div class="step-grid">' + counters.map(([label, value]) => '<div><span>' + escape(label) + '</span><strong>' + number(value) + '</strong></div>').join('') + '</div>' : '<p class="muted">该任务尚未报告阶段成果，未报告不代表已完成。</p>')
+    $('task-detail').innerHTML = '<div class="detail-status">' + tag(presentation.label, presentation.tone) + '<span>' + escape(presentation.stage) + '</span></div>'
+      + (counters.length ? '<div class="step-grid' + (counters.length === 1 ? ' single-step' : '') + '">' + counters.map(([label, value]) => '<div><span>' + escape(label) + '</span><strong>' + number(value) + '</strong></div>').join('') + '</div>' : '<p class="muted">该任务尚未报告阶段成果，未报告不代表已完成。</p>')
+      + (resultNote ? '<div class="detail-notice">' + escape(resultNote) + '</div>' : '')
       + (job.failureStage || error || job.recoveryMessage ? '<div class="detail-notice">' + (job.failureStage ? '<p><strong>未完成阶段：</strong>' + escape(STAGES[job.failureStage] || '执行步骤') + '</p>' : '') + (error ? '<p><strong>失败原因：</strong>' + escape(error) + '</p>' : '') + (job.recoveryMessage ? '<p>' + escape(job.recoveryMessage) + '</p>' : '') + '</div>' : '')
-      + (items.length ? '<h3>逐账号成果</h3>' + items.map((item) => '<div class="task-account-result"><strong>' + escape(item.accountName || (Number.isSafeInteger(item.accountId) ? '远端 #' + item.accountId : '本地账号')) + '</strong>'
-        + '<p>' + escape(item.phases ? [['tokenGenerated', '已生成 token'], ['tokenUpdated', '已回写原账号'], ['tested', '已提交测试'], ['verified', '测试通过']].filter(([key]) => item.phases[key] === true).map(([, label]) => label).join(' · ') || '尚未报告成功步骤' : '请结合阶段成果核对') + '</p>'
-        + '<p>' + escape(failureDescription(item) || REASONS[item.reasonCode] || item.reason || '') + '</p>'
-        + (Number.isSafeInteger(item.accountId) && item.accountId > 0 ? '<button type="button" class="text-button" data-select-result-account="' + item.accountId + '">选中此账号，准备独立测试</button>' : '') + '</div>').join('') : '')
+      + (items.length ? '<h3>逐账号结果</h3>' + items.map(renderTaskAccount).join('') : '')
       + (detail.children.length ? '<h3>关联执行步骤</h3>' + detail.children.map((child) => '<div class="child-job"><div><strong>' + escape(({ registration: '注册机执行', registration_resume: '已有账号续跑', phase3: '获取 token', token_import: '导入 / 回写', import: '导入 / 回写', account_test: '账号可用性测试', account_delete: '删除已确认封禁记录' })[child.type] || '后台执行步骤') + '</strong><p>' + escape(child.id) + '</p><p>' + escape(typeof child.error === 'string' ? child.error : child.error?.message || '') + '</p></div>' + tag(STATUS_LABELS[child.status] || '未知') + '<button type="button" class="text-button" data-job-logs="' + escape(child.id) + '">步骤日志</button></div>').join('') : '')
       + (detail.childNotice ? '<p class="muted small-copy">' + escape(detail.childNotice) + '</p>' : '');
     $('task-detail-actions').innerHTML = '<button type="button" class="button secondary" data-task-refresh="' + escape(job.id) + '">刷新详情</button><button type="button" class="button secondary" data-job-logs="' + escape(job.id) + '">查看日志</button>'
@@ -739,16 +806,22 @@
     await mutate('/api/console/maintain', { accountIds: targets.map((item) => item.accountId), importNew: false, refreshInvalid: false, deleteBanned: false, localTokenTargets: targets });
     state.localSelected.clear(); renderLocalTokens();
   }
-  async function testSelected() {
+  function pendingVerificationPoolOnly() {
+    return state.overview?.summary?.neverImported === 0
+      && accounts().every(account => ['keep', 'wait', 'skip', 'review', 'verify'].includes(account.action));
+  }
+  async function testSelected({ accountIds = [...state.selected], pendingOnly = false, pendingPoolOnly = false } = {}) {
     if (writeBlock()) throw new Error(writeBlock());
-    const ids = [...state.selected].sort((a, b) => a - b);
-    if (!ids.length || ids.length > 100) throw new Error('请选择 1–100 个远端账号。');
+    const ids = [...accountIds].sort((a, b) => a - b);
+    if (!ids.length || ids.length > 100 || new Set(ids).size !== ids.length) throw new Error('请选择 1–100 个不同远端账号。');
     const overview = await request('/api/console/overview');
     if (!overview || !Array.isArray(overview.accounts) || !Array.isArray(overview.jobs) || typeof overview.readOnly !== 'boolean') throw new Error('最新账号快照不完整，未提交测试。');
     state.overview = overview; state.connected = true; renderAccounts(); renderJobs(); renderControls();
     if (writeBlock()) throw new Error(writeBlock());
     const targets = ids.map((id) => accounts().find((item) => item.id === id));
     if (targets.some((item) => !item || typeof item.targetRevision !== 'string' || !item.targetRevision || typeof item.executionRevision !== 'string' || !item.executionRevision)) throw new Error('所选账号身份或执行版本无法确认，请刷新后重新选择。');
+    if (pendingOnly && targets.some(item => item.classification !== 'pending_verification' || item.action !== 'verify')
+        || pendingPoolOnly && !pendingVerificationPoolOnly()) throw new Error('待处理账号状态已变化，列表已更新；请按最新状态执行维护。');
     const model = $('test-model').value;
     if (!window.confirm('仅测试 ' + ids.length + ' 个账号（ID：' + ids.join('、') + '）？\n模型：' + (model || state.overview.settings?.policy?.testModel || '维护策略默认模型') + '\n不会注册、租号或刷新 token。测试成功后，按服务端安全策略恢复状态与调度。')) return;
     await mutate('/api/console/maintain', { accountIds: ids, importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true,
@@ -921,6 +994,14 @@
   async function maintain(selectedOnly) {
     const ids = selectedOnly ? [...state.selected].sort((a, b) => a - b) : null;
     if (selectedOnly && !ids.length) throw new Error('请先选择需要维护的远端账号。');
+    const pendingTargets = ids ? ids.map(id => accounts().find(account => account.id === id))
+      : accounts().filter(account => account.action === 'verify');
+    if (pendingTargets.length && pendingTargets.every(account => account && selectable(account) && account.classification === 'pending_verification' && account.action === 'verify')
+        && (ids || pendingVerificationPoolOnly())) {
+      // Reuse one explicit test submission, including its fresh target proof.
+      // Never turn mixed maintenance into hidden extra requests or expand IDs.
+      return testSelected({ accountIds: pendingTargets.map(account => account.id), pendingOnly: true, pendingPoolOnly: !ids });
+    }
     const scope = ids ? '所选 ' + ids.length + ' 个远端账号（ID：' + ids.join('、') + '）' : '全部账号';
     if (!window.confirm('维护' + scope + '？\n\n' + (ids ? '• 仅处理上述远端 ID，不导入其他新账号' : '• 导入从未加入过的新账号') + '\n• 仅失效 / 过期 token 重新授权，额度耗尽等待恢复\n• 明确确认封禁后，删除对应 Sub2API 记录，本地保留履历\n• 网络故障和原因不明的账号不会被删除\n\n重新授权可能发送验证码。')) return;
     await mutate('/api/console/maintain', { ...(ids ? { accountIds: ids } : {}), importNew: !ids, refreshInvalid: true, deleteBanned: true });

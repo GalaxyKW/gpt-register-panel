@@ -827,9 +827,16 @@ function safeAccount(account) {
   const planType = !planAliases.invalid && !planAliases.conflict
     && ['free', 'plus', 'pro', 'team', 'business', 'enterprise', 'edu'].includes(planAliases.value)
     ? planAliases.value : '';
+  const updatedAliases = scalarAliases([account.updated_at, account.updatedAt], 64, { rejectOuterWhitespace: true });
+  // Preserve fractional precision: this is a remote change marker, not a
+  // display date. Missing/conflicting versions cannot authorize recovery.
+  const updatedAt = !updatedAliases.invalid && !updatedAliases.conflict
+    && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/.test(updatedAliases.value || '')
+    && parseDateValue(updatedAliases.value) ? updatedAliases.value : null;
   return {
     id,
     name,
+    updatedAt,
     ...proxy,
     platform: safeRemoteText(scalarText(account.platform, 64), 64),
     type: safeRemoteText(scalarText(account.type, 64), 64),

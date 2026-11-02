@@ -26,7 +26,7 @@ function harness() {
     fetch: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 200, text: async () => JSON.stringify({ readOnly: false, capabilities: { registrationEnabled: true, phase3Enabled: true, sub2apiConfigured: true }, accounts: [], jobs: [], reconciliation: { total: 0, returned: 0, truncated: false }, activeJobs: { total: 0, returned: 0, truncated: false }, summary: {}, settings: { revision: 'r1', policy: { enabled: false }, registration: { revision: 'g1', ready: true, phase3Ready: true, phase3Issues: [], fields: [] } } }) }; },
   };
   vm.createContext(context);
-  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected, loadProxies, saveImportProxy, renderProxySetting, proxySaveIssue, defaultProxyIssue, openRegistrationReview, acknowledgeRegistrationReview, registrationReviewValid, registrationReviewIssue, persistRegistrationReview, registrationReviewPendingValid, dismissResolvedRegistrationReview, registrationResolvedElsewhere };');
+  const instrumented = source.replace('showPage(); renderControls(); refresh();', 'globalThis.harness = { state, validToken, pendingValid, persistPending, mutate, saveSettings, reconcileSettings, writeBlock, inventoryProblem, stopJob, preflight, filteredAccounts, renderMetrics, renderAccounts, renderJobs, renderNetwork, renderSettings, renderControls, renderContinuations, request, date, escape, maintain, logQuery, loadLogs, refresh, openTaskDetail, renderTaskDetail, openAccountDetail, localTarget, renderLocalTokens, loadLocalTokens, updateLocalTokens, testSelected, loadProxies, saveImportProxy, renderProxySetting, proxySaveIssue, defaultProxyIssue, openRegistrationReview, acknowledgeRegistrationReview, registrationReviewValid, registrationReviewIssue, persistRegistrationReview, registrationReviewPendingValid, dismissResolvedRegistrationReview, registrationResolvedElsewhere };');
   vm.runInContext(instrumented, context);
   const api = context.harness;
   api.state.connected = true;
@@ -63,7 +63,7 @@ test('console failed import keeps successful registration counts visible with fa
     recoveryMessage: '注册已成功，不要重新注册；核对导入结果后处理现有 token。' }];
   api.renderJobs();
   const rendered = element('jobs').innerHTML;
-  assert.match(rendered, /注册成功 1 · 导入 0 · 账号步骤失败 0/);
+  assert.match(rendered, /注册成功 1 · 导入 0/); assert.doesNotMatch(rendered, /账号步骤失败 0/);
   assert.match(rendered, /失败阶段：<\/strong>导入 Sub2API/); assert.match(rendered, /失败原因：<\/strong>目标服务连接失败/);
   assert.match(rendered, /注册已成功，不要重新注册/); assert.match(rendered, /class="tag bad">失败/);
   assert.doesNotMatch(rendered, /import_existing|aria-hidden="true">✓/);
@@ -925,6 +925,42 @@ test('console only-test uses fresh target revisions and never refreshes imports 
     accountTargets: [{ accountId: 160, targetRevision: 'fresh-target', executionRevision: 'fresh-execution' }], modelId: 'gpt-5.6-luna' });
 });
 
+for (const selectedOnly of [true, false]) {
+  test('console ' + (selectedOnly ? 'selected' : 'pool') + ' pending-only maintenance uses one fresh test request and one confirmation', async () => {
+    const h = harness(); let confirmations = 0, freshRead = false;
+    const pending = id => ({ id, classification: 'pending_verification', action: 'verify', requiresExplicitTestSelection: true,
+      targetRevision: 'old-target-' + id, executionRevision: 'old-execution-' + id });
+    h.api.state.overview.accounts = [pending(160), pending(174)]; h.api.state.overview.summary.neverImported = 0;
+    h.api.state.selected.add(174); h.api.state.selected.add(160);
+    h.context.window.confirm = text => { confirmations += 1; assert.match(text, /仅测试 2 个账号/); assert.doesNotMatch(text, /发送验证码|删除对应/); return true; };
+    mockConsole(h); const originalFetch = h.context.fetch;
+    h.context.fetch = async (url, options = {}) => {
+      if (url === '/api/console/overview' && !freshRead) {
+        freshRead = true;
+        h.api.state.overview.accounts = [160, 174, 187].map(id => ({ ...pending(id), targetRevision: 'fresh-target-' + id, executionRevision: 'fresh-execution-' + id }));
+      }
+      return originalFetch(url, options);
+    };
+    await h.api.maintain(selectedOnly);
+    const writes = h.calls.filter(call => call.options.method === 'POST');
+    assert.equal(h.calls[0].url, '/api/console/overview'); assert.equal(confirmations, 1); assert.equal(writes.length, 1);
+    assert.deepEqual(JSON.parse(writes[0].options.body), { accountIds: [160, 174], importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true,
+      accountTargets: [160, 174].map(id => ({ accountId: id, targetRevision: 'fresh-target-' + id, executionRevision: 'fresh-execution-' + id })) });
+    assert.deepEqual(Array.from(h.api.state.selected).sort((a, b) => a - b), [160, 174], 'routing must not expand the current selection');
+  });
+}
+
+test('console mixed maintenance stays one original request instead of splitting or silently expanding tests', async () => {
+  const h = harness(); h.api.state.overview.accounts = [
+    { id: 160, classification: 'pending_verification', action: 'verify', requiresExplicitTestSelection: true },
+    { id: 174, classification: 'expired', action: 'refresh' },
+  ];
+  h.api.state.selected.add(160); h.api.state.selected.add(174); mockConsole(h);
+  await h.api.maintain(true);
+  const writes = h.calls.filter(call => call.options.method === 'POST'); assert.equal(writes.length, 1);
+  assert.deepEqual(JSON.parse(writes[0].options.body), { accountIds: [160, 174], importNew: false, refreshInvalid: true, deleteBanned: true });
+});
+
 test('console only-test refuses absent identity revisions and global holds while reads stay available', async () => {
   for (const account of [{ id: 160 }, { id: 160, targetRevision: 'target' }]) {
     const h = harness(); h.api.state.overview.accounts = [account]; h.api.state.selected.add(160); mockConsole(h);
@@ -971,6 +1007,99 @@ test('console task detail matches running parent projection and does not mistake
   assert.match(h.element('task-detail').innerHTML, /进行中/); assert.doesNotMatch(h.element('task-detail').innerHTML, /排队中/);
   assert.match(h.element('task-detail').innerHTML, /已提交测试<\/span><strong>1/);
   assert.match(h.element('task-detail').innerHTML, /测试通过<\/span><strong>0/);
+});
+
+function untouchedMaintenanceSummary(skipped) {
+  return { registered: 0, imported: 0, refreshed: 0, deleted: 0, skipped, failed: 0,
+    tokensGenerated: 0, tokensUpdated: 0, tested: 0, verified: 0, testFailed: 0 };
+}
+
+for (const stage of ['completed', 'no_changes']) {
+  test('console shows ' + stage + ' all-skipped maintenance as no account work, without empty success metrics', async () => {
+    const h = harness(), summary = untouchedMaintenanceSummary(45);
+    const job = { id: uiJobId, type: 'console_maintain', status: 'succeeded', result: { stage, summary,
+      items: [{ accountId: 1, accountName: 'free00001', status: 'skipped', reasonCode: 'quota_or_cooldown', phases: { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false } },
+        { accountId: 2, accountName: 'free00002', status: 'skipped', reasonCode: 'administrator_unscheduled', phases: { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false } }] } };
+    mockConsole(h, { job });
+    h.api.state.overview.jobs = [{ id: uiJobId, type: job.type, status: job.status, stage, summary }];
+    h.api.renderJobs();
+    assert.match(h.element('jobs').innerHTML, /class="tag neutral">全部跳过/);
+    assert.doesNotMatch(h.element('jobs').innerHTML, /已完成|icon-check|账号步骤失败 0/);
+    await h.api.openTaskDetail(uiJobId);
+    const text = h.element('task-detail').innerHTML;
+    assert.match(text, /全部跳过/); assert.match(text, /本次未执行账号操作/);
+    assert.match(text, /跳过账号<\/span><strong>45/);
+    assert.equal((text.match(/<strong>0<\/strong>/g) || []).length, 0);
+    assert.match(text, /额度耗尽或限流冷却，等待恢复/);
+    assert.match(text, /当时检测到调度关闭，本次未执行测试或修改调度/);
+    assert.doesNotMatch(text, /管理员已关闭调度|尚未报告成功步骤|data-select-result-account|class="tag good">已完成/);
+    assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  });
+}
+
+test('console keeps unconfirmed or failed work distinct from an all-skipped result', () => {
+  for (const status of ['running', 'failed', 'interrupted', 'partial']) {
+    const h = harness(); h.api.state.overview.jobs = [{ id: uiJobId, type: 'console_maintain', status, stage: 'completed', summary: untouchedMaintenanceSummary(2) }];
+    h.api.renderJobs(); assert.doesNotMatch(h.element('jobs').innerHTML, /全部跳过/);
+  }
+  const h = harness(); const summary = untouchedMaintenanceSummary(2); delete summary.tokensUpdated;
+  h.api.state.overview.jobs = [{ id: uiJobId, type: 'console_maintain', status: 'succeeded', stage: 'completed', summary }];
+  h.api.renderJobs(); assert.doesNotMatch(h.element('jobs').innerHTML, /全部跳过/, 'omitted outcome fields are not proof of no work');
+});
+
+test('console separates 45 proven writebacks awaiting tests from 21 token-generation failures', async () => {
+  const h = harness(), summary = { ...untouchedMaintenanceSummary(62), failed: 66, tokensGenerated: 45, tokensUpdated: 45 };
+  const pending = Array.from({ length: 45 }, (_, i) => ({ accountId: i + 1, status: 'failed', code: 'CONSOLE_TEST_TARGET_CHANGED',
+    phases: { tokenGenerated: true, tokenUpdated: true, tested: false, verified: false }, message: '账号维护状态已变化，未测试或改变调度' }));
+  const failed = Array.from({ length: 21 }, (_, i) => ({ accountId: i + 46, status: 'failed', code: 'CONSOLE_STEP_FAILED',
+    phases: { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false }, message: '登录未完成' }));
+  const job = { id: uiJobId, type: 'console_maintain', status: 'partial', result: { stage: 'completed', summary, items: [...pending, ...failed] } };
+  mockConsole(h, { job }); h.api.state.overview.jobs = [{ id: uiJobId, type: job.type, status: job.status, stage: 'completed', summary }]; h.api.renderJobs();
+  assert.match(h.element('jobs').innerHTML, /生成 token 45/); assert.match(h.element('jobs').innerHTML, /回写 45/);
+  assert.match(h.element('jobs').innerHTML, /未完成流程 66/); assert.match(h.element('jobs').innerHTML, /测试尚未开始/);
+  assert.doesNotMatch(h.element('jobs').innerHTML, /账号步骤失败 66|测试未通过 0/);
+  await h.api.openTaskDetail(uiJobId); const text = h.element('task-detail').innerHTML;
+  assert.match(text, /45 个已回写，待测试；21 个未生成 token/);
+  assert.match(text, /无需重新获取 token/); assert.doesNotMatch(text, /测试通过<\/span><strong>0/);
+  assert.match(text, /回写原账号<\/span><strong>45/);
+  assert.equal((text.match(/data-select-result-account=/g) || []).length, 45, 'generation failures do not invite testing stale credentials');
+  assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+});
+
+test('console old skip explanations do not invent a specific historical reason or prompt per-account retries', async () => {
+  const h = harness(); h.api.state.overview.accounts = [{ id: 1, classification: 'pending_verification', action: 'verify' }];
+  mockConsole(h, { job: { id: uiJobId, type: 'console_maintain', status: 'succeeded', result: {
+    stage: 'completed', summary: untouchedMaintenanceSummary(1), items: [{ accountId: 1, status: 'skipped', phases: { tested: false },
+      message: '账号处于手动停用、额度等待或需核对状态，未测试或改变调度' }],
+  } } });
+  await h.api.openTaskDetail(uiJobId); const text = h.element('task-detail').innerHTML;
+  assert.match(text, /旧任务未记录具体跳过原因/); assert.match(text, /当前已识别为待测试恢复/);
+  assert.doesNotMatch(text, /手动停用、额度等待或需核对|data-select-result-account/);
+});
+
+test('console uses an explicit historical skip code without claiming that recovery evidence is still absent', async () => {
+  const h = harness(); h.api.state.overview.accounts = [{ id: 1, classification: 'pending_verification', action: 'verify' }];
+  mockConsole(h, { job: { id: uiJobId, type: 'console_maintain', status: 'succeeded', result: {
+    stage: 'completed', summary: untouchedMaintenanceSummary(1), items: [{ accountId: 1, status: 'skipped', code: 'administrator_unscheduled', phases: { tested: false },
+      message: '账号处于手动停用、额度等待或需核对状态，未测试或改变调度' }],
+  } } });
+  await h.api.openTaskDetail(uiJobId); const text = h.element('task-detail').innerHTML;
+  assert.match(text, /当时检测到调度关闭，本次未执行测试或修改调度/);
+  assert.match(text, /当前已识别为待测试恢复/);
+  assert.doesNotMatch(text, /旧任务未记录具体跳过原因|没有可自动恢复的回写记录|管理员已关闭调度|data-select-result-account/);
+});
+
+test('console exposes pending verification in account filters, next action and attention count', () => {
+  const h = harness(); h.api.state.overview.summary = { total: 128, healthy: 56, refreshNeeded: 21, pendingVerification: 45, needsReview: 0, banned: 0, neverImported: 0 };
+  h.api.state.overview.accounts = [{ id: 1, name: 'free00001', classification: 'pending_verification', action: 'verify', reason: 'writeback_pending_verification' },
+    { id: 2, classification: 'manual_disabled', action: 'skip', reason: 'administrator_unscheduled' }];
+  h.element('account-filter').value = 'verify'; h.api.renderAccounts(); h.api.renderMetrics();
+  assert.deepEqual(Array.from(h.api.filteredAccounts(), account => account.id), [1]);
+  assert.match(h.element('account-rows').innerHTML, /已回写，待测试/); assert.match(h.element('account-rows').innerHTML, /测试并恢复调度/);
+  assert.equal(h.element('metric-attention').textContent, '66');
+  h.api.openAccountDetail(0); assert.match(h.element('account-detail').innerHTML, /无需重新登录/);
+  h.api.openAccountDetail(1); assert.doesNotMatch(h.element('account-detail').innerHTML, /管理员已关闭调度|手动停用/);
+  assert.match(html, /<option value="verify">待测试恢复<\/option>/);
 });
 
 function mockProxySettings(h, { proxyId = null, error = null, listError = false, receiptMismatch = false } = {}) {

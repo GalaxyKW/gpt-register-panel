@@ -257,7 +257,8 @@ async function main() {
         await assertReadableText(page, ['#page-' + section + ' .page-description', ...({ register: ['.metric > span', '.channel-copy p', '#jobs .job-detail'], accounts: ['.account-email', '.accounts-table th'], logs: ['.log-time'], settings: ['.proxy-description', '.environment-list dt'] })[section]]);
         if (section === 'register') {
           const text = await page.$eval('#jobs', el => el.textContent);
-          assert.match(text, /注册成功 1 · 导入 0 · 账号步骤失败 0/); assert.match(text, /失败阶段：导入 Sub2API/); assert.match(text, /不要重新注册或租号/);
+          assert.match(text, /注册成功 1 · 导入 0/); assert.doesNotMatch(text, /账号步骤失败 0/);
+          assert.match(text, /失败阶段：导入 Sub2API/); assert.match(text, /不要重新注册或租号/);
         }
         if (process.env.PANEL_TEST_SCREENSHOT_DIR) {
           fs.mkdirSync(process.env.PANEL_TEST_SCREENSHOT_DIR, { recursive: true });
@@ -471,6 +472,71 @@ async function main() {
     assert.equal(writes().length, 1);
     assert.deepEqual(writes()[0].body, { accountIds: [160], importNew: false, refreshInvalid: false, deleteBanned: false, testOnly: true,
       accountTargets: [{ accountId: 160, targetRevision: 'fresh-target160', executionRevision: 'fresh-execution160' }], modelId: 'gpt-5.6-luna' });
+    await page.waitForFunction(() => document.querySelector('#task-dialog').open);
+  });
+  await testCase('historical all-skipped maintenance is not shown as completed work on either viewport', async page => {
+    const summary = { registered: 0, imported: 0, refreshed: 0, deleted: 0, skipped: 45, failed: 0,
+      tokensGenerated: 0, tokensUpdated: 0, tested: 0, verified: 0, testFailed: 0 };
+    const job = { id: failedId, type: 'console_maintain', status: 'succeeded', stage: 'completed',
+      summary, createdAt: '2026-11-02T02:28:38Z' };
+    fixture.overview.jobs = [job];
+    fixture.detailJobs.set(failedId, { ...job, result: { stage: 'completed', summary,
+      items: Array.from({ length: 45 }, (_, index) => ({ accountId: 160 + index,
+        accountName: 'free' + String(index + 1).padStart(5, '0'), status: 'skipped', code: 'administrator_unscheduled',
+        phases: { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false },
+        message: '账号处于手动停用、额度等待或需核对状态，未测试或改变调度' })) } });
+    await page.reload({ waitUntil: 'networkidle0' });
+    for (const width of [1440, 390]) {
+      await page.setViewport({ width, height: width === 390 ? 844 : 1050 }); await navigate(page, 'accounts');
+      await waitText(page, '#account-jobs', '全部跳过');
+      assert.equal(await page.$eval('#account-jobs', el => el.textContent.includes('已完成')), false);
+      await page.click('#account-jobs [data-job-detail="' + failedId + '"]');
+      await waitText(page, '#task-detail', '全部跳过'); await waitText(page, '#task-detail', '本次未执行账号操作');
+      await waitText(page, '#task-detail', '当时检测到调度关闭');
+      assert.equal(await page.$$eval('#task-detail .step-grid > div', rows => rows.length), 1);
+      assert.equal(await page.$eval('#task-detail', el => el.textContent.includes('尚未报告成功步骤')), false);
+      assert.equal(await page.$eval('#task-detail', el => el.textContent.includes('旧任务未记录具体跳过原因')), false);
+      assert.equal(await page.$eval('#task-detail', el => el.textContent.includes('手动停用、额度等待或需核对状态')), false);
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), true);
+      assert.equal(await page.$eval('#task-dialog', dialog => { const b = dialog.getBoundingClientRect(); return b.left >= 0 && b.right <= innerWidth + 1 && b.top >= 0 && b.bottom <= innerHeight + 1; }), true);
+      if (process.env.PANEL_TEST_SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.PANEL_TEST_SCREENSHOT_DIR, 'mock-' + width + '-all-skipped.png'), fullPage: false });
+      await closeTaskDetail(page);
+    }
+    assert.equal(writes().length, 0);
+  });
+  await testCase('confirmed token writeback goes straight to one test request without another login or mapping review', async (page, confirm) => {
+    fixture.overview.summary.pendingVerification = 1;
+    fixture.overview.summary.refreshNeeded = 0;
+    Object.assign(fixture.overview.accounts[1], { status: 'active', classification: 'pending_verification', action: 'verify',
+      reason: 'writeback_pending_verification', targetRevision: 'recovery-target160', executionRevision: 'recovery-execution160' });
+    await page.reload({ waitUntil: 'networkidle0' }); await navigate(page, 'accounts');
+    await waitText(page, '#account-rows', '已回写，待测试');
+    await waitText(page, '#account-rows', '测试并恢复调度');
+    await page.click('[data-account-id="160"]'); await page.select('#test-model', 'gpt-5.6-luna');
+    confirm(true); const priorConfirmations = fixture.confirmations.length;
+    await page.click('#test-selected'); await waitText(page, '#notice', '任务已交给服务器');
+    assert.equal(fixture.confirmations.length - priorConfirmations, 1);
+    assert.equal(writes().length, 1);
+    assert.deepEqual(writes()[0].body, { accountIds: [160], importNew: false, refreshInvalid: false, deleteBanned: false,
+      testOnly: true, accountTargets: [{ accountId: 160, targetRevision: 'recovery-target160', executionRevision: 'recovery-execution160' }], modelId: 'gpt-5.6-luna' });
+    assert.equal(writes('/api/phase3').length, 0);
+    await page.waitForFunction(() => document.querySelector('#task-dialog').open);
+  });
+  await testCase('maintain selected pending accounts uses the same single test-only confirmation', async (page, confirm) => {
+    fixture.overview.summary.pendingVerification = 1; fixture.overview.summary.refreshNeeded = 0;
+    Object.assign(fixture.overview.accounts[1], { status: 'active', classification: 'pending_verification', action: 'verify',
+      requiresExplicitTestSelection: true, reason: 'writeback_pending_verification',
+      targetRevision: 'selected-recovery160', executionRevision: 'selected-execution160' });
+    await page.reload({ waitUntil: 'networkidle0' }); await navigate(page, 'accounts');
+    await waitText(page, '#account-rows', '已回写，待测试'); await page.click('[data-account-id="160"]');
+    confirm(true); const priorConfirmations = fixture.confirmations.length;
+    await page.click('#maintain-selected'); await waitText(page, '#notice', '任务已交给服务器');
+    assert.equal(fixture.confirmations.length - priorConfirmations, 1);
+    assert.equal(writes().length, 1);
+    const submitted = writes()[0].body;
+    assert.deepEqual(submitted.accountIds, [160]); assert.equal(submitted.testOnly, true);
+    assert.equal(submitted.importNew, false); assert.equal(submitted.refreshInvalid, false); assert.equal(submitted.deleteBanned, false);
+    assert.deepEqual(submitted.accountTargets, [{ accountId: 160, targetRevision: 'selected-recovery160', executionRevision: 'selected-execution160' }]);
     await page.waitForFunction(() => document.querySelector('#task-dialog').open);
   });
   await testCase('default import proxy requires confirmation and preserves unrelated policy edits', async (page, confirm) => {

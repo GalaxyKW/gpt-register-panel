@@ -33,7 +33,9 @@ async function fixture(t, options = {}) {
     exportAccounts: async ids => ({ accounts: structuredClone(ids.length ? remote.filter(a => ids.includes(a.id)) : remote), proxies: [] }),
     applyOAuthCredentials: async (id, payload) => {
       writes.push({ action: 'update', id });
-      remote.find(a => a.id === id).credentials = { ...payload.credentials };
+      const account = remote.find(a => a.id === id);
+      account.credentials = { ...payload.credentials };
+      account.status = 'active'; account.error_message = ''; account.updated_at = new Date().toISOString();
     },
   };
   const saved = new Map();
@@ -406,6 +408,25 @@ test('test-only is version-bound, model-selectable and never imports logs in or 
   assert.deepEqual(children.map(child => child.type), ['account_test']); assert.deepEqual(children[0].payload.accountIds, [1]);
 });
 
+test('a recovery refusal before dispatch is not counted as a failed upstream test', async t => {
+  const f = await fixture(t, { tester: async ({ accountIds, db, jobId, persistResult }) => withControlPlaneLock(async () => {
+    await db.startMutationJob(jobId);
+    const result = { requested: 1, succeeded: 0, failed: 1, results: [{ accountId: accountIds[0], status: 'failed',
+      attempted: false, code: 'ACCOUNT_TEST_RECOVERY_NOT_AUTHORIZED', message: 'synthetic-do-not-forward' }] };
+    await persistResult(result); return result;
+  }) });
+  f.account(1);
+  const rows = (await f.request('/api/console/overview')).body.accounts;
+  const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
+  const job = await f.waitJob(accepted.body.jobId);
+  assert.equal(job.status, 'failed'); assert.equal(job.result.summary.tested, 0);
+  assert.equal(job.result.summary.testFailed, 0); assert.equal(job.result.summary.failed, 1);
+  assert.equal(job.result.items[0].code, 'ACCOUNT_TEST_RECOVERY_NOT_AUTHORIZED');
+  assert.match(job.result.items[0].message, /未发送测试/);
+  assert.equal(JSON.stringify(job.result.items).includes('synthetic-do-not-forward'), false);
+  assert.deepEqual(f.writes, []); assert.deepEqual(f.tested, []);
+});
+
 for (const kind of ['remote', 'endpoint', 'evidence', 'plan']) {
   test('test-only rejects changed ' + kind + ' and cannot restore scheduling on a different target', async t => {
     const f = await fixture(t); const raw = f.account(1);
@@ -471,6 +492,8 @@ test('test-only preserves manually disabled quota-wait and confirmed-ban account
   const accepted = await f.request('/api/console/maintain', testOnlyBody(rows));
   const job = await f.waitJob(accepted.body.jobId);
   assert.equal(job.status, 'succeeded'); assert.equal(job.result.summary.skipped, 3);
+  assert.equal(job.result.stage, 'no_changes'); assert.equal(job.result.outcome, 'no_changes');
+  assert.equal(new Set(job.result.items.map(item => item.message)).size, 3);
   assert.equal(job.result.summary.tested, 0); assert.deepEqual(f.tested, []); assert.deepEqual(f.writes, []);
   assert.deepEqual(job.result.childJobIds, []);
 });
