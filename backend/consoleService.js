@@ -24,6 +24,7 @@ const { strongIdentityContradiction } = require('./diff');
 const logs = require('./consoleLogs');
 const importProxy = require('./importProxy');
 const writebackRecovery = require('./writebackRecovery');
+const { resolvePhase3LoginBinding, matchesPhase3LoginBinding } = require('./phase3LoginBinding');
 
 const PARENT_TYPES = new Set(['console_register', 'console_resume', 'console_maintain', 'console_log_cleanup']);
 const TERMINAL = new Set(['succeeded', 'partial', 'failed', 'interrupted']);
@@ -193,6 +194,7 @@ function createConsoleService({ db, logger, jobManager,
       administrator_disabled: '账号已停用，保留当前设置', administrator_lifetime_expired: '账号使用期限已到，保留期限设置',
       quota_or_cooldown: '额度或冷却尚未恢复，本次等待，不重新登录', outside_free_oauth_scope: '不属于 Free OAuth 维护范围，本次跳过',
       account_deactivated: '上游已明确停用账号，本次不发送测试', user_deactivated: '上游已明确停用账号，本次不发送测试',
+      phase3_confirmed_deactivated: '此前登录已确认账号停用，已有证据适用于当前原账号；无需重复登录',
       account_suspended: '上游已明确暂停账号，本次不发送测试', account_banned: '上游已明确封禁账号，本次不发送测试',
       strong_identity_ambiguous: '账号身份存在重复，未发送测试', lifecycle_requires_reconciliation: '该账号有尚未结束的记录变更，本次未测试',
       writeback_pending_explicit_test: 'token 已回写，待单独测试；不会重新登录',
@@ -315,6 +317,7 @@ function createConsoleService({ db, logger, jobManager,
     const remote = current?._internal?.accounts || [];
     const plan = endpointKey ? maintenance.buildMaintenancePlan({ accounts: remote, lifecycles: history,
       endpointKey, policy: configuration.policy }) : { items: [] };
+    if (endpointKey) await maintenance.addConfirmedPhase3Bans(plan, { db, accounts: remote, client: client(), policy: configuration.policy });
     if (endpointKey) await addPendingVerifications(plan, remote, client());
     const accounts = plan.items.map(item => {
       const account = remote.find(a => a.id === item.accountId);
@@ -691,25 +694,39 @@ function createConsoleService({ db, logger, jobManager,
       const listing = phase3.listLocalPhase3Targets();
       const matches = listing.accounts.filter(entry => entry.eligible && entry.email === account.email);
       if (!account.email || matches.length !== 1) throw failure('CONSOLE_LOGIN_MAPPING_REQUIRED', '缺少唯一的本地登录资料，请在高级诊断核对一次');
-      request = { ...matches[0], sourceMode: 'username', remoteTarget: { accountId: account.id, targetRevision: bound.targetRevision } };
+      const candidate = matches[0];
+      request = { selectedKey: candidate.selectedKey, email: candidate.email, phone: candidate.phone || undefined,
+        phase3TargetRevision: candidate.phase3TargetRevision, sourceMode: 'username',
+        remoteTarget: { accountId: account.id, targetRevision: bound.targetRevision } };
     } else throw failure('CONSOLE_LOGIN_MAPPING_REQUIRED', '存在真实身份冲突，未自动重新登录');
     const resolved = phase3.resolvePhase3Requests([request]);
     if (resolved.eligible.length !== 1 || resolved.rejected.length) throw failure('CONSOLE_LOGIN_MAPPING_REQUIRED', resolved.rejected[0]?.message || '本地登录资料校验失败');
     const target = resolved.eligible[0];
     if (target.sourceMode === 'username') bindRemotePhase3Targets([target], accounts, client(context));
+    const loginBinding = target.sourceMode === 'username'
+      ? await resolvePhase3LoginBinding({ account, loginEmail: target.email, client: client(context), signal: context.signal })
+      : null;
     let completed;
     try { completed = await child(context, 'phase3', { email: target.email, phone: target.phone,
-      sourceMode: target.sourceMode, remoteTarget: bound }, target.canonicalKeys, options => phase3Runner({
+      sourceMode: target.sourceMode, remoteTarget: bound, ...(loginBinding ? { loginBinding } : {}) }, target.canonicalKeys, options => phase3Runner({
       ...options, email: target.email, phone: target.phone, canonicalKeys: target.canonicalKeys,
       sourceMode: target.sourceMode, executionBinding: target.executionBinding, requireExecutionBinding: true,
       remoteTarget: target.sourceMode === 'username' ? target.remoteTarget : null,
       remoteClientFactory: clientFactory,
-      beforeExecute: async () => assertRefreshCurrent(account, await client(context).getAccount(account.id, { signal: context.signal })),
+      beforeExecute: async () => {
+        const remoteClient = client(context);
+        const currentAccount = await remoteClient.getAccount(account.id, { signal: context.signal });
+        assertRefreshCurrent(account, currentAccount);
+        if (loginBinding && !matchesPhase3LoginBinding(loginBinding,
+          { account: currentAccount, loginEmail: target.email, client: remoteClient })) {
+          throw failure('CONSOLE_LOGIN_BINDING_CHANGED', '登录前原账号或登录绑定已变化，本次未重新登录');
+        }
+      },
     })); } catch (error) {
-      // A login candidate found only by email cannot prove that a failed
-      // login's ban applies to the remote strong identity. Only an existing
-      // strongly matched local token can authorize that deletion path.
-      error.consoleHasStrongLocalBinding = target.sourceMode === 'token';
+      // Use either a strongly matched local token or the original remote
+      // credential's provider identity/email binding. Metadata email alone
+      // still cannot turn a failed local login into a remote deletion.
+      error.consoleHasStrongLocalBinding = target.sourceMode === 'token' || Boolean(loginBinding);
       throw error;
     }
     const { result } = completed;
@@ -822,6 +839,7 @@ function createConsoleService({ db, logger, jobManager,
     await lifecycle.recordObservedAccounts(db, { endpointKey, accounts });
     const history = await db.listAccountLifecycles(endpointKey);
     const plan = maintenance.buildMaintenancePlan({ accounts, lifecycles: history, endpointKey, policy: context.intent });
+    await maintenance.addConfirmedPhase3Bans(plan, { db, accounts, client: client(context), policy: context.intent });
     const recoveries = await addPendingVerifications(plan, accounts, client(context));
     if (!context.intent.testOnly) {
       for (const item of plan.items) if (item.action === 'verify' && item.requiresExplicitTestSelection) {
@@ -956,7 +974,7 @@ function createConsoleService({ db, logger, jobManager,
           if (status !== 'deleted') { context.result.summary.refreshed += 1; status = 'refreshed'; }
         } else if (item.action === 'delete') {
           await updateParent(context, 'removing_banned');
-          await deleteAccount(context, item);
+          await deleteAccount(context, item, item.phase3BanJobId || null);
           context.result.summary.deleted += 1; status = 'deleted';
         } else { context.result.summary.skipped += 1; message = skipMessage(item.reasonCode); }
       } catch (error) {

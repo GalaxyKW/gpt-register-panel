@@ -10,7 +10,7 @@ const { safeAccount, Sub2ApiAdminClient } = require('../backend/adapters/sub2api
 const { DEFAULT_CONSOLE_SETTINGS, managementEndpointKey, lifecycleIdentityKeys,
   recordObservedAccounts, canCreateAccount, creationEligibility } = require('../backend/accountLifecycle');
 const { classifyAccountMaintenance, buildMaintenancePlan, deleteConfirmedBannedAccount,
-  verifyPhase3BanEvidence } = require('../backend/accountMaintenance');
+  verifyPhase3BanEvidence, addConfirmedPhase3Bans } = require('../backend/accountMaintenance');
 const { accountTestTargetDigest, accountTestTargetRevision } = require('../backend/accountTargetRevision');
 const { remotePhase3EndpointDigest } = require('../backend/remotePhase3');
 
@@ -394,7 +394,7 @@ test('phase3 ban evidence requires exact persisted disposition and original targ
     payload: { sourceMode: 'token', remoteTarget: { accountId: value.id, targetRevision: accountTestTargetRevision(value),
       identityKeys: lifecycleIdentityKeys(value), targetDigest: accountTestTargetDigest(value), endpointDigest: remotePhase3EndpointDigest(client) } },
     result: { code: 'ACCOUNT_DEACTIVATED', accountDisposition: 'discard', dispositionPersisted: true, dispositionOutcome: 'persisted' } };
-  const db = { getJob: async () => job };
+  const db = { getJob: async () => job, getJobForReconciliation: async () => ({ ...job, reconciliationHold: false }) };
   assert.equal(await verifyPhase3BanEvidence(db, job.id, { target, account: value, client }), true);
   job.payload.sourceMode = 'username';
   await assert.rejects(verifyPhase3BanEvidence(db, job.id, { target, account: value, client }));
@@ -404,6 +404,48 @@ test('phase3 ban evidence requires exact persisted disposition and original targ
   job.result.dispositionPersisted = true; job.payload.remoteTarget.accountId = 99;
   await assert.rejects(verifyPhase3BanEvidence(db, job.id, { target, account: value, client }));
 });
+
+for (const mutation of ['none', 'username_only', 'unconfirmed', 'not_persisted', 'durable_hold',
+  'endpoint', 'credentials', 'groups', 'proxy', 'active', 'disabled', 'quota', 'lifetime', 'identity_conflict', 'lifecycle_hold', 'policy_disabled']) {
+  test('retained Phase3 ban evidence planning preserves ' + mutation, async () => {
+    const client = new Sub2ApiAdminClient({ baseUrl: BASE_URL, apiKey: 'fixture-admin-key' });
+    const value = account({ error_message: '{"error":{"code":"invalid_grant"}}' });
+    const job = { id: 'job_' + '2'.repeat(24), type: 'phase3', status: 'failed', finishedAt: '2026-10-09T00:00:00.000Z',
+      payload: { sourceMode: 'token', remoteTarget: { accountId: value.id, targetRevision: accountTestTargetRevision(value),
+        identityKeys: lifecycleIdentityKeys(value), targetDigest: accountTestTargetDigest(value), endpointDigest: remotePhase3EndpointDigest(client) } },
+      result: { code: 'ACCOUNT_DEACTIVATED', accountDisposition: 'discard', dispositionPersisted: true, dispositionOutcome: 'persisted' } };
+    const db = { listConfirmedPhase3JobReferences: async () => [job.id], getJob: async () => job,
+      getJobForReconciliation: async () => ({ ...job, reconciliationHold: mutation === 'durable_hold' }) };
+    if (mutation === 'username_only') job.payload.sourceMode = 'username';
+    if (mutation === 'unconfirmed') job.result.code = 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED';
+    if (mutation === 'not_persisted') job.result.dispositionPersisted = false;
+    if (mutation === 'endpoint') client.baseUrl = BASE_URL + '/different';
+    if (mutation === 'credentials') value.tokenFingerprints.access = 'b'.repeat(16);
+    if (mutation === 'groups') value.groupIds = [99];
+    if (mutation === 'proxy') { value.proxyId = 8; value.proxyIdKnown = true; }
+    if (mutation === 'active') { value.status = 'active'; value.schedulable = true; }
+    if (mutation === 'disabled') value.status = 'disabled';
+    if (mutation === 'quota') value.maintenanceEvidence = { category: 'quota_wait', code: 'upstream_quota_or_overload' };
+    if (mutation === 'lifetime') { value.expiresAt = '2001-01-01T00:00:00.000Z'; value.expiryStatus = 'valid'; }
+    if (mutation === 'identity_conflict') value.identityConflict = true;
+    const history = mutation === 'lifecycle_hold' ? [{ endpointKey: ENDPOINT, identityKey: 'account:account-forty-seven',
+      sub2apiId: value.id, state: 'review_required' }] : [];
+    const policy = { deleteBanned: mutation !== 'policy_disabled' };
+    const plan = planFor(value, history, policy);
+    await addConfirmedPhase3Bans(plan, { db, accounts: [value], client, policy });
+    const item = plan.items[0];
+    if (mutation === 'none' || mutation === 'policy_disabled') {
+      assert.equal(item.classification, 'confirmed_banned');
+      assert.equal(item.action, mutation === 'none' ? 'delete' : 'skip');
+      assert.equal(item.reasonCode, mutation === 'none' ? 'phase3_confirmed_deactivated' : 'disabled_by_policy');
+      assert.equal(item.phase3BanJobId, job.id);
+    } else {
+      assert.notEqual(item.action, 'delete');
+      assert.equal(item.phase3BanJobId, undefined);
+    }
+    assert.equal(Object.values(plan.summary).reduce((a, b) => a + b, 0), 1);
+  });
+}
 
 test('adapter DELETE accepts only a positive exact account ID route and marks unknown writes', async () => {
   const client = new Sub2ApiAdminClient({ baseUrl: BASE_URL, apiKey: 'fixture-admin-key' });

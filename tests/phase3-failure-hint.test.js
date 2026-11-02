@@ -33,7 +33,8 @@ test('uncertain verification dispatch has an explicit fixed hint without enablin
   assert.match(error.message, /提交状态未知/);
   assert.match(error.message, /未补点或重发/);
   assert.equal(error.message.includes('synthetic-private'), false);
-  for (const key of ['code', 'retryable', 'retryAllowed', 'accountDisposition']) assert.equal(error[key], undefined);
+  assert.equal(error.code, 'VERIFICATION_DISPATCH_UNKNOWN');
+  for (const key of ['retryable', 'retryAllowed', 'accountDisposition']) assert.equal(error[key], undefined);
 });
 
 test('ordinary failure displays a hint while raw output and policy fields stay absent', () => {
@@ -42,13 +43,39 @@ test('ordinary failure displays a hint while raw output and policy fields stay a
   classifyPhase3ProcessError(error);
   assert.match(error.message, /邮件已到达/);
   assert.match(error.message, /MAIL_CODE_PARSE_FAILED/);
-  assert.equal(error.code, undefined);
+  assert.equal(error.code, 'MAIL_CODE_PARSE_FAILED');
   for (const key of ['accountDisposition', 'retryable', 'retryAllowed', 'doNotRetry', 'requiresReconciliation']) assert.equal(error[key], undefined);
   assert.equal(JSON.stringify(error).includes('fixture-private'), false);
   assert.equal(error.details.stderr, undefined);
   const message = error.message;
   classifyPhase3ProcessError(error);
   assert.equal(error.message, message);
+});
+
+test('unconfirmed account status preserves the failed-step code without becoming a discard decision', () => {
+  const error = new Error('phase3 进程失败（退出码 1）');
+  error.details = details('[主程序] OAUTH_ACCOUNT_STATUS_UNCONFIRMED: synthetic-private-page');
+  classifyPhase3ProcessError(error);
+  assert.equal(error.code, 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED');
+  assert.match(error.message, /未确认账号终态/);
+  assert.match(error.message, /未删除远端账号/);
+  assert.equal(JSON.stringify(error).includes('synthetic-private-page'), false);
+  assert.equal(error.details.stderr, undefined);
+  for (const key of ['accountDisposition', 'dispositionCode', 'dispositionPersisted', 'retryable',
+    'retryAllowed', 'doNotRetry', 'requiresReconciliation']) assert.equal(error[key], undefined);
+});
+
+test('child diagnostic code cannot manufacture terminal account or hold policy', () => {
+  for (const code of ['ACCOUNT_DEACTIVATED', 'PHASE3_TERMINATION_UNCONFIRMED', 'CONSOLE_RECONCILIATION_REQUIRED',
+    'SUB2API_WRITE_UNKNOWN', 'UNKNOWN_FAILURE']) {
+    const error = new Error('phase3 进程失败（退出码 1）');
+    error.details = details('[主程序] ' + code + ': synthetic-private-page');
+    classifyPhase3ProcessError(error);
+    assert.equal(error.code, undefined);
+    assert.equal(error.message, 'phase3 进程失败（退出码 1）');
+    for (const key of ['accountDisposition', 'dispositionCode', 'retryable', 'requiresReconciliation',
+      'writeOutcomeUnknown']) assert.equal(error[key], undefined);
+  }
 });
 
 test('supervision and reconciliation failures cannot be replaced by a display hint', () => {

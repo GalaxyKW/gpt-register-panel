@@ -197,14 +197,23 @@ function buildMaintenancePlan({ accounts, lifecycles = [], endpointKey, nowMs = 
 
 async function verifyPhase3BanEvidence(db, jobId, { target, account, client }) {
   const { validateBoundRemoteTarget, remotePhase3EndpointDigest } = require('./remotePhase3');
+  const { matchesPhase3LoginBinding } = require('./phase3LoginBinding');
   const job = await db.getJob(jobId);
+  // Public task projections intentionally omit the durable hold column. Read
+  // its integrity-checked value before reusing any completed child evidence.
+  const review = await db.getJobForReconciliation(jobId);
   const result = job?.result;
   if (job?.type !== 'phase3' || job?.status !== 'failed' || !job.finishedAt
-      || job.payload?.sourceMode !== 'token'
+      || review?.type !== 'phase3' || review.status !== 'failed' || review.reconciliationHold !== false
+      || !(job.payload?.sourceMode === 'token'
+        || (job.payload?.sourceMode === 'username' && matchesPhase3LoginBinding(job.payload.loginBinding,
+          { account, loginEmail: job.payload.email, client })))
       || result?.code !== 'ACCOUNT_DEACTIVATED' || result?.accountDisposition !== 'discard'
       || result?.dispositionPersisted !== true || result?.dispositionOutcome !== 'persisted'
       || result?.requiresReconciliation === true || result?.writeOutcomeUnknown === true
-      || result?.dispositionWriteOutcomeUnknown === true || job.reconciliationHold === true) {
+      || result?.dispositionWriteOutcomeUnknown === true
+      || JSON.stringify(review.result) !== JSON.stringify(result)
+      || JSON.stringify(review.payload) !== JSON.stringify(job.payload)) {
     throw maintenanceError('MAINTENANCE_BAN_EVIDENCE_INVALID');
   }
   let binding;
@@ -217,6 +226,38 @@ async function verifyPhase3BanEvidence(db, jobId, { target, account, client }) {
     throw maintenanceError('MAINTENANCE_BAN_EVIDENCE_INVALID');
   }
   return true;
+}
+
+async function addConfirmedPhase3Bans(plan, { db, accounts, client, policy = {} }) {
+  const targets = new Map(plan.items.filter(item =>
+    ['auth_invalid', 'expired', 'network_unknown'].includes(item.classification)
+      && !['strong_identity_ambiguous', 'lifecycle_requires_reconciliation',
+        'outside_free_oauth_scope', 'temporary_scheduling_pause'].includes(item.reasonCode)
+      && item.targetRevision && item.identityKeys.length
+  ).map(item => [item.accountId, item]));
+  if (!targets.size) return;
+  const current = new Map(accounts.map(account => [account.id, account]));
+  for (const jobId of await db.listConfirmedPhase3JobReferences()) {
+    if (!targets.size) break;
+    const job = await db.getJob(jobId);
+    const target = targets.get(job?.payload?.remoteTarget?.accountId);
+    const account = current.get(target?.accountId);
+    if (!target || !account || account.status !== 'error' || !accountInMaintenanceScope(account)) continue;
+    try { await verifyPhase3BanEvidence(db, jobId, { target, account, client }); }
+    catch (error) {
+      if (error.code === 'MAINTENANCE_BAN_EVIDENCE_INVALID') continue;
+      throw error;
+    }
+    // This is retained provider evidence for the exact unchanged remote
+    // account, not a reason to log in again or ask for a second mapping review.
+    plan.summary[target.action] -= 1;
+    target.classification = 'confirmed_banned';
+    target.action = policy.deleteBanned === false ? 'skip' : 'delete';
+    target.reasonCode = policy.deleteBanned === false ? 'disabled_by_policy' : 'phase3_confirmed_deactivated';
+    target.phase3BanJobId = jobId;
+    plan.summary[target.action] += 1;
+    targets.delete(account.id);
+  }
 }
 
 async function assertDeletionTarget(account, target, nowMs, verifyBanEvidence) {
@@ -341,4 +382,4 @@ async function deleteConfirmedBannedAccount({ client, db, target, endpointKey, b
 }
 
 module.exports = { maintenanceEvidenceFromRaw, classifyAccountMaintenance, buildMaintenancePlan,
-  deleteConfirmedBannedAccount, assertDeletionBackup, verifyPhase3BanEvidence };
+  deleteConfirmedBannedAccount, assertDeletionBackup, verifyPhase3BanEvidence, addConfirmedPhase3Bans };

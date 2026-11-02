@@ -1,5 +1,7 @@
-// Child output is untrusted. These hints are display-only: never use them to
-// classify an account, authorize retries, clear holds, or accept token output.
+// Child output is untrusted. These allowlisted diagnostic codes and fixed
+// messages describe a failed step only: never use them to classify an account,
+// authorize retries, clear holds, or accept token output. Terminal account
+// disposition is established independently from the persisted username row.
 const HINTS = Object.freeze({
   EMAIL_CODE_SUBMIT_NOT_DISPATCHED: '邮箱验证码已填入，但未确认表单提交；已停止，未重复提交',
   VERIFICATION_CODE_SUBMIT_NOT_DISPATCHED: '验证码已填入，但未确认表单提交；已停止，未重复提交',
@@ -12,6 +14,7 @@ const HINTS = Object.freeze({
   MAIL_CODE_TIMEOUT: '邮箱查询成功，但等待新的可信验证码超时',
   MAIL_CODE_AMBIGUOUS: '存在多个无法确定先后的验证码；已停止，未猜测使用',
   OAUTH_ACCOUNT_MISMATCH: '登录页面显示的账号与所选账号不一致；已停止',
+  OAUTH_ACCOUNT_STATUS_UNCONFIRMED: '登录页面提及账号停用，但本次未确认账号终态；未生成新 token，也未删除远端账号',
   ACCOUNT_CREDENTIALS_MISSING: '所选本地账号缺少登录凭据；已停止',
 });
 

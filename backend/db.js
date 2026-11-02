@@ -4627,6 +4627,17 @@ class PanelDb {
       .map(row => boundedJobListText(row.id, 128)));
   }
 
+  async listConfirmedPhase3JobReferences() {
+    // Completed account evidence must survive beyond the last 30 UI cards.
+    // Return bounded references only; every use revalidates the complete job,
+    // its durable hold and the original remote identity/execution binding.
+    return this.read(database => resultRows(database.exec(`SELECT id FROM sync_jobs
+      WHERE type = 'phase3' AND status = 'failed' AND typeof(result_json) = 'text'
+        AND instr(result_json, '"ACCOUNT_DEACTIVATED"') > 0
+      ORDER BY created_at DESC, id DESC LIMIT ${HARD_MAX_JOBS}`))
+      .map(row => boundedJobListText(row.id, 128)));
+  }
+
   async listJobsPage(limit = 50) {
     const safeLimit = normalizedJobListLimit(limit);
     const rows = await this.read((database) => {

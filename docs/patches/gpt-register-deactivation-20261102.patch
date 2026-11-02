@@ -1,0 +1,142 @@
+--- a/src/browserService.js
++++ b/src/browserService.js
+@@ -783,11 +783,14 @@
+     }
+
+     classifyAccountDeactivationPage(pageInfo) {
+-        const text = String(pageInfo?.text || '');
++        // Keep status evidence independent of the short text preview used by
++        // the login state machine. The provider may place its error after
++        // navigation/help text, beyond that preview's 500-character limit.
++        const text = String(pageInfo?.accountStatusText ?? pageInfo?.text ?? '');
+         // A mention is enough to stop, but never enough to discard an account.
+         // This includes negated/conditional text which the old broad regexp
+         // treated as an affirmative account status.
+-        const mentionsStatus = /\baccount_deactivated\b|\baccount\b[^\n.!?]{0,120}\b(?:deleted|deactivated|disabled)\b|(?:账户|帐户|账号)[^\n。！？]{0,120}(?:删除|停用|禁用)/i.test(text);
++        const mentionsStatus = /\baccount_deactivated\b|\baccount\b[^\n.!?]{0,120}\b(?:deleted|deactivated|disabled)\b|(?:账户|帐户|账号)[^\n。！？]{0,120}(?:删除|停用|禁用)/i.test(text.replace(/\s+/g, ' '));
+         if (!mentionsStatus) return 'none';
+         let authenticationOrigin = false;
+         try {
+@@ -795,19 +798,34 @@
+                 && new URL(pageInfo.url).origin === 'https://auth.openai.com';
+         } catch {}
+         const lines = text.split(/[\r\n]+/).map(line => line.trim()).filter(Boolean);
+-        const uncertain = lines.some(line => (
++        const sentences = text.split(/[.!?。！？]+/).map(sentence => sentence.replace(/\s+/g, ' ').trim()).filter(Boolean);
++        const negated = sentences.some(line => (
+             /\b(?:not|never|no longer)\s+(?:been\s+)?(?:deleted|deactivated|disabled|account_deactivated)\b/i.test(line)
+             || /(?:未曾|尚未|并未|没有|并没有|不是|并非|不曾|不会|不应|不必|未)\s*(?:被\s*)?(?:删除|停用|禁用)/.test(line)
+-            || /\b(?:if|unless|whether|when|may|might|could|would)\b[^.!?]*\b(?:account_deactivated|deleted|deactivated|disabled)\b/i.test(line)
++        ));
++        const helpContext = lines.some(line => /^(?:help(?:\s+center)?|help article|documentation|example|帮助(?:中心|文档)?|示例|例如)(?:\s*[:：]|\s*$)/i.test(line));
++        const conditional = sentences.some(line => (
++            /\b(?:if|unless|whether|when|may|might|could|would)\b[^.!?]*\b(?:account_deactivated|deleted|deactivated|disabled)\b/i.test(line)
+             || /(?:如果|假如|若|是否|可能|或许)[^。！？]*(?:account_deactivated|删除|停用|禁用)/i.test(line)
+-            || /^(?:help(?:\s+center)?|help article|documentation|example|帮助(?:中心|文档)?|示例|例如)(?:\s*[:：]|\s*$)/i.test(line)
+         ));
+-        const errorHeading = lines.some(line => /^(?:身份验证错误|身份認證錯誤|认证错误|驗證錯誤|authentication error|authentication failed)[!！:：.]?$/i.test(line));
++        const heading = '(?:身份验证错误|身份验证出错|身份認證錯誤|认证错误|驗證錯誤|authentication error|authentication failed)';
++        const errorHeading = lines.some(line => new RegExp('^' + heading + '[!！:：.]?$', 'i').test(line));
++        // Current provider pages show this explicit terminal declaration but
++        // keep the machine error code inside their diagnostic control. Match
++        // the complete first sentence under the authentication-error heading,
++        // not a substring/keyword in instructions or a conditional help text.
++        // A following "If you believe this is an error" does not negate it.
++        const errorBody = text.match(new RegExp('(?:^|[\\r\\n])\\s*' + heading
++            + '(?=\\s|[!！:：.]|你|您|You|$)[!！:：.]?\\s*([\\s\\S]*)', 'i'))?.[1] || '';
++        const firstSentence = errorBody.split(/[.!?。！？]/, 1)[0].replace(/\s+/g, ' ').trim();
++        const terminalDeclaration = /^(?:你|您)没有(?:账户|帐户|账号)[，,]因为该(?:账户|帐户|账号)已被(?:删除或停用|停用或删除)$/.test(firstSentence.replace(/\s+/g, ''))
++            || /^You (?:do not|don't) have an account because it has been (?:deleted or deactivated|deactivated or deleted)$/i.test(firstSentence);
+         const explicitCode = lines.some(line => /^(?:(?:错误(?:代)?码|error(?:\s+code)?|code)\s*[:：]\s*)?account_deactivated[.!。]?$/i.test(line));
+         const explicitErrorRecord = lines.some(line => /^account_deactivated\s*[:：]\s*(?:your\s+)?account\s+(?:(?:has been|is)\s+)?(?:deleted|deactivated|disabled)[.!。]?$/i.test(line));
+-        // Only the authentication origin's explicit error-code presentation is
+-        // terminal. A ChatGPT conversation/help page can quote the same code.
+-        return authenticationOrigin && !uncertain && ((errorHeading && explicitCode) || explicitErrorRecord)
++        // A ChatGPT conversation/help page can quote the same code or phrase;
++        // neither is evidence outside the trusted authentication origin.
++        return authenticationOrigin && !negated && !helpContext
++            && (terminalDeclaration || (!conditional && ((errorHeading && explicitCode) || explicitErrorRecord)))
+             ? 'confirmed' : 'unconfirmed';
+     }
+
+@@ -3808,6 +3826,7 @@
+                 url = this.page.url();
+                 pageInfo = await this.page.evaluate(() => ({
+                     text: (document.body?.innerText || '').substring(0, 500),
++                    accountStatusText: (document.body?.innerText || '').substring(0, 16384),
+                     btns: Array.from(document.querySelectorAll('button'))
+                         .filter(b => {
+                             const rect = b.getBoundingClientRect();
+--- a/test/browserService.branch-safety.test.js
++++ b/test/browserService.branch-safety.test.js
+@@ -533,6 +533,70 @@
+     }));
+ }
+
++const providerDeactivationChinese = '身份验证错误\n你没有账户，因为该账户已被删除或停用。如果你认为这是错误，请通过我们的帮助中心 help.openai.com 联系我们。\n重试\n诊断信息\n复制诊断信息';
++const providerDeactivationEnglish = 'Authentication error\nYou do not have an account because it has been deleted or deactivated. If you believe this is an error, contact us through our help center at help.openai.com.\nRetry\nDiagnostic information\nCopy diagnostic information';
++
++for (const [label, text] of [
++    ['current Chinese page without a visible code', providerDeactivationChinese],
++    ['English equivalent without a visible code', providerDeactivationEnglish],
++    ['single-line Chinese layout', providerDeactivationChinese.replace(/\n/g, ' ')],
++    ['single-line English layout', providerDeactivationEnglish.replace(/\n/g, ' ')],
++    ['wrapped Chinese declaration', providerDeactivationChinese.replace('因为该账户已被删除或停用', '因为该账户\n已被删除\n或停用')],
++    ['wrapped English declaration', providerDeactivationEnglish.replace('account because it has been deleted', 'account\nbecause it has been\ndeleted')],
++    ['translated error heading', providerDeactivationChinese.replace('身份验证错误', '身份验证出错')],
++    ['status beyond the short state-machine preview', 'Navigation '.repeat(60) + '\n' + providerDeactivationChinese],
++    ['affirmative status followed by a separate conditional support sentence', providerDeactivationEnglish + '\nIf your account has been deactivated, contact support.'],
++]) {
++    test(`provider terminal declaration: ${label}`, async () => immediate(async () => {
++        const { service, state } = domFixture('https://auth.openai.com/email-verification');
++        state.text = text;
++        let codeRequests = 0;
++        await assert.rejects(service.oauthLoginAndAuthorize({
++            email: 'fixture@example.test',
++            redirectUri: 'http://localhost:1455/auth/callback', expectedState: 'current',
++            onEmailCodeNeeded: async () => { codeRequests += 1; return '123456'; },
++        }), error => error.code === 'ACCOUNT_DEACTIVATED'
++            && error.accountDisposition === 'discard' && error.retryable === false);
++        assert.equal(codeRequests, 0);
++        assert.equal(state.typed.length, 0);
++        assert.equal(state.clicks.length, 0);
++    }));
++}
++
++for (const [label, text, url = 'https://auth.openai.com/email-verification'] of [
++    ['Chinese declaration without an authentication error heading', providerDeactivationChinese.replace('身份验证错误\n', '')],
++    ['English declaration without an authentication error heading', providerDeactivationEnglish.replace('Authentication error\n', '')],
++    ['conditional Chinese claim', providerDeactivationChinese.replace('你没有账户', '如果你没有账户')],
++    ['conditional English claim', providerDeactivationEnglish.replace('You do not have', 'If you do not have')],
++    ['negated Chinese status', providerDeactivationChinese.replace('已被删除或停用', '未被删除或停用')],
++    ['negated English status', providerDeactivationEnglish.replace('has been deleted', 'has not been deleted')],
++    ['contradictory wrapped status', providerDeactivationEnglish + '\nYour account has not been\ndeactivated.'],
++    ['Chinese documentation quoting the whole page', '帮助文档\n' + providerDeactivationChinese],
++    ['English documentation quoting the whole page', 'Help center\n' + providerDeactivationEnglish],
++    ['quoted declaration introduced as an example', providerDeactivationEnglish.replace('You do not', 'For example, You do not')],
++    ['non-authentication conversation quoting the provider page', providerDeactivationChinese, 'https://chatgpt.com/c/fixture'],
++]) {
++    test(`terminal declaration counterexample: ${label}`, async () => immediate(async () => {
++        const { service, state } = domFixture(url);
++        state.text = text;
++        await assert.rejects(service.oauthLoginAndAuthorize({
++            email: 'fixture@example.test',
++            redirectUri: 'http://localhost:1455/auth/callback', expectedState: 'current',
++        }), error => error.code === 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED'
++            && error.accountDisposition !== 'discard' && error.retryAuthorization !== true);
++        assert.equal(state.typed.length, 0);
++        assert.equal(state.clicks.length, 0);
++    }));
++}
++
++test('untrusted page cannot promote the complete provider declaration to terminal status', async () => immediate(async () => {
++    const { service, state } = domFixture('https://proxy-error.example.test/error');
++    state.text = providerDeactivationChinese;
++    await assert.rejects(service.oauthLoginAndAuthorize({
++        email: 'fixture@example.test', redirectUri: 'http://localhost:1455/auth/callback', expectedState: 'current',
++    }), error => error.code === 'UNEXPECTED_EXTERNAL_AUTH_REDIRECT' && error.accountDisposition !== 'discard');
++}));
++
+ test('password reset returning to login without confirmation preserves the candidate and old password', async () => immediate(async () => {
+     const { service, state, node } = domFixture('https://auth.openai.com/log-in/password');
+     const form = node('form', { action: state.url });

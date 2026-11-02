@@ -27,10 +27,19 @@ async function fixture(t, options = {}) {
   const document = { email, chatgpt_account_id: 'maintenance-account', chatgpt_user_id: 'maintenance-user',
     plan_type: 'free', access_token: secret(), refresh_token: secret(), expires_at: '2099-01-01T00:00:00.000Z' };
   const original = { ...document, access_token: secret(), refresh_token: secret(), expires_at: '2001-01-01T00:00:00.000Z' };
+  if (options.providerLoginBinding) {
+    const claims = { email, exp: 978307200, sub: 'maintenance-user', 'https://api.openai.com/auth': {
+      chatgpt_account_id: 'maintenance-account', chatgpt_user_id: 'maintenance-user', chatgpt_plan_type: 'free' } };
+    original.access_token = Buffer.from(JSON.stringify({ alg: 'RS256', typ: 'JWT' })).toString('base64url') + '.'
+      + Buffer.from(JSON.stringify(claims)).toString('base64url') + '.' + secret();
+    secrets.push(original.access_token);
+  }
   const relativePath = 'tokens/maintained-account.json';
   if (!options.noLocalToken) fs.writeFileSync(path.join(root, relativePath), JSON.stringify(original), { mode: 0o600 });
   const output = options.wrongOutputIdentity ? { ...document, chatgpt_account_id: 'some-other-account' } : document;
-  const script = options.ban ? [
+  const script = options.unconfirmedBan ? [
+    "console.error('[主程序] OAUTH_ACCOUNT_STATUS_UNCONFIRMED: synthetic status evidence unavailable'); process.exitCode=1;",
+  ] : options.ban ? [
     "const fs = require('node:fs');",
     "const rows=JSON.parse(fs.readFileSync('username.json','utf8'));",
     "rows[0].status='account_deleted'; rows[0].phase3Disposition='discard'; rows[0].phase3LastErrorCode='ACCOUNT_DEACTIVATED';",
@@ -42,6 +51,7 @@ async function fixture(t, options = {}) {
   ];
   fs.writeFileSync(path.join(root, 'index.js'), script.join('\n'), { mode: 0o600 });
   const raw = { id: 47, name: 'free00047', platform: 'openai', type: 'oauth', status: 'error', schedulable: false,
+    ...(options.providerLoginBinding ? { updated_at: new Date().toISOString() } : {}),
     group_ids: [1], credentials: { ...original },
     credentials_status: { has_access_token: true, has_refresh_token: true, has_id_token: false },
     error_message: '{"error":{"code":"invalid_grant"}}' };
@@ -130,6 +140,7 @@ async function fixture(t, options = {}) {
     phase3Runner: async args => {
       counters.phase3 += 1;
       if (options.quotaAtExecution) raw.error_message = '{"error":{"code":"insufficient_quota"}}';
+      if (options.changeLoginBindingAtExecution) raw.updated_at = new Date(Date.now() + 1000).toISOString();
       return runPhase3Job(args);
     },
     ...options.consoleOptions,
@@ -346,12 +357,80 @@ test('real Phase3 terminal disposition plus prior strong local binding authorize
   assert.equal((await f.db.listAccountLifecycles(managementEndpointKey(f.client.baseUrl))).filter(row => row.state === 'deleted').length, 2);
 });
 
+test('confirmed Phase3 disposition remains deletable in later maintenance without another login or manual review', async t => {
+  const f = await fixture(t, { ban: true });
+  const first = await f.maintain({ deleteBanned: false });
+  assert.equal(first.status, 'failed'); assert.equal(first.result.summary.deleted, 0);
+  assert.equal(f.counters.phase3, 1); assert.deepEqual(f.writes, []);
+  const priorChildren = await Promise.all(first.result.childJobIds.map(id => f.db.getJob(id)));
+  const proofId = priorChildren.find(row => row.type === 'phase3').id;
+  assert.ok((await f.db.listConfirmedPhase3JobReferences()).includes(proofId));
+  const before = (await f.request('/api/console/overview')).body;
+  const account = before.accounts.find(row => row.id === 47);
+  assert.equal(account.classification, 'confirmed_banned');
+  assert.equal(account.action, 'delete'); assert.equal(account.reason, 'phase3_confirmed_deactivated');
+  const second = await f.maintain({ refreshInvalid: false });
+  assert.equal(second.status, 'succeeded', second.error || second.result.items[0]?.message);
+  assert.equal(second.result.summary.deleted, 1); assert.equal(second.result.summary.refreshed, 0);
+  assert.equal(f.counters.phase3, 1); assert.equal(f.counters.preflight, 1);
+  assert.deepEqual(f.writes, [{ action: 'delete', id: 47 }]); assert.deepEqual(f.tested, []);
+  assert.deepEqual(f.remote.map(row => row.id), [99]);
+  assert.deepEqual(await f.db.getJob(first.id), first, 'original failed task is retained unchanged');
+});
+
+for (const deferred of [false, true]) {
+  test('remote credential identity binds username-only terminal deletion ' + (deferred ? 'across maintenance runs' : 'in the original run'), async t => {
+    const f = await fixture(t, { ban: true, noLocalToken: true, providerLoginBinding: true });
+    const first = await f.maintain({ deleteBanned: !deferred });
+    const phase = (await Promise.all(first.result.childJobIds.map(id => f.db.getJob(id)))).find(row => row.type === 'phase3');
+    assert.ok(phase, first.result.items[0]?.code + ': ' + first.result.items[0]?.message);
+    assert.equal(phase.payload.sourceMode, 'username');
+    assert.ok(phase.payload.loginBinding, 'login proof is persisted before the child starts');
+    assert.equal(phase.result.code, 'ACCOUNT_DEACTIVATED');
+    let final = first;
+    if (deferred) {
+      assert.equal(first.status, 'failed'); assert.deepEqual(f.writes, []);
+      const item = (await f.request('/api/console/overview')).body.accounts.find(row => row.id === 47);
+      assert.equal(item.action, 'delete'); assert.equal(item.reason, 'phase3_confirmed_deactivated');
+      final = await f.maintain({ refreshInvalid: false });
+    }
+    assert.equal(final.status, 'succeeded', final.error || final.result.items[0]?.message);
+    assert.equal(final.result.summary.deleted, 1); assert.equal(f.counters.phase3, 1);
+    assert.equal(f.counters.preflight, 1); assert.deepEqual(f.tested, []);
+    assert.deepEqual(f.writes, [{ action: 'delete', id: 47 }]); assert.deepEqual(f.remote.map(row => row.id), [99]);
+  });
+}
+
+test('username login proof is rechecked after child admission and before the engine starts', async t => {
+  const f = await fixture(t, { ban: true, noLocalToken: true, providerLoginBinding: true, changeLoginBindingAtExecution: true });
+  const job = await f.maintain();
+  assert.equal(job.status, 'failed'); assert.equal(job.result.items[0].code, 'CONSOLE_LOGIN_BINDING_CHANGED');
+  assert.deepEqual(f.writes, []); assert.equal(f.remote.length, 2);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, 'username.json'), 'utf8'))[0].status, 'oauth_done');
+});
+
+test('unconfirmed provider status keeps its concrete failure code in parent and child API results', async t => {
+  const f = await fixture(t, { unconfirmedBan: true });
+  const job = await f.maintain();
+  assert.equal(job.status, 'failed'); assert.equal(job.result.items[0].code, 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED');
+  const children = await Promise.all(job.result.childJobIds.map(id => f.db.getJob(id)));
+  const child = children.find(row => row.type === 'phase3');
+  const exposed = (await f.request('/api/jobs/' + child.id)).body;
+  assert.equal(exposed.result.code, 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED');
+  assert.equal(exposed.result.accountDisposition, undefined);
+  assert.equal(job.result.summary.deleted, 0); assert.deepEqual(f.writes, []);
+  assert.equal((await f.request('/api/console/overview')).body.accounts.find(row => row.id === 47).action, 'refresh');
+});
+
 test('a ban while logging into an email-only local candidate cannot authorize remote deletion', async t => {
   const f = await fixture(t, { ban: true, noLocalToken: true });
   const job = await f.maintain();
   assert.equal(job.status, 'failed'); assert.equal(job.result.summary.deleted, 0);
+  assert.equal(f.counters.phase3, 1); assert.equal(job.result.items[0].code, 'ACCOUNT_DEACTIVATED');
   assert.deepEqual(f.writes, []); assert.equal(f.remote.length, 2);
   assert.equal(await f.db.countActiveJobs(), 0);
+  const overview = (await f.request('/api/console/overview')).body;
+  assert.notEqual(overview.accounts.find(row => row.id === 47).classification, 'confirmed_banned');
 });
 
 test('unknown delete result keeps a permanent tombstone and blocks subsequent pipeline admission', async t => {

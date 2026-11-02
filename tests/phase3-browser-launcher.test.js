@@ -88,9 +88,24 @@ test('real child failure reaches the job as a fixed actionable hint without chil
     assert.match(error.message, /未确认表单提交/);
     assert.match(error.message, /EMAIL_CODE_SUBMIT_NOT_DISPATCHED/);
     assert.equal(error.details?.terminationConfirmed, true);
-    assert.equal(error.code, undefined);
+    assert.equal(error.code, 'EMAIL_CODE_SUBMIT_NOT_DISPATCHED');
     assert.equal(error.accountDisposition, undefined);
     assert.equal(JSON.stringify(error).includes('synthetic-private-payload'), false);
     return true;
   });
+});
+
+test('real child account-status failure retains its code without granting account deletion', async (t) => {
+  const f = fixture(t, "console.error('[主程序] OAUTH_ACCOUNT_STATUS_UNCONFIRMED: synthetic-private-page'); process.exitCode=1;");
+  const before = fs.readFileSync(path.join(f.root, 'username.json'), 'utf8');
+  await assert.rejects(runPhase3Job(f.args), error => {
+    assert.equal(error.code, 'OAUTH_ACCOUNT_STATUS_UNCONFIRMED');
+    assert.match(error.message, /未确认账号终态/);
+    assert.equal(error.details?.terminationConfirmed, true);
+    assert.equal(error.accountDisposition, undefined);
+    assert.equal(error.requiresReconciliation, undefined);
+    assert.equal(JSON.stringify(error).includes('synthetic-private-page'), false);
+    return true;
+  });
+  assert.equal(fs.readFileSync(path.join(f.root, 'username.json'), 'utf8'), before);
 });

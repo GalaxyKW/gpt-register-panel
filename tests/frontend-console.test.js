@@ -816,6 +816,17 @@ test('console only extends network preflight deadline and deduplicates both chec
   await api.request('/api/console/settings'); assert.deepEqual(deadlines, [170000, 45000]);
 });
 
+test('console explains confirmed Phase3 deactivation as deletion without another login or mapping review', () => {
+  const { api, element, calls } = harness(); element('account-filter').value = 'all';
+  api.state.overview.accounts = [{ id: 42, name: 'free00042', classification: 'confirmed_banned', action: 'delete', reason: 'phase3_confirmed_deactivated' }];
+  api.renderAccounts(); api.openAccountDetail(0);
+  assert.match(element('account-rows').innerHTML, /删除远端记录/);
+  assert.match(element('account-detail').innerHTML, /此前登录已确认停用，将删除原远端记录，无需再次登录/);
+  assert.match(element('account-detail').innerHTML, /无需再次登录或人工配对/);
+  assert.doesNotMatch(element('account-detail').innerHTML, /phase3_confirmed_deactivated|优先核对并回写|独立测试/);
+  assert.equal(calls.length, 0);
+});
+
 test('console distinguishes administrator account lifetime expiry from OAuth expiry', () => {
   const { api, element } = harness(); element('account-filter').value = 'all';
   api.state.overview.accounts = [{ id: 42, classification: 'manual_disabled', action: 'skip', reason: 'administrator_lifetime_expired' }];
@@ -1012,6 +1023,27 @@ test('console task detail matches running parent projection and does not mistake
 function untouchedMaintenanceSummary(skipped) {
   return { registered: 0, imported: 0, refreshed: 0, deleted: 0, skipped, failed: 0,
     tokensGenerated: 0, tokensUpdated: 0, tested: 0, verified: 0, testFailed: 0 };
+}
+
+for (const [label, item] of [
+  ['normal maintenance with unstarted token phases', { reasonCode: 'phase3_confirmed_deactivated',
+    phases: { tokenGenerated: false, tokenUpdated: false, tested: false, verified: false } }],
+  ['reviewed historical deletion without token phases', { reasonCode: 'operator_reviewed_provider_deactivation',
+    message: '已根据原任务停用页面删除原远端记录；未重新登录' }],
+]) {
+  test('console shows confirmed deletion as completed work: ' + label, async () => {
+    const h = harness();
+    mockConsole(h, { job: { id: uiJobId, type: 'console_maintain', status: 'succeeded', result: {
+      stage: 'completed', summary: { ...untouchedMaintenanceSummary(0), deleted: 1 },
+      items: [{ accountId: 42, accountName: 'free00042', status: 'deleted', ...item }],
+    } } });
+    await h.api.openTaskDetail(uiJobId); const text = h.element('task-detail').innerHTML;
+    assert.match(text, /class="tag good">已删除/);
+    assert.match(text, /已删除原 Sub2API 记录/);
+    assert.match(text, /删除记录<\/span><strong>1/);
+    assert.doesNotMatch(text, /尚无已完成步骤|未生成新 token|处理结果|data-select-result-account|将删除原远端记录|继续测试/);
+    assert.equal(h.calls.filter(call => call.options.method === 'POST').length, 0);
+  });
 }
 
 for (const stage of ['completed', 'no_changes']) {
